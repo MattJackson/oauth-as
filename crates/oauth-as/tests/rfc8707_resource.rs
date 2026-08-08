@@ -616,7 +616,7 @@ async fn the_requested_resource_replaces_the_configured_aud_claim() {
 async fn a_resource_outside_the_allowlist_is_invalid_target() {
     let clock = ManualClock::at_epoch();
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
-    cfg.allowed_resources = vec!["https://a.example/api".to_string()];
+    cfg.allowed_resources = Some(Box::new(["https://a.example/api".into()]));
     let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock);
     srv.register_client(client_credentials_client())
         .await
@@ -659,7 +659,7 @@ async fn an_empty_allowlist_means_no_restriction() {
     let clock = ManualClock::at_epoch();
     let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     assert!(
-        cfg.allowed_resources.is_empty(),
+        cfg.allowed_resources.is_none(),
         "the default is unrestricted, and that is the documented risk"
     );
     let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock);

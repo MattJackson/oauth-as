@@ -76,6 +76,8 @@ struct Inner {
     refresh: HashMap<String, RefreshTokenRecord>,
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
     replay_ids: HashMap<String, SystemTime>,
+    #[cfg(feature = "par")]
+    pushed: HashMap<String, oauth_as::par::PushedAuthorizationRequest>,
 }
 
 struct NaiveStore {
@@ -226,6 +228,36 @@ impl Storage for NaiveStore {
     ) -> Result<(), StorageError> {
         self.lock().codes.insert(record.code.clone(), record);
         Ok(())
+    }
+
+    #[cfg(feature = "par")]
+    async fn put_pushed_authorization_request(
+        &self,
+        record: oauth_as::par::PushedAuthorizationRequest,
+    ) -> Result<(), StorageError> {
+        self.lock()
+            .pushed
+            .insert(record.request_uri.clone(), record);
+        Ok(())
+    }
+
+    /// Honours the same `read_then_delete` fault as the other takes: a `request_uri` is single use
+    /// (RFC 9126 s4), so a store that reads then deletes double-spends it exactly as it would a
+    /// refresh token, and the harness should be able to catch it here too.
+    #[cfg(feature = "par")]
+    async fn take_pushed_authorization_request(
+        &self,
+        request_uri: &str,
+    ) -> Result<Option<oauth_as::par::PushedAuthorizationRequest>, StorageError> {
+        if self.faults.read_then_delete {
+            let record = self.lock().pushed.get(request_uri).cloned();
+            round_trip_to_the_store().await;
+            if record.is_some() {
+                self.lock().pushed.remove(request_uri);
+            }
+            return Ok(record);
+        }
+        Ok(self.lock().pushed.remove(request_uri))
     }
 
     async fn take_authorization_code(

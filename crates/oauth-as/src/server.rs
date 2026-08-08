@@ -122,10 +122,14 @@ pub struct ServerConfig {
     pub scopes_supported: Option<Vec<String>>,
     /// The RFC 8707 resource indicators this server is WILLING to issue tokens for.
     ///
-    /// EMPTY (the default) means no restriction, which is the pre-existing behaviour and is why
+    /// `None` (the default) means no restriction, which is the pre-existing behaviour and is why
     /// it is the default: turning refusal on by default would break every deployment already
-    /// using resource indicators. It is also why an empty value is a real risk rather than a
+    /// using resource indicators. It is also why `None` is a real risk rather than a
     /// neutral one, and the risk is worth stating here rather than in a changelog.
+    ///
+    /// `Option<Box<[Box<str>]>>` rather than `Vec<String>` so a host that never sets it pays ONE
+    /// pointer on every `ServerConfig`, not a 24 byte vector header. The list is written once at
+    /// construction and only ever iterated.
     ///
     /// RFC 8707 section 2 requires `invalid_target` when the server "is unwilling or unable to
     /// issue an access token" for a requested resource. With this empty, the server has no notion
@@ -136,9 +140,20 @@ pub struct ServerConfig {
     /// identifier, and authorises.
     ///
     /// A deployment serving more than one resource server should set this.
-    pub allowed_resources: Vec<String>,
+    pub allowed_resources: Option<Box<[Box<str>]>>,
     /// RFC 8414 `service_documentation`.
     pub service_documentation: Option<String>,
+    /// RFC 9396 section 10 `authorization_details_types_supported`: the authorization
+    /// details types this deployment actually implements.
+    ///
+    /// `None` is the DEFAULT and means NO type is supported, so every `authorization_details`
+    /// request is refused with `invalid_authorization_details`. That is not conservatism for
+    /// its own sake, it is section 5: "The AS MUST refuse to process any unknown
+    /// authorization details type", and a server that has been told nothing about a type
+    /// cannot be said to know it. Compiling the `rar` feature in is therefore not the same
+    /// as turning it on; a host turns it on by naming its types here.
+    #[cfg(feature = "rar")]
+    pub authorization_details_types_supported: Option<Vec<String>>,
     /// RFC 9728 section 4 `protected_resources`: the resource identifiers of the protected
     /// resources this AS issues tokens for. `None` (the default) omits the member; see
     /// [`crate::metadata::AuthorizationServerMetadata::protected_resources`], and note that
@@ -240,8 +255,12 @@ impl ServerConfig {
             #[cfg(feature = "jar")]
             jar: None,
             scopes_supported: None,
-            allowed_resources: Vec::new(),
+            allowed_resources: None,
             service_documentation: None,
+            // OFF. An undeclared catalogue supports no types: see the field's own docs and
+            // RFC 9396 section 5.
+            #[cfg(feature = "rar")]
+            authorization_details_types_supported: None,
             #[cfg(feature = "resource-metadata")]
             protected_resources: None,
             #[cfg(feature = "jwt")]
@@ -501,6 +520,18 @@ pub struct TokenRequestContext<'a> {
     pub credential: ClientCredential<'a>,
     /// The RFC 8707 `resource` parameters, in wire order.
     pub resources: &'a [String],
+    /// The RFC 9396 `authorization_details` parameter, raw and unparsed.
+    ///
+    /// Here rather than on each [`TokenRequest`] variant for the reason `resources` is
+    /// here: section 6 defines it as a parameter of the token REQUEST, independent of
+    /// `grant_type`. What it MEANS does depend on the grant, and section 6 is what decides:
+    /// `authorization_code` and `refresh_token` may narrow what the authorization request
+    /// obtained and never widen it; `client_credentials` has no prior authorization request,
+    /// so its details are checked against the supported types and used; and the device grant
+    /// refuses any at all, because the RFC 8628 section 3.1 request cannot carry them in
+    /// this crate and so granted nothing for a poll to narrow to.
+    #[cfg(feature = "rar")]
+    pub authorization_details: Option<&'a str>,
     /// The RFC 9449 `DPoP` request header, verbatim and unparsed.
     ///
     /// `None` means the client sent none, which is refused only when
@@ -691,6 +722,132 @@ fn storage_error(e: StorageError) -> ErrorResponse {
     ErrorResponse::new(ErrorCode::ServerError)
 }
 
+/// The RFC 9396 authorization details flowing through one issuance: what a grant carries,
+/// what a token request asked to narrow it to, and what the issued token ends up with.
+///
+/// A WRAPPER rather than the details themselves, and the reason is structural. `issue` and
+/// the grant helpers have to have exactly ONE signature in every feature configuration: an
+/// argument can carry a `cfg`, but the ARGUMENT AT THE CALL SITE cannot, so a gated
+/// parameter would mean duplicating five call sites under `cfg` and giving the eight
+/// existing arguments five more places to drift. This is the same reasoning `Bound` above
+/// records for the RFC 9449 key binding.
+///
+/// Without `rar` this struct has no fields, so it is zero sized, every construction of it
+/// compiles to nothing, and the default build's token future keeps the size
+/// `tests/allocation.rs` pins. That gate exists because crossing tokio's 2048-byte debug
+/// boxing threshold costs an allocation on every request that reaches the endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrantedDetails {
+    /// BOXED, and an `Option` so that the common case is a null pointer. The token future
+    /// is 1976 bytes against tokio's 2048-byte debug boxing threshold, and this value is
+    /// live in it at six points; carrying the details inline (three words) crossed the
+    /// threshold and cost a 2 KB allocation on EVERY token request, which is exactly the
+    /// regression `tests/allocation.rs` was written to catch, and it caught this one. One
+    /// word costs 48 bytes of the future instead of 144, and the allocation behind the
+    /// `Some` is paid only by a request that actually carries authorization details.
+    #[cfg(feature = "rar")]
+    inner: Option<Box<crate::rar::AuthorizationDetails>>,
+}
+
+impl GrantedDetails {
+    /// Wrap details read off a grant record, keeping the empty case a null pointer.
+    #[cfg(feature = "rar")]
+    fn of(details: &crate::rar::AuthorizationDetails) -> Self {
+        GrantedDetails {
+            inner: (!details.is_empty()).then(|| Box::new(details.clone())),
+        }
+    }
+
+    /// What an authorization code granted (RFC 9396 section 7: the details as approved by
+    /// the resource owner and assigned to the token this code mints).
+    fn of_code(record: &AuthorizationCodeRecord) -> Self {
+        #[cfg(feature = "rar")]
+        {
+            GrantedDetails::of(&record.authorization_details)
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            let _ = record;
+            GrantedDetails {}
+        }
+    }
+
+    /// What a refresh chain carries, which is what the previous leg narrowed it to.
+    fn of_refresh(record: &RefreshTokenRecord) -> Self {
+        #[cfg(feature = "rar")]
+        {
+            GrantedDetails::of(&record.authorization_details)
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            let _ = record;
+            GrantedDetails {}
+        }
+    }
+
+    /// What an already-issued token carries, for a grant that continues it: the RFC 8693
+    /// exchange, where the exchanged token inherits the subject token's details.
+    ///
+    /// `dead_code` for the same reason [`Bound::secret`] carries it: its only caller is
+    /// behind another slice's cargo feature, and gating this on that feature by name would
+    /// tie this module to a flag it has no other business knowing.
+    #[allow(dead_code)]
+    pub(crate) fn of_token(token: &IssuedToken) -> Self {
+        #[cfg(feature = "rar")]
+        {
+            GrantedDetails::of(&token.authorization_details)
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            let _ = token;
+            GrantedDetails {}
+        }
+    }
+
+    /// The owned details to write onto a record.
+    #[cfg(feature = "rar")]
+    fn into_details(self) -> crate::rar::AuthorizationDetails {
+        self.inner.map(|d| *d).unwrap_or_default()
+    }
+
+    /// Whether anything was asked for at all.
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        #[cfg(feature = "rar")]
+        {
+            self.inner.is_none()
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            true
+        }
+    }
+
+    /// The details an issuance gets: `requested` may NARROW what `self` carries and may
+    /// never widen it (RFC 9396 section 6). Delegated to [`crate::rar`], which is where the
+    /// comparison rule and the argument for it live; this is the seam, not the rule.
+    fn narrow(&self, requested: &GrantedDetails) -> Result<GrantedDetails, ErrorResponse> {
+        #[cfg(feature = "rar")]
+        {
+            let requested = match &requested.inner {
+                // Nothing asked for, so nothing to narrow: the grant passes through.
+                None => return Ok(self.clone()),
+                Some(requested) => requested.as_ref(),
+            };
+            // A grant carrying none narrows to nothing, and `narrow` refuses accordingly:
+            // widening from nothing is still widening. The empty set allocates nothing.
+            let empty = crate::rar::AuthorizationDetails::none();
+            let granted = self.inner.as_deref().unwrap_or(&empty);
+            Ok(GrantedDetails::of(&granted.narrow(requested)?))
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            let _ = requested;
+            Ok(GrantedDetails {})
+        }
+    }
+}
+
 /// The refresh chain an issuance CONTINUES: carried from the redeemed record to its replacement,
 /// so that rotation preserves both the family (RFC 9700 section 4.14.2 revokes by grant) and the
 /// absolute lifetime (a chain must not slide its own expiry forward every time it rotates).
@@ -816,6 +973,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         subject: Option<&str>,
         scope: &ScopeSet,
         resource: &[String],
+        details: &GrantedDetails,
         now: SystemTime,
         jti: String,
         bound: &Bound<'_>,
@@ -863,6 +1021,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
             jti,
             scope: (!scope.is_empty()).then(|| scope.to_string()),
+            // RFC 9396 s9.1: the AS is RECOMMENDED to add the authorization details as a
+            // top-level claim, so a resource server holding a JWT does not have to call
+            // introspection to learn what the token actually authorizes. NOT filtered per
+            // audience, which s9.1 also suggests: filtering means deciding which detail
+            // belongs to which resource server, and only the API that defined the `type`
+            // knows that (s6.1). A detail that names its own `locations` has already said
+            // so, in a form the resource server can check for itself.
+            #[cfg(feature = "rar")]
+            authorization_details: details.clone().into_details(),
             // RFC 8705 s3.1: the same binding the AS-side record carries, in the form a
             // resource server can check for itself without calling introspection at all.
             #[cfg(feature = "mtls")]
@@ -956,11 +1123,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // because refusing would break every deployment that already relies on resource
             // indicators. That means this check protects only hosts that configure it, which is
             // stated plainly on the config field rather than left for someone to discover.
-            if !self.config.allowed_resources.is_empty()
-                && !self.config.allowed_resources.iter().any(|a| a == value)
-            {
-                return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
-                    .with_description("this server does not issue tokens for that resource"));
+            if let Some(allowed) = &self.config.allowed_resources {
+                if !allowed.iter().any(|a| &**a == value) {
+                    return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
+                        .with_description("this server does not issue tokens for that resource"));
+                }
             }
             // A repeated identical indicator is the same request twice, not two audiences.
             if !out.iter().any(|kept: &String| kept == value) {
@@ -1571,6 +1738,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ) -> Result<TokenResponse, ErrorResponse> {
         let requested_resources =
             self.validate_resources(context.resources.iter().map(|r| r.as_str()))?;
+        // RFC 9396 s5 and s6, parsed and type-checked ONCE here for the same reason the
+        // resource indicators are validated once here: it is a parameter of the token
+        // request itself, not of any one grant. The s5 type check has to run at THIS
+        // endpoint too and not only at the authorization endpoint, because
+        // `client_credentials` reaches issuance without ever passing the other one.
+        #[cfg(feature = "rar")]
+        let requested_details = match context.authorization_details {
+            None => GrantedDetails::default(),
+            Some(raw) => {
+                let parsed = crate::rar::AuthorizationDetails::parse(raw)?;
+                parsed.require_supported_types(
+                    self.config.authorization_details_types_supported.as_deref(),
+                )?;
+                GrantedDetails::of(&parsed)
+            }
+        };
+        #[cfg(not(feature = "rar"))]
+        let requested_details = GrantedDetails::default();
         // RFC 9449 s4.3, before anything else touches the store: see `verify_dpop`.
         #[cfg(feature = "dpop")]
         let jkt = Box::pin(self.verify_dpop(context.dpop_proof)).await?;
@@ -1595,6 +1780,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         redirect_uri.as_deref(),
                         code_verifier.as_deref(),
                         &requested_resources,
+                        requested_details,
                     )
                     .await;
                 self.emit_refusal(&client_id, GrantType::AuthorizationCode, &outcome);
@@ -1616,6 +1802,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         &bound,
                         scope.as_ref(),
                         requested_resources,
+                        requested_details,
                     )
                     .await;
                 self.emit_refusal(&client_id, GrantType::ClientCredentials, &outcome);
@@ -1634,6 +1821,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                             "the device authorization request granted no resource to narrow to",
                         ),
                     );
+                }
+                // RFC 9396 s6, and the same argument: the device authorization request
+                // cannot carry authorization_details in this crate, so there is nothing
+                // granted for this poll to narrow to, and minting detail here would be
+                // authorizing something the user never saw.
+                #[cfg(feature = "rar")]
+                if !requested_details.is_empty() {
+                    return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                        .with_description(
+                            "the device authorization request granted no authorization_details",
+                        ));
                 }
                 let bound = Bound {
                     cred: context.credential.or_secret(client_secret.as_deref()),
@@ -1662,6 +1860,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         &refresh_token,
                         scope.as_ref(),
                         &requested_resources,
+                        requested_details,
                     )
                     .await;
                 self.emit_refusal(&client_id, GrantType::RefreshToken, &outcome);
@@ -1891,7 +2090,41 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 })
             })?;
 
-        Ok(ValidatedAuthorizationRequest::new(
+        // RFC 9396 authorization_details, checked last among the redirectable checks for
+        // the same reason `resource` is checked late: it is the newest of them, and a
+        // request that is also missing PKCE should hear about PKCE. Reported to the client
+        // rather than to the user, since by here the redirect URI is trusted, and REFUSED
+        // rather than ignored (section 5), because a client whose authorization detail was
+        // silently dropped would obtain a token it believes says something it does not.
+        #[cfg(feature = "rar")]
+        let details = {
+            let to_redirect = |error: ErrorResponse| {
+                AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                    redirect_uri: redirect_uri.clone(),
+                    error,
+                    state: state.clone(),
+                    iss: self.issuer_identifier().to_string(),
+                })
+            };
+            match request.authorization_details.as_deref() {
+                None => crate::rar::AuthorizationDetails::none(),
+                Some(raw) => {
+                    let parsed =
+                        crate::rar::AuthorizationDetails::parse(raw).map_err(to_redirect)?;
+                    parsed
+                        .require_supported_types(
+                            self.config.authorization_details_types_supported.as_deref(),
+                        )
+                        .map_err(to_redirect)?;
+                    parsed
+                }
+            }
+        };
+
+        // `mut` plus a setter rather than a ninth constructor argument: see
+        // `ValidatedAuthorizationRequest::set_authorization_details`.
+        #[allow(unused_mut)]
+        let mut validated = ValidatedAuthorizationRequest::new(
             client.client_id,
             redirect_uri,
             scope,
@@ -1900,7 +2133,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             CodeChallengeMethod::S256,
             self.issuer_identifier().to_string(),
             resource,
-        ))
+        );
+        #[cfg(feature = "rar")]
+        validated.set_authorization_details(details);
+        Ok(validated)
     }
 
     /// Mint an authorization code for a request the user has approved (RFC 6749 section 4.1.2).
@@ -1925,6 +2161,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             code_challenge_method: request.code_challenge_method,
             // RFC 8707 s2: what the token this code redeems into may be audience-restricted to.
             resource: request.resource.clone(),
+            // RFC 9396 s7: the details as granted, which is what the redeeming token request
+            // may narrow and what the issued token will carry.
+            #[cfg(feature = "rar")]
+            authorization_details: request.authorization_details.clone(),
             expires_at: now + self.config.authorization_code_ttl,
             state: AuthorizationCodeState::Issued,
         };
@@ -1950,6 +2190,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     }
 
     /// RFC 6749 section 4.1.3 with the OAuth 2.1 PKCE requirement: redeem an authorization code.
+    // Eight arguments rather than seven, for the reason `issue` carries the same allow: the
+    // alternative is a parameter struct nobody else would ever construct, wrapping values
+    // that are already named at this function's one call site.
+    #[allow(clippy::too_many_arguments)]
     async fn authorization_code_token(
         &self,
         client_id: &ClientId,
@@ -1958,6 +2202,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         redirect_uri: Option<&str>,
         code_verifier: Option<&str>,
         requested_resources: &[String],
+        requested_details: GrantedDetails,
     ) -> Result<TokenResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, &bound.cred).await?;
         if !client.allows_grant(GrantType::AuthorizationCode) {
@@ -2075,8 +2320,25 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // redirect_uri mismatches above do: asking for the wrong resource is a client bug, and
         // burning a live code for a bug the client can fix on retry is a denial of service the
         // attacker gets for free.
-        let resource = match Self::narrow_resources(&record.resource, requested_resources) {
-            Ok(r) => r,
+        // RFC 8707 s2 and RFC 9396 s6 are the SAME rule applied to two parameters: the token
+        // request may narrow what the authorization request obtained, and never widen it.
+        // Both are computed as one fallible expression with ONE error path, rather than two
+        // `match` blocks each holding an `ErrorResponse` across a `put_authorization_code`
+        // await of its own: this function IS the token future, and `tests/allocation.rs`
+        // holds that future under tokio's 2048-byte debug boxing threshold, past which every
+        // single token request pays a 2 KB allocation.
+        //
+        // The code goes BACK on refusal, exactly as the redirect_uri and PKCE mismatches
+        // above do: asking for the wrong thing is a client bug, and burning a live code for
+        // a bug the client can fix on retry is a denial of service the attacker gets free.
+        let narrowed =
+            Self::narrow_resources(&record.resource, requested_resources).and_then(|r| {
+                GrantedDetails::of_code(&record)
+                    .narrow(&requested_details)
+                    .map(|d| (r, d))
+            });
+        let (resource, details) = match narrowed {
+            Ok(narrowed) => narrowed,
             Err(e) => {
                 let _ = self.store.put_authorization_code(record).await;
                 return Err(e);
@@ -2091,6 +2353,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 Some(record.subject.clone()),
                 record.scope.clone(),
                 resource,
+                details,
                 None,
                 true,
             )
@@ -2120,6 +2383,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         bound: &Bound<'_>,
         requested_scope: Option<&ScopeSet>,
         resource: Vec<String>,
+        details: GrantedDetails,
     ) -> Result<TokenResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, &bound.cred).await?;
         // RFC 6749 section 4.4: this grant is for confidential clients. A public client has no
@@ -2145,6 +2409,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             None,
             scope,
             resource,
+            // RFC 9396 s6: there is no prior authorization request here, so there is nothing
+            // to narrow AGAINST. The client authenticated as itself and is naming what it
+            // means to do, which is the whole of what the parameter says in this grant; the
+            // s5 type check has already run at the endpoint.
+            details,
             None,
             false,
         )
@@ -2234,6 +2503,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     Some(subject),
                     taken.scope,
                     Vec::new(),
+                    // No details: the device authorization request does not carry them and
+                    // the poll above refuses any the client sends.
+                    GrantedDetails::default(),
                     None,
                     true,
                 )
@@ -2250,6 +2522,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         refresh_token: &str,
         requested_scope: Option<&ScopeSet>,
         requested_resources: &[String],
+        requested_details: GrantedDetails,
     ) -> Result<TokenResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, &bound.cred).await?;
         if !client.allows_grant(GrantType::RefreshToken) {
@@ -2367,8 +2640,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
         // RFC 8707 s2, the same narrowing rule as the scope rule immediately above and refused the
         // same way: the record goes back so a client that asked for the wrong resource can retry.
-        let resource = match Self::narrow_resources(&record.resource, requested_resources) {
-            Ok(r) => r,
+        // RFC 8707 s2 and RFC 9396 s6, one fallible expression and one error path, for the
+        // reason the authorization code grant gives above. The chain carries what the
+        // PREVIOUS leg narrowed to, so a client that narrowed once cannot climb back on the
+        // next rotation; the record goes back either way, because a widening attempt here is
+        // a client bug and not evidence of compromise.
+        let narrowed =
+            Self::narrow_resources(&record.resource, requested_resources).and_then(|r| {
+                GrantedDetails::of_refresh(&record)
+                    .narrow(&requested_details)
+                    .map(|d| (r, d))
+            });
+        let (resource, details) = match narrowed {
+            Ok(narrowed) => narrowed,
             Err(e) => {
                 self.store
                     .put_refresh_token(record)
@@ -2386,6 +2670,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 record.subject.clone(),
                 scope,
                 resource,
+                details,
                 Some(RefreshChain {
                     family_id: record.family_id.clone(),
                     expires_at: record.expires_at,
@@ -2445,6 +2730,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         subject: Option<String>,
         scope: ScopeSet,
         resource: Vec<String>,
+        details: GrantedDetails,
         chain: Option<RefreshChain>,
         allow_refresh: bool,
     ) -> std::pin::Pin<
@@ -2457,6 +2743,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             subject,
             scope,
             resource,
+            details,
             chain,
             allow_refresh,
         ))
@@ -2471,6 +2758,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         subject: Option<String>,
         scope: ScopeSet,
         resource: Vec<String>,
+        details: GrantedDetails,
         chain: Option<RefreshChain>,
         allow_refresh: bool,
     ) -> Result<TokenResponse, ErrorResponse> {
@@ -2480,6 +2768,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // under the configuration nobody builds locally.
         #[cfg(not(feature = "dpop"))]
         let _ = bound;
+        // Likewise: without `rar` the details are a zero sized value nothing reads.
+        #[cfg(not(feature = "rar"))]
+        let _ = details;
         let now = self.clock.now();
 
         let issues_refresh = allow_refresh
@@ -2520,6 +2811,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             subject.as_deref(),
             &scope,
             &resource,
+            &details,
             now,
             access_token,
             bound,
@@ -2541,6 +2833,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 subject: subject.clone(),
                 scope: scope.clone(),
                 resource: resource.clone(),
+                // RFC 9396 s7: the details as granted, assigned to this access token. This
+                // is what introspection (s9.2) reports and what the s9.1 JWT claim carries.
+                #[cfg(feature = "rar")]
+                authorization_details: details.clone().into_details(),
                 issued_at: now,
                 expires_at: now + self.config.access_token_ttl,
                 family_id: family_id.clone(),
@@ -2570,6 +2866,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     scope: scope.clone(),
                     // The chain remembers what it may narrow from on the next rotation.
                     resource,
+                    #[cfg(feature = "rar")]
+                    authorization_details: details.into_details(),
                     expires_at,
                     // Present whenever a refresh token is: `issues_refresh` is what decided both.
                     family_id: family_id.unwrap_or_default(),
@@ -2691,6 +2989,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // the grant carried RFC 8707 resource indicators. Omitted rather than empty when it
                 // does not: see `IntrospectionResponse::aud`.
                 aud: (!t.resource.is_empty()).then(|| t.resource.clone()),
+                // RFC 9396 s9.2: the details as a top-level member of the introspection
+                // response. For an OPAQUE token this is the ONLY way a resource server can
+                // learn what the token actually authorizes, which is the whole point of the
+                // parameter.
+                #[cfg(feature = "rar")]
+                authorization_details: t.authorization_details.clone(),
                 // RFC 9449 s6.1 with RFC 7800 s3.1. A resource server that introspects must be
                 // able to confirm the binding, or the binding stops at this server and the RS is
                 // back to trusting a bearer string.

@@ -93,12 +93,23 @@ pub mod http;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod metadata;
+/// RFC 8705 mutual-TLS client authentication and certificate-bound access tokens,
+/// behind the `mtls` cargo feature (off by default). READ THE MODULE DOCS FIRST: this
+/// crate cannot validate a certificate chain it did not negotiate, so the host's TLS
+/// layer is load bearing in a way no type here can enforce.
+#[cfg(feature = "mtls")]
+pub mod mtls;
 /// RFC 9126 pushed authorization requests and RFC 9101 signed request objects, behind the `par`
 /// and `jar` cargo features (both off by default). They are the two ways an authorization request
 /// reaches this server without travelling through the browser as rewritable query text.
 #[cfg(any(feature = "par", feature = "jar"))]
 pub mod par;
 pub mod pkce;
+/// RFC 9396 rich authorization requests, behind the `rar` cargo feature (off by
+/// default). Structured authorization detail for the things a scope string cannot say,
+/// such as which account a payment comes out of.
+#[cfg(feature = "rar")]
+pub mod rar;
 pub mod registration;
 /// RFC 9728 protected resource metadata, behind the `resource-metadata` cargo feature
 /// (off by default). Read the module docs before using it: the document RFC 9728 defines
@@ -107,6 +118,19 @@ pub mod registration;
 pub mod resource_metadata;
 pub mod scope;
 pub mod server;
+/// A runnable conformance harness for the [`store::Storage`] contract, behind the
+/// `test-util` cargo feature (off by default), for a HOST to run against its OWN store.
+///
+/// The contract this crate depends on most is that `take_*` is an ATOMIC
+/// remove-and-return; a read-then-delete implementation of it passes every single-node
+/// test a host is likely to write and double-spends refresh tokens on two nodes. Nothing
+/// in this crate can detect that, which is why the check ships as something the host runs.
+///
+/// Not re-exported at the crate root on purpose: `Violation` and `CHECKS` are generic
+/// words that only mean something next to the thing they describe, and a host names this
+/// surface once, in a test.
+#[cfg(feature = "test-util")]
+pub mod storage_conformance;
 pub mod store;
 pub mod token;
 /// RFC 8693 token exchange, behind the `token-exchange` cargo feature (off by default).
@@ -139,6 +163,13 @@ pub use http::{
     SubjectResolver,
 };
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
+#[cfg(feature = "mtls")]
+pub use mtls::{
+    CertificateThumbprint, ClientCertificate, ExpectedSubject, MtlsClientRegistration,
+    MtlsRegistrationError, RegisteredCertificates, SELF_SIGNED_TLS_CLIENT_AUTH, TLS_CLIENT_AUTH,
+    TLS_CLIENT_AUTH_SAN_DNS, TLS_CLIENT_AUTH_SAN_EMAIL, TLS_CLIENT_AUTH_SAN_IP,
+    TLS_CLIENT_AUTH_SAN_URI, TLS_CLIENT_AUTH_SUBJECT_DN,
+};
 #[cfg(feature = "jar")]
 pub use par::{
     JarConfig, RegisteredRequestObjectKey, RequestObjectAlg, RequestObjectKeyError,
@@ -147,6 +178,11 @@ pub use par::{
 #[cfg(feature = "par")]
 pub use par::{
     ParConfig, PushedAuthorizationRequest, PushedAuthorizationResponse, REQUEST_URI_PREFIX,
+};
+#[cfg(feature = "rar")]
+pub use rar::{
+    AuthorizationDetail, AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES,
+    MAX_AUTHORIZATION_DETAILS_DEPTH, MAX_AUTHORIZATION_DETAILS_ELEMENTS,
 };
 pub use registration::{
     ClientInformation, ClientMetadata, RegistrationAttempt, RegistrationConfig,

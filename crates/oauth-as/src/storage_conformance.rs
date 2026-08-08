@@ -1972,6 +1972,8 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
             "https://rs-one.example/".to_string(),
             "https://rs-two.example/".to_string(),
         ],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         expires_at: at(60),
         state: AuthorizationCodeState::Consumed {
             access_token: "at-minted-by-this-code".to_string(),
@@ -1990,6 +1992,8 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
             "https://rs-one.example/".to_string(),
             "https://rs-two.example/".to_string(),
         ],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         issued_at: at_before(10),
         expires_at: at(3600),
         family_id: family_id.map(str::to_string),
@@ -1999,6 +2003,13 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
         // is.
         #[cfg(feature = "dpop")]
         jkt: Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I".into()),
+        // RFC 8705 s3.1: the client certificate this token is bound to. Dropping it has the same
+        // consequence as dropping `jkt` above, by the other mechanism: a certificate-bound token
+        // silently becomes a bearer token, and nothing on the token plane can tell.
+        #[cfg(feature = "mtls")]
+        x5t_s256: Some(Box::new(crate::mtls::CertificateThumbprint::from_der(
+            b"conformance-fixture-certificate",
+        ))),
     }
 }
 
@@ -2012,6 +2023,8 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
             "https://rs-one.example/".to_string(),
             "https://rs-two.example/".to_string(),
         ],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         expires_at: Some(at(86_400)),
         family_id: family_id.to_string(),
         state: RefreshTokenState::Spent,
@@ -2020,6 +2033,13 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
         // holding the key that gets refused.
         #[cfg(feature = "dpop")]
         jkt: Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I".into()),
+        // RFC 8705 s3.1: the client certificate this token is bound to. Dropping it has the same
+        // consequence as dropping `jkt` above, by the other mechanism: a certificate-bound token
+        // silently becomes a bearer token, and nothing on the token plane can tell.
+        #[cfg(feature = "mtls")]
+        x5t_s256: Some(Box::new(crate::mtls::CertificateThumbprint::from_der(
+            b"conformance-fixture-certificate",
+        ))),
     }
 }
 
