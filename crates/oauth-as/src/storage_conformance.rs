@@ -218,6 +218,8 @@ pub type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 type SpawnFn = Arc<dyn Fn(Task) + Send + Sync>;
 type BoxTake<T> = Pin<Box<dyn Future<Output = Result<Option<T>, StorageError>> + Send>>;
+/// What the racers hand back: one take's answer per racer, in completion order.
+type TakeResults<T> = Vec<Result<Option<T>, StorageError>>;
 
 /// The default number of racers per `take_*` check.
 const DEFAULT_RACERS: usize = 8;
@@ -780,7 +782,7 @@ where
         report: &mut Report,
         check: &'static str,
         what: &str,
-        results: Vec<Result<Option<T>, StorageError>>,
+        results: TakeResults<T>,
     ) {
         let winners = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
         let errors = results.iter().filter(|r| r.is_err()).count();
@@ -821,7 +823,7 @@ where
     /// Build `racers` futures from `make`, all parked on one rendezvous gate, and run them
     /// concurrently: on the host's runtime when a spawner was installed, otherwise polled together
     /// on this task. See the module docs for what each mode does and does not prove.
-    async fn race<T, M>(&self, report: &mut Report, make: M) -> Vec<Result<Option<T>, StorageError>>
+    async fn race<T, M>(&self, report: &mut Report, make: M) -> TakeResults<T>
     where
         // Every record this races over is a plain owned value; see `JoinAll` on why `Unpin` costs
         // nothing here.
@@ -834,7 +836,7 @@ where
 
         let results = match &self.spawn {
             Some(spawn) => {
-                let collected: Arc<Mutex<Vec<Result<Option<T>, StorageError>>>> =
+                let collected: Arc<Mutex<TakeResults<T>>> =
                     Arc::new(Mutex::new(Vec::with_capacity(n)));
                 let latch = Latch::new(n);
                 for fut in futures {

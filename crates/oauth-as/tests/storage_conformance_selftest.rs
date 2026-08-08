@@ -402,7 +402,7 @@ fn checks_that_fired(violations: &[Violation]) -> Vec<&'static str> {
     names
 }
 
-fn detail_of<'a>(violations: &'a [Violation], check: &str) -> String {
+fn detail_of(violations: &[Violation], check: &str) -> String {
     violations
         .iter()
         .filter(|v| v.check == check)
