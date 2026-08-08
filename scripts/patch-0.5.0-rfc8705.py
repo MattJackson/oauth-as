@@ -26,6 +26,10 @@ crates/oauth-as/src/lib.rs
   Declares and re-exports the new module behind its feature.
 
 crates/oauth-as/src/client.rs
+  NOTE: these three anchors sit AFTER the RFC 7523 `ConfidentialAssertion` variant, its `Debug`
+  arm and its `verify_with` arm, because both slices append to the same three places and 7523
+  landed first. If 7523 is ever reverted, re-anchor on `ConfidentialSecretHash` instead.
+
   A `ClientAuth::Mtls` variant, its hand-written `Debug` arm, and its `verify_with` arm. The
   `verify_with` arm is the security-relevant one and it answers `false` unconditionally: a
   mutual-TLS registration has no secret, so no presented secret may ever authenticate it, and that
@@ -96,14 +100,15 @@ EDITS = [
         "pub mod mtls;",
         [
             (
-                "pub mod metadata;\n",
+                "pub mod metadata;\npub mod pkce;\n",
+                "pub mod metadata;\n"
                 "/// RFC 8705 mutual-TLS client authentication and certificate-bound access tokens,\n"
                 "/// behind the `mtls` cargo feature (off by default). READ THE MODULE DOCS FIRST: this\n"
                 "/// crate cannot validate a certificate chain it did not negotiate, so the host's TLS\n"
                 "/// layer is load bearing in a way no type here can enforce.\n"
                 '#[cfg(feature = "mtls")]\n'
                 "pub mod mtls;\n"
-                "pub mod metadata;\n",
+                "pub mod pkce;\n",
             ),
             (
                 "pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};\n",
@@ -111,21 +116,9 @@ EDITS = [
                 '#[cfg(feature = "mtls")]\n'
                 "pub use mtls::{\n"
                 "    CertificateThumbprint, ClientCertificate, ExpectedSubject, MtlsClientRegistration,\n"
-                "    MtlsRegistrationError, RegisteredCertificates, SELF_SIGNED_TLS_CLIENT_AUTH,\n"
-                "    TLS_CLIENT_AUTH, TLS_CLIENT_AUTH_SAN_DNS, TLS_CLIENT_AUTH_SAN_EMAIL,\n"
-                "    TLS_CLIENT_AUTH_SAN_IP, TLS_CLIENT_AUTH_SAN_URI, TLS_CLIENT_AUTH_SUBJECT_DN,\n"
-                "};\n",
-            ),
-            (
-                "pub use token::{\n"
-                "    IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,\n"
-                "    TokenType, TokenTypeHint,\n"
-                "};\n",
-                '#[cfg(feature = "mtls")]\n'
-                "pub use token::Confirmation;\n"
-                "pub use token::{\n"
-                "    IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,\n"
-                "    TokenType, TokenTypeHint,\n"
+                "    MtlsRegistrationError, RegisteredCertificates, SELF_SIGNED_TLS_CLIENT_AUTH, TLS_CLIENT_AUTH,\n"
+                "    TLS_CLIENT_AUTH_SAN_DNS, TLS_CLIENT_AUTH_SAN_EMAIL, TLS_CLIENT_AUTH_SAN_IP,\n"
+                "    TLS_CLIENT_AUTH_SAN_URI, TLS_CLIENT_AUTH_SUBJECT_DN,\n"
                 "};\n",
             ),
         ],
@@ -135,14 +128,8 @@ EDITS = [
         "ClientAuth::Mtls",
         [
             (
-                "    ConfidentialSecretHash {\n"
-                "        /// The stored verifier.\n"
-                "        hash: SecretHash,\n"
-                "    },\n"
-                "}\n",
-                "    ConfidentialSecretHash {\n"
-                "        /// The stored verifier.\n"
-                "        hash: SecretHash,\n"
+                "        keys: crate::client_assertion::AssertionKeys,\n    },\n}\n",
+                "        keys: crate::client_assertion::AssertionKeys,\n"
                 "    },\n"
                 "    /// RFC 8705: a confidential client that authenticates with a mutual-TLS CERTIFICATE and\n"
                 "    /// holds no shared secret at all. This is the variant a deployment whose policy forbids\n"
@@ -150,10 +137,11 @@ EDITS = [
                 "    /// client proves possession of a private key to the host's TLS layer, and this crate is\n"
                 "    /// handed the resulting certificate as an established fact.\n"
                 "    ///\n"
-                "    /// Carried INLINE rather than boxed, which is measured rather than assumed: the widest\n"
-                "    /// shape [`crate::mtls::MtlsClientRegistration`] can take is one `String` plus a\n"
-                "    /// discriminant, against `ConfidentialSecretHash`'s two `String`s, so this variant does\n"
-                "    /// not make `ClientAuth` (or the [`Client`] cloned on every token request) any bigger.\n"
+                "    /// Carried INLINE rather than boxed, on the same measurement as the assertion variant\n"
+                "    /// above: the widest shape [`crate::mtls::MtlsClientRegistration`] can take is one\n"
+                "    /// `String` plus a discriminant, against `ConfidentialSecretHash`'s two `String`s, so\n"
+                "    /// this variant does not make `ClientAuth`, or the [`Client`] cloned out of the store on\n"
+                "    /// every token-plane request, any bigger than it already was.\n"
                 '    #[cfg(feature = "mtls")]\n'
                 "    Mtls {\n"
                 "        /// Which RFC 8705 method, and what it expects to see.\n"
@@ -162,14 +150,12 @@ EDITS = [
                 "}\n",
             ),
             (
-                "            ClientAuth::ConfidentialSecretHash { hash } => f\n"
-                '                .debug_struct("ConfidentialSecretHash")\n'
-                '                .field("hash", hash)\n'
+                '                .debug_struct("ConfidentialAssertion")\n'
+                '                .field("keys", keys)\n'
                 "                .finish(),\n"
                 "        }\n",
-                "            ClientAuth::ConfidentialSecretHash { hash } => f\n"
-                '                .debug_struct("ConfidentialSecretHash")\n'
-                '                .field("hash", hash)\n'
+                '                .debug_struct("ConfidentialAssertion")\n'
+                '                .field("keys", keys)\n'
                 "                .finish(),\n"
                 "            // NOT redacted: a registration that names an expected subject DN or a certificate\n"
                 "            // thumbprint holds no secret. Both are public facts about a public document, and\n"
@@ -183,23 +169,16 @@ EDITS = [
                 "        }\n",
             ),
             (
-                "            ClientAuth::ConfidentialSecretHash { hash } => match presented {\n"
-                "                Some(p) => hash.verify(p, verifier),\n"
-                "                None => false,\n"
-                "            },\n"
-                "        }\n",
-                "            ClientAuth::ConfidentialSecretHash { hash } => match presented {\n"
-                "                Some(p) => hash.verify(p, verifier),\n"
-                "                None => false,\n"
-                "            },\n"
-                "            // NEVER, and not because the check lives elsewhere. A mutual-TLS registration has\n"
-                "            // no secret to compare against, so there is no presented string that could be the\n"
-                "            // right one, and `None` is not the right one either (unlike `Public`, this client\n"
-                "            // is confidential and something must be proven). The certificate is checked by\n"
-                "            // `crate::mtls::verify_client_credentials`, which is reached only from\n"
-                "            // `AuthorizationServer::authenticate_client`; every OTHER caller of this function,\n"
-                "            // now or later, therefore fails closed on a mutual-TLS client rather than\n"
-                "            // accidentally authenticating one with no evidence at all.\n"
+                "            ClientAuth::ConfidentialAssertion { .. } => false,\n        }\n",
+                "            ClientAuth::ConfidentialAssertion { .. } => false,\n"
+                "            // NEVER, and for the same reason as the assertion arm above. A mutual-TLS\n"
+                "            // registration has no secret to compare against, so there is no presented string\n"
+                "            // that could be the right one, and `None` is not the right answer either: unlike\n"
+                "            // `Public`, this client is confidential and something must be proven. The\n"
+                "            // certificate is checked by `crate::mtls::verify_certificate`, which is reached\n"
+                "            // only from `AuthorizationServer::authenticate_client`; every OTHER caller of\n"
+                "            // this function, now or later, therefore fails closed on a mutual-TLS client\n"
+                "            // rather than accidentally authenticating one with no evidence at all.\n"
                 '            #[cfg(feature = "mtls")]\n'
                 "            ClientAuth::Mtls { .. } => false,\n"
                 "        }\n",
@@ -208,27 +187,54 @@ EDITS = [
     ),
     (
         "crates/oauth-as/src/token.rs",
-        "pub struct Confirmation",
+        "x5t_s256",
         [
+            # The `cnf` object becomes a HOME for confirmation methods rather than one method's
+            # value. See the docstring at the top of this script.
             (
-                "/// The RFC 7009 section 2.1 `token_type_hint`.",
-                "/// The RFC 7800 `cnf` (confirmation) claim: how a token is SENDER CONSTRAINED, meaning what\n"
-                "/// a presenter has to prove in addition to holding the string.\n"
+                "/// The RFC 7800 section 3.1 confirmation claim, in the one shape this server produces: the\n"
+                "/// RFC 9449 section 6.1 `jkt`, a JWK thumbprint.\n"
                 "///\n"
-                "/// A struct with one optional member per confirmation method, rather than a bare thumbprint,\n"
-                "/// and that shape is the point. RFC 7800 section 3.1 defines `cnf` as a JSON OBJECT whose\n"
-                "/// members are confirmation methods, and different sender-constraining mechanisms register\n"
-                "/// different members in the same object: RFC 8705 section 3.1 registers `x5t#S256` for a\n"
-                "/// certificate binding, and RFC 9449 section 6.1 registers `jkt` for a DPoP key binding. A\n"
-                "/// token can legitimately carry both, so neither may be modelled as \"the\" confirmation.\n"
-                "/// Adding a method means adding an optional member here; it never means replacing this type.\n"
+                "/// This is what a resource server checks the binding against, and it is the whole reason DPoP is\n"
+                "/// worth anything at introspection time: without it the binding is known only to the authorization\n"
+                "/// server, and an RS that introspects is back to trusting a bearer string.\n"
+                '#[cfg(feature = "dpop")]\n'
+                "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n"
+                "pub struct Confirmation {\n"
+                "    /// The RFC 7638 SHA-256 thumbprint of the client's proof key, base64url without padding.\n"
+                "    pub jkt: String,\n"
+                "}\n"
+                "\n"
+                '#[cfg(feature = "dpop")]\n'
+                "impl Confirmation {\n"
+                "    /// Wrap a thumbprint.\n"
+                "    pub fn jkt(jkt: impl Into<String>) -> Self {\n"
+                "        Confirmation { jkt: jkt.into() }\n"
+                "    }\n"
+                "}\n",
+                "/// The RFC 7800 section 3.1 confirmation claim: HOW a token is sender constrained, meaning\n"
+                "/// what a presenter has to prove in addition to holding the string.\n"
                 "///\n"
-                "/// Omitted entirely from a serialized token or introspection response when it is empty (see\n"
-                "/// [`Confirmation::is_empty`]): an empty `cnf` object would claim a constraint exists and\n"
-                "/// then name none, which is worse than silence.\n"
-                '#[cfg(feature = "mtls")]\n'
+                "/// This is what a resource server checks the binding against, and it is the whole reason\n"
+                "/// sender constraining is worth anything at introspection time: without it the binding is\n"
+                "/// known only to the authorization server, and an RS that introspects is back to trusting a\n"
+                "/// bearer string.\n"
+                "///\n"
+                "/// EVERY MEMBER IS OPTIONAL, and that is the design rather than an accident. RFC 7800 section\n"
+                "/// 3.1 defines `cnf` as a JSON OBJECT whose members are confirmation methods, and different\n"
+                "/// sender-constraining mechanisms register different members OF THE SAME OBJECT: RFC 9449\n"
+                "/// section 6.1 registers `jkt` for a DPoP key binding, RFC 8705 section 3.1 registers\n"
+                "/// `x5t#S256` for a certificate binding. A token can legitimately carry both, so neither may\n"
+                "/// be modelled as \"the\" confirmation and neither may overwrite the other. Adding a mechanism\n"
+                "/// means adding an optional member here; it never means replacing this type.\n"
+                '#[cfg(any(feature = "dpop", feature = "mtls"))]\n'
                 "#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]\n"
                 "pub struct Confirmation {\n"
+                "    /// RFC 9449 section 6.1 `jkt`: the RFC 7638 SHA-256 thumbprint of the client's proof\n"
+                "    /// key, base64url without padding.\n"
+                '    #[cfg(feature = "dpop")]\n'
+                '    #[serde(default, skip_serializing_if = "Option::is_none")]\n'
+                "    pub jkt: Option<String>,\n"
                 "    /// RFC 8705 section 3.1 `x5t#S256`: the SHA-256 thumbprint of the DER encoding of the\n"
                 "    /// X.509 certificate the client presented when the token was issued. A resource server\n"
                 "    /// checks it with [`Confirmation::confirms_certificate`].\n"
@@ -237,86 +243,106 @@ EDITS = [
                 "    pub x5t_s256: Option<crate::mtls::CertificateThumbprint>,\n"
                 "}\n"
                 "\n"
-                '#[cfg(feature = "mtls")]\n'
+                '#[cfg(any(feature = "dpop", feature = "mtls"))]\n'
                 "impl Confirmation {\n"
-                "    /// Whether this carries no confirmation method at all, which is what an ordinary bearer\n"
-                "    /// token has.\n"
-                "    pub fn is_empty(&self) -> bool {\n"
-                "        self.x5t_s256.is_none()\n"
-                "    }\n"
-                "}\n"
-                "\n"
-                "/// The RFC 7009 section 2.1 `token_type_hint`.",
-            ),
-            (
-                "    /// The resource server(s) the token is for: the RFC 8707 resource indicators the grant was\n"
-                "    /// narrowed to.\n",
-                "    /// RFC 8705 section 3.2: the confirmation method this token is bound to, so a resource\n"
-                "    /// server that introspects can check the binding rather than being told it exists.\n"
-                "    /// Absent for an ordinary bearer token.\n"
-                '    #[cfg(feature = "mtls")]\n'
-                '    #[serde(default, skip_serializing_if = "Option::is_none")]\n'
-                "    pub cnf: Option<Confirmation>,\n"
-                "    /// The resource server(s) the token is for: the RFC 8707 resource indicators the grant was\n"
-                "    /// narrowed to.\n",
-            ),
-            (
-                "            iss: None,\n            aud: None,\n        }\n",
-                "            iss: None,\n"
-                "            aud: None,\n"
-                "            // An inactive answer describes nothing, including how the token was constrained.\n"
+                "    /// Wrap a DPoP key thumbprint.\n"
+                '    #[cfg(feature = "dpop")]\n'
+                "    pub fn jkt(jkt: impl Into<String>) -> Self {\n"
+                "        Confirmation {\n"
+                "            jkt: Some(jkt.into()),\n"
                 '            #[cfg(feature = "mtls")]\n'
-                "            cnf: None,\n"
-                "        }\n",
+                "            x5t_s256: None,\n"
+                "        }\n"
+                "    }\n"
+                "\n"
+                "    /// Whether this names no confirmation method at all, which is what an ordinary bearer\n"
+                "    /// token has. The `cnf` member is OMITTED for such a token rather than sent as an empty\n"
+                "    /// object: an empty `cnf` claims a constraint exists and then names none, which is worse\n"
+                "    /// than silence.\n"
+                "    pub fn is_empty(&self) -> bool {\n"
+                "        #[cfg(feature = \"dpop\")]\n"
+                "        if self.jkt.is_some() {\n"
+                "            return false;\n"
+                "        }\n"
+                "        #[cfg(feature = \"mtls\")]\n"
+                "        if self.x5t_s256.is_some() {\n"
+                "            return false;\n"
+                "        }\n"
+                "        true\n"
+                "    }\n"
+                "}\n",
             ),
+            # The introspection member now reports either mechanism, so its cfg widens.
             (
-                "    /// The RFC 8707 resource indicators this token is restricted to; empty when the grant named\n"
-                "    /// none.",
-                "    /// RFC 8705 section 3: the confirmation this token is BOUND to, `None` for an ordinary\n"
-                "    /// bearer token. Recorded on the AS-side record, not only in a signed JWT, because this\n"
-                "    /// crate's default access token is opaque: RFC 8705 section 3.2 has a resource server\n"
-                "    /// learn the binding by INTROSPECTING, and it can only be reported if it was persisted.\n"
+                "    /// RFC 9449 section 6.1: the key this token is bound to, present exactly when it is bound to\n"
+                "    /// one.\n"
                 "    ///\n"
-                "    /// BOXED, for the same reason [`crate::client::Client::registration`] is. This record is\n"
-                "    /// cloned out of the host's store on every introspection and written on every issuance,\n"
-                "    /// and `tests/allocation.rs` holds it to a size budget; one null pointer costs 8 bytes for\n"
-                "    /// the deployments that issue plain bearer tokens, and the confirmation itself is\n"
-                "    /// allocated only for a token that actually has one. It also means the DPoP `jkt` member\n"
-                "    /// can join [`Confirmation`] later without growing this record again.\n"
-                '    #[cfg(feature = "mtls")]\n'
-                '    #[serde(default, skip_serializing_if = "Option::is_none")]\n'
-                "    pub cnf: Option<Box<Confirmation>>,\n"
-                "    /// The RFC 8707 resource indicators this token is restricted to; empty when the grant named\n"
-                "    /// none.",
+                "    /// RFC 7662 section 2.2 lets a server return any claim it likes here, and RFC 9449 section 5\n"
+                "    /// is explicit that a resource server has to be able to confirm the binding. Omitted rather\n"
+                "    /// than sent as `null` for an unbound token, because `\"cnf\": null` reads to a careless RS as a\n"
+                "    /// confirmation it has already checked.\n"
+                '    #[cfg(feature = "dpop")]\n'
+                '    #[serde(skip_serializing_if = "Option::is_none")]\n'
+                "    pub cnf: Option<Confirmation>,\n",
+                "    /// How this token is sender constrained, present exactly when it is: RFC 9449 section 6.1\n"
+                "    /// `jkt` for a DPoP key, RFC 8705 section 3.2 `x5t#S256` for a client certificate, or both.\n"
+                "    ///\n"
+                "    /// RFC 7662 section 2.2 lets a server return any claim it likes here, and RFC 9449 section 5\n"
+                "    /// and RFC 8705 section 3.2 are each explicit that a resource server has to be able to\n"
+                "    /// confirm the binding. Omitted rather than sent as `null` for an unbound token, because\n"
+                "    /// `\"cnf\": null` reads to a careless RS as a confirmation it has already checked.\n"
+                '    #[cfg(any(feature = "dpop", feature = "mtls"))]\n'
+                '    #[serde(skip_serializing_if = "Option::is_none")]\n'
+                "    pub cnf: Option<Confirmation>,\n",
             ),
-            # The whole body, not one line of it: a `#[cfg]` cannot sit inside a method-call
-            # chain (it would have to attach to an expression, which the grammar does not allow),
-            # so the chain becomes a binding the optional field can be added to.
             (
-                '        f.debug_struct("IssuedToken")\n'
-                '            .field("access_token", &"[redacted]")\n'
-                '            .field("client_id", &self.client_id)\n'
-                '            .field("subject", &self.subject)\n'
-                '            .field("scope", &self.scope)\n'
-                '            .field("resource", &self.resource)\n'
-                '            .field("issued_at", &self.issued_at)\n'
-                '            .field("expires_at", &self.expires_at)\n'
-                '            .field("family_id", &self.family_id)\n'
-                "            .finish()\n",
-                '        let mut out = f.debug_struct("IssuedToken");\n'
-                '        out.field("access_token", &"[redacted]")\n'
-                '            .field("client_id", &self.client_id)\n'
-                '            .field("subject", &self.subject)\n'
-                '            .field("scope", &self.scope)\n'
-                '            .field("resource", &self.resource)\n'
-                '            .field("issued_at", &self.issued_at)\n'
-                '            .field("expires_at", &self.expires_at)\n'
-                '            .field("family_id", &self.family_id);\n'
-                "        // Not a credential: a thumbprint is a hash of a public document, and it is\n"
-                "        // exactly what an operator needs when a bound token is being refused.\n"
-                '        #[cfg(feature = "mtls")]\n'
-                '        out.field("cnf", &self.cnf);\n'
-                "        out.finish()\n",
+                '            #[cfg(feature = "dpop")]\n            cnf: None,\n',
+                '            #[cfg(any(feature = "dpop", feature = "mtls"))]\n            cnf: None,\n',
+            ),
+            # The AS-side record. Boxed for the size reason its own doc gives.
+            (
+                '    #[cfg(feature = "dpop")]\n'
+                "    pub jkt: Option<Box<str>>,\n"
+                "    /// The authorization grant this token belongs to (see [`RefreshTokenRecord::family_id`]).\n",
+                '    #[cfg(feature = "dpop")]\n'
+                "    pub jkt: Option<Box<str>>,\n"
+                "    /// RFC 8705 section 3: the SHA-256 thumbprint of the client certificate this token is\n"
+                "    /// bound to, or `None` for a token that is not certificate bound.\n"
+                "    ///\n"
+                "    /// Recorded on the AS side, and not only inside a signed JWT, for the same reason `jkt`\n"
+                "    /// next door is: this crate's default access token is OPAQUE, and RFC 8705 section 3.2\n"
+                "    /// has a resource server learn the binding by INTROSPECTING, which it can only be told\n"
+                "    /// if it was persisted.\n"
+                "    ///\n"
+                "    /// `Option<Box<_>>` rather than the 32-byte thumbprint inline, on the same measurement\n"
+                "    /// as `jkt`: this record is written and read on every token-plane request and\n"
+                "    /// `tests/allocation.rs` holds it to a size budget, so an unbound token pays one null\n"
+                "    /// pointer and the allocation happens only for a token that is actually bound.\n"
+                '    #[cfg(feature = "mtls")]\n'
+                "    pub x5t_s256: Option<Box<crate::mtls::CertificateThumbprint>>,\n"
+                "    /// The authorization grant this token belongs to (see [`RefreshTokenRecord::family_id`]).\n",
+            ),
+            # The refresh chain remembers it too, so a rotation cannot launder the binding away.
+            (
+                '    #[cfg(feature = "dpop")]\n'
+                "    pub jkt: Option<Box<str>>,\n"
+                "    /// The FAMILY this token belongs to: one identifier shared by every token, access or refresh,\n",
+                '    #[cfg(feature = "dpop")]\n'
+                "    pub jkt: Option<Box<str>>,\n"
+                "    /// RFC 8705 section 3: the client certificate this refresh chain is bound to, or `None`\n"
+                "    /// for an unbound chain.\n"
+                "    ///\n"
+                "    /// Carried across rotation and CHECKED on redemption, exactly as `jkt` is and for the\n"
+                "    /// same argument: without it the binding would be decorative past the first access\n"
+                "    /// token, because a stolen refresh token could simply be re-bound to whatever\n"
+                "    /// certificate the thief holds on the next rotation. Section 3 makes this a MUST for\n"
+                "    /// public clients specifically; this crate applies it to every chain that was issued\n"
+                "    /// over a certificate, because a chain whose holder proved possession of a key once\n"
+                "    /// should have to keep proving it, and for a confidential mutual-TLS client the rule\n"
+                "    /// costs nothing (it presents that certificate on every request anyway).\n"
+                '    #[cfg(feature = "mtls")]\n'
+                "    pub x5t_s256: Option<Box<crate::mtls::CertificateThumbprint>>,\n"
+                "    /// The FAMILY this token belongs to: one identifier shared by every token, access or refresh,\n",
             ),
         ],
     ),
@@ -326,8 +352,7 @@ EDITS = [
         [
             (
                 "    /// The host's own [`RateLimiter`] refused the attempt before it was evaluated.\n"
-                "    RateLimited,\n"
-                "}\n",
+                "    RateLimited,\n",
                 "    /// The host's own [`RateLimiter`] refused the attempt before it was evaluated.\n"
                 "    RateLimited,\n"
                 "    /// The registration authenticates with RFC 8705 mutual TLS and NO certificate reached\n"
@@ -341,8 +366,7 @@ EDITS = [
                 "    /// subject values, or section 2.2 thumbprints). This one IS the attack shape: a caller\n"
                 "    /// holding some valid certificate trying to be a client it is not.\n"
                 '    #[cfg(feature = "mtls")]\n'
-                "    CertificateMismatch,\n"
-                "}\n",
+                "    CertificateMismatch,\n",
             )
         ],
     ),
@@ -351,12 +375,7 @@ EDITS = [
         "tls_client_certificate_bound_access_tokens",
         [
             (
-                "    /// RFC 8707 (resource indicators), which this server also implements, registers NO metadata\n"
-                "    /// member of its own, so there is deliberately nothing here to advertise it.\n"
-                "    pub authorization_response_iss_parameter_supported: bool,\n"
-                "}\n",
-                "    /// RFC 8707 (resource indicators), which this server also implements, registers NO metadata\n"
-                "    /// member of its own, so there is deliberately nothing here to advertise it.\n"
+                "    pub authorization_response_iss_parameter_supported: bool,\n}\n",
                 "    pub authorization_response_iss_parameter_supported: bool,\n"
                 "    /// RFC 8705 section 3.3. Always `true` in a build with the `mtls` feature, and absent\n"
                 "    /// entirely without it, which is the same honesty rule `jwks_uri` follows.\n"
@@ -371,48 +390,6 @@ EDITS = [
                 "}\n",
             ),
             (
-                "        let endpoint = |override_: &Option<String>, path: &str| {\n"
-                "            override_\n"
-                "                .clone()\n"
-                "                .unwrap_or_else(|| under_issuer(&iss, path))\n"
-                "        };\n",
-                "        let endpoint = |override_: &Option<String>, path: &str| {\n"
-                "            override_\n"
-                "                .clone()\n"
-                "                .unwrap_or_else(|| under_issuer(&iss, path))\n"
-                "        };\n"
-                "        // Exactly the client authentication methods the token endpoint accepts. `mut` only\n"
-                "        // when the optional mutual-TLS methods are compiled in, which is what the allow below\n"
-                "        // is for: advertising a method this build cannot honor is the lie this document\n"
-                "        // exists to avoid, and so is staying silent about one it does honor (a client that\n"
-                "        // cannot discover `tls_client_auth` has no way to know not to send a secret).\n"
-                "        #[allow(unused_mut)]\n"
-                "        let mut token_endpoint_auth_methods_supported = vec![\n"
-                '            "client_secret_basic".to_string(),\n'
-                '            "client_secret_post".to_string(),\n'
-                "            // RFC 8414 s2: the registered value a public client uses. This server accepts\n"
-                "            // public clients, so omitting it would understate what it does.\n"
-                '            "none".to_string(),\n'
-                "        ];\n"
-                "        // RFC 8705 s2.1.1 and s2.2.1 register these two values; RFC 8414 s2 is what makes\n"
-                "        // advertising them the way a client learns mutual TLS is available without probing.\n"
-                '        #[cfg(feature = "mtls")]\n'
-                "        token_endpoint_auth_methods_supported.extend([\n"
-                "            crate::mtls::TLS_CLIENT_AUTH.to_string(),\n"
-                "            crate::mtls::SELF_SIGNED_TLS_CLIENT_AUTH.to_string(),\n"
-                "        ]);\n",
-            ),
-            (
-                "            token_endpoint_auth_methods_supported: vec![\n"
-                '                "client_secret_basic".to_string(),\n'
-                '                "client_secret_post".to_string(),\n'
-                "                // RFC 8414 s2: the registered value a public client uses. This server accepts\n"
-                "                // public clients, so omitting it would understate what it does.\n"
-                '                "none".to_string(),\n'
-                "            ],\n",
-                "            token_endpoint_auth_methods_supported,\n",
-            ),
-            (
                 "            authorization_response_iss_parameter_supported: true,\n",
                 "            authorization_response_iss_parameter_supported: true,\n"
                 '            #[cfg(feature = "mtls")]\n'
@@ -420,430 +397,154 @@ EDITS = [
             ),
         ],
     ),
+]
+
+EDITS[5][2].append(
+    (
+        "                    methods.push(crate::client_assertion::PRIVATE_KEY_JWT.to_string());\n"
+        "                }\n"
+        "                methods\n",
+        "                    methods.push(crate::client_assertion::PRIVATE_KEY_JWT.to_string());\n"
+        "                }\n"
+        "                // RFC 8705 s2.1.1 and s2.2.1 register these two, advertised exactly when this\n"
+        "                // build can actually check a certificate. Both halves matter: advertising a\n"
+        "                // method the endpoint rejects is a lie a client cannot recover from, and staying\n"
+        "                // silent about one it accepts is how a client ends up sending a shared secret it\n"
+        "                // did not need to have.\n"
+        '                #[cfg(feature = "mtls")]\n'
+        "                {\n"
+        "                    methods.push(crate::mtls::TLS_CLIENT_AUTH.to_string());\n"
+        "                    methods.push(crate::mtls::SELF_SIGNED_TLS_CLIENT_AUTH.to_string());\n"
+        "                }\n"
+        "                methods\n",
+    )
+)
+
+EDITS.append(
     (
         "crates/oauth-as/src/server.rs",
-        "PresentedCertificate",
+        "certificate: Option<&'a crate::mtls::ClientCertificate",
         [
-            # ---------------------------------------------------------------- the threaded type
             (
-                "/// The refresh chain an issuance CONTINUES:",
-                "/// The client certificate a request presented, threaded from the endpoints that authenticate\n"
-                "/// a client down to [`AuthorizationServer::issue`], which is where RFC 8705 section 3 records\n"
-                "/// the binding.\n"
-                "///\n"
-                "/// Two spellings, so the plumbing is written once rather than once per feature set. With\n"
-                "/// `mtls` on it is one pointer; with the feature OFF it is a zero-sized `PhantomData`, so\n"
-                "/// every parameter it is passed in costs nothing at all: not a byte on the stack and not a\n"
-                "/// byte in the token future, which sits inside tokio's 2048-byte boxing threshold and which\n"
-                "/// `tests/allocation.rs` exists to keep there. Threading an `Option<&_>` that is always `None`\n"
-                "/// would have read more simply and made every default build pay for a feature it did not\n"
-                "/// enable.\n"
-                '#[cfg(feature = "mtls")]\n'
-                "pub(crate) type PresentedCertificate<'a> = Option<&'a crate::mtls::ClientCertificate<'a>>;\n"
-                '#[cfg(not(feature = "mtls"))]\n'
-                "pub(crate) type PresentedCertificate<'a> = std::marker::PhantomData<&'a ()>;\n"
-                "\n"
-                "/// \"No certificate was presented\", in whichever of the two spellings this build uses.\n"
-                '#[cfg(feature = "mtls")]\n'
-                "pub(crate) fn no_certificate<'a>() -> PresentedCertificate<'a> {\n"
-                "    None\n"
-                "}\n"
-                "\n"
-                '#[cfg(not(feature = "mtls"))]\n'
-                "pub(crate) fn no_certificate<'a>() -> PresentedCertificate<'a> {\n"
-                "    std::marker::PhantomData\n"
-                "}\n"
-                "\n"
-                "/// The refresh chain an issuance CONTINUES:",
-            ),
-            # ------------------------------------------------------------- authenticate_client
-            (
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "    ) -> Result<Client, ErrorResponse> {\n",
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<Client, ErrorResponse> {\n",
+                "    /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.\n"
+                '    #[cfg(feature = "client_assertion")]\n'
+                "    pub client_assertion: Option<&'a str>,\n"
+                "}\n",
+                "    /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.\n"
+                '    #[cfg(feature = "client_assertion")]\n'
+                "    pub client_assertion: Option<&'a str>,\n"
+                "    /// The RFC 8705 client certificate the HOST has ALREADY VERIFIED for this connection.\n"
+                "    ///\n"
+                "    /// READ [`crate::mtls`]'s trust boundary section before setting this. This library\n"
+                "    /// never sees a socket, so it cannot validate a chain it did not negotiate: a host that\n"
+                "    /// fills this in from an unverified source (an unstripped `X-Client-Cert` header, a\n"
+                "    /// terminator that requests but does not require a certificate) has authenticated\n"
+                "    /// nobody, and every comparison this crate then makes is against a value the caller\n"
+                "    /// chose.\n"
+                "    ///\n"
+                "    /// It does two separate jobs, either of which can apply on its own:\n"
+                "    ///\n"
+                "    /// - section 2, AUTHENTICATION: a client registered with\n"
+                "    ///   [`crate::client::ClientAuth::Mtls`] is authenticated by this certificate and by\n"
+                "    ///   nothing else. Such a client cannot authenticate through a call that leaves this\n"
+                "    ///   `None`, which is the point: a host that forgets to pass the certificate gets\n"
+                "    ///   `invalid_client`, never a token.\n"
+                "    /// - section 3, BINDING: the issued access token is bound to this certificate whatever\n"
+                "    ///   the client's authentication method was, including a public client (section 4).\n"
+                "    ///   Binding is not conditional on a per-client flag, because a bound token is never\n"
+                "    ///   less safe than the unbound one it replaces, and a client that does not want\n"
+                "    ///   binding does not present a certificate.\n"
+                '    #[cfg(feature = "mtls")]\n'
+                "    pub certificate: Option<&'a crate::mtls::ClientCertificate<'a>>,\n"
+                "}\n",
             ),
             (
-                "        // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this\n"
-                "        // crate does not implement is decided by the host's verifier (see\n"
-                "        // `crate::client::SecretVerifier`), and by nobody at all when none is installed.\n"
-                "        if !client\n"
-                "            .auth\n"
-                "            .verify_with(client_secret, self.hooks.secret_verifier())\n"
-                "        {\n"
-                "            self.hooks.record(attempt, AttemptOutcome::Failed);\n"
-                "            self.hooks.emit(|| Event::ClientAuthenticationFailed {\n"
-                "                client_id: client_id.as_str(),\n"
-                "                failure: ClientAuthFailure::SecretMismatch,\n"
-                "            });\n"
-                "            return Err(ErrorResponse::new(ErrorCode::InvalidClient));\n"
+                "        ClientCredential {\n"
+                "            client_secret,\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion_type: None,\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion: None,\n"
                 "        }\n",
+                "        ClientCredential {\n"
+                "            client_secret,\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion_type: None,\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion: None,\n"
+                '            #[cfg(feature = "mtls")]\n'
+                "            certificate: None,\n"
+                "        }\n",
+            ),
+            (
+                "        ClientCredential {\n"
+                "            client_secret: None,\n"
+                "            client_assertion_type,\n"
+                "            client_assertion: Some(client_assertion),\n"
+                "        }\n"
+                "    }\n",
+                "        ClientCredential {\n"
+                "            client_secret: None,\n"
+                "            client_assertion_type,\n"
+                "            client_assertion: Some(client_assertion),\n"
+                '            #[cfg(feature = "mtls")]\n'
+                "            certificate: None,\n"
+                "        }\n"
+                "    }\n"
+                "\n"
+                "    /// The RFC 8705 credential: the client certificate the host verified during the TLS\n"
+                "    /// handshake, and no secret at all.\n"
+                "    ///\n"
+                "    /// For a client that authenticates some OTHER way and still wants its token bound\n"
+                "    /// (RFC 8705 section 4, including a public client), set\n"
+                "    /// [`ClientCredential::certificate`] on the credential it is already using rather than\n"
+                "    /// replacing it with this one.\n"
+                '    #[cfg(feature = "mtls")]\n'
+                "    pub fn certificate(certificate: &'a crate::mtls::ClientCertificate<'a>) -> Self {\n"
+                "        ClientCredential {\n"
+                "            certificate: Some(certificate),\n"
+                "            ..ClientCredential::secret(None)\n"
+                "        }\n"
+                "    }\n",
+            ),
+            (
                 "        // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this\n"
                 "        // crate does not implement is decided by the host's verifier (see\n"
-                "        // `crate::client::SecretVerifier`), and by nobody at all when none is installed.\n"
+                "        // `crate::client::SecretVerifier`), and by nobody at all when none is installed.\n",
+                "        // RFC 8705 s2 mutual-TLS client authentication, handled apart from the secret\n"
+                "        // comparison below for the same reason the assertion above is: it is a different\n"
+                "        // KIND of credential. There is nothing to compare; there is a certificate the HOST\n"
+                "        // verified, matched against what the registration says it expects to see.\n"
                 "        //\n"
-                "        // RFC 8705 s2 adds a SECOND family of credential, and `crate::mtls` is the one place\n"
-                "        // the two meet: a mutual-TLS registration is decided by the certificate and never by a\n"
-                "        // secret, every other registration is decided exactly as it was before, and neither\n"
-                "        // family can be authenticated with the other's evidence. Without the feature there is\n"
-                "        // no certificate to consider and this is the call it always was.\n"
+                "        // Dispatched on the REGISTRATION, never on what the request happened to present.\n"
+                "        // That direction is load bearing in both senses: a certificate presented by a\n"
+                "        // secret-authenticating client never reaches this path (it is for section 3 binding\n"
+                "        // only), and a mutual-TLS client can never fall through to the secret comparison\n"
+                "        // below.\n"
                 '        #[cfg(feature = "mtls")]\n'
-                "        let verified = crate::mtls::verify_client_credentials(\n"
-                "            &client,\n"
-                "            client_secret,\n"
-                "            certificate,\n"
-                "            self.hooks.secret_verifier(),\n"
-                "        );\n"
-                '        #[cfg(not(feature = "mtls"))]\n'
-                "        let verified = {\n"
-                "            let _ = certificate;\n"
-                "            if client\n"
-                "                .auth\n"
-                "                .verify_with(client_secret, self.hooks.secret_verifier())\n"
-                "            {\n"
-                "                Ok(())\n"
-                "            } else {\n"
-                "                Err(ClientAuthFailure::SecretMismatch)\n"
-                "            }\n"
-                "        };\n"
-                "        if let Err(failure) = verified {\n"
-                "            self.hooks.record(attempt, AttemptOutcome::Failed);\n"
-                "            self.hooks.emit(|| Event::ClientAuthenticationFailed {\n"
-                "                client_id: client_id.as_str(),\n"
-                "                failure,\n"
-                "            });\n"
-                "            return Err(ErrorResponse::new(ErrorCode::InvalidClient));\n"
-                "        }\n",
-            ),
-            # ------------------------------------------------------------- device_authorization
-            (
-                "    /// RFC 8628 section 3.1/3.2: start a device authorization.\n"
-                "    pub async fn device_authorization(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "    ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n"
-                "        if !client.allows_grant(GrantType::DeviceCode) {\n",
-                "    /// RFC 8628 section 3.1/3.2: start a device authorization.\n"
-                "    pub async fn device_authorization(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "    ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {\n"
-                "        self.device_authorization_inner(\n"
-                "            client_id,\n"
-                "            client_secret,\n"
-                "            requested_scope,\n"
-                "            no_certificate(),\n"
-                "        )\n"
-                "        .await\n"
-                "    }\n"
+                "        if matches!(client.auth, crate::client::ClientAuth::Mtls { .. }) {\n"
+                "            return match crate::mtls::verify_certificate(&client, cred) {\n"
+                "                Ok(()) => {\n"
+                "                    self.hooks.record(attempt, AttemptOutcome::Succeeded);\n"
+                "                    Ok(client)\n"
+                "                }\n"
+                "                Err(failure) => {\n"
+                "                    self.hooks.record(attempt, AttemptOutcome::Failed);\n"
+                "                    self.hooks.emit(|| Event::ClientAuthenticationFailed {\n"
+                "                        client_id: client_id.as_str(),\n"
+                "                        failure,\n"
+                "                    });\n"
+                "                    // The same bare `invalid_client` every other refusal here returns: RFC\n"
+                "                    // 6749 s5.2 collapses them on purpose, so a caller cannot probe a\n"
+                "                    // registration. The host's audit channel was told which it was.\n"
+                "                    Err(ErrorResponse::new(ErrorCode::InvalidClient))\n"
+                "                }\n"
+                "            };\n"
+                "        }\n"
                 "\n"
-                "    /// RFC 8628 section 3.1/3.2 for a client that authenticates with RFC 8705 mutual TLS.\n"
-                "    ///\n"
-                "    /// `certificate` is the certificate the HOST has already verified; read\n"
-                "    /// [`crate::mtls`]'s trust boundary section before wiring it up.\n"
-                '    #[cfg(feature = "mtls")]\n'
-                "    pub async fn device_authorization_with_certificate(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "        certificate: Option<&crate::mtls::ClientCertificate<'_>>,\n"
-                "    ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {\n"
-                "        self.device_authorization_inner(client_id, client_secret, requested_scope, certificate)\n"
-                "            .await\n"
-                "    }\n"
-                "\n"
-                "    async fn device_authorization_inner(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n"
-                "        if !client.allows_grant(GrantType::DeviceCode) {\n",
-            ),
-            # -------------------------------------------------------------------- token endpoint
-            (
-                "    pub async fn token_with_resources(\n"
-                "        &self,\n"
-                "        request: TokenRequest,\n"
-                "        resources: &[String],\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let requested_resources = Self::validate_resources(resources.iter().map(|r| r.as_str()))?;\n",
-                "    pub async fn token_with_resources(\n"
-                "        &self,\n"
-                "        request: TokenRequest,\n"
-                "        resources: &[String],\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        self.token_inner(request, resources, no_certificate()).await\n"
-                "    }\n"
-                "\n"
-                "    /// The token endpoint for a request that arrived over a mutual-TLS connection (RFC 8705).\n"
-                "    ///\n"
-                "    /// `certificate` is the client certificate the HOST verified during the TLS handshake, and\n"
-                "    /// it does two separate jobs, either of which can apply on its own:\n"
-                "    ///\n"
-                "    /// - section 2, AUTHENTICATION: a client registered with [`crate::client::ClientAuth::Mtls`]\n"
-                "    ///   is authenticated by this certificate and by nothing else. Such a client cannot\n"
-                "    ///   authenticate through [`AuthorizationServer::token`] at all, which is the point: a\n"
-                "    ///   host that forgets to pass the certificate gets `invalid_client`, never a token.\n"
-                "    /// - section 3, BINDING: the issued access token is bound to this certificate whatever the\n"
-                "    ///   client's authentication method was, including a public client (section 4). Binding is\n"
-                "    ///   not conditional on a per-client flag, because a bound token is never less safe than\n"
-                "    ///   the unbound one it replaces, and a client that does not want binding does not present\n"
-                "    ///   a certificate.\n"
-                "    ///\n"
-                "    /// READ [`crate::mtls`]'s trust boundary section first. This crate cannot validate a\n"
-                "    /// certificate chain it did not negotiate.\n"
-                '    #[cfg(feature = "mtls")]\n'
-                "    pub async fn token_with_certificate(\n"
-                "        &self,\n"
-                "        request: TokenRequest,\n"
-                "        resources: &[String],\n"
-                "        certificate: Option<&crate::mtls::ClientCertificate<'_>>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        self.token_inner(request, resources, certificate).await\n"
-                "    }\n"
-                "\n"
-                "    async fn token_inner(\n"
-                "        &self,\n"
-                "        request: TokenRequest,\n"
-                "        resources: &[String],\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let requested_resources = Self::validate_resources(resources.iter().map(|r| r.as_str()))?;\n",
-            ),
-            (
-                "                        redirect_uri.as_deref(),\n"
-                "                        code_verifier.as_deref(),\n"
-                "                        &requested_resources,\n"
-                "                    )\n",
-                "                        redirect_uri.as_deref(),\n"
-                "                        code_verifier.as_deref(),\n"
-                "                        &requested_resources,\n"
-                "                        certificate,\n"
-                "                    )\n",
-            ),
-            (
-                "                        client_secret.as_deref(),\n"
-                "                        scope.as_ref(),\n"
-                "                        requested_resources,\n"
-                "                    )\n",
-                "                        client_secret.as_deref(),\n"
-                "                        scope.as_ref(),\n"
-                "                        requested_resources,\n"
-                "                        certificate,\n"
-                "                    )\n",
-            ),
-            (
-                "                    .device_token(&client_id, client_secret.as_deref(), &device_code)\n",
-                "                    .device_token(\n"
-                "                        &client_id,\n"
-                "                        client_secret.as_deref(),\n"
-                "                        &device_code,\n"
-                "                        certificate,\n"
-                "                    )\n",
-            ),
-            (
-                "                        &refresh_token,\n"
-                "                        scope.as_ref(),\n"
-                "                        &requested_resources,\n"
-                "                    )\n",
-                "                        &refresh_token,\n"
-                "                        scope.as_ref(),\n"
-                "                        &requested_resources,\n"
-                "                        certificate,\n"
-                "                    )\n",
-            ),
-            # --------------------------------------------------------- authorization_code_token
-            (
-                "        code_verifier: Option<&str>,\n"
-                "        requested_resources: &[String],\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n"
-                "        if !client.allows_grant(GrantType::AuthorizationCode) {\n",
-                "        code_verifier: Option<&str>,\n"
-                "        requested_resources: &[String],\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n"
-                "        if !client.allows_grant(GrantType::AuthorizationCode) {\n",
-            ),
-            (
-                "                record.scope.clone(),\n"
-                "                resource,\n"
-                "                None,\n"
-                "                true,\n"
-                "            )\n",
-                "                record.scope.clone(),\n"
-                "                resource,\n"
-                "                None,\n"
-                "                true,\n"
-                "                certificate,\n"
-                "            )\n",
-            ),
-            # ---------------------------------------------------------- client_credentials_token
-            (
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "        resource: Vec<String>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n",
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "        resource: Vec<String>,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n",
-            ),
-            (
-                "            GrantType::ClientCredentials,\n"
-                "            None,\n"
-                "            scope,\n"
-                "            resource,\n"
-                "            None,\n"
-                "            false,\n"
-                "        )\n",
-                "            GrantType::ClientCredentials,\n"
-                "            None,\n"
-                "            scope,\n"
-                "            resource,\n"
-                "            None,\n"
-                "            false,\n"
-                "            certificate,\n"
-                "        )\n",
-            ),
-            # ------------------------------------------------------------------------ device_token
-            (
-                "        client_secret: Option<&str>,\n"
-                "        device_code: &str,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n",
-                "        client_secret: Option<&str>,\n"
-                "        device_code: &str,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n",
-            ),
-            (
-                "                    Some(subject),\n"
-                "                    taken.scope,\n"
-                "                    Vec::new(),\n"
-                "                    None,\n"
-                "                    true,\n"
-                "                )\n",
-                "                    Some(subject),\n"
-                "                    taken.scope,\n"
-                "                    Vec::new(),\n"
-                "                    None,\n"
-                "                    true,\n"
-                "                    certificate,\n"
-                "                )\n",
-            ),
-            # ----------------------------------------------------------------------- refresh_token
-            (
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "        requested_resources: &[String],\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n",
-                "        requested_scope: Option<&ScopeSet>,\n"
-                "        requested_resources: &[String],\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n",
-            ),
-            (
-                "                Some(RefreshChain {\n"
-                "                    family_id: record.family_id.clone(),\n"
-                "                    expires_at: record.expires_at,\n"
-                "                }),\n"
-                "                true,\n"
-                "            )\n",
-                "                Some(RefreshChain {\n"
-                "                    family_id: record.family_id.clone(),\n"
-                "                    expires_at: record.expires_at,\n"
-                "                }),\n"
-                "                true,\n"
-                "                certificate,\n"
-                "            )\n",
-            ),
-            # ------------------------------------------------------------------------------ issue
-            (
-                "        chain: Option<RefreshChain>,\n"
-                "        allow_refresh: bool,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let now = self.clock.now();\n",
-                "        chain: Option<RefreshChain>,\n"
-                "        allow_refresh: bool,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<TokenResponse, ErrorResponse> {\n"
-                "        let now = self.clock.now();\n"
-                "\n"
-                "        // RFC 8705 s3: an access token issued over a mutual-TLS connection is BOUND to the\n"
-                "        // certificate that connection used, so a stolen copy of the string is worth nothing to\n"
-                "        // anyone who cannot also complete a handshake with that client's private key. Recorded\n"
-                "        // on the AS-side record and not only in a signed JWT, because this crate's default\n"
-                "        // token is opaque and s3.2 has a resource server learn the binding by introspecting.\n"
-                "        // BOXED for the reason `IssuedToken::cnf` states.\n"
-                '        #[cfg(feature = "mtls")]\n'
-                "        let cnf = certificate\n"
-                "            .map(|c| Box::new(crate::token::Confirmation::for_certificate(c)));\n",
-            ),
-            (
-                "        #[cfg(feature = \"jwt\")]\n"
-                "        let access_token = self.wire_access_token(\n"
-                "            client,\n"
-                "            subject.as_deref(),\n"
-                "            &scope,\n"
-                "            &resource,\n"
-                "            now,\n"
-                "            access_token,\n"
-                "        )?;\n"
-                "        self.store\n"
-                "            .put_token(IssuedToken {\n"
-                "                access_token: access_token.clone(),\n",
-                "        #[cfg(feature = \"jwt\")]\n"
-                "        let access_token = self.wire_access_token(\n"
-                "            client,\n"
-                "            subject.as_deref(),\n"
-                "            &scope,\n"
-                "            &resource,\n"
-                "            now,\n"
-                "            access_token,\n"
-                "            certificate,\n"
-                "        )?;\n"
-                "        self.store\n"
-                "            .put_token(IssuedToken {\n"
-                '                #[cfg(feature = "mtls")]\n'
-                "                cnf,\n"
-                "                access_token: access_token.clone(),\n",
-            ),
-            # ------------------------------------------------------------------ wire_access_token
-            (
-                "        now: SystemTime,\n"
-                "        jti: String,\n"
-                "    ) -> Result<String, ErrorResponse> {\n",
-                "        now: SystemTime,\n"
-                "        jti: String,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<String, ErrorResponse> {\n",
+                "        // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this\n"
+                "        // crate does not implement is decided by the host's verifier (see\n"
+                "        // `crate::client::SecretVerifier`), and by nobody at all when none is installed.\n",
             ),
             (
                 "            jti,\n"
@@ -852,165 +553,155 @@ EDITS = [
                 "            jti,\n"
                 "            scope: (!scope.is_empty()).then(|| scope.to_string()),\n"
                 "            // RFC 8705 s3.1: the same binding the AS-side record carries, in the form a\n"
-                "            // resource server can check without calling introspection at all.\n"
+                "            // resource server can check for itself without calling introspection at all.\n"
                 '            #[cfg(feature = "mtls")]\n'
-                "            cnf: certificate.map(crate::token::Confirmation::for_certificate),\n"
+                "            cnf: bound.cred.certificate.map(|c| crate::token::Confirmation {\n"
+                '                #[cfg(feature = "dpop")]\n'
+                "                jkt: None,\n"
+                "                x5t_s256: Some(*c.thumbprint()),\n"
+                "            }),\n"
                 "        };\n",
             ),
-            # ------------------------------------------------------------- introspection_response
             (
-                "    pub async fn introspection_response(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "    ) -> Result<IntrospectionResponse, ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n",
-                "    pub async fn introspection_response(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "    ) -> Result<IntrospectionResponse, ErrorResponse> {\n"
-                "        self.introspection_response_inner(client_id, client_secret, token, no_certificate())\n"
-                "            .await\n"
-                "    }\n"
-                "\n"
-                "    /// RFC 7662 introspection for a caller that authenticates with RFC 8705 mutual TLS.\n"
-                "    ///\n"
-                "    /// The RESPONSE reports the RFC 8705 section 3.2 `cnf` binding either way; this entry\n"
-                "    /// point exists so that a deployment whose policy forbids shared secrets can also\n"
-                "    /// introspect, rather than being able to obtain tokens and not to ask about them.\n"
-                '    #[cfg(feature = "mtls")]\n'
-                "    pub async fn introspection_response_with_certificate(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "        certificate: Option<&crate::mtls::ClientCertificate<'_>>,\n"
-                "    ) -> Result<IntrospectionResponse, ErrorResponse> {\n"
-                "        self.introspection_response_inner(client_id, client_secret, token, certificate)\n"
-                "            .await\n"
-                "    }\n"
-                "\n"
-                "    async fn introspection_response_inner(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<IntrospectionResponse, ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n",
+                "        now: SystemTime,\n        jti: String,\n    ) -> Result<String, ErrorResponse> {\n",
+                "        now: SystemTime,\n"
+                "        jti: String,\n"
+                "        bound: &Bound<'_>,\n"
+                "    ) -> Result<String, ErrorResponse> {\n"
+                "        // Only the RFC 8705 binding is read out of it here; without that feature the\n"
+                "        // signed claim set does not depend on how the client authenticated.\n"
+                '        #[cfg(not(feature = "mtls"))]\n'
+                "        let _ = bound;\n",
             ),
             (
-                "                aud: (!t.resource.is_empty()).then(|| t.resource.clone()),\n",
-                "                aud: (!t.resource.is_empty()).then(|| t.resource.clone()),\n"
-                "                // RFC 8705 s3.2. This is the whole point of persisting the binding rather\n"
-                "                // than only signing it into a JWT: a resource server holding an OPAQUE token\n"
-                "                // has no other way to discover that the token is certificate bound, and a\n"
-                "                // binding nobody can read is a binding nobody enforces.\n"
+                "            now,\n            access_token,\n        )?;\n",
+                "            now,\n            access_token,\n            bound,\n        )?;\n",
+            ),
+            (
+                '                #[cfg(feature = "dpop")]\n'
+                "                jkt: bound.jkt.map(Box::from),\n"
+                "                access_token: access_token.clone(),\n",
+                '                #[cfg(feature = "dpop")]\n'
+                "                jkt: bound.jkt.map(Box::from),\n"
+                "                // RFC 8705 s3, and the same argument as `jkt` immediately above: an opaque\n"
+                "                // token carries its binding nowhere else, so s3.2 introspection could not\n"
+                "                // report it if it were not written down here.\n"
                 '                #[cfg(feature = "mtls")]\n'
-                "                cnf: t.cnf.as_deref().cloned(),\n",
+                "                x5t_s256: bound\n"
+                "                    .cred\n"
+                "                    .certificate\n"
+                "                    .map(|c| Box::new(*c.thumbprint())),\n"
+                "                access_token: access_token.clone(),\n",
             ),
-            # ------------------------------------------------------------------------------ revoke
             (
-                "    pub async fn revoke(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "        token_type_hint: Option<TokenTypeHint>,\n"
-                "    ) -> Result<(), ErrorResponse> {\n"
-                "        let client = self.authenticate_client(client_id, client_secret).await?;\n",
-                "    pub async fn revoke(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "        token_type_hint: Option<TokenTypeHint>,\n"
-                "    ) -> Result<(), ErrorResponse> {\n"
-                "        self.revoke_inner(\n"
-                "            client_id,\n"
-                "            client_secret,\n"
-                "            token,\n"
-                "            token_type_hint,\n"
-                "            no_certificate(),\n"
-                "        )\n"
-                "        .await\n"
-                "    }\n"
+                '                    #[cfg(feature = "dpop")]\n'
+                "                    jkt: bound.jkt.map(Box::from),\n"
+                "                    refresh_token: rt.clone(),\n",
+                '                    #[cfg(feature = "dpop")]\n'
+                "                    jkt: bound.jkt.map(Box::from),\n"
+                "                    // RFC 8705 s3: the chain remembers the certificate it was issued to, and\n"
+                "                    // rotation checks it. See the check in `refresh_token`.\n"
+                '                    #[cfg(feature = "mtls")]\n'
+                "                    x5t_s256: bound\n"
+                "                        .cred\n"
+                "                        .certificate\n"
+                "                        .map(|c| Box::new(*c.thumbprint())),\n"
+                "                    refresh_token: rt.clone(),\n",
+            ),
+            (
+                '        #[cfg(feature = "dpop")]\n'
+                "        if record.jkt.as_deref() != bound.jkt {\n"
+                "            self.store\n"
+                "                .put_refresh_token(record)\n"
+                "                .await\n"
+                "                .map_err(storage_error)?;\n"
+                "            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)\n"
+                '                .with_description("this refresh token is bound to a different DPoP key"));\n'
+                "        }\n",
+                '        #[cfg(feature = "dpop")]\n'
+                "        if record.jkt.as_deref() != bound.jkt {\n"
+                "            self.store\n"
+                "                .put_refresh_token(record)\n"
+                "                .await\n"
+                "                .map_err(storage_error)?;\n"
+                "            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)\n"
+                '                .with_description("this refresh token is bound to a different DPoP key"));\n'
+                "        }\n"
                 "\n"
-                "    /// RFC 7009 revocation for a client that authenticates with RFC 8705 mutual TLS.\n"
-                "    ///\n"
-                "    /// Present for the same reason the introspection sibling is: a client that can obtain a\n"
-                "    /// token and cannot revoke it has no answer to its own compromise.\n"
-                '    #[cfg(feature = "mtls")]\n'
-                "    pub async fn revoke_with_certificate(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "        token_type_hint: Option<TokenTypeHint>,\n"
-                "        certificate: Option<&crate::mtls::ClientCertificate<'_>>,\n"
-                "    ) -> Result<(), ErrorResponse> {\n"
-                "        self.revoke_inner(client_id, client_secret, token, token_type_hint, certificate)\n"
-                "            .await\n"
-                "    }\n"
-                "\n"
-                "    async fn revoke_inner(\n"
-                "        &self,\n"
-                "        client_id: &ClientId,\n"
-                "        client_secret: Option<&str>,\n"
-                "        token: &str,\n"
-                "        token_type_hint: Option<TokenTypeHint>,\n"
-                "        certificate: PresentedCertificate<'_>,\n"
-                "    ) -> Result<(), ErrorResponse> {\n"
-                "        let client = self\n"
-                "            .authenticate_client(client_id, client_secret, certificate)\n"
-                "            .await?;\n",
+                "        // RFC 8705 s3, and word for word the same argument as the DPoP check above: a chain\n"
+                "        // issued over a client certificate stays bound to THAT certificate, and a rotation\n"
+                "        // has to present it again. Without this the binding is decorative past the first\n"
+                "        // access token, because a stolen refresh token could be re-bound to the thief's own\n"
+                "        // certificate on the next rotation. Section 3 makes it a MUST for public clients\n"
+                "        // specifically; applying it to every bound chain costs a confidential mutual-TLS\n"
+                "        // client nothing, since it presents that certificate on every request anyway.\n"
+                '        #[cfg(feature = "mtls")]\n'
+                "        if record.x5t_s256.as_deref() != bound.cred.certificate.map(|c| c.thumbprint()) {\n"
+                "            self.store\n"
+                "                .put_refresh_token(record)\n"
+                "                .await\n"
+                "                .map_err(storage_error)?;\n"
+                "            return Err(ErrorResponse::new(ErrorCode::InvalidGrant).with_description(\n"
+                '                "this refresh token is bound to a different client certificate",\n'
+                "            ));\n"
+                "        }\n",
+            ),
+            (
+                '                #[cfg(feature = "dpop")]\n'
+                "                cnf: t.jkt.as_deref().map(crate::token::Confirmation::jkt),\n",
+                "                // RFC 9449 s6.1 and RFC 8705 s3.2, in ONE RFC 7800 s3.1 object. Both\n"
+                "                // mechanisms register a member of `cnf` and a token can carry both, so this\n"
+                "                // is built from every binding the record has rather than from whichever one\n"
+                "                // happens to be checked first. Omitted entirely when there is none.\n"
+                '                #[cfg(any(feature = "dpop", feature = "mtls"))]\n'
+                "                cnf: {\n"
+                "                    let cnf = crate::token::Confirmation {\n"
+                '                        #[cfg(feature = "dpop")]\n'
+                "                        jkt: t.jkt.as_deref().map(str::to_string),\n"
+                '                        #[cfg(feature = "mtls")]\n'
+                "                        x5t_s256: t.x5t_s256.as_deref().copied(),\n"
+                "                    };\n"
+                "                    (!cnf.is_empty()).then_some(cnf)\n"
+                "                },\n",
             ),
         ],
-    ),
+    )
+)
+
+EDITS.append(
     (
-        "crates/oauth-as/src/token_exchange.rs",
-        "no_certificate",
+        "crates/oauth-as/src/http.rs",
+        "mtls",
         [
-            # RFC 8693 goes through the same `authenticate_client` and the same `issue` as every
-            # other grant (that reuse is the whole point of the 0.7.0 patch), so it has to name the
-            # new parameter. It passes "no certificate" in both places, deliberately: exchanging a
-            # token is not a mutual-TLS flow in this crate yet, and a grant that silently accepted a
-            # certificate for authentication without anybody having designed that path would be a
-            # worse answer than a grant that plainly does not offer it.
             (
-                "    let client = server\n"
-                "        .authenticate_client(request.client_id, request.client_secret)\n"
-                "        .await?;\n",
-                "    let client = server\n"
-                "        .authenticate_client(\n"
-                "            request.client_id,\n"
-                "            request.client_secret,\n"
-                "            crate::server::no_certificate(),\n"
-                "        )\n"
-                "        .await?;\n",
-            ),
-            (
-                "            scope,\n"
-                "            resource,\n"
-                "            None,\n"
-                "            false,\n"
-                "        )\n"
-                "        .await?;\n",
-                "            scope,\n"
-                "            resource,\n"
-                "            None,\n"
-                "            false,\n"
-                "            crate::server::no_certificate(),\n"
-                "        )\n"
-                "        .await?;\n",
-            ),
+                "            client_secret: self.client_secret.as_deref(),\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion_type: self.client_assertion_type.as_deref(),\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion: self.client_assertion.as_deref(),\n"
+                "        }\n",
+                "            client_secret: self.client_secret.as_deref(),\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion_type: self.client_assertion_type.as_deref(),\n"
+                '            #[cfg(feature = "client_assertion")]\n'
+                "            client_assertion: self.client_assertion.as_deref(),\n"
+                "            // ALWAYS `None`, and it has to be. This router is handed a parsed request; it\n"
+                "            // does not terminate TLS and never sees the connection, so there is no\n"
+                "            // certificate here that anybody verified. RFC 8705 clients reach the server\n"
+                "            // through `ClientCredential::certificate` from a host that DID terminate the\n"
+                "            // connection. Reading one out of a proxy header here would be the exact\n"
+                "            // mistake `crate::mtls`'s trust boundary section warns about, and it would be\n"
+                "            // made on every deployment's behalf rather than on the one host that knows\n"
+                "            // whether its terminator can be trusted.\n"
+                '            #[cfg(feature = "mtls")]\n'
+                "            certificate: None,\n"
+                "        }\n",
+            )
         ],
-    ),
+    )
+)
+
+EDITS.append(
     (
         "crates/oauth-as/src/jwt.rs",
         "pub cnf:",
@@ -1036,49 +727,36 @@ EDITS = [
                 "}\n",
             )
         ],
-    ),
-    (
-        "crates/oauth-as/src/tests/token.rs",
-        "cnf:",
-        [
-            (
-                "    let record = IssuedToken {\n"
-                '        access_token: "at-secret-value".into(),\n',
-                "    let record = IssuedToken {\n"
-                '        #[cfg(feature = "mtls")]\n'
-                "        cnf: None,\n"
-                '        access_token: "at-secret-value".into(),\n',
-            )
-        ],
-    ),
-    (
-        "crates/oauth-as/tests/grant_state_edges.rs",
-        "cnf:",
-        [
-            (
-                "    let token = |name: &str, family: Option<&str>| IssuedToken {\n"
-                "        resource: Vec::new(),\n",
-                "    let token = |name: &str, family: Option<&str>| IssuedToken {\n"
-                '        #[cfg(feature = "mtls")]\n'
-                "        cnf: None,\n"
-                "        resource: Vec::new(),\n",
-            )
-        ],
-    ),
-    (
-        "crates/oauth-as/tests/storage_sweep.rs",
-        "cnf:",
-        [
-            (
-                "    IssuedToken {\n        resource: Vec::new(),\n",
-                "    IssuedToken {\n"
-                '        #[cfg(feature = "mtls")]\n'
-                "        cnf: None,\n"
-                "        resource: Vec::new(),\n",
-            )
-        ],
-    ),
-]
+    )
+)
+
+# The struct literals. Rust requires every field to be named, so each of these has to learn the
+# new one; each anchor carries the literal's opening line, which is what makes it unique.
+def _literal(rel, sites):
+    return (rel, "x5t_s256", [
+        (
+            opener + '        #[cfg(feature = "dpop")]\n' + indent + "jkt: None,\n",
+            opener + '        #[cfg(feature = "dpop")]\n' + indent + "jkt: None,\n"
+            + '        #[cfg(feature = "mtls")]\n' + indent + "x5t_s256: None,\n",
+        )
+        for opener, indent in sites
+    ])
+
+EDITS.append(_literal("crates/oauth-as/tests/grant_state_edges.rs", [
+    ("    let token = |name: &str, family: Option<&str>| IssuedToken {\n", "        "),
+    ("    let refresh = |name: &str, family: &str| RefreshTokenRecord {\n", "        "),
+]))
+EDITS.append(_literal("crates/oauth-as/tests/storage_sweep.rs", [
+    ("fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {\n    IssuedToken {\n", "        "),
+    ("fn refresh_token(token: &str, expires_at: Option<SystemTime>) -> RefreshTokenRecord {\n    RefreshTokenRecord {\n", "        "),
+]))
+EDITS.append(_literal("crates/oauth-as/tests/storage_contract.rs", [
+    ("fn sample_refresh_token(token: &str) -> RefreshTokenRecord {\n    RefreshTokenRecord {\n", "        "),
+]))
+EDITS.append(_literal("crates/oauth-as/src/tests/token.rs", [
+    ("    let record = IssuedToken {\n", "        "),
+    ("    let record = RefreshTokenRecord {\n", "        "),
+]))
 
 
 def main() -> int:

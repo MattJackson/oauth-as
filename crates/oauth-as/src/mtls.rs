@@ -55,8 +55,9 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::client::{Client, ClientAuth, SecretVerifier};
+use crate::client::{Client, ClientAuth};
 use crate::events::ClientAuthFailure;
+use crate::server::ClientCredential;
 use crate::token::Confirmation;
 
 /// The RFC 8705 section 2.1.1 `token_endpoint_auth_method` value for the PKI method: the client is
@@ -607,60 +608,64 @@ impl Confirmation {
     }
 
     /// The confirmation an access token issued over `certificate` carries (RFC 8705 section 3.1).
+    ///
+    /// The RFC 9449 `jkt` member, when that feature is also compiled in, is left absent rather
+    /// than overwritten: a token can be bound by both mechanisms at once and neither owns the
+    /// object. See [`Confirmation`].
     pub fn for_certificate(certificate: &ClientCertificate<'_>) -> Self {
         Confirmation {
+            #[cfg(feature = "dpop")]
+            jkt: None,
             x5t_s256: Some(*certificate.thumbprint()),
         }
     }
 }
 
-/// Verify a client's credential, with RFC 8705 mutual TLS as one of the possibilities.
+/// Whether the certificate on this request authenticates `client`, for a registration that
+/// authenticates BY certificate.
 ///
-/// This is the ONE place the two authentication families meet, and the shape of it is the security
-/// argument. A registration says which family it belongs to, and the other family's credential is
-/// never consulted:
+/// Reached from `AuthorizationServer::authenticate_client`, which dispatches on the REGISTRATION
+/// rather than on what the request happened to present. That direction is the security argument:
 ///
-/// - a [`ClientAuth::Mtls`] registration is decided by the certificate and ONLY by the certificate.
-///   No secret can authenticate it, because it has none to compare against, and a request that
-///   presents one is refused rather than ignored (OAuth 2.1 section 2.4 has a client use exactly
-///   one authentication method; a request carrying two is a client that does not know which
-///   credential it is relying on). Note that this holds even with this module compiled out:
-///   [`ClientAuth::verify_with`] answers `false` for the variant, so an mTLS registration in a
-///   build without the feature authenticates nobody rather than everybody.
-/// - every other registration is decided by [`ClientAuth::verify_with`] exactly as before. A
-///   certificate presented alongside is NOT an authentication credential there; it is used only for
-///   RFC 8705 section 4 token binding, which is available to clients that authenticate some other
-///   way (and to public clients, which authenticate not at all).
-pub(crate) fn verify_client_credentials(
+/// - a [`ClientAuth::Mtls`] registration is decided here and ONLY here. It has no secret, so there
+///   is no string that could be the right one, and it never reaches the secret comparison. Note
+///   this holds even with this module compiled out: [`ClientAuth::verify_with`] answers `false`
+///   for the variant, so an mTLS registration in a build without the feature authenticates nobody
+///   rather than everybody.
+/// - every other registration is decided exactly as it was before, and a certificate presented
+///   alongside is NOT an authentication credential there. It is used only for RFC 8705 section 3
+///   token binding, which section 4 makes available to clients that authenticate some other way,
+///   and to public clients, which authenticate not at all.
+pub(crate) fn verify_certificate(
     client: &Client,
-    presented_secret: Option<&str>,
-    certificate: Option<&ClientCertificate<'_>>,
-    verifier: Option<&dyn SecretVerifier>,
+    cred: &ClientCredential<'_>,
 ) -> Result<(), ClientAuthFailure> {
-    match &client.auth {
-        ClientAuth::Mtls { registration } => {
-            if presented_secret.is_some() {
-                return Err(ClientAuthFailure::SecretMismatch);
-            }
-            let certificate = certificate.ok_or(ClientAuthFailure::NoCertificatePresented)?;
-            // The registration decides, and it is the ONLY thing that decides. "The host verified
-            // this certificate" says the chain is good, not that it belongs to this client: every
-            // deployment that trusts a CA for client certificates has more than one certificate
-            // under it, and for the section 2.2 self-signed method a certificate is something the
-            // caller can mint for themselves in a second.
-            if registration.accepts(certificate) {
-                Ok(())
-            } else {
-                Err(ClientAuthFailure::CertificateMismatch)
-            }
-        }
-        _ => {
-            if client.auth.verify_with(presented_secret, verifier) {
-                Ok(())
-            } else {
-                Err(ClientAuthFailure::SecretMismatch)
-            }
-        }
+    let registration = match &client.auth {
+        ClientAuth::Mtls { registration } => registration,
+        // Not reachable through `authenticate_client`. A direct caller that lands here has asked
+        // whether a certificate authenticates a client that does not authenticate by certificate,
+        // and the answer to that is no rather than "try something else".
+        _ => return Err(ClientAuthFailure::SecretMismatch),
+    };
+    // RFC 6749 s2.3, and OAuth 2.1 s2.4 in the same words: a client uses exactly ONE
+    // authentication method per request. A request carrying a secret as well has not said which
+    // credential it is relying on, and a server that picks one behaves differently from the next
+    // server, which is the ambiguity an intermediary exploits.
+    if cred.client_secret.is_some() {
+        return Err(ClientAuthFailure::SecretMismatch);
+    }
+    let certificate = cred
+        .certificate
+        .ok_or(ClientAuthFailure::NoCertificatePresented)?;
+    // The registration decides, and it is the ONLY thing that decides. "The host verified this
+    // certificate" says the chain is good, not that it belongs to this client: every deployment
+    // that trusts a CA for client certificates has more than one certificate under it, and for the
+    // section 2.2 self-signed method a certificate is something the caller can mint for themselves
+    // in a second.
+    if registration.accepts(certificate) {
+        Ok(())
+    } else {
+        Err(ClientAuthFailure::CertificateMismatch)
     }
 }
 
