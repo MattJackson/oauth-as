@@ -55,6 +55,16 @@ fn the_issuer_path_is_only_what_follows_the_authority() {
     // A scheme-less string is not an issuer RFC 8414 s2 admits; it is read as authority plus
     // path rather than rejected here.
     assert_eq!(issuer_path("as.example/tenant1"), "/tenant1");
+
+    // SHORT authorities, which is where an arithmetic slip in "skip past the scheme" stops being
+    // invisible. With a long host name a wrong offset still lands before the first `/`, so the
+    // path that comes back is accidentally right; with a short one it lands after it and the
+    // whole tenant path silently disappears. That would put every derived route, and the RFC 8414
+    // s3.1 well-known path with it, at the wrong place for exactly the deployments least likely
+    // to notice.
+    assert_eq!(issuer_path("https://a.io/tenant"), "/tenant");
+    assert_eq!(issuer_path("http://a.io/t"), "/t");
+    assert_eq!(issuer_path("https://a.io"), "");
 }
 
 /// RFC 8414 s2 with RFC 9068 s4: `jwks_uri` is advertised exactly when this server signs its
