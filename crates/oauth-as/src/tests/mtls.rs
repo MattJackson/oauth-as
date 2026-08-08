@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Matthew Jackson
 
 //! Unit tests for [`crate::mtls`], kept out of the implementation file. These reach private items
-//! (`ClientCertificate::satisfies`, `verify_client_credentials`), so they live in the crate rather
+//! (`ClientCertificate::satisfies`, `verify_certificate`), so they live in the crate rather
 //! than in `tests/`.
 //!
 //! The ATTACK tests here are the ones that matter, and each names the thing an attacker ends up
@@ -15,6 +15,18 @@ use super::*;
 use crate::client::ClientId;
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
+use crate::server::ClientCredential;
+
+/// The credential a request presents: a certificate, a secret, or (the attack) neither.
+fn cred<'a>(
+    secret: Option<&'a str>,
+    certificate: Option<&'a ClientCertificate<'a>>,
+) -> ClientCredential<'a> {
+    ClientCredential {
+        certificate,
+        ..ClientCredential::secret(secret)
+    }
+}
 
 /// Two certificates that differ in one byte, so their thumbprints differ and nothing else about
 /// the fixture does. Not real X.509: nothing in this crate parses the bytes (see the module docs on
@@ -47,7 +59,10 @@ fn the_thumbprint_is_unpadded_base64url_of_the_sha256_of_the_der() {
     let thumbprint = CertificateThumbprint::from_der(CERT_A);
     let text = thumbprint.to_base64url();
     assert_eq!(text.len(), 43, "{text}");
-    assert!(!text.contains('='), "RFC 8705 s3.1 is base64url WITHOUT padding: {text}");
+    assert!(
+        !text.contains('='),
+        "RFC 8705 s3.1 is base64url WITHOUT padding: {text}"
+    );
     assert!(
         !text.contains('+') && !text.contains('/'),
         "the URL-safe alphabet has no + or /: {text}"
@@ -185,7 +200,7 @@ fn a_certificate_with_the_wrong_subject_does_not_authenticate() {
         .with_san_dns(&["intern.example.com"]);
 
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&attacker), None),
+        verify_certificate(&client, &cred(None, Some(&attacker))),
         Err(ClientAuthFailure::CertificateMismatch),
         "a certificate issued to a different subject must not authenticate this client"
     );
@@ -193,7 +208,7 @@ fn a_certificate_with_the_wrong_subject_does_not_authenticate() {
     // The registered subject, and nothing else, is what authenticates.
     let genuine = ClientCertificate::from_der(CERT_A).with_subject_dn("CN=payments,O=Example,C=GB");
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&genuine), None),
+        verify_certificate(&client, &cred(None, Some(&genuine))),
         Ok(())
     );
 }
@@ -214,14 +229,14 @@ fn a_san_match_of_the_wrong_kind_does_not_authenticate() {
         .with_san_uri(&["client.example.com"])
         .with_san_email(&["client.example.com"]);
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&attacker), None),
+        verify_certificate(&client, &cred(None, Some(&attacker))),
         Err(ClientAuthFailure::CertificateMismatch)
     );
 
     let genuine = ClientCertificate::from_der(CERT_A)
         .with_san_dns(&["other.example.com", "client.example.com"]);
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&genuine), None),
+        verify_certificate(&client, &cred(None, Some(&genuine))),
         Ok(())
     );
 }
@@ -237,7 +252,7 @@ fn a_wildcard_san_matches_only_itself() {
     ));
     let wildcard = ClientCertificate::from_der(CERT_B).with_san_dns(&["*.example.com"]);
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&wildcard), None),
+        verify_certificate(&client, &cred(None, Some(&wildcard))),
         Err(ClientAuthFailure::CertificateMismatch)
     );
 }
@@ -252,7 +267,7 @@ fn matching_is_case_sensitive() {
     ));
     let shouty = ClientCertificate::from_der(CERT_A).with_san_dns(&["CLIENT.EXAMPLE.COM"]);
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&shouty), None),
+        verify_certificate(&client, &cred(None, Some(&shouty))),
         Err(ClientAuthFailure::CertificateMismatch)
     );
 }
@@ -270,11 +285,11 @@ fn a_self_signed_certificate_nobody_registered_does_not_authenticate() {
     ));
     let forged = ClientCertificate::from_der(CERT_B);
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&forged), None),
+        verify_certificate(&client, &cred(None, Some(&forged))),
         Err(ClientAuthFailure::CertificateMismatch)
     );
     assert_eq!(
-        verify_client_credentials(&client, None, Some(&ClientCertificate::from_der(CERT_A)), None),
+        verify_certificate(&client, &cred(None, Some(&ClientCertificate::from_der(CERT_A)))),
         Ok(())
     );
 }
@@ -288,7 +303,7 @@ fn every_registered_self_signed_certificate_authenticates() {
     ));
     for der in [CERT_A, CERT_B] {
         assert_eq!(
-            verify_client_credentials(&client, None, Some(&ClientCertificate::from_der(der)), None),
+            verify_certificate(&client, &cred(None, Some(&ClientCertificate::from_der(der)))),
             Ok(())
         );
     }
@@ -340,14 +355,14 @@ fn no_secret_and_no_certificate_authenticates_a_mutual_tls_client() {
 
     // Nothing at all presented.
     assert_eq!(
-        verify_client_credentials(&client, None, None, None),
+        verify_certificate(&client, &cred(None, None)),
         Err(ClientAuthFailure::NoCertificatePresented),
         "naming a client id is not authenticating as it"
     );
     // A secret presented, with no certificate: there is nothing to compare it against, and
     // "nothing to compare against" must never read as "compared and matched".
     assert_eq!(
-        verify_client_credentials(&client, Some("hunter2"), None, None),
+        verify_certificate(&client, &cred(Some("hunter2"), None)),
         Err(ClientAuthFailure::SecretMismatch)
     );
     // A secret presented ALONGSIDE the right certificate. OAuth 2.1 section 2.4 has a client use
@@ -355,7 +370,7 @@ fn no_secret_and_no_certificate_authenticates_a_mutual_tls_client() {
     // which credential it is relying on, and this crate refuses rather than silently picking.
     let genuine = ClientCertificate::from_der(CERT_A).with_san_dns(&["client.example.com"]);
     assert_eq!(
-        verify_client_credentials(&client, Some("hunter2"), Some(&genuine), None),
+        verify_certificate(&client, &cred(Some("hunter2"), Some(&genuine))),
         Err(ClientAuthFailure::SecretMismatch)
     );
 
@@ -368,36 +383,39 @@ fn no_secret_and_no_certificate_authenticates_a_mutual_tls_client() {
     assert!(client.auth.is_confidential());
 }
 
-/// The converse: a certificate presented by a client that authenticates with a SECRET is not an
-/// authentication credential and must not become one. It is used only for RFC 8705 section 3
-/// binding, so a caller who steals a client id and holds any verified certificate still needs the
-/// secret.
+/// ATTACK, the converse. A certificate must never authenticate a client that registered some
+/// OTHER credential. `verify_certificate` is reached only for a mutual-TLS registration, and this
+/// pins that it fails closed for every other one rather than falling back to "well, a certificate
+/// was presented": a caller who steals a client id and holds any certificate the deployment
+/// verified still needs that client's actual credential.
+///
+/// The end-to-end half of this, where a secret client and a public client both present a
+/// certificate and are judged on their own credential (and get an RFC 8705 section 4 BOUND token
+/// out of it), is in `tests/mtls.rs`, which can reach the whole token endpoint.
 #[test]
-fn a_certificate_does_not_authenticate_a_secret_client() {
+fn a_certificate_does_not_authenticate_a_client_registered_any_other_way() {
+    let certificate = ClientCertificate::from_der(CERT_A).with_san_dns(&["client.example.com"]);
     let mut client = mtls_client(MtlsClientRegistration::TlsClientAuth(
         ExpectedSubject::SanDns("client.example.com".to_string()),
     ));
-    client.auth = ClientAuth::ConfidentialSecret {
-        secret: "s3cret".to_string(),
-    };
-    let certificate = ClientCertificate::from_der(CERT_A).with_san_dns(&["client.example.com"]);
 
-    assert_eq!(
-        verify_client_credentials(&client, None, Some(&certificate), None),
-        Err(ClientAuthFailure::SecretMismatch),
-        "holding a certificate is not knowing the secret"
-    );
-    assert_eq!(
-        verify_client_credentials(&client, Some("s3cret"), Some(&certificate), None),
-        Ok(())
-    );
-    // And a public client stays public: the certificate binds its token (section 4) and
-    // authenticates nothing.
-    client.auth = ClientAuth::Public;
-    assert_eq!(
-        verify_client_credentials(&client, None, Some(&certificate), None),
-        Ok(())
-    );
+    for other in [
+        ClientAuth::Public,
+        ClientAuth::ConfidentialSecret {
+            secret: "s3cret".to_string(),
+        },
+        ClientAuth::ConfidentialSecretHash {
+            hash: crate::client::SecretHash::sha256("s3cret"),
+        },
+    ] {
+        client.auth = other;
+        assert_eq!(
+            verify_certificate(&client, &cred(None, Some(&certificate))),
+            Err(ClientAuthFailure::SecretMismatch),
+            "a certificate is not this registration's credential: {:?}",
+            client.auth
+        );
+    }
 }
 
 // -------------------------------------------------------------- the confirmation, and its coexistence
@@ -456,7 +474,10 @@ fn the_confirmation_serializes_as_the_rfc_7800_object() {
         "jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I",
     });
     let parsed: Confirmation = serde_json::from_value(both).unwrap();
-    assert_eq!(parsed.certificate_thumbprint(), Some(&CertificateThumbprint::from_der(CERT_A)));
+    assert_eq!(
+        parsed.certificate_thumbprint(),
+        Some(&CertificateThumbprint::from_der(CERT_A))
+    );
 }
 
 /// The method name is what the RFC 8414 document advertises and what a client registration records,
@@ -470,9 +491,9 @@ fn the_registered_method_names_are_the_rfc_8705_spellings() {
         "tls_client_auth"
     );
     assert_eq!(
-        MtlsClientRegistration::SelfSignedTlsClientAuth(RegisteredCertificates::from_der_certificates(
-            [CERT_A]
-        ))
+        MtlsClientRegistration::SelfSignedTlsClientAuth(
+            RegisteredCertificates::from_der_certificates([CERT_A])
+        )
         .method_name(),
         "self_signed_tls_client_auth"
     );

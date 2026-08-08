@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use oauth_as::{
     AuthorizationServerMetadata, CertificateThumbprint, Client, ClientAuth, ClientCertificate,
-    ClientId, ErrorCode, Event, EventSink, ExpectedSubject, GrantType, MtlsClientRegistration,
-    RegisteredCertificates, ScopeSet, ServerConfig, TokenRequest, TokenTypeHint,
+    ClientCredential, ClientId, ErrorCode, Event, EventSink, ExpectedSubject, GrantType,
+    MtlsClientRegistration, RegisteredCertificates, ScopeSet, ServerConfig, TokenRequest,
+    TokenRequestContext, TokenTypeHint,
 };
 use support::{server_with, ManualClock};
 
@@ -118,6 +119,16 @@ fn attacker_certificate() -> ClientCertificate<'static> {
         .with_san_dns(SANS)
 }
 
+/// The context a request carrying a verified client certificate arrives with. This is the whole
+/// of the host-facing seam: there is no separate mutual-TLS entry point, because a certificate is
+/// a credential and credentials go in [`ClientCredential`].
+fn with_certificate<'a>(certificate: &'a ClientCertificate<'a>) -> TokenRequestContext<'a> {
+    TokenRequestContext {
+        credential: ClientCredential::certificate(certificate),
+        ..Default::default()
+    }
+}
+
 fn cc_request(client_id: &str) -> TokenRequest {
     TokenRequest::ClientCredentials {
         client_id: ClientId::new(client_id),
@@ -147,7 +158,7 @@ impl EventSink for Failures {
 async fn a_mutual_tls_client_authenticates_with_its_certificate() {
     let srv = server_with(ManualClock::at_epoch(), vec![pki_client()]).await;
     let token = srv
-        .token_with_certificate(cc_request("payments"), &[], Some(&genuine_certificate()))
+        .token_with_context(cc_request("payments"), with_certificate(&genuine_certificate()))
         .await
         .expect("the registered certificate must authenticate the client");
     assert_eq!(token.scope.as_deref(), Some("api:read"));
@@ -158,7 +169,7 @@ async fn a_mutual_tls_client_authenticates_with_its_certificate() {
 async fn a_self_signed_client_authenticates_with_the_certificate_it_registered() {
     let srv = server_with(ManualClock::at_epoch(), vec![self_signed_client()]).await;
     let certificate = ClientCertificate::from_der(CLIENT_DER);
-    srv.token_with_certificate(cc_request("selfie"), &[], Some(&certificate))
+    srv.token_with_context(cc_request("selfie"), with_certificate(&certificate))
         .await
         .expect("the registered certificate must authenticate the client");
 }
@@ -177,7 +188,7 @@ async fn a_certificate_issued_to_someone_else_gets_no_token() {
         .with_event_sink(Box::new(sink));
 
     let refused = srv
-        .token_with_certificate(cc_request("payments"), &[], Some(&attacker_certificate()))
+        .token_with_context(cc_request("payments"), with_certificate(&attacker_certificate()))
         .await
         .expect_err("a certificate issued to another subject must not authenticate this client");
     assert_eq!(refused.error, ErrorCode::InvalidClient);
@@ -208,21 +219,20 @@ async fn a_mutual_tls_client_cannot_authenticate_without_a_certificate() {
     // The mutual-TLS endpoint, with the host passing None because its terminator forwarded
     // nothing. Same refusal: an absent certificate is not a satisfied one.
     let refused = srv
-        .token_with_certificate(cc_request("payments"), &[], None)
+        .token_with_context(cc_request("payments"), TokenRequestContext::default())
         .await
         .expect_err("an absent certificate must not authenticate anybody");
     assert_eq!(refused.error, ErrorCode::InvalidClient);
 
     // A guessed secret, which the registration does not have and so cannot match.
     let refused = srv
-        .token_with_certificate(
+        .token_with_context(
             TokenRequest::ClientCredentials {
                 client_id: ClientId::new("payments"),
                 client_secret: Some("hunter2".to_string()),
                 scope: None,
             },
-            &[],
-            None,
+            TokenRequestContext::default(),
         )
         .await
         .expect_err("a mutual-TLS registration has no secret, so no secret is the right one");
@@ -259,7 +269,7 @@ async fn a_certificate_does_not_stand_in_for_a_clients_secret() {
     let srv = server_with(ManualClock::at_epoch(), vec![secret_client]).await;
 
     let refused = srv
-        .token_with_certificate(cc_request("legacy"), &[], Some(&genuine_certificate()))
+        .token_with_context(cc_request("legacy"), with_certificate(&genuine_certificate()))
         .await
         .expect_err("holding a certificate is not knowing the secret");
     assert_eq!(refused.error, ErrorCode::InvalidClient);
@@ -276,7 +286,7 @@ async fn an_access_token_issued_over_a_certificate_is_bound_to_it() {
     let srv = server_with(ManualClock::at_epoch(), vec![pki_client()]).await;
     let certificate = genuine_certificate();
     let token = srv
-        .token_with_certificate(cc_request("payments"), &[], Some(&certificate))
+        .token_with_context(cc_request("payments"), with_certificate(&certificate))
         .await
         .unwrap();
 
@@ -285,29 +295,30 @@ async fn an_access_token_issued_over_a_certificate_is_bound_to_it() {
         .await
         .unwrap()
         .expect("the token was just issued");
-    let cnf = record.cnf.as_deref().expect("RFC 8705 s3: the token is bound");
     assert_eq!(
-        cnf.certificate_thumbprint(),
-        Some(&CertificateThumbprint::from_der(CLIENT_DER))
+        record.x5t_s256.as_deref(),
+        Some(&CertificateThumbprint::from_der(CLIENT_DER)),
+        "RFC 8705 s3: the AS-side record carries the binding, which is the only place an OPAQUE \
+         token's binding can live"
     );
 
+    // RFC 7662 s2.2 / RFC 8705 s3.2: the wire document a resource server actually reads.
+    let wire = srv
+        .introspection_response_with_credential(
+            &ClientId::new("payments"),
+            &ClientCredential::certificate(&certificate),
+            &token.access_token,
+        )
+        .await
+        .unwrap();
     // The resource server's half. This is the check that makes the binding worth anything.
+    let cnf = wire.cnf.clone().expect("RFC 8705 s3.2: a bound token reports cnf");
     assert!(cnf.confirms_certificate(CLIENT_DER));
     assert!(
         !cnf.confirms_certificate(ATTACKER_DER),
         "a stolen bound token replayed over a different connection must not confirm"
     );
 
-    // RFC 7662 s2.2 / RFC 8705 s3.2: the wire document a resource server actually reads.
-    let wire = srv
-        .introspection_response_with_certificate(
-            &ClientId::new("payments"),
-            None,
-            &token.access_token,
-            Some(&certificate),
-        )
-        .await
-        .unwrap();
     let json = serde_json::to_value(&wire).unwrap();
     assert_eq!(json["active"], serde_json::json!(true));
     assert_eq!(
@@ -325,8 +336,11 @@ async fn an_access_token_issued_over_a_certificate_is_bound_to_it() {
 /// unbound token must hear no.
 #[tokio::test]
 async fn an_unbound_token_reports_no_binding_at_all() {
-    let srv = server_with(ManualClock::at_epoch(), vec![support::client_credentials_client()])
-        .await;
+    let srv = server_with(
+        ManualClock::at_epoch(),
+        vec![support::client_credentials_client()],
+    )
+    .await;
     let token = srv
         .token(TokenRequest::ClientCredentials {
             client_id: ClientId::new("cc-app"),
@@ -338,7 +352,7 @@ async fn an_unbound_token_reports_no_binding_at_all() {
 
     let record = srv.introspect(&token.access_token).await.unwrap().unwrap();
     assert!(
-        record.cnf.is_none(),
+        record.x5t_s256.is_none(),
         "a token issued with no certificate is a plain bearer token and must say so"
     );
 
@@ -367,7 +381,7 @@ async fn a_public_clients_token_is_still_bound_to_its_certificate() {
 
     let code = issue_code(&srv, "public-app", support::PUBLIC_REDIRECT, "read").await;
     let token = srv
-        .token_with_certificate(
+        .token_with_context(
             TokenRequest::AuthorizationCode {
                 client_id: ClientId::new("public-app"),
                 client_secret: None,
@@ -375,18 +389,15 @@ async fn a_public_clients_token_is_still_bound_to_its_certificate() {
                 redirect_uri: Some(support::PUBLIC_REDIRECT.to_string()),
                 code_verifier: Some(support::RFC7636_VERIFIER.to_string()),
             },
-            &[],
-            Some(&certificate),
+            with_certificate(&certificate),
         )
         .await
         .unwrap();
 
     let record = srv.introspect(&token.access_token).await.unwrap().unwrap();
-    assert!(
-        record
-            .cnf
-            .as_deref()
-            .is_some_and(|c| c.confirms_certificate(CLIENT_DER)),
+    assert_eq!(
+        record.x5t_s256.as_deref(),
+        Some(&CertificateThumbprint::from_der(CLIENT_DER)),
         "RFC 8705 s4: a public client's token binds to the certificate it presented"
     );
 }
@@ -402,7 +413,7 @@ async fn a_refreshed_token_binds_to_the_certificate_of_the_refresh_request() {
 
     let code = issue_code(&srv, "payments", PKI_REDIRECT, "api:read").await;
     let first = srv
-        .token_with_certificate(
+        .token_with_context(
             TokenRequest::AuthorizationCode {
                 client_id: ClientId::new("payments"),
                 client_secret: None,
@@ -410,34 +421,32 @@ async fn a_refreshed_token_binds_to_the_certificate_of_the_refresh_request() {
                 redirect_uri: Some(PKI_REDIRECT.to_string()),
                 code_verifier: Some(support::RFC7636_VERIFIER.to_string()),
             },
-            &[],
-            Some(&certificate),
+            with_certificate(&certificate),
         )
         .await
         .expect("the certificate authenticates the code redemption too");
-    let refresh = first.refresh_token.expect("this grant issues a refresh chain");
+    let refresh = first
+        .refresh_token
+        .expect("this grant issues a refresh chain");
 
     let rotated = srv
-        .token_with_certificate(
+        .token_with_context(
             TokenRequest::RefreshToken {
                 client_id: ClientId::new("payments"),
                 client_secret: None,
                 refresh_token: refresh,
                 scope: None,
             },
-            &[],
-            Some(&certificate),
+            with_certificate(&certificate),
         )
         .await
         .expect("the certificate authenticates the refresh leg too");
 
     for token in [&first.access_token, &rotated.access_token] {
         let record = srv.introspect(token).await.unwrap().unwrap();
-        assert!(
-            record
-                .cnf
-                .as_deref()
-                .is_some_and(|c| c.confirms_certificate(CLIENT_DER)),
+        assert_eq!(
+            record.x5t_s256.as_deref(),
+            Some(&CertificateThumbprint::from_der(CLIENT_DER)),
             "every leg of the chain must carry the binding, or refreshing launders it away"
         );
     }
@@ -452,27 +461,25 @@ async fn a_mutual_tls_client_can_introspect_and_revoke_its_own_tokens() {
     let srv = server_with(ManualClock::at_epoch(), vec![pki_client()]).await;
     let certificate = genuine_certificate();
     let token = srv
-        .token_with_certificate(cc_request("payments"), &[], Some(&certificate))
+        .token_with_context(cc_request("payments"), with_certificate(&certificate))
         .await
         .unwrap();
 
     let seen = srv
-        .introspection_response_with_certificate(
+        .introspection_response_with_credential(
             &ClientId::new("payments"),
-            None,
+            &ClientCredential::certificate(&certificate),
             &token.access_token,
-            Some(&certificate),
         )
         .await
         .unwrap();
     assert!(seen.active);
 
-    srv.revoke_with_certificate(
+    srv.revoke_with_credential(
         &ClientId::new("payments"),
-        None,
+        &ClientCredential::certificate(&certificate),
         &token.access_token,
         Some(TokenTypeHint::AccessToken),
-        Some(&certificate),
     )
     .await
     .unwrap();
@@ -481,12 +488,11 @@ async fn a_mutual_tls_client_can_introspect_and_revoke_its_own_tokens() {
     // ATTACK: the same two endpoints must refuse the attacker's certificate, or introspection
     // becomes the oracle RFC 7662 s4 warns about and revocation becomes a free kill switch.
     let refused = srv
-        .revoke_with_certificate(
+        .revoke_with_credential(
             &ClientId::new("payments"),
-            None,
+            &ClientCredential::certificate(&attacker_certificate()),
             "anything",
             None,
-            Some(&attacker_certificate()),
         )
         .await
         .expect_err("the wrong certificate must not revoke this client's tokens");
@@ -500,21 +506,19 @@ async fn the_device_authorization_endpoint_takes_a_certificate() {
     client.grant_types.push(GrantType::DeviceCode);
     let srv = server_with(ManualClock::at_epoch(), vec![client]).await;
 
-    srv.device_authorization_with_certificate(
+    srv.device_authorization_with_credential(
         &ClientId::new("payments"),
+        &ClientCredential::certificate(&genuine_certificate()),
         None,
-        None,
-        Some(&genuine_certificate()),
     )
     .await
     .expect("the certificate authenticates the device authorization request");
 
     let refused = srv
-        .device_authorization_with_certificate(
+        .device_authorization_with_credential(
             &ClientId::new("payments"),
+            &ClientCredential::certificate(&attacker_certificate()),
             None,
-            None,
-            Some(&attacker_certificate()),
         )
         .await
         .expect_err("and the wrong one does not");
@@ -574,11 +578,15 @@ async fn a_signed_access_token_carries_the_cnf_claim() {
     srv.register_client(pki_client()).await.unwrap();
 
     let token = srv
-        .token_with_certificate(cc_request("payments"), &[], Some(&genuine_certificate()))
+        .token_with_context(cc_request("payments"), with_certificate(&genuine_certificate()))
         .await
         .unwrap();
 
-    let payload = token.access_token.split('.').nth(1).expect("a JWS has three parts");
+    let payload = token
+        .access_token
+        .split('.')
+        .nth(1)
+        .expect("a JWS has three parts");
     let claims: serde_json::Value = serde_json::from_slice(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
