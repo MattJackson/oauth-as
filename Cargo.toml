@@ -1,0 +1,15 @@
+[package]
+name = "oauth-as"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+description = "Placeholder. An embeddable OAuth 2.1 Authorization Server library is in development; this release reserves the name and contains no implementation."
+repository = "https://github.com/MattJackson/oauth-as"
+homepage = "https://github.com/MattJackson/oauth-as"
+documentation = "https://docs.rs/oauth-as"
+readme = "README.md"
+keywords = ["oauth", "oauth2", "authorization", "authentication", "placeholder"]
+categories = ["authentication"]
+
+[dependencies]
