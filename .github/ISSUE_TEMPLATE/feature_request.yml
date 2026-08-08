@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose something oauth-as does not do yet.
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check ROADMAP.md. It is an honest inventory of what a mature third-party
+        authorization server does that this crate does not do yet, ordered into releases, and
+        each item says what it BUYS. If your request is already there, comment on this repository
+        instead of filing a duplicate. If it is not, this project's rule is: nothing goes on the
+        roadmap because a competitor has it. Say what a real deployment cannot do without it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What can't you do today, and what does this buy you
+      description: >-
+        Describe the concrete thing you are blocked on. "Answers a question a real deployment
+        asks" is the bar this project holds requests to; a feature that cannot answer that
+        question does not belong on the roadmap.
+    validations:
+      required: true
+
+  - type: input
+    id: rfc-section
+    attributes:
+      label: Relevant RFC (if any)
+      description: If this maps to a specific RFC, name it, e.g. "RFC 9449 (DPoP)" or "RFC 7591 (dynamic client registration)".
+      placeholder: "RFC 8705"
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you have tried instead
+      description: Workarounds, host-side implementations, or other libraries you evaluated, and why they fall short.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else worth knowing.
+    validations:
+      required: false

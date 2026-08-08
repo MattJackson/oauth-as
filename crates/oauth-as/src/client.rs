@@ -7,6 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
@@ -34,7 +35,11 @@ impl fmt::Display for ClientId {
 }
 
 /// How the client authenticates to the token endpoint (RFC 6749 section 2.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written rather than derived (see below) so that `ConfidentialSecret`'s secret
+/// never appears in a debug format. `Client` derives `Debug` and holds a `ClientAuth`, so this
+/// also keeps `{:?}` on a whole `Client` safe, without needing a hand-written `Debug` there too.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientAuth {
     /// A public client (native app, browser app, device): no secret exists, so possession of the
     /// `client_id` proves nothing and the flows compensate (PKCE, device-code user interaction).
@@ -47,11 +52,35 @@ pub enum ClientAuth {
     },
 }
 
+/// Hand-written so `ConfidentialSecret { secret }` never prints the secret. An AS library that
+/// logs nothing itself should still not make `tracing::debug!(?client)` on a host's part into a
+/// plaintext credential leak; deriving `Debug` here would do exactly that. Every non-secret
+/// variant and field stays visible so the type is still useful to debug-print.
+impl fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClientAuth::Public => f.write_str("Public"),
+            ClientAuth::ConfidentialSecret { secret: _ } => f
+                .debug_struct("ConfidentialSecret")
+                .field("secret", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
 impl ClientAuth {
     /// Verify a presented secret. Public clients accept `None` and reject any presented secret
     /// (presenting a secret for a secretless registration is a client mixup worth failing loud
-    /// on). Confidential clients require the exact secret; comparison is constant time in the
-    /// length of the registered secret.
+    /// on). Confidential clients require the exact secret; the comparison is constant time
+    /// regardless of the length of either the registered or the presented secret (see
+    /// [`constant_time_eq`]).
+    ///
+    /// What this does NOT cover: if the caller (see `server.rs`) returns early for an unknown
+    /// `client_id` before ever calling `verify`, an unknown client and a known client with a
+    /// wrong secret are distinguishable by timing even though `verify` itself leaks nothing.
+    /// Making those two paths cost the same wall time is the caller's responsibility, not this
+    /// function's; a caller that cares should call `verify` against some registered client (or an
+    /// equivalent-cost dummy) on the unknown-client path too.
     pub fn verify(&self, presented: Option<&str>) -> bool {
         match self {
             ClientAuth::Public => presented.is_none(),
@@ -63,16 +92,36 @@ impl ClientAuth {
     }
 }
 
-/// Constant-time byte comparison: the accumulator visits every byte of both inputs regardless of
-/// where the first difference sits, so timing does not leak a prefix match. Length inequality is
-/// folded into the accumulator rather than short-circuited.
+/// Constant-time equality, by comparing SHA-256 digests over a fixed 32 bytes rather than the raw
+/// inputs.
+///
+/// Hashing first is what makes this constant time, on two axes that a raw byte-by-byte compare
+/// cannot deliver at once:
+///
+/// 1. Value: the accumulator below visits all 32 digest bytes regardless of where (or whether) the
+///    inputs first differ, so no early difference shows up as an early exit.
+/// 2. Length: SHA-256 always produces exactly 32 bytes no matter how long `a` or `b` are, so the
+///    loop always runs exactly 32 iterations. Comparing the raw inputs directly, even with a
+///    "run for max(a.len(), b.len())" loop, makes wall time grow with the presented secret's
+///    length once it exceeds the registered one, which lets a network attacker binary-search the
+///    registered secret's length by timing the token endpoint. Hashing first removes the input
+///    length from the loop bound entirely.
+///
+/// This also happens to make the function actually correct: two digests are equal only when the
+/// two inputs were equal (SHA-256 collision resistance), so there is no longer a length-encoding
+/// edge case where sufficiently padded unequal inputs compare equal.
+///
+/// This is NOT password hashing, and SHA-256 is not being used as a KDF here. `secret` is a
+/// high-entropy, host-generated and host-managed credential, not a human-chosen password, so
+/// there is no offline-guessing threat this needs to be slow against. SHA-256's only job in this
+/// function is to be a fixed-width length equaliser ahead of a constant-time compare; nobody
+/// should read this as a template for verifying user passwords.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut acc: u8 = (a.len() ^ b.len()) as u8 | ((a.len() ^ b.len()) >> 8) as u8;
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        acc |= x ^ y;
+    let da = Sha256::digest(a);
+    let db = Sha256::digest(b);
+    let mut acc: u8 = 0;
+    for i in 0..32 {
+        acc |= da[i] ^ db[i];
     }
     acc == 0
 }

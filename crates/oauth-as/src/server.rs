@@ -23,7 +23,8 @@ use crate::grant::GrantType;
 use crate::scope::ScopeSet;
 use crate::store::{Storage, StorageError};
 use crate::token::{
-    IntrospectionResponse, IssuedToken, RefreshTokenRecord, TokenResponse, TokenType, TokenTypeHint,
+    IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,
+    TokenType, TokenTypeHint,
 };
 
 /// Seconds since the Unix epoch, for the RFC 7519 `exp` / `iat` style claims RFC 7662 reuses.
@@ -103,10 +104,42 @@ pub struct ServerConfig {
     /// Absolute refresh chain lifetime; `None` (the default) means no time expiry. Rotation
     /// preserves the chain's original expiry rather than sliding it.
     pub refresh_token_ttl: Option<Duration>,
-    /// User code length in symbols, excluding the display hyphen. Default 8 (about 34 bits over
-    /// the 20-symbol alphabet, the RFC 8628 section 6.1 example shape).
+    /// How long a ROTATED (spent) refresh token is retained purely so that its reuse can be
+    /// detected, when its chain has no absolute expiry of its own. Default 30 days.
+    ///
+    /// Reuse detection (OAuth 2.1 draft section 6.1, RFC 9700 section 4.14.2) only works while the
+    /// superseded token is still recognisable, so this is the window in which a stolen-and-rotated
+    /// token still triggers revocation of its family. Past it the record is sweepable and a
+    /// presentation reads as an unknown token. When the chain HAS an absolute expiry, that expiry
+    /// is used instead: there is nothing left to protect once the chain itself is dead.
+    pub refresh_reuse_window: Duration,
+    /// User code length in symbols, excluding the display hyphen. Default
+    /// [`MIN_USER_CODE_LENGTH`] (about 34 bits over the 20-symbol alphabet, the RFC 8628 section
+    /// 6.1 example shape).
+    ///
+    /// Values below [`MIN_USER_CODE_LENGTH`] are CLAMPED UP at generation, not honoured. This is
+    /// not tuning: 4 symbols is about 160,000 possibilities, which is seconds of guessing against
+    /// an endpoint this library cannot rate limit, and 0 produces an empty code that every grant
+    /// collides on. Clamping rather than rejecting keeps a misconfiguration from becoming a
+    /// runtime failure at the one moment a user is standing in front of a device.
     pub user_code_length: usize,
 }
+
+/// The floor [`ServerConfig::user_code_length`] is clamped up to: the RFC 8628 section 6.1 example
+/// shape, about 34 bits over the 20-symbol alphabet.
+///
+/// Section 6.1 is explicit that this entropy is adequate only IN COMBINATION WITH rate limiting of
+/// user-code entry. This library performs none and cannot: it never sees a request, only the host
+/// does. See [`AuthorizationServer::approve_device`].
+pub const MIN_USER_CODE_LENGTH: usize = 8;
+
+/// How many times user-code generation may redraw on a collision before giving up.
+///
+/// A collision at the floor length is a roughly one-in-a-hundred-billion event per live grant, so
+/// a run of this many is not chance: it is a store that is full, broken, or under an allocation
+/// flood. Bounded rather than unbounded because an endpoint that spins forever under load is a
+/// worse failure than one that answers `server_error`.
+const USER_CODE_GENERATION_ATTEMPTS: usize = 8;
 
 impl ServerConfig {
     /// A config with RFC-shaped defaults; `issuer` and `verification_uri` have no sane default and
@@ -131,7 +164,10 @@ impl ServerConfig {
             access_token_ttl: Duration::from_secs(3600),
             issue_refresh_tokens: true,
             refresh_token_ttl: None,
-            user_code_length: 8,
+            // 30 days: long enough that a chain abandoned by a client that later comes back with
+            // a stale token is still recognised as reuse rather than as noise.
+            refresh_reuse_window: Duration::from_secs(30 * 24 * 60 * 60),
+            user_code_length: MIN_USER_CODE_LENGTH,
         }
     }
 }
@@ -280,6 +316,14 @@ fn storage_error(e: StorageError) -> ErrorResponse {
     ErrorResponse::new(ErrorCode::ServerError)
 }
 
+/// The refresh chain an issuance CONTINUES: carried from the redeemed record to its replacement,
+/// so that rotation preserves both the family (RFC 9700 section 4.14.2 revokes by grant) and the
+/// absolute lifetime (a chain must not slide its own expiry forward every time it rotates).
+struct RefreshChain {
+    family_id: String,
+    expires_at: Option<SystemTime>,
+}
+
 /// The authorization server. Generic over the host's [`Storage`] and (for tests) the [`Clock`].
 pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
     config: ServerConfig,
@@ -310,7 +354,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self.config
     }
 
-    /// The storage seam, for host-side administration (listing, sweeping).
+    /// The storage seam, so the host can administer its own store.
+    ///
+    /// The one administrative operation this crate REQUIRES of the host is eviction:
+    /// [`Storage::sweep_expired`] must be called on some host-chosen schedule, because nothing in
+    /// this crate ever evicts anything on its own. There is no background task here and there will
+    /// not be one (see the crate docs on zero cost until enabled), so a host that never sweeps has
+    /// a store that only grows: consumed authorization codes and spent refresh records are
+    /// retained ON PURPOSE until their expiry (that retention is what makes replay and reuse
+    /// detectable), and expired access tokens and abandoned device grants are simply never looked
+    /// at again. Anything else the host wants to do here, such as listing, is its own store's
+    /// business and not this trait's.
     pub fn store(&self) -> &S {
         &self.store
     }
@@ -371,7 +425,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
         let now = self.clock.now();
         let device_code = random_hex(32);
-        let user_code = display_user_code(&random_user_code(self.config.user_code_length));
+        let user_code = self.unique_user_code().await?;
         let grant = DeviceGrant {
             device_code: device_code.clone(),
             user_code: user_code.clone(),
@@ -402,6 +456,38 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         })
     }
 
+    /// Draw a user code that no live grant already answers to.
+    ///
+    /// RFC 8628 section 6.1 sizes the user code for a human to type, which is exactly why it is
+    /// short enough to collide: the birthday bound at the floor length is in the low hundreds of
+    /// thousands of concurrent live grants. An accepted collision is not a cosmetic problem, it is
+    /// two devices sharing one credential, and it corrupts the store's index for both.
+    ///
+    /// The draw is checked, not assumed. The check is advisory (another grant can be written
+    /// between the lookup and the put), which is why [`Storage::put_device_grant`] is REQUIRED to
+    /// refuse a collision outright: this loop keeps the common case cheap, the store keeps it
+    /// correct.
+    async fn unique_user_code(&self) -> Result<String, ErrorResponse> {
+        // Clamped, not honoured: see `ServerConfig::user_code_length`.
+        let len = self.config.user_code_length.max(MIN_USER_CODE_LENGTH);
+        for _ in 0..USER_CODE_GENERATION_ATTEMPTS {
+            let raw = random_user_code(len);
+            // The store indexes NORMALIZED codes, and `raw` is already the normalized form (the
+            // alphabet is upper case and carries no hyphen), so this needs no second pass.
+            if self
+                .store
+                .find_device_grant_by_user_code(&raw)
+                .await
+                .map_err(storage_error)?
+                .is_none()
+            {
+                return Ok(display_user_code(&raw));
+            }
+        }
+        Err(ErrorResponse::new(ErrorCode::ServerError)
+            .with_description("could not allocate an unused user code"))
+    }
+
     /// Fetch a still-live pending grant by entered user code, for the verification UI actions.
     async fn pending_grant_by_user_code(
         &self,
@@ -428,6 +514,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     }
 
     /// The host's verification UI approves a grant for `subject` (the authenticated user).
+    ///
+    /// # The host MUST rate limit calls to this
+    ///
+    /// RFC 8628 section 5.1 is explicit that the user code's entropy is sufficient only IN
+    /// COMBINATION WITH rate limiting: the code is short because a human types it, and an
+    /// unthrottled verification endpoint turns "short enough to type" into "short enough to
+    /// enumerate". This library performs NO rate limiting and cannot, because it never sees a
+    /// request: it has no notion of a caller, an IP, a session, or a user. Every unknown-code
+    /// answer this returns must be counted and throttled by the HOST, per whatever identity the
+    /// host actually has. Without that, [`MIN_USER_CODE_LENGTH`] symbols is a guessing exercise,
+    /// not a credential.
     pub async fn approve_device(
         &self,
         entered_user_code: &str,
@@ -444,6 +541,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     }
 
     /// The host's verification UI records the user's refusal.
+    ///
+    /// The same RFC 8628 section 5.1 obligation as [`AuthorizationServer::approve_device`] applies:
+    /// this path also tells a caller whether a code exists, so the HOST must rate limit it too. An
+    /// attacker enumerating codes does not care which of the two endpoints answers.
     pub async fn deny_device(&self, entered_user_code: &str) -> Result<(), DeviceApprovalError> {
         let mut grant = self.pending_grant_by_user_code(entered_user_code).await?;
         grant.state = DeviceGrantState::Denied;
@@ -648,14 +749,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
-        Ok(ValidatedAuthorizationRequest {
-            client_id: client.client_id,
+        Ok(ValidatedAuthorizationRequest::new(
+            client.client_id,
             redirect_uri,
             scope,
             state,
-            code_challenge: code_challenge.to_string(),
-            code_challenge_method: CodeChallengeMethod::S256,
-        })
+            code_challenge.to_string(),
+            CodeChallengeMethod::S256,
+        ))
     }
 
     /// Mint an authorization code for a request the user has approved (RFC 6749 section 4.1.2).
@@ -720,6 +821,28 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .map_err(storage_error)?
             .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
 
+        // A code belongs to the client it was issued to, and this is checked FIRST, before the
+        // replay branch below, because that branch is DESTRUCTIVE. Ordering it the other way makes
+        // "revoke the tokens this code minted" reachable by whoever presents the code, and a code
+        // is a value that leaks: into logs, into `Referer` headers, into browser history. The
+        // record goes BACK rather than being burned, for the same reason: the legitimate client
+        // must still be able to complete its flow, and letting a third party destroy a live code
+        // is a denial of service for free.
+        //
+        // Being honest about what this check is and is not. For a CONFIDENTIAL client it is an
+        // authentication gate, because `authenticate_client` above proved the caller holds the
+        // secret. For a PUBLIC client it is not: RFC 6749 section 4.1.2 notes that a public client
+        // id is not a secret and anyone may claim one, so a leaked code still lets an attacker
+        // reach this branch as the client the code WAS issued to, and still ends that client's
+        // tokens. That residual is inherent to public clients and PKCE does not close it, since
+        // the revocation happens before any verifier is checked. What the ordering above does buy
+        // is that the residual stops at the client whose code actually leaked, instead of being
+        // handed to every registered client in the deployment.
+        if record.client_id != client.client_id {
+            let _ = self.store.put_authorization_code(record).await;
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+
         // A code presented twice is evidence it leaked, so RFC 6749 section 4.1.2 and RFC 9700
         // section 4.1.1 want the tokens it already minted revoked, not just the replay refused.
         // Refusing the replay alone would leave the attacker's stolen access token live.
@@ -728,17 +851,25 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             refresh_token,
         } = &record.state
         {
-            let _ = self.store.delete_token(access_token).await;
+            // Revoking by FAMILY rather than by the two recorded strings, so that a chain the
+            // client has legitimately rotated since redemption dies too: the compromise is of the
+            // grant, not of one token from it (RFC 9700 section 4.14.2).
+            let mut revoked_family = false;
             if let Some(rt) = refresh_token {
-                let _ = self.store.take_refresh_token(rt).await;
+                if let Ok(Some(rec)) = self.store.get_refresh_token(rt).await {
+                    let _ = self.store.revoke_token_family(&rec.family_id).await;
+                    revoked_family = true;
+                }
             }
-            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
-        }
-
-        // A code belongs to the client it was issued to. The record goes BACK rather than being
-        // burned: the legitimate client must still be able to complete its flow, and letting an
-        // unauthenticated third party destroy a live code is a denial of service for free.
-        if record.client_id != client.client_id {
+            if !revoked_family {
+                // No refresh chain to reach the family through (or it is already swept): the
+                // access token this code minted is still nameable directly.
+                let _ = self.store.delete_token(access_token).await;
+            }
+            // The consumed record goes BACK. `src/authorization.rs` and `src/store.rs` both
+            // promise it is retained until its own expiry, and that promise is what makes replay
+            // detection work more than once: taking it here would make the NEXT replay read as an
+            // unknown code, which is the answer a typo gets.
             let _ = self.store.put_authorization_code(record).await;
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
@@ -919,21 +1050,50 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
         }
 
-        // Consume first (atomic), then judge. Deliberate consequences: a token presented by the
-        // WRONG authenticated client is destroyed rather than left redeemable (leaked-token
-        // hardening, in the spirit of RFC 9700's rotation guidance), and a replay after rotation
-        // is a plain `invalid_grant`.
+        // Consume first (atomic): that is what makes redemption single use under concurrency.
+        // Judging comes after, and every judgement below either puts the record back or has a
+        // stated reason not to.
         let record = self
             .store
             .take_refresh_token(refresh_token)
             .await
             .map_err(storage_error)?
             .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
+
+        // Presented by a client it was not issued to. The record goes BACK: the presenter proved
+        // only that they hold a string, and destroying a live credential on that basis locks out
+        // the client that legitimately holds it while costing the attacker nothing. Same reasoning
+        // as the authorization code path, which has always put the record back on a mismatch.
         if record.client_id != client.client_id {
+            self.store
+                .put_refresh_token(record)
+                .await
+                .map_err(storage_error)?;
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
+
+        // REUSE. This token was already rotated away, so two parties hold it, and the AS has just
+        // been handed unambiguous evidence of that. OAuth 2.1 draft section 6.1 and RFC 9700
+        // section 4.14.2: invalidate the presented token AND revoke the tokens issued for that
+        // authorization grant. Refusing the presentation alone would be the defence inverted,
+        // because the party who presents the superseded token is by definition the one who did NOT
+        // redeem it first, which in a theft is the victim.
+        //
+        // The family revocation removes every record carrying this id, including this one, so
+        // there is nothing to put back.
+        if record.state == RefreshTokenState::Spent {
+            self.store
+                .revoke_token_family(&record.family_id)
+                .await
+                .map_err(storage_error)?;
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                .with_description("refresh token reuse detected; the grant has been revoked"));
+        }
+
         if let Some(expires_at) = record.expires_at {
             if self.clock.now() >= expires_at {
+                // Not put back: an expired chain can never become valid again, and keeping it
+                // would only be storage the host has to sweep.
                 return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
                     .with_description("refresh token chain expired"));
             }
@@ -955,28 +1115,69 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
-        self.issue(
-            &client,
-            record.subject.clone(),
-            scope,
-            Some(record.expires_at),
-            true,
-        )
-        .await
+        let issued = self
+            .issue(
+                &client,
+                record.subject.clone(),
+                scope,
+                Some(RefreshChain {
+                    family_id: record.family_id.clone(),
+                    expires_at: record.expires_at,
+                }),
+                true,
+            )
+            .await?;
+
+        // Retain the rotated token, marked spent, exactly as the authorization code path retains a
+        // consumed code and for the same reason: a deleted token makes a later presentation
+        // indistinguishable from an unknown string, and reuse detection is then impossible. A
+        // chain with no absolute expiry gets a retention deadline here, so the record is
+        // reclaimable by `Storage::sweep_expired` rather than immortal.
+        let spent = RefreshTokenRecord {
+            state: RefreshTokenState::Spent,
+            expires_at: record
+                .expires_at
+                .or_else(|| Some(self.clock.now() + self.config.refresh_reuse_window)),
+            ..record
+        };
+        self.store
+            .put_refresh_token(spent)
+            .await
+            .map_err(storage_error)?;
+
+        Ok(issued)
     }
 
     /// Mint and persist an access token (and, when configured, a rotated refresh token).
-    /// `refresh_chain_expiry`: `None` starts a NEW chain (device redemption); `Some(inherited)`
-    /// continues one (rotation keeps the absolute lifetime).
+    ///
+    /// `chain`: `None` starts a NEW family (a fresh grant); `Some(_)` continues an existing one,
+    /// keeping both its family id and its absolute lifetime, which is what makes rotation a chain
+    /// rather than a sequence of unrelated tokens.
     async fn issue(
         &self,
         client: &Client,
         subject: Option<String>,
         scope: ScopeSet,
-        refresh_chain_expiry: Option<Option<SystemTime>>,
+        chain: Option<RefreshChain>,
         allow_refresh: bool,
     ) -> Result<TokenResponse, ErrorResponse> {
         let now = self.clock.now();
+
+        let issues_refresh = allow_refresh
+            && self.config.issue_refresh_tokens
+            && client.allows_grant(GrantType::RefreshToken);
+
+        // The family id is minted (or inherited) BEFORE the access token, because the access token
+        // has to carry it: RFC 9700 section 4.14.2 revokes the tokens of the whole grant on
+        // detected reuse, and an access token with no family is unreachable from that event. A
+        // grant that issues no refresh chain has no family, and allocates nothing for one: there
+        // is no chain to reuse, so there is nothing to revoke by family.
+        let family_id = match (&chain, issues_refresh) {
+            (Some(c), _) => Some(c.family_id.clone()),
+            (None, true) => Some(random_hex(16)),
+            (None, false) => None,
+        };
+
         let access_token = random_hex(32);
         self.store
             .put_token(IssuedToken {
@@ -986,16 +1187,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 scope: scope.clone(),
                 issued_at: now,
                 expires_at: now + self.config.access_token_ttl,
+                family_id: family_id.clone(),
             })
             .await
             .map_err(storage_error)?;
 
-        let refresh_token = if allow_refresh
-            && self.config.issue_refresh_tokens
-            && client.allows_grant(GrantType::RefreshToken)
-        {
-            let expires_at = match refresh_chain_expiry {
-                Some(inherited) => inherited,
+        let refresh_token = if issues_refresh {
+            let expires_at = match &chain {
+                Some(c) => c.expires_at,
                 None => self.config.refresh_token_ttl.map(|ttl| now + ttl),
             };
             let rt = random_hex(32);
@@ -1006,6 +1205,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     subject,
                     scope: scope.clone(),
                     expires_at,
+                    // Present whenever a refresh token is: `issues_refresh` is what decided both.
+                    family_id: family_id.unwrap_or_default(),
+                    state: RefreshTokenState::Active,
                 })
                 .await
                 .map_err(storage_error)?;
@@ -1052,6 +1254,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         token: &str,
     ) -> Result<IntrospectionResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, client_secret).await?;
+        // RFC 7662 section 2.1 requires the endpoint to be protected, and section 4 says it MUST
+        // NOT be publicly available, because it otherwise describes any token an attacker has
+        // merely obtained a copy of. A PUBLIC client has no secret to verify, so "authenticated as
+        // a public client" is a sentence true of every caller on the internet: naming a client id
+        // is not authentication, and an ownership check made against an identity anyone may claim
+        // is not an access control. Same refusal as `client_credentials_token`, for the same
+        // reason.
+        if matches!(client.auth, crate::client::ClientAuth::Public) {
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
+                .with_description("introspection requires a confidential client"));
+        }
         let record = self.introspect(token).await.map_err(storage_error)?;
         Ok(match record {
             Some(t) if t.client_id == client.client_id => IntrospectionResponse {
@@ -1086,18 +1299,32 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         token_type_hint: Option<TokenTypeHint>,
     ) -> Result<(), ErrorResponse> {
         let client = self.authenticate_client(client_id, client_secret).await?;
+        // RFC 7009 section 2.1 requires client authentication here and requires the server to
+        // verify the token was issued to the requesting client. A public client cannot satisfy the
+        // first, so it cannot be held to the second: anyone may name a public client id, which
+        // would make this an unauthenticated kill switch for every token that client holds.
+        if matches!(client.auth, crate::client::ClientAuth::Public) {
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
+                .with_description("revocation requires a confidential client"));
+        }
 
         let try_refresh = || async {
-            match self.store.take_refresh_token(token).await {
-                Ok(Some(record)) if record.client_id == client.client_id => Ok(true),
-                // Another client's token: put it back untouched. Section 2.1 says the server
-                // MUST verify ownership, and silently destroying someone else's refresh chain
-                // would be a denial of service available to any registered client.
-                Ok(Some(record)) => {
-                    let _ = self.store.put_refresh_token(record).await;
-                    Ok(false)
+            // READ, then take. Section 2.1's ownership check is a question ABOUT someone else's
+            // credential, so it must not be answered by removing it: a take-then-put-back is a
+            // non-atomic read-modify-write on a live token, it opens a window in which the real
+            // owner's concurrent refresh sees nothing, and if the restoring write fails the
+            // victim's chain is destroyed permanently while this endpoint still answers 200.
+            // Reading first means a non-owner's request touches nothing at all.
+            match self.store.get_refresh_token(token).await {
+                Ok(Some(record)) if record.client_id == client.client_id => {
+                    self.store
+                        .take_refresh_token(token)
+                        .await
+                        .map_err(storage_error)?;
+                    Ok(true)
                 }
-                Ok(None) => Ok(false),
+                // Unknown, or somebody else's: nothing to do, and section 2.2 makes both a 200.
+                Ok(_) => Ok(false),
                 Err(e) => Err(storage_error(e)),
             }
         };

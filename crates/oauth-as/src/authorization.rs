@@ -12,7 +12,10 @@
 //! a request with no `code_challenge`, or with `response_type=token`, has to reach the state
 //! machine so the machine can answer it the way the RFC prescribes. Parsing into
 //! [`ValidatedAuthorizationRequest`] is what validation MEANS here, and only the validated form
-//! can mint a code.
+//! can mint a code. [`ValidatedAuthorizationRequest`] carries a private witness field so that,
+//! within this crate, [`ValidatedAuthorizationRequest::new`] is the only way to produce one; a
+//! host consuming this crate cannot construct one for itself. See that type's doc comment for
+//! exactly what is and is not proven by this.
 //!
 //! # Why the two error shapes are different
 //!
@@ -29,6 +32,7 @@
 //! consent screen is shown, owns its data.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -108,8 +112,18 @@ impl<'a> AuthorizationRequest<'a> {
 }
 
 /// A request that has passed validation: the client exists, is allowed this grant, the redirect
-/// URI is one of its registrations, and the PKCE parameters are well formed. Only this form can
-/// mint a code, so an unvalidated request cannot reach issuance by construction.
+/// URI is one of its registrations, and the PKCE parameters are well formed.
+///
+/// The data fields stay `pub` for read access (state, ergonomics, and the smallest diff over the
+/// existing call sites in `tests/authorization_code.rs`, none of which construct this type by
+/// hand). What actually enforces "only a validated request can mint a code" is the private
+/// `_sealed` field below: because it is not `pub`, no struct-literal expression written outside
+/// this module (that includes every downstream host, since this module is the only one with
+/// access to `Sealed`) can name every field of this struct, so a `ValidatedAuthorizationRequest`
+/// can only come from [`ValidatedAuthorizationRequest::new`], which only
+/// `AuthorizationServer::validate_authorization_request` (in `server.rs`, within this crate)
+/// calls. That is what "cannot be spelled" now actually means: not "the fields are private" (they
+/// are not), but "the value cannot be produced without going through validation first."
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedAuthorizationRequest {
     /// The validated client.
@@ -124,9 +138,48 @@ pub struct ValidatedAuthorizationRequest {
     pub code_challenge: String,
     /// The PKCE method (only `S256`).
     pub code_challenge_method: CodeChallengeMethod,
+    /// Zero-sized witness, private to this module. Its only purpose is that it cannot be named
+    /// (let alone constructed) outside `authorization.rs`, so a struct-literal expression cannot
+    /// build a whole `ValidatedAuthorizationRequest` from anywhere else, in this crate or out of
+    /// it. See the struct doc comment.
+    _sealed: Sealed,
 }
 
+/// The witness type behind [`ValidatedAuthorizationRequest`]'s sealed field. Deliberately
+/// private and zero-sized: it carries no data and exists only to make the containing struct
+/// unconstructible by struct-literal syntax from outside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sealed;
+
 impl ValidatedAuthorizationRequest {
+    /// The only constructor. `pub(crate)` rather than private: `AuthorizationServer::
+    /// validate_authorization_request` lives in `server.rs`, a sibling module, and is the sole
+    /// intended caller. `pub(crate)` is strictly narrower than the old fully-`pub` struct
+    /// literal: no code outside this crate can reach this function, so no host can hand
+    /// [`crate::server::AuthorizationServer::issue_authorization_code`] a request it invented
+    /// itself. (Within the crate, `pub(crate)` cannot stop a different in-crate module from also
+    /// calling this constructor honestly; the guarantee this seals is against a host of the
+    /// library, not against other code inside it.)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        client_id: ClientId,
+        redirect_uri: String,
+        scope: ScopeSet,
+        state: Option<String>,
+        code_challenge: String,
+        code_challenge_method: CodeChallengeMethod,
+    ) -> Self {
+        ValidatedAuthorizationRequest {
+            client_id,
+            redirect_uri,
+            scope,
+            state,
+            code_challenge,
+            code_challenge_method,
+            _sealed: Sealed,
+        }
+    }
+
     /// The redirect describing the user refusing consent (RFC 6749 section 4.1.2.1
     /// `access_denied`). A refusal is an answer the client is entitled to receive, not an error
     /// page.
@@ -242,7 +295,10 @@ impl std::error::Error for AuthorizationError {}
 /// 4.1.2 and RFC 9700 section 4.1.1 want a replayed code to revoke the tokens it already minted.
 /// Deleting the record on redemption would make a replay indistinguishable from a typo, and the
 /// stolen access token would stay live.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` is hand-written (see below), for the same reason as [`crate::client::ClientAuth`]: the
+/// `Consumed` variant carries the access and refresh tokens this code minted, and those are bearer
+/// credentials that a host's `tracing::debug!(?record)` must not write to a log in plaintext.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorizationCodeState {
     /// Issued and not yet redeemed.
     Issued,
@@ -255,8 +311,35 @@ pub enum AuthorizationCodeState {
     },
 }
 
+impl fmt::Debug for AuthorizationCodeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthorizationCodeState::Issued => f.write_str("Issued"),
+            AuthorizationCodeState::Consumed {
+                access_token: _,
+                refresh_token,
+            } => f
+                .debug_struct("Consumed")
+                .field("access_token", &"[redacted]")
+                .field(
+                    "refresh_token",
+                    // Presence/absence is worth keeping visible (it distinguishes an
+                    // authorization-code-only grant from one that also minted a refresh token);
+                    // the value itself is not.
+                    &refresh_token.as_ref().map(|_| "[redacted]"),
+                )
+                .finish(),
+        }
+    }
+}
+
 /// A persisted authorization code (RFC 6749 section 4.1.2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see below): `code` is itself a bearer credential (RFC 6749 section
+/// 4.1.2 treats a leaked code as equivalent to a leaked token for as long as it is live, which is
+/// why replay revokes what it minted, see [`AuthorizationCodeState`]'s doc comment), so it must
+/// not appear in a debug format either.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationCodeRecord {
     /// The code string (the storage key).
     pub code: String,
@@ -276,6 +359,22 @@ pub struct AuthorizationCodeRecord {
     pub expires_at: SystemTime,
     /// Whether the code has been redeemed, and what it produced.
     pub state: AuthorizationCodeState,
+}
+
+impl fmt::Debug for AuthorizationCodeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizationCodeRecord")
+            .field("code", &"[redacted]")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scope", &self.scope)
+            .field("subject", &self.subject)
+            .field("code_challenge", &self.code_challenge)
+            .field("code_challenge_method", &self.code_challenge_method)
+            .field("expires_at", &self.expires_at)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 /// `?` if the URI has no query yet, `&` if it does.

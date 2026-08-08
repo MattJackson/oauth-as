@@ -1,0 +1,3 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking oauth-as v0.1.0 (/Users/matthew/Developer/oauth-as/crates/oauth-as)

@@ -393,18 +393,6 @@ async fn refresh_rotation_is_single_use_with_absolute_lifetime() {
         "scope carries over when not narrowed"
     );
 
-    // The spent token is dead (OAuth 2.1 single-use rotation).
-    let err = srv
-        .token(TokenRequest::RefreshToken {
-            client_id: ClientId::new("device-client"),
-            client_secret: None,
-            refresh_token: rt1,
-            scope: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err.error, ErrorCode::InvalidGrant);
-
     // Narrowing works; widening is invalid_scope and does NOT burn the presented token.
     let narrowed = srv
         .token(TokenRequest::RefreshToken {
@@ -439,6 +427,34 @@ async fn refresh_rotation_is_single_use_with_absolute_lifetime() {
         again.refresh_token.is_some(),
         "an invalid_scope rejection must not consume the token"
     );
+    let rt4 = again.refresh_token.expect("rotation issues a replacement");
+
+    // The spent token is dead (OAuth 2.1 draft s6.1 single-use rotation), and presenting it is
+    // REUSE, so RFC 9700 s4.14.2 revokes the whole chain with it. This assertion moved to the end
+    // of the test when reuse detection landed: it used to sit immediately after the first
+    // rotation, which only passed because the reused token was refused in isolation and the rest
+    // of the chain was left alive. That was the defect, not the test order. See
+    // tests/refresh_reuse.rs for the attack this behaviour exists to stop.
+    let err = srv
+        .token(TokenRequest::RefreshToken {
+            client_id: ClientId::new("device-client"),
+            client_secret: None,
+            refresh_token: rt1,
+            scope: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.error, ErrorCode::InvalidGrant);
+    let err = srv
+        .token(TokenRequest::RefreshToken {
+            client_id: ClientId::new("device-client"),
+            client_secret: None,
+            refresh_token: rt4,
+            scope: None,
+        })
+        .await
+        .expect_err("detected reuse revokes every token of the grant, not just the replayed one");
+    assert_eq!(err.error, ErrorCode::InvalidGrant);
 }
 
 #[tokio::test]

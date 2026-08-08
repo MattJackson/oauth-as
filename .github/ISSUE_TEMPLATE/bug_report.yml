@@ -1,0 +1,85 @@
+name: Bug report
+description: Something in oauth-as does not behave the way the RFCs, or its own documentation, say it should.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this. If this is a security vulnerability, a way to
+        obtain, use, or destroy a token or grant a party should not have, or anything else
+        described in SECURITY.md's scope, please STOP and use GitHub's private vulnerability
+        reporting instead (Security tab, "Report a vulnerability"). A publicly filed
+        vulnerability against an authorization server is a disclosure.
+
+  - type: input
+    id: version
+    attributes:
+      label: oauth-as crate version
+      description: The exact version from your Cargo.lock, or the git commit if you are building against dev/qa.
+      placeholder: "0.1.0, or commit b166cb9"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: features
+    attributes:
+      label: Feature flags enabled
+      description: Which features does your Cargo.toml enable for oauth-as? Select all that apply.
+      multiple: true
+      options:
+        - default (no features)
+        - http
+        - jwt
+        - other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`.
+      placeholder: "rustc 1.86.0 (or later, or the MSRV 1.75)"
+    validations:
+      required: true
+
+  - type: input
+    id: rfc-section
+    attributes:
+      label: RFC section believed to be violated (if any)
+      description: >-
+        If you believe this is a spec conformance issue, name the RFC and section, e.g.
+        "RFC 6749 s4.1.2.1" or "RFC 8628 s3.5". Leave blank if this is not a conformance question.
+      placeholder: "RFC 7636 s4.3"
+    validations:
+      required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what actually happened. Concrete requests and responses are far more useful than a description of the class of problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >-
+        A minimal reproduction: code, request sequence, or a link to a branch/gist. If this
+        involves the conformance harness, note whether `scripts/oauth-conformance.sh --check`
+        reproduces it.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: >-
+        Anything else relevant: storage backend in use, whether MemoryStorage or a custom
+        Storage impl, logs, etc.
+    validations:
+      required: false

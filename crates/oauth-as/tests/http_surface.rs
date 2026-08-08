@@ -1,0 +1,1119 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
+//! The optional `http` feature's wire surface, driven over a real socket.
+//!
+//! These tests bind an ephemeral port and speak HTTP/1.1 by hand rather than going through a
+//! client library. That is deliberate: the things under test here are the STATUS LINE and the
+//! HEADERS the RFCs mandate (`Cache-Control: no-store`, `WWW-Authenticate` on a 401, the absence
+//! of a redirect), and a convenience client is exactly the layer that hides them. Writing the
+//! bytes means the assertions are about what went on the wire.
+//!
+//! The bias of the file is toward REFUSALS. An authorization server that never says no passes a
+//! happy-path suite while being unusable, so most of what follows drives the error paths and
+//! pins the code, the status, and the headers each one is required to carry.
+
+#![cfg(feature = "http")]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::response::IntoResponse as _;
+use oauth_as::client::{Client, ClientAuth, ClientId};
+use oauth_as::grant::GrantType;
+use oauth_as::http::{ConsentDecision, RouterBuilder};
+use oauth_as::scope::ScopeSet;
+use oauth_as::server::{AuthorizationServer, ServerConfig};
+use oauth_as::store::MemoryStorage;
+use serde_json::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
+
+const PUBLIC_ID: &str = "test-public";
+const CONFIDENTIAL_ID: &str = "test-confidential";
+const SECRET: &str = "test-secret-0123456789";
+const REDIRECT_URI: &str = "http://127.0.0.1:9999/cb";
+/// Deliberately full of HTML metacharacters: it is rendered on the verification page.
+const PUBLIC_NAME: &str = "Acme <TV> & \"Friends\"";
+/// RFC 7636 appendix B verifier, and the challenge it hashes to.
+const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+/// A parsed HTTP/1.1 response. Header names are lowercased so lookups need no case juggling.
+struct Resp {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Resp {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body)
+            .unwrap_or_else(|e| panic!("body is not JSON ({e}): {:?}", self.body))
+    }
+}
+
+/// Speak one HTTP/1.1 request/response exchange. `Connection: close` means the response ends at
+/// EOF, so no chunked/length parsing is needed to read it whole.
+async fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Resp {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n",
+        addr = addr
+    );
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    match body {
+        Some(b) => {
+            // A caller that supplied its own Content-Type is testing that header, so it is not
+            // overwritten here.
+            let has_ct = extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+            if !has_ct {
+                req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+            }
+            req.push_str(&format!("Content-Length: {}\r\n\r\n", b.len()));
+            req.push_str(b);
+        }
+        None => req.push_str("\r\n"),
+    }
+    stream.write_all(req.as_bytes()).await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("malformed response: {text:?}"));
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().expect("status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status code in {status_line:?}"));
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    Resp {
+        status,
+        headers,
+        body: body.to_string(),
+    }
+}
+
+/// Which host-supplied seams a test server has wired.
+///
+/// Each one is a thing this library refuses to invent, and each default is the REFUSING one, so a
+/// test that does not name a seam is testing the unwired behaviour on purpose.
+#[derive(Default, Clone, Copy)]
+struct Wiring {
+    /// [`RouterBuilder::with_subject_resolver`]: a logged-in user.
+    subject: bool,
+    /// [`RouterBuilder::with_consent_resolver`]: the RFC 6749 s10.12 consent step.
+    consent: Consent,
+    /// [`RouterBuilder::with_csrf_tokens`]: session-bound CSRF tokens for the device form.
+    csrf: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Consent {
+    /// No resolver at all: the authorization endpoint must refuse.
+    #[default]
+    Unwired,
+    Approve,
+    Deny,
+    /// The realistic shape: the resolver renders its own consent screen.
+    Screen,
+}
+
+impl Wiring {
+    /// Everything a browser-facing host must wire.
+    fn full() -> Self {
+        Wiring {
+            subject: true,
+            consent: Consent::Approve,
+            csrf: true,
+        }
+    }
+
+    fn subject_only() -> Self {
+        Wiring {
+            subject: true,
+            ..Wiring::default()
+        }
+    }
+}
+
+/// The test host's session store for CSRF tokens: session id (from a `Cookie: sid=...`) to the
+/// one token currently outstanding for it. A real host would use its own session storage; what
+/// matters for the tests is that `consume` REMOVES, which is what makes a token single use.
+type CsrfSessions = Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
+
+/// The session id this request carries, from a `Cookie: sid=...`. `None` means not signed in.
+fn session_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("cookie")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|c| c.trim().strip_prefix("sid="))
+        .map(str::to_string)
+        .next()
+}
+
+/// The cookie header value a test client sends to be "signed in" as `VICTIM_SESSION`.
+const VICTIM_SESSION: &str = "sid=victim-session";
+
+/// Bind an ephemeral port, serve the router on it, and hand back the address. The issuer is set
+/// from the bound address so the RFC 8414 s3.3 issuer/URL match holds, exactly as a host must.
+async fn start(seed_subject: bool) -> SocketAddr {
+    start_wired(match seed_subject {
+        true => Wiring::full(),
+        false => Wiring::default(),
+    })
+    .await
+    .0
+}
+
+/// As [`start`], but with the seams named explicitly, and returning the host's CSRF session store
+/// so a test can play the part of a browser holding the token it was issued.
+async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let issuer = format!("http://{addr}");
+    let config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
+    let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+
+    let scopes = ScopeSet::from_tokens(["read", "write"]).expect("scopes");
+    server
+        .register_client(Client {
+            client_id: ClientId::new(PUBLIC_ID),
+            auth: ClientAuth::Public,
+            grant_types: vec![
+                GrantType::AuthorizationCode,
+                GrantType::DeviceCode,
+                GrantType::RefreshToken,
+            ],
+            redirect_uris: vec![REDIRECT_URI.to_string()],
+            allowed_scopes: scopes.clone(),
+            default_scopes: scopes.clone(),
+            // A client name is registration data, and under RFC 7591 dynamic registration it is
+            // attacker-supplied. The metacharacters are here so every test that renders it also
+            // proves it is escaped.
+            name: Some(PUBLIC_NAME.to_string()),
+        })
+        .await
+        .expect("register public");
+    server
+        .register_client(Client {
+            client_id: ClientId::new(CONFIDENTIAL_ID),
+            auth: ClientAuth::ConfidentialSecret {
+                secret: SECRET.to_string(),
+            },
+            grant_types: vec![GrantType::ClientCredentials, GrantType::AuthorizationCode],
+            redirect_uris: vec![REDIRECT_URI.to_string()],
+            allowed_scopes: scopes.clone(),
+            default_scopes: scopes,
+            name: None,
+        })
+        .await
+        .expect("register confidential");
+
+    let sessions: CsrfSessions = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let mut builder = RouterBuilder::new(server);
+    if wiring.subject {
+        // A host reads its own session; this one calls every request the same user, which is
+        // what makes the CSRF tests meaningful (the attacker's forced request resolves to the
+        // VICTIM, exactly as it would with a real cookie).
+        builder = builder.with_subject_resolver(|_headers| Some("test-user".to_string()));
+    }
+    builder = match wiring.consent {
+        Consent::Unwired => builder,
+        Consent::Approve => builder.with_consent_resolver(|_req| ConsentDecision::Approve),
+        Consent::Deny => builder.with_consent_resolver(|_req| ConsentDecision::Deny),
+        Consent::Screen => builder.with_consent_resolver(|req| {
+            let mut body = String::from("Allow ");
+            body.push_str(req.client_id.as_str());
+            body.push_str(" scope ");
+            body.push_str(&req.scope.to_string());
+            ConsentDecision::Respond(Box::new((axum::http::StatusCode::OK, body).into_response()))
+        }),
+    };
+    if wiring.csrf {
+        let issue = Arc::clone(&sessions);
+        let consume = Arc::clone(&sessions);
+        builder = builder.with_csrf_tokens(
+            move |headers| {
+                let sid = session_id(headers)?;
+                let token = format!("csrf-for-{sid}");
+                issue.lock().unwrap().insert(sid, token.clone());
+                Some(token)
+            },
+            // REMOVES, so a token works exactly once.
+            move |headers| consume.lock().unwrap().remove(&session_id(headers)?),
+        );
+    }
+    let router = builder.build().expect("router");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (addr, sessions)
+}
+
+/// RFC 8414 s3.1/s3.3: the document is served at the well-known path, its issuer equals the URL
+/// it was fetched from, and every endpoint it advertises answers rather than 404ing. An
+/// advertised endpoint that does not exist is a metadata lie the client cannot recover from.
+#[tokio::test]
+async fn advertised_endpoints_do_not_404() {
+    let addr = start(true).await;
+    let meta = request(
+        addr,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(meta.status, 200);
+    let doc = meta.json();
+    assert_eq!(doc["issuer"], format!("http://{addr}"));
+
+    for key in [
+        "authorization_endpoint",
+        "token_endpoint",
+        "device_authorization_endpoint",
+        "introspection_endpoint",
+        "revocation_endpoint",
+    ] {
+        let url = doc[key].as_str().unwrap_or_else(|| panic!("{key} missing"));
+        let path = url
+            .strip_prefix(&format!("http://{addr}"))
+            .unwrap_or_else(|| panic!("{key} is not under the issuer: {url}"));
+        let method = if key == "authorization_endpoint" {
+            "GET"
+        } else {
+            "POST"
+        };
+        let body = if method == "POST" {
+            Some("junk=junk")
+        } else {
+            None
+        };
+        let resp = request(addr, method, path, &[], body).await;
+        assert_ne!(resp.status, 404, "advertised {key} 404s at {path}");
+        assert_ne!(resp.status, 405, "advertised {key} rejects its own method");
+    }
+}
+
+/// RFC 6749 s5.1: a successful token response MUST carry `Cache-Control: no-store` and
+/// `Pragma: no-cache`. These responses contain a bearer credential; a cache that keeps one hands
+/// it to the next reader.
+#[tokio::test]
+async fn token_success_is_no_store() {
+    let addr = start(true).await;
+    let resp = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=client_credentials&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert!(
+        resp.header("cache-control")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("no-store")),
+        "RFC 6749 s5.1 requires Cache-Control: no-store, got {:?}",
+        resp.header("cache-control")
+    );
+    assert!(
+        resp.header("pragma")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache")),
+        "RFC 6749 s5.1 requires Pragma: no-cache"
+    );
+    assert_eq!(resp.json()["token_type"], "Bearer");
+}
+
+/// RFC 6749 s5.2: when the client authenticated via the `Authorization` header and that
+/// authentication failed, the response MUST be 401 AND MUST carry `WWW-Authenticate`.
+#[tokio::test]
+async fn failed_basic_auth_is_401_with_challenge() {
+    let addr = start(true).await;
+    let basic = base64_standard(&format!("{CONFIDENTIAL_ID}:wrong-secret"));
+    let resp = request(
+        addr,
+        "POST",
+        "/token",
+        &[("Authorization", &format!("Basic {basic}"))],
+        Some("grant_type=client_credentials"),
+    )
+    .await;
+    assert_eq!(resp.status, 401, "body: {}", resp.body);
+    let challenge = resp
+        .header("www-authenticate")
+        .expect("RFC 6749 s5.2: a 401 for header auth MUST include WWW-Authenticate");
+    assert!(
+        challenge.starts_with("Basic realm="),
+        "challenge must name the Basic scheme and a realm, got {challenge:?}"
+    );
+    assert_eq!(resp.json()["error"], "invalid_client");
+}
+
+/// RFC 6749 s2.3.1: Basic credentials are form-urlencoded BEFORE being base64ed. A client whose
+/// id or secret contains a reserved character round-trips only if the server decodes them.
+#[tokio::test]
+async fn basic_credentials_are_form_urldecoded() {
+    let addr = start(true).await;
+    // `test-secret-0123456789` percent-encoded in a way a conforming client is allowed to use.
+    let basic = base64_standard(&format!("{CONFIDENTIAL_ID}:test%2Dsecret%2D0123456789"));
+    let resp = request(
+        addr,
+        "POST",
+        "/token",
+        &[("Authorization", &format!("Basic {basic}"))],
+        Some("grant_type=client_credentials"),
+    )
+    .await;
+    assert_eq!(
+        resp.status, 200,
+        "RFC 6749 s2.3.1 requires the credentials to be form-urldecoded; body: {}",
+        resp.body
+    );
+}
+
+/// RFC 6749 s5.2: a client-authentication failure that was NOT presented in the `Authorization`
+/// header is a 400. Answering 401 without a challenge would violate RFC 9110 s15.5.2.
+#[tokio::test]
+async fn failed_body_auth_is_400_not_401() {
+    let addr = start(true).await;
+    let resp = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=client_credentials&client_id={CONFIDENTIAL_ID}&client_secret=wrong"
+        )),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert!(resp.header("www-authenticate").is_none());
+    assert_eq!(resp.json()["error"], "invalid_client");
+}
+
+/// RFC 6749 s2.3: "The client MUST NOT use more than one authentication method in each request."
+#[tokio::test]
+async fn two_authentication_methods_is_invalid_request() {
+    let addr = start(true).await;
+    let basic = base64_standard(&format!("{CONFIDENTIAL_ID}:{SECRET}"));
+    let resp = request(
+        addr,
+        "POST",
+        "/token",
+        &[("Authorization", &format!("Basic {basic}"))],
+        Some(&format!(
+            "grant_type=client_credentials&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"], "invalid_request");
+}
+
+/// RFC 6749 s5.2: an unknown grant_type has its own code, and a missing one is a malformed
+/// request. Collapsing either into a bare 400 tells the client nothing it can act on.
+#[tokio::test]
+async fn grant_type_dispatch_refusals() {
+    let addr = start(true).await;
+    let unknown = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!("grant_type=magic-beans&client_id={PUBLIC_ID}")),
+    )
+    .await;
+    assert_eq!(unknown.status, 400);
+    assert_eq!(unknown.json()["error"], "unsupported_grant_type");
+
+    let missing = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!("client_id={PUBLIC_ID}")),
+    )
+    .await;
+    assert_eq!(missing.status, 400);
+    assert_eq!(missing.json()["error"], "invalid_request");
+}
+
+/// RFC 6749 s4.1.2.1: until the client and the redirect URI are validated there is no address
+/// the server may safely send an error to, so it MUST NOT redirect. A server that redirects here
+/// is the redirect-URI attack.
+#[tokio::test]
+async fn authorization_endpoint_does_not_redirect_before_validation() {
+    let addr = start(true).await;
+
+    // No client_id at all.
+    let bare = request(addr, "GET", "/authorize", &[], None).await;
+    assert_eq!(bare.status, 400, "body: {}", bare.body);
+    assert!(bare.header("location").is_none());
+    assert_eq!(bare.json()["error"], "invalid_request");
+
+    // Unknown client_id.
+    let unknown = request(
+        addr,
+        "GET",
+        "/authorize?response_type=code&client_id=nobody&redirect_uri=http%3A%2F%2Fevil.example%2Fcb",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(unknown.status, 400);
+    assert!(unknown.header("location").is_none());
+
+    // Known client, UNREGISTERED redirect_uri: still no redirect (OAuth 2.1 s4.1.3 exact match).
+    let bad_redirect = request(
+        addr,
+        "GET",
+        &format!(
+            "/authorize?response_type=code&client_id={PUBLIC_ID}\
+             &redirect_uri=http%3A%2F%2Fevil.example%2Fcb"
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(bad_redirect.status, 400);
+    assert!(
+        bad_redirect.header("location").is_none(),
+        "an unregistered redirect_uri must never be redirected to"
+    );
+}
+
+/// The other side of the same rule: once the client and redirect URI ARE validated, protocol
+/// errors go back to the client as a redirect (RFC 6749 s4.1.2.1), carrying `state`.
+#[tokio::test]
+async fn authorization_errors_after_validation_do_redirect() {
+    let addr = start(true).await;
+    let resp = request(
+        addr,
+        "GET",
+        &format!(
+            "/authorize?response_type=token&client_id={PUBLIC_ID}\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&state=xyz"
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 302);
+    let location = resp.header("location").expect("302 needs Location");
+    assert!(location.starts_with(REDIRECT_URI), "got {location}");
+    assert!(
+        location.contains("error=unsupported_response_type"),
+        "{location}"
+    );
+    assert!(location.contains("state=xyz"), "{location}");
+}
+
+/// The happy path exists too: a complete request with PKCE issues a code by redirect when the
+/// host's subject resolver names an authenticated resource owner.
+#[tokio::test]
+async fn authorization_issues_a_code_when_a_subject_is_resolved() {
+    let addr = start(true).await;
+    let resp = request(
+        addr,
+        "GET",
+        &format!(
+            "/authorize?response_type=code&client_id={PUBLIC_ID}\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&state=s1\
+             &code_challenge={CHALLENGE}&code_challenge_method=S256"
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 302, "body: {}", resp.body);
+    let location = resp.header("location").expect("Location").to_string();
+    let code = location
+        .split(['?', '&'])
+        .find_map(|p| p.strip_prefix("code="))
+        .expect("no code in redirect");
+
+    let token = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=authorization_code&code={code}&client_id={PUBLIC_ID}\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&code_verifier={VERIFIER}"
+        )),
+    )
+    .await;
+    assert_eq!(token.status, 200, "body: {}", token.body);
+    assert!(token.json()["access_token"].is_string());
+}
+
+/// With no host-supplied resolver there is no authenticated resource owner, so the request is
+/// refused DIRECTLY rather than redirected: telling the client `access_denied` at its redirect
+/// URI would claim a user refused when no user was ever asked.
+#[tokio::test]
+async fn authorization_without_a_resolver_refuses_directly() {
+    let addr = start(false).await;
+    let resp = request(
+        addr,
+        "GET",
+        &format!(
+            "/authorize?response_type=code&client_id={PUBLIC_ID}\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb\
+             &code_challenge={CHALLENGE}&code_challenge_method=S256"
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert!(resp.header("location").is_none());
+    assert_eq!(resp.json()["error"], "access_denied");
+}
+
+/// RFC 8628 s3.1/3.2 over the wire, then the verification UI: GET renders a form, POST of
+/// `user_code` approves, and the device's next poll gets its token.
+#[tokio::test]
+async fn device_flow_over_http() {
+    let addr = start(true).await;
+    let start_resp = request(
+        addr,
+        "POST",
+        "/device_authorization",
+        &[],
+        Some(&format!("client_id={PUBLIC_ID}")),
+    )
+    .await;
+    assert_eq!(start_resp.status, 200, "body: {}", start_resp.body);
+    let doc = start_resp.json();
+    let device_code = doc["device_code"]
+        .as_str()
+        .expect("device_code")
+        .to_string();
+    let user_code = doc["user_code"].as_str().expect("user_code").to_string();
+    assert_eq!(doc["verification_uri"], format!("http://{addr}/device"));
+
+    // Before approval: RFC 8628 s3.5 authorization_pending.
+    let pending = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=urn:ietf:params:oauth:grant-type:device_code\
+             &device_code={device_code}&client_id={PUBLIC_ID}"
+        )),
+    )
+    .await;
+    assert_eq!(pending.status, 400);
+    assert_eq!(pending.json()["error"], "authorization_pending");
+
+    let form = request(addr, "GET", "/device", &[], None).await;
+    assert_eq!(form.status, 200);
+    assert!(
+        form.body.contains("name=\"user_code\""),
+        "the verification page must offer a user_code field: {}",
+        form.body
+    );
+
+    let approve = request(
+        addr,
+        "POST",
+        "/device",
+        &[],
+        Some(&format!("user_code={}", user_code.replace('-', "%2D"))),
+    )
+    .await;
+    assert_eq!(approve.status, 200, "body: {}", approve.body);
+
+    let issued = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=urn:ietf:params:oauth:grant-type:device_code\
+             &device_code={device_code}&client_id={PUBLIC_ID}"
+        )),
+    )
+    .await;
+    // The poll interval has not elapsed, so RFC 8628 s3.5 slow_down is the correct answer here;
+    // what matters is that the approval took effect and the grant is no longer pending.
+    assert!(
+        issued.status == 200 || issued.json()["error"] == "slow_down",
+        "unexpected post-approval poll: {} {}",
+        issued.status,
+        issued.body
+    );
+}
+
+/// RFC 7662 s2.2: introspection answers about the CALLER's own token, and `active: false` is the
+/// whole answer for anything else. RFC 7009 s2.2: revoking an unknown token is a 200.
+#[tokio::test]
+async fn introspection_and_revocation() {
+    let addr = start(true).await;
+    let token: Value = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=client_credentials&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await
+    .json();
+    let access = token["access_token"].as_str().expect("access_token");
+
+    let live = request(
+        addr,
+        "POST",
+        "/introspect",
+        &[],
+        Some(&format!(
+            "token={access}&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await;
+    assert_eq!(live.status, 200, "body: {}", live.body);
+    assert_eq!(live.json()["active"], true);
+
+    let revoked = request(
+        addr,
+        "POST",
+        "/revoke",
+        &[],
+        Some(&format!(
+            "token={access}&token_type_hint=access_token\
+             &client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await;
+    assert_eq!(revoked.status, 200, "body: {}", revoked.body);
+
+    let after = request(
+        addr,
+        "POST",
+        "/introspect",
+        &[],
+        Some(&format!(
+            "token={access}&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await;
+    assert_eq!(after.json()["active"], false);
+
+    // RFC 7009 s2.2: an unknown token is still a 200, so the endpoint cannot be used to test
+    // whether a token string is real.
+    let unknown = request(
+        addr,
+        "POST",
+        "/revoke",
+        &[],
+        Some(&format!(
+            "token=never-existed&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await;
+    assert_eq!(unknown.status, 200);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Attack tests. Each one drives an attack end to end and requires the server to refuse.
+// ---------------------------------------------------------------------------------------------
+
+/// Start a device grant for the public client and return `(device_code, user_code)`.
+async fn begin_device_grant(addr: SocketAddr) -> (String, String) {
+    let doc = request(
+        addr,
+        "POST",
+        "/device_authorization",
+        &[],
+        Some(&format!("client_id={PUBLIC_ID}")),
+    )
+    .await
+    .json();
+    (
+        doc["device_code"]
+            .as_str()
+            .expect("device_code")
+            .to_string(),
+        doc["user_code"].as_str().expect("user_code").to_string(),
+    )
+}
+
+/// Poll the device token endpoint once.
+async fn poll_device(addr: SocketAddr, device_code: &str) -> Resp {
+    request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=urn:ietf:params:oauth:grant-type:device_code\
+             &device_code={device_code}&client_id={PUBLIC_ID}"
+        )),
+    )
+    .await
+}
+
+/// Scrape the CSRF token out of a rendered form, which is the only way a browser gets it: it is
+/// bound to the session, so an attacker on another origin cannot read it.
+fn csrf_token_in(body: &str) -> String {
+    let marker = "name=\"csrf_token\" value=\"";
+    let start = body
+        .find(marker)
+        .unwrap_or_else(|| panic!("no CSRF token in the rendered form: {body}"))
+        + marker.len();
+    let rest = &body[start..];
+    rest[..rest.find('"').expect("unterminated value")].to_string()
+}
+
+/// GET the verification page as a signed-in browser would, and return the page plus its token.
+async fn verification_form(addr: SocketAddr, query: &str) -> (Resp, String) {
+    let page = request(
+        addr,
+        "GET",
+        &format!("/device{query}"),
+        &[("Cookie", VICTIM_SESSION)],
+        None,
+    )
+    .await;
+    let token = csrf_token_in(&page.body);
+    (page, token)
+}
+
+/// C1. ATTACK: cross-site forced device approval, which is account takeover.
+///
+/// The attacker starts a device grant for a client they control, hosts an auto-submitting HTML
+/// form at their own origin targeting the AS verification URI with that `user_code`, and waits
+/// for any AS-authenticated victim to load the page. A plain form POST is a CORS "simple
+/// request", so there is no preflight to stop it and the victim's session cookie rides along.
+/// The AS resolves the subject from those ambient credentials and binds the attacker's grant to
+/// the VICTIM; the attacker then polls the token endpoint and holds the victim's tokens.
+///
+/// RFC 6749 s10.12 requires the AS to implement CSRF protection for its authorization endpoint
+/// and to ensure a malicious client cannot obtain authorization without the resource owner's
+/// awareness and explicit consent. RFC 8628 s3.3 leaves the interaction shape to the
+/// implementation but does not license removing that.
+#[tokio::test]
+async fn c1_cross_origin_form_post_must_not_approve_a_device_grant() {
+    // FULLY wired: this attack must fail against a host that did everything right, not only
+    // against one that wired nothing.
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
+    let (device_code, user_code) = begin_device_grant(addr).await;
+
+    // Exactly what a browser sends for a cross-origin <form method="post"> submission: the
+    // victim's cookie rides along, and the attacker cannot read the CSRF token from another
+    // origin, so there is none.
+    let forced = request(
+        addr,
+        "POST",
+        "/device",
+        &[
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", "https://attacker.example"),
+            ("Sec-Fetch-Site", "cross-site"),
+            ("Referer", "https://attacker.example/setup-your-tv"),
+        ],
+        Some(&format!(
+            "user_code={}&action=approve",
+            user_code.replace('-', "%2D")
+        )),
+    )
+    .await;
+    assert!(
+        forced.status >= 400,
+        "a cross-origin form POST must be refused, got {} {}",
+        forced.status,
+        forced.body
+    );
+
+    // The decisive assertion: the grant must still be waiting for a real user.
+    let poll = poll_device(addr, &device_code).await;
+    assert_eq!(
+        poll.json()["error"],
+        "authorization_pending",
+        "the attacker's grant was approved by a cross-site request: {} {}",
+        poll.status,
+        poll.body
+    );
+}
+
+/// C1. ATTACK: the same forced approval with no CSRF token at all.
+///
+/// Even without the cross-site headers, a host that wired no CSRF seam must not approve, because
+/// there is nothing tying this POST to a form the resource owner was actually shown. RFC 6749
+/// s10.12. A library with no session store cannot mint the token itself, so "no seam wired" has
+/// to mean REFUSE, never "proceed unprotected".
+#[tokio::test]
+async fn c1_device_approval_without_a_csrf_token_is_refused() {
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
+    let (device_code, user_code) = begin_device_grant(addr).await;
+
+    let forced = request(
+        addr,
+        "POST",
+        "/device",
+        &[
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", &format!("http://{addr}")),
+        ],
+        Some(&format!(
+            "user_code={}&action=approve",
+            user_code.replace('-', "%2D")
+        )),
+    )
+    .await;
+    assert!(
+        forced.status >= 400,
+        "an approval with no CSRF token must be refused, got {} {}",
+        forced.status,
+        forced.body
+    );
+    assert_eq!(
+        poll_device(addr, &device_code).await.json()["error"],
+        "authorization_pending",
+        "the grant was approved without a CSRF token"
+    );
+}
+
+/// C1. A host that wired no CSRF seam must not be handed an unprotected form to submit.
+///
+/// RFC 6749 s10.12: the protection is the AS's obligation, so the failure mode of an unwired host
+/// is a refusal, not a form that works and is forgeable.
+#[tokio::test]
+async fn c1_verification_form_is_not_rendered_without_a_csrf_seam() {
+    let (addr, _sessions) = start_wired(Wiring::subject_only()).await;
+    let page = request(addr, "GET", "/device", &[("Cookie", VICTIM_SESSION)], None).await;
+    assert!(
+        !page.body.contains("<form"),
+        "a host with no CSRF seam must not be served a submittable form: {}",
+        page.body
+    );
+
+    // And the direct POST an attacker would send anyway is refused too, since a host that never
+    // renders the form is not a host that stopped anyone from posting to it.
+    let (device_code, user_code) = begin_device_grant(addr).await;
+    let forced = request(
+        addr,
+        "POST",
+        "/device",
+        &[
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", &format!("http://{addr}")),
+        ],
+        Some(&format!(
+            "user_code={}&action=approve",
+            user_code.replace('-', "%2D")
+        )),
+    )
+    .await;
+    assert!(forced.status >= 400, "body: {}", forced.body);
+    assert_eq!(
+        poll_device(addr, &device_code).await.json()["error"],
+        "authorization_pending"
+    );
+}
+
+/// C1. The approval POST must require `application/x-www-form-urlencoded`.
+///
+/// Defence in depth for RFC 6749 s10.12: a body this server will not parse cannot be smuggled in
+/// as a cross-origin "simple request" from a form or a no-preflight `fetch`.
+#[tokio::test]
+async fn c1_device_approval_requires_form_urlencoded_content_type() {
+    let addr = start(true).await;
+    let (device_code, user_code) = begin_device_grant(addr).await;
+
+    let forced = request(
+        addr,
+        "POST",
+        "/device",
+        &[("Content-Type", "text/plain;charset=UTF-8")],
+        Some(&format!(
+            "user_code={}&action=approve",
+            user_code.replace('-', "%2D")
+        )),
+    )
+    .await;
+    assert_eq!(
+        forced.status, 415,
+        "a non-form content type must be refused: {}",
+        forced.body
+    );
+    assert_eq!(
+        poll_device(addr, &device_code).await.json()["error"],
+        "authorization_pending"
+    );
+}
+
+/// C2. ATTACK: remote phishing over `verification_uri_complete` (RFC 8628 s5.4).
+///
+/// The attacker starts a device grant for their own client and mails the victim the deep link
+/// ("click here to finish setting up your TV"). RFC 8628 s5.4 notes that this member removes the
+/// one friction point, typing the code, that makes the attack harder, and s3.3 is explicit that
+/// the AS SHOULD display information about the device and require an explicit confirmation step.
+/// A page that shows a bare input and an Approve button shows the victim nothing they could
+/// notice, so it must name the client and the scope being asked for.
+#[tokio::test]
+async fn c2_verification_page_names_the_client_and_the_scope() {
+    let addr = start(true).await;
+    let (_device_code, user_code) = begin_device_grant(addr).await;
+
+    let page = request(
+        addr,
+        "GET",
+        &format!("/device?user_code={}", user_code.replace('-', "%2D")),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(page.status, 200, "body: {}", page.body);
+    assert!(
+        page.body.contains("Acme") && page.body.contains("Friends"),
+        "RFC 8628 s3.3: the page must name the client asking for access: {}",
+        page.body
+    );
+    assert!(
+        page.body.contains("read") && page.body.contains("write"),
+        "RFC 8628 s3.3: the page must state the scope being granted: {}",
+        page.body
+    );
+    // The client name is registration data and, under RFC 7591, attacker-supplied.
+    assert!(
+        !page.body.contains("<TV>") && page.body.contains("&lt;TV&gt;"),
+        "the client name must be HTML-escaped: {}",
+        page.body
+    );
+}
+
+/// C2. ATTACK: the deep link must not be one click from approval on a page that says nothing.
+///
+/// RFC 8628 s3.3 requires an explicit confirmation step, so a POST that carries no affirmative
+/// approval action is not consent and must not approve.
+#[tokio::test]
+async fn c2_approval_requires_an_affirmative_action() {
+    let addr = start(true).await;
+    let (device_code, user_code) = begin_device_grant(addr).await;
+
+    let bare = request(
+        addr,
+        "POST",
+        "/device",
+        &[],
+        Some(&format!("user_code={}", user_code.replace('-', "%2D"))),
+    )
+    .await;
+    assert_eq!(
+        poll_device(addr, &device_code).await.json()["error"],
+        "authorization_pending",
+        "a POST with no affirmative action approved the grant: {} {}",
+        bare.status,
+        bare.body
+    );
+}
+
+/// C4. ATTACK: silent authorization at the authorization endpoint.
+///
+/// A cross-site top-level navigation to `/authorize` makes a logged-in user's browser hand a
+/// registered client an authorization code with no consent step anywhere. RFC 6749 s10.12
+/// requires the AS to ensure the resource owner is aware of and explicitly consents to the
+/// authorization; PKCE and the registered redirect URI bound WHO can redeem the code, not WHETHER
+/// the user agreed to issue it.
+#[tokio::test]
+async fn c4_authorization_endpoint_must_not_issue_a_code_without_consent() {
+    let addr = start(true).await;
+    let resp = request(
+        addr,
+        "GET",
+        &format!(
+            "/authorize?response_type=code&client_id={PUBLIC_ID}\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&state=s1\
+             &code_challenge={CHALLENGE}&code_challenge_method=S256"
+        ),
+        &[],
+        None,
+    )
+    .await;
+    let location = resp.header("location").unwrap_or_default().to_string();
+    assert!(
+        !location.contains("code="),
+        "a code was issued with no consent step: {} {location}",
+        resp.status
+    );
+}
+
+/// C12. RFC 8414 s3.1: for an issuer with a path component the well-known string is inserted
+/// BETWEEN the host and the path, so `https://as.example/tenant1` publishes at
+/// `https://as.example/.well-known/oauth-authorization-server/tenant1`.
+///
+/// Security relevant because RFC 8414 s3.3's issuer/URL identity check is a mix-up
+/// countermeasure: a document served where the check cannot pass trains clients to skip it, and
+/// in a multi-tenant deployment every tenant would collide on the one bare path.
+#[tokio::test]
+async fn c12_well_known_document_lives_under_the_issuer_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let issuer = format!("http://{addr}/tenant1");
+    let config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
+    let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+    let router = RouterBuilder::new(server).build().expect("router");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let doc = request(
+        addr,
+        "GET",
+        "/.well-known/oauth-authorization-server/tenant1",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        doc.status, 200,
+        "RFC 8414 s3.1 path for a tenant issuer: {}",
+        doc.body
+    );
+    assert_eq!(doc.json()["issuer"], issuer);
+
+    // And the endpoints it advertises are served at their own full paths, not at the bare ones.
+    let token = request(addr, "POST", "/tenant1/token", &[], Some("junk=junk")).await;
+    assert_ne!(token.status, 404, "advertised token_endpoint 404s");
+}
+
+/// Base64 (standard alphabet, padded) as RFC 7617 requires for the Basic scheme.
+fn base64_standard(s: &str) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    STANDARD.encode(s.as_bytes())
+}

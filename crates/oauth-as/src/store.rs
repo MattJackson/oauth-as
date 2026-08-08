@@ -12,8 +12,15 @@
 //!   multi-node store must implement them with a genuinely atomic primitive (compare-and-set,
 //!   `DELETE ... RETURNING`, or equivalent); a plain read-then-delete reintroduces the double-spend.
 //! - `put_device_grant` upserts by `device_code` and must keep any user-code index consistent.
+//!   "Consistent" has two halves, and both are load bearing: a put that CHANGES a grant's user
+//!   code must retire the old index entry, and a put whose user code is already indexed for a
+//!   DIFFERENT `device_code` must be REFUSED rather than repointing the index. See
+//!   [`Storage::put_device_grant`].
 //! - User-code lookups are by NORMALIZED code (see [`crate::device::normalize_user_code`]); the
 //!   store indexes what it is given and does not normalize.
+//! - Nothing in this crate evicts anything on a timer: there is no background task, by design.
+//!   Expired records are reclaimed only when the HOST calls [`Storage::sweep_expired`]. A host
+//!   that never calls it has a store that only grows.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -57,8 +64,22 @@ pub trait Storage: Send + Sync {
     /// Insert or replace a client registration.
     fn put_client(&self, client: Client) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Insert or replace a device grant, keyed by `device_code` (also maintaining the user-code
-    /// index).
+    /// Insert or replace a device grant, keyed by `device_code`, maintaining the user-code index.
+    ///
+    /// Two REQUIRED behaviours beyond a plain upsert, both of which a naive "insert the new
+    /// mapping" implementation gets wrong:
+    ///
+    /// 1. If the grant's normalized user code is already indexed for a DIFFERENT `device_code`,
+    ///    this MUST fail with a [`StorageError`] and write nothing. RFC 8628 section 6.1 makes the
+    ///    user code the credential a human types, so two live grants answering to one code is two
+    ///    devices sharing an identity. Silently repointing the index also orphans both grants: the
+    ///    older one can no longer be approved, and taking it removes an index entry that now names
+    ///    the newer one.
+    /// 2. If a put CHANGES the user code of an existing `device_code`, the OLD index entry MUST be
+    ///    retired. Leaving it behind means the superseded code goes on resolving to the grant.
+    ///
+    /// The server relies on (1) to make its user-code generation retry loop meaningful: it asks
+    /// the store whether a code is taken, but only the store can answer that without a race.
     fn put_device_grant(
         &self,
         grant: DeviceGrant,
@@ -126,13 +147,75 @@ pub trait Storage: Send + Sync {
         record: RefreshTokenRecord,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// Look up a refresh token record WITHOUT removing it.
+    ///
+    /// This exists so that a check ABOUT a refresh token never has to be built out of a
+    /// read-modify-write ON it. RFC 7009 section 2.1 requires revocation to verify that the token
+    /// was issued to the requesting client; doing that by taking the record and putting it back on
+    /// a mismatch is a destructive operation on a credential the caller was never entitled to
+    /// touch, and if the restoring write fails, the victim's chain is gone for good while the
+    /// endpoint still answers 200.
+    fn get_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> impl Future<Output = Result<Option<RefreshTokenRecord>, StorageError>> + Send;
+
     /// Atomically remove and return a refresh token record. This is what makes rotation single
     /// use: under concurrent refresh exactly one caller wins and every other presentation of the
     /// same token is `invalid_grant`.
+    ///
+    /// The server puts a SPENT record back after a successful rotation (see
+    /// [`crate::token::RefreshTokenState`]), so that a later presentation is recognisable as reuse
+    /// rather than as an unknown string.
     fn take_refresh_token(
         &self,
         refresh_token: &str,
     ) -> impl Future<Output = Result<Option<RefreshTokenRecord>, StorageError>> + Send;
+
+    /// Revoke EVERY token, access and refresh, carrying `family_id`, and return how many records
+    /// were removed.
+    ///
+    /// This is the RFC 9700 section 4.14.2 remedy for detected refresh token reuse: the AS
+    /// invalidates the presented token and revokes the tokens issued for that authorization grant.
+    /// Removing only the replayed token would leave the thief's rotated chain, and every access
+    /// token minted along it, entirely live.
+    ///
+    /// Implementations SHOULD make this reachable without a full scan (index `family_id` on both
+    /// the access token and the refresh token tables). It runs only on a detected compromise, so
+    /// it is not a hot path, but it must actually complete.
+    ///
+    /// Removing records that are already gone is success: this runs on evidence of compromise and
+    /// must not be turned into an error by a concurrent revocation.
+    fn revoke_token_family(
+        &self,
+        family_id: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Remove every record that is dead at `now`, and return how many were removed.
+    ///
+    /// The HOST must call this, on whatever schedule it likes; this crate has no background task
+    /// and will never grow one (see the crate docs on zero cost until enabled). Nothing else
+    /// reclaims storage: consumed authorization codes are retained deliberately until their
+    /// expiry, spent refresh records are retained deliberately until theirs, and expired access
+    /// tokens and abandoned device grants are simply never looked at again. RFC 8628 section 3.1
+    /// lets any client entitled to the device grant allocate a grant per request, so without a
+    /// sweep the growth is attacker-paced.
+    ///
+    /// "Dead at `now`" means, for each kind:
+    ///
+    /// - device grants with `expires_at <= now`
+    /// - authorization codes with `expires_at <= now` (in either state)
+    /// - access tokens with `expires_at <= now`
+    /// - refresh records with `Some(expires_at) <= now`. A record with `expires_at: None` is a
+    ///   chain with no absolute lifetime and is NOT dead; the server gives a spent record a
+    ///   retention deadline precisely so this method can reclaim it.
+    ///
+    /// It must be safe to call concurrently with request handling, and safe to call when there is
+    /// nothing to do (answering 0).
+    fn sweep_expired(
+        &self,
+        now: std::time::SystemTime,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
 }
 
 #[derive(Default)]
@@ -182,6 +265,26 @@ impl Storage for MemoryStorage {
     async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
         let mut g = self.lock();
         let normalized = crate::device::normalize_user_code(&grant.user_code);
+
+        // (1) The code must not already belong to a different device. Checked BEFORE any write, so
+        // a refusal leaves the store exactly as it was.
+        if let Some(owner) = g.user_code_index.get(&normalized) {
+            if owner != &grant.device_code {
+                return Err(StorageError::new(
+                    "user code is already indexed for a different device_code",
+                ));
+            }
+        }
+
+        // (2) A put that changes this grant's user code retires the old entry, or the superseded
+        // code goes on resolving here.
+        if let Some(previous) = g.device_by_code.get(&grant.device_code) {
+            let previous_normalized = crate::device::normalize_user_code(&previous.user_code);
+            if previous_normalized != normalized {
+                g.user_code_index.remove(&previous_normalized);
+            }
+        }
+
         g.user_code_index
             .insert(normalized, grant.device_code.clone());
         g.device_by_code.insert(grant.device_code.clone(), grant);
@@ -255,10 +358,70 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    async fn get_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+        Ok(self.lock().refresh.get(refresh_token).cloned())
+    }
+
     async fn take_refresh_token(
         &self,
         refresh_token: &str,
     ) -> Result<Option<RefreshTokenRecord>, StorageError> {
         Ok(self.lock().refresh.remove(refresh_token))
+    }
+
+    async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
+        // A scan is honest for a map with no secondary index, and this runs once per detected
+        // compromise rather than per request. A host with a real database indexes `family_id`.
+        let mut g = self.lock();
+        let before = g.tokens.len() + g.refresh.len();
+        g.tokens
+            .retain(|_, t| t.family_id.as_deref() != Some(family_id));
+        g.refresh.retain(|_, r| r.family_id != family_id);
+        Ok((before - (g.tokens.len() + g.refresh.len())) as u64)
+    }
+
+    async fn sweep_expired(&self, now: std::time::SystemTime) -> Result<u64, StorageError> {
+        let mut g = self.lock();
+        let mut removed = 0u64;
+
+        // Device grants first, so the index pass below sees the survivors.
+        let before = g.device_by_code.len();
+        g.device_by_code.retain(|_, grant| now < grant.expires_at);
+        removed += (before - g.device_by_code.len()) as u64;
+        // The index is not counted separately: it is not a record, it is a pointer to one, and a
+        // dangling pointer here would make a reaped user code resolve to nothing.
+        let live = &g.device_by_code;
+        let stale: Vec<String> = g
+            .user_code_index
+            .iter()
+            .filter(|(_, dc)| !live.contains_key(*dc))
+            .map(|(uc, _)| uc.clone())
+            .collect();
+        for uc in stale {
+            g.user_code_index.remove(&uc);
+        }
+
+        let before = g.codes.len();
+        g.codes.retain(|_, c| now < c.expires_at);
+        removed += (before - g.codes.len()) as u64;
+
+        let before = g.tokens.len();
+        g.tokens.retain(|_, t| now < t.expires_at);
+        removed += (before - g.tokens.len()) as u64;
+
+        // `None` means the chain has no absolute lifetime, so it is not dead. A SPENT record from
+        // such a chain was stamped with a retention deadline at rotation, which is what lets this
+        // reclaim it (see `RefreshTokenRecord::expires_at`).
+        let before = g.refresh.len();
+        g.refresh.retain(|_, r| match r.expires_at {
+            Some(exp) => now < exp,
+            None => true,
+        });
+        removed += (before - g.refresh.len()) as u64;
+
+        Ok(removed)
     }
 }

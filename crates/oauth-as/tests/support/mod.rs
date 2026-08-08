@@ -7,12 +7,14 @@
 
 pub mod alloc;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::{
-    AuthorizationRequest, AuthorizationServer, Client, ClientAuth, ClientId, Clock, GrantType,
-    MemoryStorage, ScopeSet, ServerConfig, TokenRequest, TokenResponse,
+    AuthorizationCodeRecord, AuthorizationRequest, AuthorizationServer, Client, ClientAuth,
+    ClientId, Clock, DeviceGrant, DeviceGrantState, GrantType, IssuedToken, MemoryStorage,
+    RefreshTokenRecord, ScopeSet, ServerConfig, Storage, StorageError, TokenRequest, TokenResponse,
 };
 
 /// A clock the test advances by hand. Shared with the server under test.
@@ -200,4 +202,190 @@ pub async fn mint_code_token(
     })
     .await
     .expect("fixture code redemption must succeed")
+}
+
+/// As [`mint_code_token`], but also hands back the (now consumed) authorization code. Suites that
+/// test REPLAY need the code string itself, which the token response does not carry.
+pub async fn mint_code_token_keeping_code<S: Storage>(
+    srv: &AuthorizationServer<S, ManualClock>,
+    client_id: &str,
+    client_secret: Option<&str>,
+    redirect_uri: &str,
+    scope: &str,
+    subject: &str,
+) -> (TokenResponse, String) {
+    let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
+    let req = AuthorizationRequest {
+        response_type: Some("code".to_string().into()),
+        client_id: Some(client_id.to_string().into()),
+        redirect_uri: Some(redirect_uri.to_string().into()),
+        scope: Some(scope.to_string().into()),
+        state: None,
+        code_challenge: Some(challenge.into()),
+        code_challenge_method: Some("S256".to_string().into()),
+    };
+    let validated = srv
+        .validate_authorization_request(&req)
+        .await
+        .expect("fixture authorization request must validate");
+    let response = srv
+        .issue_authorization_code(&validated, subject)
+        .await
+        .expect("fixture code issuance must succeed");
+    let issued = srv
+        .token(TokenRequest::AuthorizationCode {
+            client_id: ClientId::new(client_id),
+            client_secret: client_secret.map(str::to_string),
+            code: response.code.clone(),
+            redirect_uri: Some(redirect_uri.to_string()),
+            code_verifier: Some(RFC7636_VERIFIER.to_string()),
+        })
+        .await
+        .expect("fixture code redemption must succeed");
+    (issued, response.code)
+}
+
+/// A [`Storage`] that delegates to [`MemoryStorage`] and lies on demand, so the tests can pin what
+/// the server does when the store fails or when generated codes collide. Both switches are off
+/// until a test turns them on.
+#[derive(Default)]
+pub struct FaultStorage {
+    inner: MemoryStorage,
+    /// When set, every `put_refresh_token` fails. This is the transient-write-failure case that
+    /// turns a read-modify-write on someone else's live credential into permanent destruction.
+    pub fail_put_refresh: AtomicBool,
+    /// When set, every user-code lookup reports a hit, as an unending run of collisions would.
+    pub collide_user_codes: AtomicBool,
+}
+
+impl FaultStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Storage for FaultStorage {
+    async fn get_client(&self, client_id: &ClientId) -> Result<Option<Client>, StorageError> {
+        self.inner.get_client(client_id).await
+    }
+
+    async fn put_client(&self, client: Client) -> Result<(), StorageError> {
+        self.inner.put_client(client).await
+    }
+
+    async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
+        self.inner.put_device_grant(grant).await
+    }
+
+    async fn get_device_grant(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<DeviceGrant>, StorageError> {
+        self.inner.get_device_grant(device_code).await
+    }
+
+    async fn find_device_grant_by_user_code(
+        &self,
+        normalized_user_code: &str,
+    ) -> Result<Option<DeviceGrant>, StorageError> {
+        if self.collide_user_codes.load(Ordering::SeqCst) {
+            // Any non-None answer is a collision as far as the generator is concerned; reusing a
+            // real stored grant keeps the value well formed.
+            return Ok(Some(colliding_grant(normalized_user_code)));
+        }
+        self.inner
+            .find_device_grant_by_user_code(normalized_user_code)
+            .await
+    }
+
+    async fn take_device_grant(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<DeviceGrant>, StorageError> {
+        self.inner.take_device_grant(device_code).await
+    }
+
+    async fn put_authorization_code(
+        &self,
+        record: AuthorizationCodeRecord,
+    ) -> Result<(), StorageError> {
+        self.inner.put_authorization_code(record).await
+    }
+
+    async fn take_authorization_code(
+        &self,
+        code: &str,
+    ) -> Result<Option<AuthorizationCodeRecord>, StorageError> {
+        self.inner.take_authorization_code(code).await
+    }
+
+    async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
+        self.inner.put_token(token).await
+    }
+
+    async fn get_token(&self, access_token: &str) -> Result<Option<IssuedToken>, StorageError> {
+        self.inner.get_token(access_token).await
+    }
+
+    async fn delete_token(&self, access_token: &str) -> Result<(), StorageError> {
+        self.inner.delete_token(access_token).await
+    }
+
+    async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {
+        if self.fail_put_refresh.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected write failure"));
+        }
+        self.inner.put_refresh_token(record).await
+    }
+
+    async fn get_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+        self.inner.get_refresh_token(refresh_token).await
+    }
+
+    async fn take_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+        self.inner.take_refresh_token(refresh_token).await
+    }
+
+    async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
+        self.inner.revoke_token_family(family_id).await
+    }
+
+    async fn sweep_expired(&self, now: SystemTime) -> Result<u64, StorageError> {
+        self.inner.sweep_expired(now).await
+    }
+}
+
+/// A well formed grant to answer a forced user-code collision with.
+fn colliding_grant(user_code: &str) -> DeviceGrant {
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    DeviceGrant {
+        device_code: "already-taken-device-code".to_string(),
+        user_code: user_code.to_string(),
+        client_id: ClientId::new("some-other-client"),
+        scope: ScopeSet::parse("read").unwrap(),
+        state: DeviceGrantState::Pending,
+        created_at: now,
+        expires_at: now + Duration::from_secs(600),
+        interval: Duration::from_secs(5),
+        last_poll_at: None,
+    }
+}
+
+/// A server over [`FaultStorage`], for the failure-injection suites.
+pub async fn fault_server_with(
+    clock: ManualClock,
+    clients: Vec<Client>,
+) -> AuthorizationServer<FaultStorage, ManualClock> {
+    let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    let srv = AuthorizationServer::with_clock(cfg, FaultStorage::new(), clock);
+    for c in clients {
+        srv.register_client(c).await.unwrap();
+    }
+    srv
 }

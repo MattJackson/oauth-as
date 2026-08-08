@@ -7,3 +7,41 @@ members = [
     "crates/oauth-as",
     "crates/oauth-as-conformance",
 ]
+
+# COMPILE SETTINGS, and an honest note about their reach.
+#
+# Cargo profiles are honored ONLY for the workspace being built. A consumer who depends on
+# oauth-as compiles it with THEIR profile, and nothing written here reaches them. So these
+# settings govern our own builds, benchmarks and size measurements; they are not, and cannot be,
+# a performance promise to a consumer.
+#
+# What actually determines a consumer's cost is the shape of the code, not this table:
+#   * AuthorizationServer<S, C> is generic over the host's Storage and Clock, so its code is
+#     monomorphized per (Storage, Clock) pair the host instantiates. One pair is the normal case
+#     and costs one copy; a host that instantiates several pays for several. This is a deliberate
+#     trade: generics keep the storage seam allocation-free and devirtualized, where a
+#     `dyn Storage` would add an indirect call on every storage operation on the token path.
+#   * The default feature set is empty, so a consumer who wants only the protocol core links no
+#     HTTP stack and no signing code at all.
+# The guidance we give consumers lives in the README rather than here, where they would never
+# see it.
+[profile.release]
+# Cross-crate inlining. Worth real size and speed on a crate this small, because most of the
+# hot paths are thin wrappers over the storage seam that only become cheap once inlined.
+lto = "fat"
+# One codegen unit: strictly better optimization at the cost of build time, which we can afford
+# because the crate is small.
+codegen-units = 1
+opt-level = 3
+# Strip symbols from OUR binaries (the conformance example). Does not affect the published rlib.
+strip = "symbols"
+# NB: panic = "abort" is deliberately NOT set. This crate is a library embedded in a host, and a
+# host is entitled to catch a panic at its request boundary rather than lose the process. Forcing
+# abort on our own release builds would also make the example behave unlike a real embedding.
+
+# A profile for measuring what the crate actually costs, rather than guessing. Same optimization
+# as release, but keeps debug info so size attribution tools can name what is big.
+[profile.sizecheck]
+inherits = "release"
+strip = "none"
+debug = 1

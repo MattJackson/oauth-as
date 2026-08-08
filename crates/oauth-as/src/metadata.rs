@@ -18,8 +18,53 @@ use serde::{Deserialize, Serialize};
 use crate::grant::DEVICE_CODE_GRANT_URN;
 use crate::server::ServerConfig;
 
-/// The path RFC 8414 section 3 reserves for this document, relative to the issuer.
+/// The well-known URI suffix RFC 8414 section 3 registers for this document.
+///
+/// This is the BARE form, correct only for an issuer with no path component. Use
+/// [`well_known_path`] to place the document for a given issuer: section 3.1 does not append the
+/// issuer's path to this string, it inserts this string between the host and that path.
 pub const WELL_KNOWN_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// The path component of an issuer identifier: `""` for `https://as.example`, `"/tenant1"` for
+/// `https://as.example/tenant1`.
+///
+/// Parsed by hand rather than with a URL crate because the whole shape needed is "everything from
+/// the first `/` after the authority", and this crate's dependency policy does not admit a URL
+/// parser for one line of string handling. A trailing slash is trimmed so
+/// `https://as.example/tenant1/` and `https://as.example/tenant1` agree.
+pub fn issuer_path(issuer: &str) -> &str {
+    let authority = match issuer.find("://") {
+        Some(i) => &issuer[i + 3..],
+        // A scheme-less string is not a shape RFC 8414 admits (section 2 requires an https URL),
+        // so it is read as a bare authority plus path rather than rejected here: the router is
+        // what refuses to serve an incoherent configuration.
+        None => issuer,
+    };
+    match authority.find('/') {
+        Some(i) => authority[i..].trim_end_matches('/'),
+        None => "",
+    }
+}
+
+/// Where this document lives for `issuer`, as an absolute path from the origin's root.
+///
+/// RFC 8414 section 3.1 is explicit and frequently got wrong: the well-known string is inserted
+/// BETWEEN the host and the issuer's path component. For issuer `https://as.example/tenant1` the
+/// document is at `https://as.example/.well-known/oauth-authorization-server/tenant1`, NOT at
+/// `https://as.example/tenant1/.well-known/...` and NOT at the bare well-known path.
+///
+/// Getting this wrong is a security matter and not only a routing one. Section 3.3 requires the
+/// client to check that the `issuer` member equals the URL the document was retrieved from, and
+/// that check is a mix-up countermeasure (RFC 9700 section 4.14). A document served where the
+/// check cannot pass teaches clients to skip it. In a multi-tenant deployment it is also a
+/// correctness bug outright: every tenant would collide on the one bare path.
+pub fn well_known_path(issuer: &str) -> String {
+    let path = issuer_path(issuer);
+    let mut out = String::with_capacity(WELL_KNOWN_PATH.len() + path.len());
+    out.push_str(WELL_KNOWN_PATH);
+    out.push_str(path);
+    out
+}
 
 /// An RFC 8414 authorization server metadata document.
 ///

@@ -12,6 +12,16 @@ readme = "../../README.md"
 keywords = ["oauth", "oauth2", "authorization", "device-flow", "pkce"]
 categories = ["authentication", "web-programming"]
 
+# FEATURES. The default set is EMPTY and stays that way. A consumer who wants only the library
+# gets no HTTP stack and no async runtime: the whole premise of this crate is that the host owns
+# the listener, so an optional feature is the only place a web framework may appear.
+[features]
+default = []
+# `http` adds an axum router over AuthorizationServer, for hosts that want the RFC-shaped wire
+# surface rather than writing it themselves, and for the black-box conformance harness (which
+# needs an external process to talk to). Nothing in the library depends on it.
+http = ["dep:axum", "dep:tokio"]
+
 # DEPENDENCY POLICY: the runtime dependency set is deliberately tiny, and none of these
 # implies an async runtime, an HTTP stack, or a persistence layer; the HOST owns all three.
 [dependencies]
@@ -20,6 +30,14 @@ serde_json = "1"
 getrandom = "0.3"
 sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
 base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
+
+# OPTIONAL, feature `http` only. `default-features = false` keeps the pulled-in tree to what the
+# router actually uses: no JSON extractor (bodies are serialized here so the RFC-mandated headers
+# are set on the same response), no tracing, no multipart.
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
+# Needed only because `axum::serve` (and therefore any host or example that binds a listener)
+# needs a runtime. The router itself is runtime-agnostic.
+tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
@@ -36,3 +54,10 @@ oauth2 = { version = "=5.0.0", default-features = false }
 jsonschema = "0.49"
 http = "1"
 url = "2"
+
+# The conformance serve shim (crates/oauth-as/conformance-serve.sh) runs this example. It carries
+# the deterministic fixtures the black-box harness's launch contract asks for; the LIBRARY must
+# never ship conformance fixtures, so they live here and nowhere else.
+[[example]]
+name = "conformance_server"
+required-features = ["http"]

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/MattJackson/oauth-as/security/advisories/new
+    about: >-
+      This is an authorization server. A publicly filed vulnerability is a disclosure. Do not
+      open a public issue for a security problem; use GitHub's private vulnerability reporting
+      (Security tab, "Report a vulnerability") as documented in SECURITY.md.

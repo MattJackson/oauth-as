@@ -127,6 +127,30 @@ pub struct IssuedToken {
     pub issued_at: SystemTime,
     /// Expiry instant; the token is dead at and after this instant.
     pub expires_at: SystemTime,
+    /// The authorization grant this token belongs to (see [`RefreshTokenRecord::family_id`]).
+    ///
+    /// RFC 9700 section 4.14.2 requires that detecting refresh token reuse revokes "the tokens
+    /// issued for that authorization grant", not merely the refresh chain, so an access token has
+    /// to be reachable from the grant it came from. `None` for a grant that produced no refresh
+    /// chain (RFC 6749 section 4.4 client credentials), where there is no chain to be reused and
+    /// so nothing to revoke by family.
+    pub family_id: Option<String>,
+}
+
+/// Whether a persisted refresh token is still redeemable.
+///
+/// Rotated tokens are RETAINED in the `Spent` state rather than deleted, exactly as consumed
+/// authorization codes are (see [`crate::authorization::AuthorizationCodeState`]) and for exactly
+/// the same reason: a token deleted on rotation makes a later presentation indistinguishable from
+/// a typo, and the AS then answers the one signal it gets that a token leaked by disconnecting
+/// whichever party redeemed second, which in practice is the honest one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefreshTokenState {
+    /// Live: redeemable exactly once.
+    Active,
+    /// Already rotated away. Presenting it is REUSE, which OAuth 2.1 draft section 6.1 and RFC
+    /// 9700 section 4.14.2 treat as evidence of compromise: the whole family dies.
+    Spent,
 }
 
 /// A persisted refresh token. Single use: redemption goes through
@@ -136,14 +160,30 @@ pub struct IssuedToken {
 pub struct RefreshTokenRecord {
     /// The opaque refresh token string (the storage key).
     pub refresh_token: String,
-    /// The client the token was issued to; presentation by any other client consumes it.
+    /// The client the token was issued to; presentation by any other client is `invalid_grant`
+    /// and leaves the record untouched.
     pub client_id: ClientId,
     /// The resource owner the chain acts for.
     pub subject: Option<String>,
     /// The scope originally granted; refreshes may narrow, never widen.
     pub scope: ScopeSet,
     /// Absolute chain expiry; `None` means the chain does not expire by time.
+    ///
+    /// On a `Spent` record this doubles as the RETENTION deadline: a spent token is kept only so
+    /// that its reuse can be recognised, and a chain with no absolute expiry would otherwise keep
+    /// every superseded link forever. The server therefore stamps a spent record from a
+    /// never-expiring chain with `now + ServerConfig::refresh_reuse_window`, which is what makes
+    /// [`crate::store::Storage::sweep_expired`] able to reclaim it.
     pub expires_at: Option<SystemTime>,
+    /// The FAMILY this token belongs to: one identifier shared by every token, access or refresh,
+    /// minted from the same authorization grant, and carried across rotation unchanged.
+    ///
+    /// This is what makes RFC 9700 section 4.14.2 implementable at all. Without it the AS can
+    /// refuse a reused token but cannot reach the tokens the thief already rotated into, which is
+    /// the defence exactly inverted: the victim is locked out and the attacker is not.
+    pub family_id: String,
+    /// Whether this link is still redeemable, or is a retained rotated one.
+    pub state: RefreshTokenState,
 }
 
 #[cfg(test)]

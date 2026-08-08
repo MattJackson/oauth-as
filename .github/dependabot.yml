@@ -1,0 +1,21 @@
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # oauth2 is a dev-dependency of both crates/oauth-as and crates/oauth-as-conformance, and it
+    # is pinned EXACTLY at "=5.0.0" on purpose: it is the independent third-party client that
+    # judges whether this server's responses are spec-legal (see README.md's maturity section
+    # and the dependency comments in each Cargo.toml). A silent version bump here would change
+    # what "conformant" means without anyone deciding that on purpose. Any upgrade to oauth2 must
+    # be a deliberate, reviewed decision by the owner, not an automated dependency bump, so
+    # dependabot is told to leave it alone.
+    ignore:
+      - dependency-name: "oauth2"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

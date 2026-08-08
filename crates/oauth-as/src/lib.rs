@@ -49,6 +49,9 @@ pub mod client;
 pub mod device;
 pub mod error;
 pub mod grant;
+/// An OPTIONAL axum router over the server, behind the `http` cargo feature (off by default).
+#[cfg(feature = "http")]
+pub mod http;
 pub mod metadata;
 pub mod pkce;
 pub mod scope;
@@ -65,10 +68,15 @@ pub use client::{Client, ClientAuth, ClientId};
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 pub use error::{ErrorCode, ErrorResponse};
 pub use grant::GrantType;
+#[cfg(feature = "http")]
+pub use http::{RouterBuilder, RouterError, SubjectResolver};
 pub use metadata::{AuthorizationServerMetadata, WELL_KNOWN_PATH};
 pub use scope::{Scope, ScopeSet};
-pub use server::{AuthorizationServer, Clock, ServerConfig, SystemClock, TokenRequest};
+pub use server::{
+    AuthorizationServer, Clock, ServerConfig, SystemClock, TokenRequest, MIN_USER_CODE_LENGTH,
+};
 pub use store::{MemoryStorage, Storage, StorageError};
 pub use token::{
-    IntrospectionResponse, IssuedToken, RefreshTokenRecord, TokenResponse, TokenType, TokenTypeHint,
+    IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,
+    TokenType, TokenTypeHint,
 };

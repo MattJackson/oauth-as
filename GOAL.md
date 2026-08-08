@@ -7,8 +7,18 @@ specific answer, not as a feeling about quality.
 
 ## THE GOAL
 
-Ship `oauth-as 0.1.0` to crates.io as an embeddable OAuth 2.1 Authorization Server library that a
-stranger can adopt on the evidence, not on trust.
+Build `oauth-as` into an embeddable OAuth 2.1 Authorization Server library that a stranger can
+adopt on the evidence, not on trust, and publish it to crates.io AT 0.9.0.
+
+**The publish target is 0.9.0, not 0.1.0.** Nothing goes to crates.io before then. 0.1.0 through
+0.8.0 are built, tested and pushed through the dev/qa/main promotion pipeline, but they are not
+published: a crates.io release is permanent, a version can be yanked but never deleted, and there
+is no reason to spend permanent version numbers on a surface that is still changing shape every
+release. The name is already held by the 0.0.1 placeholder, so there is nothing to defend.
+
+At 0.9.0 the crate does what third party tooling and third party clients expect of an OAuth 2.1
+authorization server (see ROADMAP.md), everything is green, and the work PAUSES so the owner can
+test it himself. 1.0.0 comes after that, and only if it feels solid.
 
 Three properties, in priority order. Where they conflict, the earlier one wins.
 
@@ -112,12 +122,19 @@ CHECK: read the README against this list. Every claim maps to a command in this 
 CHECK: the package list is in the release commit message or the PR body, so the review is
 auditable after the fact.
 
-### Gate 10: the owner says go
+### Gate 10: the owner says go, at 0.9.0
+- [ ] Every gate above passes at version 0.9.0
 - [ ] The publish command is handed to the owner. It is NOT run by an agent.
+- [ ] Work PAUSES there so the owner can test the published crate himself
 
 A crates.io publish is permanent. A version can be yanked, never deleted. There is deliberately no
 crates.io credential on the build machine, and the publish workflow is dispatch-only behind a
-manual-approval environment so it cannot fire by accident.
+manual-approval environment so it cannot fire by accident. An agent preparing the release and an
+agent performing it are different things, and only the first one happens here.
+
+After the pause, 1.0.0 is cut only if the owner's own testing agrees with the evidence. See the
+1.0.0 criteria in ROADMAP.md: the feeling is allowed to veto the checklist, it is not allowed to
+substitute for it.
 
 ## ORDER OF WORK
 
