@@ -52,24 +52,39 @@ with `cargo mutants -p oauth-as --features http` instead.
 
 ## Where this actually stands, so nobody reads the file above as "done"
 
-Last authoritative run, default features, `http.rs` and `metadata.rs` excluded:
-**369 mutants, 280 caught, 44 missed, 44 unviable, 1 timeout.**
+Last authoritative run: `cargo mutants -p oauth-as --features http,jwt --timeout 180`, at commit
+`5f663c0`, with NOTHING excluded. This is the first run that ever compiled `src/http.rs`, so the
+"artifact of the default feature set" note above no longer describes reality: the HTTP surface is
+now measured like everything else.
 
-Of the 44 missed, exactly ONE is recorded above as equivalent. The other 43 are real, unclosed
-holes, and they are all in surface that arrived after that run was scoped:
+**617 mutants: 498 caught, 36 missed, 77 unviable, 6 timeout.**
 
-- 33 in `crates/oauth-as/src/jwt.rs`
-- 10 in `crates/oauth-as/src/server.rs`, in the jwt-only functions (`wire_access_token`, `jwks`,
-  `jwks_uri`)
+A note on how that number was obtained, because it matters for whether it can be trusted. The
+first pass was run at `-j 10` on a machine that was busy, and 185 mutants hit the 180 second
+timeout: an overloaded machine timing out proves nothing about the suite. Those 185 were re-run at
+`-j 3 --timeout 300`, and the counts above are the first pass with every one of those results
+replaced by its re-run. Only 6 survived the longer timeout, and each of those 6 is genuinely
+non-terminating rather than merely slow:
 
-The one timeout is `user_code_symbol -> None`, a genuinely non-terminating mutant: rejection
-sampling that never accepts a byte loops forever. `cargo mutants` counts a timeout as caught,
-because the suite does not pass, and that is the right answer here.
+- four in `http.rs` `decode_component`, where `i += 1` becomes `i -= 1` or `i *= 1` and the index
+  never advances past the `while i < bytes.len()` bound;
+- `jwt.rs` `from_scalar_bytes`, where `scalar.len() != 32` becomes `== 32` so EVERY 32 byte scalar
+  is rejected and `EcdsaP256Key::generate`'s rejection-sampling loop can never accept one;
+- `server.rs` `user_code_symbol -> None`, the same rejection-sampling case recorded before.
 
-**The `http` surface has never been mutation tested at all**, for the feature-gating reason above.
-That is not a small gap: it is the module that terminates every request, holds the CSRF and consent
-seams, and parses attacker-controlled input.
+`cargo mutants` counts a timeout as caught, because the suite does not pass. That is the right
+answer for all six.
 
-So Gate 4 in `GOAL.md` is NOT met yet. It is met when a run with `--features http,jwt` comes back
-with every survivor either killed or recorded here with its argument. Anyone tempted to tick that
-gate early should re-read the bar at the top of this file.
+### The 36 survivors
+
+They are being worked through now; this section is updated as each is closed. By file:
+
+- 19 in `crates/oauth-as/src/http.rs`
+- 10 in `crates/oauth-as/src/jwt.rs`
+- 4 in `crates/oauth-as/src/metadata.rs`
+- 1 in `crates/oauth-as/src/scope.rs` (the `ScopeSet::empty` entry recorded above)
+- 1 in `crates/oauth-as/src/events.rs`, 1 in `crates/oauth-as/src/server.rs`
+
+So Gate 4 in `GOAL.md` is NOT met yet. It is met when every survivor above is either killed by a
+test or recorded here with its argument. Anyone tempted to tick that gate early should re-read the
+bar at the top of this file.
