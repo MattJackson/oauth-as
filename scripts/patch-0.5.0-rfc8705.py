@@ -100,15 +100,17 @@ EDITS = [
         "pub mod mtls;",
         [
             (
-                "pub mod metadata;\npub mod pkce;\n",
+                # Anchored on `metadata` alone, and inserted AFTER it, so this survives whatever
+                # other optional modules land in between: rustfmt sorts module declarations, and
+                # `metadata` < `mtls` < everything else that could appear here.
+                "pub mod metadata;\n",
                 "pub mod metadata;\n"
                 "/// RFC 8705 mutual-TLS client authentication and certificate-bound access tokens,\n"
                 "/// behind the `mtls` cargo feature (off by default). READ THE MODULE DOCS FIRST: this\n"
                 "/// crate cannot validate a certificate chain it did not negotiate, so the host's TLS\n"
                 "/// layer is load bearing in a way no type here can enforce.\n"
                 '#[cfg(feature = "mtls")]\n'
-                "pub mod mtls;\n"
-                "pub mod pkce;\n",
+                "pub mod mtls;\n",
             ),
             (
                 "pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};\n",
