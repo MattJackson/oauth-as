@@ -20,6 +20,74 @@ fn display_form_hyphenates_even_lengths() {
     assert_eq!(display_user_code("ABCDE"), "ABCDE");
 }
 
+/// RFC 8628 section 5.1: the user code is short because a human types it, and its entropy is only
+/// sufficient in combination with host rate limiting. That makes every bit of it worth defending,
+/// so the byte-to-symbol mapping must be exactly uniform rather than approximately so.
+///
+/// Checked EXHAUSTIVELY over all 256 byte values, which is why `user_code_symbol` exists as a
+/// separate function: uniformity is not observable in any single generated code, and a test that
+/// could only look at sampled output would have to be a statistical argument instead of a proof.
+/// The three facts below are what "unbiased rejection sampling" actually means:
+///
+/// 1. exactly 240 of the 256 byte values are accepted (240 is the largest multiple of the 20
+///    symbol alphabet that fits in a byte),
+/// 2. every accepted value maps into the alphabet, and
+/// 3. every symbol has exactly the same number of preimages, so no symbol is more likely.
+///
+/// Widening the accepted range by even one value (`<` becoming `<=`) breaks fact 3 by giving the
+/// first symbol a thirteenth preimage; narrowing or inverting it breaks facts 1 and 3; replacing
+/// the modulo with a division breaks fact 3 by making the last eight symbols unreachable.
+#[test]
+fn the_user_code_symbol_draw_is_exactly_uniform_over_the_alphabet() {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut accepted = 0usize;
+    for byte in 0u8..=255 {
+        match user_code_symbol(byte) {
+            Some(symbol) => {
+                accepted += 1;
+                assert!(
+                    USER_CODE_ALPHABET.contains(&symbol),
+                    "byte {byte} produced {symbol}, which is outside the RFC 8628 s6.1 alphabet"
+                );
+                *counts.entry(symbol).or_insert(0usize) += 1;
+            }
+            None => assert!(
+                byte >= USER_CODE_REJECT_AT,
+                "byte {byte} is below the rejection bound and must have been accepted"
+            ),
+        }
+    }
+
+    assert_eq!(
+        accepted, 240,
+        "exactly the 240 values below the rejection bound may be folded into the alphabet"
+    );
+    assert_eq!(
+        counts.len(),
+        USER_CODE_ALPHABET.len(),
+        "every symbol in the alphabet must be reachable"
+    );
+    for (symbol, count) in &counts {
+        assert_eq!(
+            *count, 12,
+            "symbol {} has {count} preimages, not the uniform 12: the draw is biased",
+            *symbol as char
+        );
+    }
+}
+
+/// The generator itself, on top of the mapping above: it must keep drawing until it has exactly
+/// `len` symbols (a rejected byte costs a redraw, never a short code), and never emit anything
+/// outside the RFC 8628 section 6.1 alphabet.
+#[test]
+fn random_user_code_redraws_rejections_rather_than_shortening_the_code() {
+    for len in [MIN_USER_CODE_LENGTH, 9, 16] {
+        let code = random_user_code(len);
+        assert_eq!(code.len(), len, "a rejected byte must cost a redraw");
+        assert!(code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)));
+    }
+}
+
 #[test]
 fn random_hex_has_the_stated_entropy_width() {
     let h = random_hex(32);

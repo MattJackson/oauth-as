@@ -21,6 +21,8 @@ use crate::device::{
 };
 use crate::error::{ErrorCode, ErrorResponse};
 use crate::grant::GrantType;
+#[cfg(feature = "jwt")]
+use crate::jwt::{AccessTokenClaims, AccessTokenFormat, Jwks};
 use crate::scope::ScopeSet;
 use crate::store::{Storage, StorageError};
 use crate::token::{
@@ -85,6 +87,12 @@ pub struct ServerConfig {
     pub scopes_supported: Option<Vec<String>>,
     /// RFC 8414 `service_documentation`.
     pub service_documentation: Option<String>,
+    /// What the client receives as its `access_token`. Defaults to [`AccessTokenFormat::Opaque`],
+    /// which is the behaviour of this crate without the `jwt` feature; setting
+    /// [`AccessTokenFormat::Jwt`] makes the wire token an RFC 9068 `at+jwt` while the AS-side
+    /// record is still persisted, so introspection and revocation are unchanged.
+    #[cfg(feature = "jwt")]
+    pub access_token_format: AccessTokenFormat,
     /// Authorization code lifetime. RFC 6749 section 4.1.2 recommends a maximum of 10 minutes;
     /// the default is 60 seconds, which is ample for a redirect round trip.
     pub authorization_code_ttl: Duration,
@@ -157,6 +165,8 @@ impl ServerConfig {
             jwks_uri: None,
             scopes_supported: None,
             service_documentation: None,
+            #[cfg(feature = "jwt")]
+            access_token_format: AccessTokenFormat::Opaque,
             authorization_code_ttl: Duration::from_secs(60),
             include_verification_uri_complete: true,
             device_code_ttl: Duration::from_secs(600),
@@ -345,16 +355,42 @@ fn random_hex(n_bytes: usize) -> String {
     out
 }
 
+/// The rejection-sampling bound: the largest multiple of [`USER_CODE_ALPHABET`]'s length that fits
+/// in a byte. Values at or above it are redrawn rather than folded, because folding them would
+/// hand the low-index symbols extra probability.
+const USER_CODE_REJECT_AT: u8 = 240;
+
+/// Map one random byte to a user-code symbol, or reject it for a redraw.
+///
+/// This is split out of [`random_user_code`] ON PURPOSE, and the reason is testability rather than
+/// structure. The property that matters here is UNIFORMITY, and uniformity is not a property of any
+/// single generated code: a test that can only look at sampled output has to argue statistically,
+/// which means either a test that is flaky or a test that draws hundreds of thousands of samples to
+/// notice a bias of a few percent. As a total function of one byte it can instead be checked
+/// EXHAUSTIVELY over all 256 inputs, which settles the question outright (see
+/// `src/tests/server.rs`).
+///
+/// The numbers are load bearing. 240 is the largest multiple of 20 below 256, so the accepted
+/// values 0..=239 cover each of the 20 symbols exactly 12 times. Accepting one more value would
+/// give symbol 0 a thirteenth preimage, an 8% excess over its peers, and RFC 8628 section 5.1 is
+/// explicit that the user code's entropy is already only just sufficient (in combination with host
+/// rate limiting) because the code is short enough for a human to type.
+fn user_code_symbol(byte: u8) -> Option<u8> {
+    if byte < USER_CODE_REJECT_AT {
+        Some(USER_CODE_ALPHABET[(byte % 20) as usize])
+    } else {
+        None
+    }
+}
+
 /// A user code of `len` symbols over [`USER_CODE_ALPHABET`], unbiased via rejection sampling.
 fn random_user_code(len: usize) -> String {
     let mut out = String::with_capacity(len);
     let mut byte = [0u8; 1];
     while out.len() < len {
         getrandom::fill(&mut byte).expect("OS randomness for OAuth artifacts");
-        // 240 is the largest multiple of 20 below 256: values at or above it would bias the
-        // low-index symbols if taken modulo, so they are redrawn.
-        if byte[0] < 240 {
-            out.push(USER_CODE_ALPHABET[(byte[0] % 20) as usize] as char);
+        if let Some(symbol) = user_code_symbol(byte[0]) {
+            out.push(symbol as char);
         }
     }
     out
@@ -423,6 +459,68 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             config,
             store,
             clock,
+        }
+    }
+
+    /// Turn the freshly minted random token into what actually goes on the wire: itself when the
+    /// format is opaque (the byte-for-byte pre-feature behaviour), or an RFC 9068 access token
+    /// carrying it as `jti` when the host configured signing.
+    #[cfg(feature = "jwt")]
+    fn wire_access_token(
+        &self,
+        client: &Client,
+        subject: Option<&str>,
+        scope: &ScopeSet,
+        now: SystemTime,
+        jti: String,
+    ) -> Result<String, ErrorResponse> {
+        let jwt = match &self.config.access_token_format {
+            AccessTokenFormat::Opaque => return Ok(jti),
+            AccessTokenFormat::Jwt(jwt) => jwt,
+        };
+        let claims = AccessTokenClaims {
+            iss: self.config.issuer.clone(),
+            exp: crate::jwt::unix_seconds(now + self.config.access_token_ttl)
+                .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
+            aud: jwt.audience().clone(),
+            // RFC 9068 section 2.2: `sub` is REQUIRED. Where there is no resource owner (a
+            // client-only grant) the RFC's own answer is the client identifier, so the claim is
+            // never absent and never invented.
+            sub: subject
+                .unwrap_or_else(|| client.client_id.as_str())
+                .to_string(),
+            client_id: client.client_id.as_str().to_string(),
+            iat: crate::jwt::unix_seconds(now)
+                .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
+            jti,
+            scope: (!scope.is_empty()).then(|| scope.to_string()),
+        };
+        jwt.sign_access_token(&claims).map_err(|e| {
+            // The host sees the real error through its own logging of the config it supplied; the
+            // wire gets the opaque code, as with storage failures.
+            let _ = e;
+            ErrorResponse::new(ErrorCode::ServerError)
+        })
+    }
+
+    /// The RFC 7517 key set to serve at `jwks_uri`, or `None` when tokens are opaque. PUBLIC key
+    /// parameters only.
+    #[cfg(feature = "jwt")]
+    pub fn jwks(&self) -> Option<Jwks> {
+        match &self.config.access_token_format {
+            AccessTokenFormat::Opaque => None,
+            AccessTokenFormat::Jwt(jwt) => Some(jwt.jwks()),
+        }
+    }
+
+    /// The configured `jwks_uri`, or `None`. An RFC 8414 metadata document must advertise
+    /// `jwks_uri` exactly when this is `Some`: advertising a key set for an AS that signs nothing
+    /// is a lie, and signing without advertising leaves resource servers unable to verify.
+    #[cfg(feature = "jwt")]
+    pub fn jwks_uri(&self) -> Option<&str> {
+        match &self.config.access_token_format {
+            AccessTokenFormat::Opaque => None,
+            AccessTokenFormat::Jwt(jwt) => jwt.jwks_uri(),
         }
     }
 
@@ -1256,6 +1354,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
 
         let access_token = random_hex(32);
+        // RFC 9068, when the host configured it: the WIRE token becomes a signed JWT and the
+        // random string above becomes its `jti`. The record below is persisted either way, keyed
+        // by whatever the client will actually present, so RFC 7662 introspection and RFC 7009
+        // revocation keep working and a revoked JWT is genuinely dead at this AS rather than
+        // merely deprecated.
+        #[cfg(feature = "jwt")]
+        let access_token =
+            self.wire_access_token(client, subject.as_deref(), &scope, now, access_token)?;
         self.store
             .put_token(IssuedToken {
                 access_token: access_token.clone(),

@@ -88,6 +88,10 @@ fn zero_cost_efficiency_gates() {
             authorization_request_from_borrowed_pairs_allocates_nothing,
         ),
         (
+            "authorization_response_location_allocates_exactly_once_at_the_exact_size",
+            authorization_response_location_allocates_exactly_once_at_the_exact_size,
+        ),
+        (
             "device_authorization_hot_path_allocation_bound",
             device_authorization_hot_path_allocation_bound,
         ),
@@ -271,6 +275,54 @@ fn authorization_request_from_borrowed_pairs_allocates_nothing() {
             bytes: 0
         },
         "AuthorizationRequest::from_pairs on borrowed &str must not allocate at all, got {d:?}"
+    );
+}
+
+/// `AuthorizationResponse::location` sizes its output buffer from
+/// `AuthorizationResponse::encoded_len`, a private worst-case estimate whose whole job is to make
+/// the function allocate EXACTLY once (see its doc comment). That estimate is otherwise invisible:
+/// a wrong one still produces the correct string, because `String` simply reallocates. Allocator
+/// traffic is the only observation that can tell a right estimate from a wrong one, which is
+/// exactly what this counting allocator exists for.
+///
+/// The inputs below are chosen so the estimate is EXACT rather than merely sufficient: every byte
+/// of both the code and the state is outside the RFC 3986 unreserved set, so each expands to three
+/// characters, which is the `len * 3` the estimate assumes. With an exact estimate:
+///
+/// - an UNDER-estimate (a smaller constant, a dropped term, `* 3` weakened to `+ 3` or `/ 3`)
+///   makes the single `with_capacity` too small and `String` reallocates, raising `allocs`;
+/// - an OVER-estimate (a term multiplied instead of added) still allocates once but asks the
+///   allocator for more bytes than the string can ever need, raising `bytes`.
+///
+/// Pinning both to their exact values therefore constrains the estimate in both directions.
+fn authorization_response_location_allocates_exactly_once_at_the_exact_size() {
+    // 4 characters, none of them unreserved, so the encoded form is 12 characters.
+    let code = "&=#?";
+    // 3 characters, likewise, so the encoded form is 9 characters.
+    let state = " /+";
+    let redirect_uri = "https://app.example/cb";
+
+    let response = oauth_as::AuthorizationResponse {
+        code: code.to_string(),
+        state: Some(state.to_string()),
+    };
+    let (location, d) = measure(|| response.location(redirect_uri));
+
+    // "?code=" is 6 characters, "&state=" is 7: exactly the two constants the estimate carries.
+    let exact_len = redirect_uri.len() + 6 + code.len() * 3 + 7 + state.len() * 3;
+    assert_eq!(
+        location.len(),
+        exact_len,
+        "test setup: every input byte must percent-encode to three characters, got {location}"
+    );
+    assert_eq!(
+        d,
+        Delta {
+            allocs: 1,
+            deallocs: 0,
+            bytes: exact_len
+        },
+        "location() must allocate its buffer once, at exactly the size the output needs: {d:?}"
     );
 }
 

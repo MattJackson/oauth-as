@@ -167,8 +167,8 @@ pub fn client_credentials_client() -> Client {
 /// Drive a full authorization_code redemption for `client_id`, returning the issued token
 /// response. Used by suites that need a real, subject-bearing token to introspect or revoke
 /// rather than re-deriving the code flow inline.
-pub async fn mint_code_token(
-    srv: &AuthorizationServer<MemoryStorage, ManualClock>,
+pub async fn mint_code_token<S: Storage>(
+    srv: &AuthorizationServer<S, ManualClock>,
     client_id: &str,
     client_secret: Option<&str>,
     redirect_uri: &str,
@@ -256,6 +256,28 @@ pub struct FaultStorage {
     pub fail_put_refresh: AtomicBool,
     /// When set, every user-code lookup reports a hit, as an unending run of collisions would.
     pub collide_user_codes: AtomicBool,
+    /// The ORDER in which the server consulted the two token lookups.
+    ///
+    /// RFC 7009 section 2.1 makes `token_type_hint` an optimisation: the server SHOULD look in the
+    /// hinted store first, and MUST keep looking if the hint was wrong. "Which store was asked
+    /// first" is therefore the whole of the observable behaviour, and it is invisible in the
+    /// endpoint's result, because a correct server reaches the same outcome either way. Recording
+    /// the order is the only way a test can hold the server to the hint rather than to the outcome.
+    pub lookup_order: Mutex<Vec<&'static str>>,
+}
+
+impl FaultStorage {
+    fn record(&self, what: &'static str) {
+        self.lookup_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(what);
+    }
+
+    /// The recorded lookups, oldest first, and reset ready for the next observation.
+    pub fn take_lookup_order(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.lookup_order.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 impl FaultStorage {
@@ -324,6 +346,7 @@ impl Storage for FaultStorage {
     }
 
     async fn get_token(&self, access_token: &str) -> Result<Option<IssuedToken>, StorageError> {
+        self.record("get_token");
         self.inner.get_token(access_token).await
     }
 
@@ -342,6 +365,7 @@ impl Storage for FaultStorage {
         &self,
         refresh_token: &str,
     ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+        self.record("get_refresh_token");
         self.inner.get_refresh_token(refresh_token).await
     }
 
