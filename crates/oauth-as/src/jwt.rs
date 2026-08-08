@@ -401,6 +401,10 @@ pub(crate) fn unix_seconds(t: SystemTime) -> Result<u64, JwtError> {
         .map_err(|_| JwtError("clock is before the Unix epoch".into()))
 }
 
+#[cfg(test)]
+#[path = "tests/jwt.rs"]
+mod tests;
+
 // =============================================================================================
 // VERIFICATION.
 //
