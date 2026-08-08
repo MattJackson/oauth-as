@@ -1,0 +1,32 @@
+[
+  {
+    "check_id": "MCP-AUD-001",
+    "severity": "error",
+    "title": "RFC 8707 resource indicators not supported",
+    "detail": "Without resource binding, an MCP server cannot ensure that tokens minted for it aren't replayable against a different MCP server (the Obsidian-disclosed confused-deputy pattern).",
+    "spec_link": "https://datatracker.ietf.org/doc/html/rfc8707",
+    "remediation": "Set `resource_indicators_supported: true` and enforce the `resource` parameter on /token requests.",
+    "tier": "spec_required",
+    "extra": {}
+  },
+  {
+    "check_id": "MCP-DCR-001",
+    "severity": "warning",
+    "title": "Dynamic Client Registration not advertised",
+    "detail": "Without RFC 7591 DCR, MCP clients (Claude Desktop, Cursor, Continue, VS Code MCP) cannot self-register. Every user must manually obtain a client_id.",
+    "spec_link": "https://datatracker.ietf.org/doc/html/rfc7591",
+    "remediation": "Expose a /register endpoint validated to RFC 7591 \u00a72.",
+    "tier": "spec_required",
+    "extra": {}
+  },
+  {
+    "check_id": "MCP-REFRESH-001",
+    "severity": "warning",
+    "title": "Refresh tokens without DPoP support",
+    "detail": "AS supports refresh_token but does not advertise DPoP (RFC 9449). Public MCP clients cannot sender-constrain their refresh tokens, increasing token-theft impact.",
+    "spec_link": "https://datatracker.ietf.org/doc/html/rfc9449",
+    "remediation": "Set `dpop_signing_alg_values_supported: ['ES256']` and issue DPoP-bound refresh tokens to public clients.",
+    "tier": "advisory",
+    "extra": {}
+  }
+]

@@ -134,3 +134,10 @@ url = "2"
 [[example]]
 name = "conformance_server"
 required-features = ["http", "jwt"]
+
+# The RFC 9728 fixture resource (see the example's own module docs for why an AUTHORIZATION SERVER
+# crate ships a resource-server example, and for what it deliberately is not). `http` for the
+# listener, `resource-metadata` for the type it serves.
+[[example]]
+name = "protected_resource_fixture"
+required-features = ["http", "resource-metadata"]
