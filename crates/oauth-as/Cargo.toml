@@ -16,6 +16,12 @@ readme = "../../README.md"
 keywords = ["oauth", "oauth2", "authorization", "device-flow", "pkce"]
 categories = ["authentication", "web-programming"]
 
+# conformance-serve.sh is launched by scripts/oauth-conformance.sh from a git checkout and
+# resolves the workspace root as ../.., which does not exist in an unpacked tarball. It is broken
+# by construction for a consumer, so shipping it would only mislead. The EXAMPLE it runs is kept,
+# because it is the only worked demonstration of wiring the optional http router.
+exclude = ["conformance-serve.sh"]
+
 # FEATURES. The default set is EMPTY and stays that way. A consumer who wants only the library
 # gets no HTTP stack and no async runtime: the whole premise of this crate is that the host owns
 # the listener, so an optional feature is the only place a web framework may appear.
