@@ -826,6 +826,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .authenticate_registration(client_id, registration_access_token)
             .await?;
         let config = self.registration_config()?;
+
+        // The host decides on an UPDATE too, and this is not a formality. RFC 7592 section 2.2
+        // has the client send a complete replacement metadata document, so every content control
+        // a policy applied at registration (a `client_name` impersonating the deployment, a
+        // `redirect_uris` entry on a domain the host will not serve) is exactly what this call can
+        // rewrite. Consulting the policy only on the way in would leave every one of those
+        // controls one PUT away from being void, and the registration access token is long lived
+        // where an initial access token is typically single use.
+        //
+        // `initial_access_token` is None because there is no second one to present: RFC 7592
+        // section 2 authenticates this request with the registration access token, which
+        // `authenticate_registration` above has already verified.
+        let attempt = RegistrationAttempt {
+            initial_access_token: None,
+            metadata,
+        };
+        match self.hooks().registration_policy() {
+            Some(policy) if policy.authorize(&attempt) == RegistrationDecision::Allow => {}
+            _ => return Err(RegistrationFailure::Unauthorized),
+        }
+
         let registered = validate(metadata, config)?;
 
         // A change of authentication method that needs a secret the registration does not have
