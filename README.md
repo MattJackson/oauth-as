@@ -14,7 +14,7 @@ the consent experience; the library owns the protocol.
 
 ```toml
 [dependencies]
-oauth-as = "0.2"
+oauth-as = "0.9"
 ```
 
 ## What it does
@@ -24,14 +24,31 @@ oauth-as = "0.2"
 | Authorization code grant | RFC 6749 s4.1 | PKCE required, `S256` only, exact redirect URI matching |
 | PKCE | RFC 7636 | Verified against the appendix B vector |
 | Device authorization grant | RFC 8628 | Full state machine: pending, `slow_down`, expiry, denial, single use |
-| Refresh rotation | RFC 6749 s6 | Single use, absolute chain lifetime, **reuse detection revokes the family** |
+| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, **reuse detection revokes the family** |
 | Client credentials | RFC 6749 s4.4 | Confidential clients only, no refresh token |
 | Server metadata | RFC 8414 | Derived from config, so an advertised endpoint is one that exists |
 | Token introspection | RFC 7662 | Unknown, expired and other clients' tokens all read `{"active": false}` |
-| Token revocation | RFC 7009 | Idempotent, ownership verified, no existence oracle |
+| Token revocation | RFC 7009 | Idempotent, ownership verified, no existence oracle, cascades to the grant |
 | Mix-up defence | RFC 9207 | `iss` on every authorization response, success and error |
 | Resource indicators | RFC 8707 | Narrowable audience, wired into the JWT `aud` claim |
-| JWT access tokens | RFC 9068 | `at+jwt` / ES256 with a JWKS document, optional |
+| Dynamic client registration | RFC 7591 / 7592 | Off unless configured AND a host policy is installed |
+
+Behind off-by-default features:
+
+| Capability | Spec | Feature |
+| ---------- | ---- | ------- |
+| JWT access tokens and JWKS | RFC 9068 / 7517 | `jwt` |
+| JWT client authentication | RFC 7523 | `client_assertion` |
+| DPoP sender-constrained tokens | RFC 9449 | `dpop` |
+| mTLS client auth and certificate-bound tokens | RFC 8705 | `mtls` |
+| Pushed authorization requests | RFC 9126 | `par` |
+| Signed request objects | RFC 9101 | `jar` |
+| Token exchange | RFC 8693 | `token-exchange` |
+| Rich authorization requests | RFC 9396 | `rar` |
+| Protected resource metadata | RFC 9728 | `resource-metadata` |
+| Consent records and step-up auth | RFC 9470 | `consent` |
+| An axum router over all of it | | `http` |
+| A `Storage` conformance harness for hosts | | `test-util` |
 
 Plus the seams a real deployment needs: an audit **event sink**, a **rate limiting** hook
 (RFC 8628 s5.1 makes device user code entropy adequate only in combination with one), a **client
@@ -107,11 +124,23 @@ trust, including by its authors. So:
 ### What is not claimed
 
 There is **no OAuth 2.1 certification programme in existence** (it is still an Internet Draft), so
-no implementation can hold one. **No third party conformance tool has been run**, because none that
-applies exists: the OpenID Foundation suite covers OIDC and FAPI and contains zero references to
-RFC 8628; `authgent` is an MCP scanner that skips every check without RFC 9728 metadata; OAuch has
-no headless mode. The independent judges here are the vendored vectors and the pinned client. That
-is a real bar and it is not certification, and this README will not imply otherwise.
+no implementation can hold one, and none is claimed here.
+
+What IS now claimable, and was not before:
+
+- **Two independently written third party client libraries, in two languages, accept this server**:
+  `oauth2 = "=5.0.0"` (Rust) and `golang.org/x/oauth2 v0.36.0` (the Go project's own). Each pinned
+  exactly, each gate proven able to go red. They cover different ground: the Go drive exercises
+  client credentials and refresh rotation, which the Rust one does not.
+- **A third party scanner nobody here wrote applies its own RFC 8414, RFC 7636, RFC 9207, RFC 8707
+  and RFC 7591 checks to this crate's metadata document**, in CI, pinned. Its findings are recorded
+  and explained in `crates/oauth-as-conformance/authgent-baseline.json` rather than silenced, and
+  the gate is on anything NEW rather than on zero.
+
+Still not claimable, and stated so it stays that way: any certification, any OpenID Foundation
+conformance run, any MCP conformance claim. A FAPI 2.0 `plain_oauth` run is achievable and the
+remaining work is written down in `crates/oauth-as-conformance/EXTERNAL-TOOLING.md`, but it has not
+been done. A headless OAuch run is impossible by design and its authors say so.
 
 The 0.x version is deliberate. If you need a battle hardened server today, use one. If you want an
 embeddable, host agnostic OAuth 2.1 core with its evidence and its gaps both in the open, this is
