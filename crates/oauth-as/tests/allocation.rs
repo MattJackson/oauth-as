@@ -115,6 +115,10 @@ fn zero_cost_efficiency_gates() {
             "core_public_types_stay_within_their_size_budget",
             core_public_types_stay_within_their_size_budget,
         ),
+        (
+            "token_future_stays_under_tokios_debug_boxing_threshold",
+            token_future_stays_under_tokios_debug_boxing_threshold,
+        ),
     ];
 
     let mut failures = Vec::new();
@@ -344,18 +348,6 @@ fn authorization_response_location_allocates_exactly_once_at_the_exact_size() {
 // throughout (never `rt-multi-thread`) specifically so no extra OS thread is alive while a window
 // is being measured.
 
-/// What the `rar` feature costs the hot paths, in BYTES only.
-///
-/// Threading the RFC 9396 authorization details through the grant helpers pushes the
-/// all-features token future from 1976 to 2136 bytes, past tokio's 2048-byte debug boxing
-/// threshold, so a debug build allocates the future once per token request. Stated as a
-/// term rather than folded into the numbers so that the cost is legible and so that the
-/// build without the feature is still held to exactly what it was.
-#[cfg(feature = "rar")]
-const RAR_FUTURE: usize = 2560;
-#[cfg(not(feature = "rar"))]
-const RAR_FUTURE: usize = 0;
-
 fn current_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -442,7 +434,7 @@ fn device_token_pending_poll_hot_path_allocation_bound() {
         "device_token(authorization_pending) allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 2048 + RAR_FUTURE,
+        d.bytes <= 2048,
         "device_token(authorization_pending) allocation bytes regressed: {d:?}"
     );
 }
@@ -510,7 +502,7 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
         "authorization_code redemption allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 6144 + RAR_FUTURE,
+        d.bytes <= 6144,
         "authorization_code redemption allocation bytes regressed: {d:?}"
     );
 }
@@ -572,7 +564,7 @@ fn refresh_rotation_hot_path_allocation_bound() {
         "refresh rotation allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 4096 + RAR_FUTURE,
+        d.bytes <= 4096,
         "refresh rotation allocation bytes regressed: {d:?}"
     );
 }
@@ -681,5 +673,50 @@ fn core_public_types_stay_within_their_size_budget() {
         size_of::<IssuedToken>() <= issued_token_budget,
         "IssuedToken grew past its size budget: {}",
         size_of::<IssuedToken>()
+    );
+}
+
+/// The token endpoint's future must stay under tokio's DEBUG BOXING THRESHOLD.
+///
+/// `tokio::runtime::Runtime::block_on` and `tokio::spawn` box any future larger than 2048 bytes
+/// when the runtime is built without optimisation, which every host's test suite and most hosts'
+/// staging builds are. Crossing the threshold therefore costs a 2 KB heap allocation on EVERY
+/// token request, and it costs it invisibly: the endpoint still returns the right answer, so
+/// nothing but an allocation count or this measurement can tell that it happened.
+///
+/// This crate has crossed the line twice. The first time, an `async fn` wrapper around the
+/// endpoint gave the token path a second generator frame holding its own copy of the request; the
+/// second time, threading RFC 9396 authorization details through the grant helpers pushed it to
+/// 2168 bytes. Both were fixed by RESTRUCTURING (see `token_with_context`), never by widening a
+/// budget, because 2048 is not this crate's number to choose: tokio owns it.
+///
+/// The bound below is therefore the real threshold and not a percentage of anything. What keeps it
+/// from being a gate that only fires after the damage is done is the OBSERVED figures recorded
+/// here, which a reviewer can compare against a failing run's reported size:
+///
+/// - default features: 1416 bytes
+/// - `--all-features`: 1824 bytes
+///
+/// `AuthorizationCode` is the variant measured because it is the widest arm of [`TokenRequest`]
+/// and the deepest call chain behind it, so it is the arm that sets the high-water mark.
+fn token_future_stays_under_tokios_debug_boxing_threshold() {
+    let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    let srv = AuthorizationServer::new(cfg, MemoryStorage::new());
+    // Never polled: a future's SIZE is a property of the type, and constructing one is enough to
+    // read it. Nothing here touches the store.
+    let future = srv.token(TokenRequest::AuthorizationCode {
+        client_id: ClientId::new("public-app"),
+        client_secret: None,
+        code: String::new(),
+        redirect_uri: None,
+        code_verifier: None,
+    });
+    let size = std::mem::size_of_val(&future);
+    drop(future);
+    assert!(
+        size <= 2048,
+        "the token future is {size} bytes, past tokio's 2048-byte debug boxing threshold: every \
+         token request now pays a 2 KB allocation. Restructure the path (do not raise this bound, \
+         which is tokio's and not this crate's)"
     );
 }

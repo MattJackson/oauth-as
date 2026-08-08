@@ -783,7 +783,7 @@ fn storage_error(e: StorageError) -> ErrorResponse {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GrantedDetails {
     /// BOXED, and an `Option` so that the common case is a null pointer. The token future
-    /// is 1976 bytes against tokio's 2048-byte debug boxing threshold, and this value is
+    /// is 1824 bytes against tokio's 2048-byte debug boxing threshold, and this value is
     /// live in it at six points; carrying the details inline (three words) crossed the
     /// threshold and cost a 2 KB allocation on EVERY token request, which is exactly the
     /// regression `tests/allocation.rs` was written to catch, and it caught this one. One
@@ -1768,150 +1768,175 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// with an emptier context, so there is one implementation of the token endpoint and not three.
     /// Both of them are plain functions returning THIS future rather than `async fn`s that await
     /// it, and that is a measurement rather than a style: an `async fn` wrapper is a second
-    /// generator frame holding its own copy of the 160-byte [`TokenRequest`] while the inner future
+    /// generator frame holding its own copy of the 120-byte [`TokenRequest`] while the inner future
     /// holds another, and adding one pushed the token future over tokio's 2048-byte debug boxing
     /// threshold. `tests/allocation.rs` caught it.
+    ///
+    /// # Why THIS one is a plain function too, and not an `async fn`
+    ///
+    /// The same measurement, one level down, and it is the largest single saving on this path.
+    /// An `async fn` stores its parameters TWICE: once as the coroutine's upvars, which is where
+    /// they live before the first poll, and again as the locals they are moved into on that first
+    /// poll. rustc does not overlay the two, so `request` (120 bytes) and `context` (104 bytes)
+    /// were each counted twice for the whole life of the future. A plain function returning an
+    /// `async move` block captures each ONCE, as an upvar the body reads directly.
+    ///
+    /// Measured on the RFC 6749 s4.1.3 arm, which is the widest: 2056 bytes as an `async fn`
+    /// against 1824 as a block, both `--all-features`. The first of those is past tokio's
+    /// threshold and costs a 2 KB heap allocation on every single token request.
     ///
     /// The client secret may be presented EITHER on the [`TokenRequest`] variant (where it has
     /// always lived) or on [`TokenRequestContext::credential`]; the context wins when both are set,
     /// and neither is silently dropped.
+    // `manual_async_fn` is exactly the simplification this function must NOT take: see the
+    // measurement in the doc comment above. An `async fn` here stores `request` and `context`
+    // twice over and puts the token future past tokio's debug boxing threshold.
+    #[allow(clippy::manual_async_fn)]
     pub fn token_with_context<'a>(
         &'a self,
         request: TokenRequest,
         context: TokenRequestContext<'a>,
     ) -> impl std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + 'a {
         async move {
-        let requested_resources =
-            self.validate_resources(context.resources.iter().map(|r| r.as_str()))?;
-        // RFC 9396 s5 and s6, parsed and type-checked ONCE here for the same reason the
-        // resource indicators are validated once here: it is a parameter of the token
-        // request itself, not of any one grant. The s5 type check has to run at THIS
-        // endpoint too and not only at the authorization endpoint, because
-        // `client_credentials` reaches issuance without ever passing the other one.
-        #[cfg(feature = "rar")]
-        let requested_details = match context.authorization_details {
-            None => GrantedDetails::default(),
-            Some(raw) => {
-                let parsed = crate::rar::AuthorizationDetails::parse(raw)?;
-                parsed.require_supported_types(
-                    self.config.authorization_details_types_supported.as_deref(),
-                )?;
-                GrantedDetails::of(&parsed)
-            }
-        };
-        #[cfg(not(feature = "rar"))]
-        let requested_details = GrantedDetails::default();
-        // RFC 9449 s4.3, before anything else touches the store: see `verify_dpop`.
-        #[cfg(feature = "dpop")]
-        let jkt = Box::pin(self.verify_dpop(context.dpop_proof)).await?;
-        match request {
-            TokenRequest::AuthorizationCode {
-                client_id,
-                client_secret,
-                code,
-                redirect_uri,
-                code_verifier,
-            } => {
-                let bound = Bound {
-                    cred: context.credential.or_secret(client_secret.as_deref()),
-                    #[cfg(feature = "dpop")]
-                    jkt: jkt.as_deref(),
-                };
-                let outcome = self
-                    .authorization_code_token(
-                        &client_id,
-                        &bound,
-                        &code,
-                        redirect_uri.as_deref(),
-                        code_verifier.as_deref(),
-                        &requested_resources,
-                        requested_details,
-                    )
-                    .await;
-                self.emit_refusal(&client_id, GrantType::AuthorizationCode, &outcome);
-                outcome
-            }
-            TokenRequest::ClientCredentials {
-                client_id,
-                client_secret,
-                scope,
-            } => {
-                let bound = Bound {
-                    cred: context.credential.or_secret(client_secret.as_deref()),
-                    #[cfg(feature = "dpop")]
-                    jkt: jkt.as_deref(),
-                };
-                let outcome = self
-                    .client_credentials_token(
-                        &client_id,
-                        &bound,
-                        scope.as_ref(),
-                        requested_resources,
-                        requested_details,
-                    )
-                    .await;
-                self.emit_refusal(&client_id, GrantType::ClientCredentials, &outcome);
-                outcome
-            }
-            TokenRequest::DeviceCode {
-                client_id,
-                client_secret,
-                device_code,
-            } => {
-                // RFC 8707 s2: nothing was granted to narrow to, so a resource here would be an
-                // audience the user never approved. See `token_with_resources`.
-                if !requested_resources.is_empty() {
-                    return Err(
-                        ErrorResponse::new(ErrorCode::InvalidTarget).with_description(
-                            "the device authorization request granted no resource to narrow to",
-                        ),
-                    );
+            let requested_resources =
+                self.validate_resources(context.resources.iter().map(|r| r.as_str()))?;
+            // RFC 9396 s5 and s6, parsed and type-checked ONCE here for the same reason the
+            // resource indicators are validated once here: it is a parameter of the token
+            // request itself, not of any one grant. The s5 type check has to run at THIS
+            // endpoint too and not only at the authorization endpoint, because
+            // `client_credentials` reaches issuance without ever passing the other one.
+            #[cfg(feature = "rar")]
+            let requested_details = match context.authorization_details {
+                None => GrantedDetails::default(),
+                Some(raw) => {
+                    let parsed = crate::rar::AuthorizationDetails::parse(raw)?;
+                    parsed.require_supported_types(
+                        self.config.authorization_details_types_supported.as_deref(),
+                    )?;
+                    GrantedDetails::of(&parsed)
                 }
-                // RFC 9396 s6, and the same argument: the device authorization request
-                // cannot carry authorization_details in this crate, so there is nothing
-                // granted for this poll to narrow to, and minting detail here would be
-                // authorizing something the user never saw.
-                #[cfg(feature = "rar")]
-                if !requested_details.is_empty() {
-                    return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
-                        .with_description(
-                            "the device authorization request granted no authorization_details",
-                        ));
+            };
+            #[cfg(not(feature = "rar"))]
+            let requested_details = GrantedDetails::default();
+            // RFC 9449 s4.3, before anything else touches the store: see `verify_dpop`.
+            #[cfg(feature = "dpop")]
+            let jkt = Box::pin(self.verify_dpop(context.dpop_proof)).await?;
+            // Matched by REFERENCE, and that is the second half of the same measurement the doc
+            // comment above records. Moving the fields out of the enum does not free the enum's
+            // own slot in the coroutine: `request` is an upvar, so its 120 bytes are reserved for
+            // the whole life of the future either way, and the moved-out owned fields were then a
+            // second 120 bytes of the same data live across the grant helper's await. Borrowing
+            // costs the helpers nothing, because every one of them already takes `&str` /
+            // `&ClientId` / `Option<&ScopeSet>`. Measured at 128 bytes of the all-features token
+            // future, 1952 down to 1824.
+            match &request {
+                TokenRequest::AuthorizationCode {
+                    client_id,
+                    client_secret,
+                    code,
+                    redirect_uri,
+                    code_verifier,
+                } => {
+                    let bound = Bound {
+                        cred: context.credential.or_secret(client_secret.as_deref()),
+                        #[cfg(feature = "dpop")]
+                        jkt: jkt.as_deref(),
+                    };
+                    let outcome = self
+                        .authorization_code_token(
+                            client_id,
+                            &bound,
+                            code,
+                            redirect_uri.as_deref(),
+                            code_verifier.as_deref(),
+                            &requested_resources,
+                            requested_details,
+                        )
+                        .await;
+                    self.emit_refusal(client_id, GrantType::AuthorizationCode, &outcome);
+                    outcome
                 }
-                let bound = Bound {
-                    cred: context.credential.or_secret(client_secret.as_deref()),
-                    #[cfg(feature = "dpop")]
-                    jkt: jkt.as_deref(),
-                };
-                let outcome = self.device_token(&client_id, &bound, &device_code).await;
-                self.emit_refusal(&client_id, GrantType::DeviceCode, &outcome);
-                outcome
+                TokenRequest::ClientCredentials {
+                    client_id,
+                    client_secret,
+                    scope,
+                } => {
+                    let bound = Bound {
+                        cred: context.credential.or_secret(client_secret.as_deref()),
+                        #[cfg(feature = "dpop")]
+                        jkt: jkt.as_deref(),
+                    };
+                    let outcome = self
+                        .client_credentials_token(
+                            client_id,
+                            &bound,
+                            scope.as_ref(),
+                            requested_resources,
+                            requested_details,
+                        )
+                        .await;
+                    self.emit_refusal(client_id, GrantType::ClientCredentials, &outcome);
+                    outcome
+                }
+                TokenRequest::DeviceCode {
+                    client_id,
+                    client_secret,
+                    device_code,
+                } => {
+                    // RFC 8707 s2: nothing was granted to narrow to, so a resource here would be an
+                    // audience the user never approved. See `token_with_resources`.
+                    if !requested_resources.is_empty() {
+                        return Err(
+                            ErrorResponse::new(ErrorCode::InvalidTarget).with_description(
+                                "the device authorization request granted no resource to narrow to",
+                            ),
+                        );
+                    }
+                    // RFC 9396 s6, and the same argument: the device authorization request
+                    // cannot carry authorization_details in this crate, so there is nothing
+                    // granted for this poll to narrow to, and minting detail here would be
+                    // authorizing something the user never saw.
+                    #[cfg(feature = "rar")]
+                    if !requested_details.is_empty() {
+                        return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                            .with_description(
+                                "the device authorization request granted no authorization_details",
+                            ));
+                    }
+                    let bound = Bound {
+                        cred: context.credential.or_secret(client_secret.as_deref()),
+                        #[cfg(feature = "dpop")]
+                        jkt: jkt.as_deref(),
+                    };
+                    let outcome = self.device_token(client_id, &bound, device_code).await;
+                    self.emit_refusal(client_id, GrantType::DeviceCode, &outcome);
+                    outcome
+                }
+                TokenRequest::RefreshToken {
+                    client_id,
+                    client_secret,
+                    refresh_token,
+                    scope,
+                } => {
+                    let bound = Bound {
+                        cred: context.credential.or_secret(client_secret.as_deref()),
+                        #[cfg(feature = "dpop")]
+                        jkt: jkt.as_deref(),
+                    };
+                    let outcome = self
+                        .refresh_token(
+                            client_id,
+                            &bound,
+                            refresh_token,
+                            scope.as_ref(),
+                            &requested_resources,
+                            requested_details,
+                        )
+                        .await;
+                    self.emit_refusal(client_id, GrantType::RefreshToken, &outcome);
+                    outcome
+                }
             }
-            TokenRequest::RefreshToken {
-                client_id,
-                client_secret,
-                refresh_token,
-                scope,
-            } => {
-                let bound = Bound {
-                    cred: context.credential.or_secret(client_secret.as_deref()),
-                    #[cfg(feature = "dpop")]
-                    jkt: jkt.as_deref(),
-                };
-                let outcome = self
-                    .refresh_token(
-                        &client_id,
-                        &bound,
-                        &refresh_token,
-                        scope.as_ref(),
-                        &requested_resources,
-                        requested_details,
-                    )
-                    .await;
-                self.emit_refusal(&client_id, GrantType::RefreshToken, &outcome);
-                outcome
-            }
-        }
         }
     }
 
