@@ -142,7 +142,12 @@ EDITS = [
                 "# because a deployment that has not defined any authorization details TYPE has nothing to\n"
                 "# express with it, and because the parameter is unauthenticated attacker-supplied JSON at\n"
                 "# the authorization endpoint: a server that has not decided it needs this should not be\n"
-                "# parsing it. No dependency: serde_json is already here and is all this needs.\n"
+                "# parsing it.\n"
+                "#\n"
+                "# NO NEW DEPENDENCY: serde_json is already an unconditional dependency of this crate and is\n"
+                "# all this needs. If serde_json is ever made optional, this feature MUST gain\n"
+                "# `dep:serde_json`; it is written as an empty list today only because a `dep:` entry naming\n"
+                "# a non-optional dependency is a cargo error.\n"
                 "rar = []\n",
                 1,
             )

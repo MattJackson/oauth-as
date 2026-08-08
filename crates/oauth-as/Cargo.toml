@@ -78,6 +78,18 @@ resource-metadata = []
 # OFF by default because it is a grant that mints a token from a token, and a deployment
 # that has not decided its delegation policy should not have the endpoint compiled in.
 token-exchange = []
+# RFC 9396 rich authorization requests: the `authorization_details` parameter, which says
+# what a client is asking for as structure rather than as a scope string. OFF by default
+# because a deployment that has not defined any authorization details TYPE has nothing to
+# express with it, and because the parameter is unauthenticated attacker-supplied JSON at
+# the authorization endpoint: a server that has not decided it needs this should not be
+# parsing it.
+#
+# NO NEW DEPENDENCY: serde_json is already an unconditional dependency of this crate and is
+# all this needs. If serde_json is ever made optional, this feature MUST gain
+# `dep:serde_json`; it is written as an empty list today only because a `dep:` entry naming
+# a non-optional dependency is a cargo error.
+rar = []
 # A RUNNABLE conformance harness for the `Storage` contract, for a HOST to call from its
 # own test suite against its own implementation (crates/oauth-as/src/storage_conformance.rs).
 #
