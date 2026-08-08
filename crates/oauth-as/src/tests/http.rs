@@ -369,3 +369,145 @@ fn a_verification_uri_off_the_issuer_is_not_an_error() {
     ));
     assert!(RouterBuilder::new(server).build().is_ok());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Closing holes a `--features http,jwt` mutation run found. Each test below exists because the
+// code it covers could be changed and nothing failed.
+// ---------------------------------------------------------------------------------------------
+
+/// Exhaustive over all 256 byte values, because a hex nibble decoder is exactly the kind of small
+/// arithmetic where a wrong constant is invisible in the cases anyone thinks to write. The
+/// existing decoder tests used `%2D`, `%20` and `%3A`: digits and uppercase only, so the entire
+/// lowercase arm and every arithmetic constant in it went unpinned.
+///
+/// RFC 3986 s2.1 makes the two hex digits case-insensitive, so lowercase is not an edge case, it
+/// is what most clients emit.
+#[test]
+fn hex_value_is_exhaustively_correct_over_every_byte() {
+    const DIGITS: &[u8] = b"0123456789abcdef";
+    for b in 0u8..=255 {
+        // The reference answer, written independently of the implementation: the position of this
+        // byte in the hex alphabet, case-folded, or nothing at all.
+        let expected = DIGITS
+            .iter()
+            .position(|d| *d == b.to_ascii_lowercase())
+            .map(|i| i as u8);
+        assert_eq!(hex_value(b), expected, "byte {b:#04x}");
+    }
+}
+
+/// The same decoder from the outside: a lowercase escape has to produce the byte it names.
+#[test]
+fn lowercase_percent_escapes_decode_to_the_byte_they_name() {
+    assert_eq!(decode_component("%2f"), "/");
+    assert_eq!(decode_component("%6a"), "j");
+    assert_eq!(decode_component("%7e"), "~");
+    // Mixed case in one escape, which RFC 3986 s2.1 also permits.
+    assert_eq!(decode_component("%2F"), "/");
+    assert_eq!(decode_component("%6A"), "j");
+    assert_eq!(
+        decode_component("urn%3aietf%3aparams%3aoauth%3agrant-type%3adevice_code"),
+        "urn:ietf:params:oauth:grant-type:device_code"
+    );
+}
+
+/// A `%` with exactly ONE byte after it. The escape guard has to demand both nibbles are real
+/// INDICES, not merely that one more byte exists, or the decoder reads past the end of an
+/// attacker-supplied string. The existing tests covered `%` at the very end and `%zz`, both of
+/// which miss this position by one.
+#[test]
+fn a_truncated_escape_at_the_end_is_passed_through_rather_than_read_past() {
+    assert_eq!(decode_component("%2"), "%2");
+    assert_eq!(decode_component("%"), "%");
+    assert_eq!(decode_component("ab%f"), "ab%f");
+    assert_eq!(decode_component("a%2b%c"), "a+%c");
+}
+
+/// RFC 8707 s2 permits `resource` to be repeated, and every occurrence counts: dropping one would
+/// issue a token for less than the client asked for, silently. This is the one parameter the
+/// first-wins rule in [`param`] must not be applied to.
+#[test]
+fn every_resource_indicator_survives_including_repeats() {
+    let pairs = parse_pairs(
+        "resource=https%3A%2F%2Fa.example&client_id=c&resource=https%3A%2F%2Fb.example",
+    );
+    assert_eq!(
+        resource_indicators(&pairs),
+        vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string()
+        ]
+    );
+    assert!(resource_indicators(&parse_pairs("client_id=c")).is_empty());
+}
+
+/// A supplied `scope` has to be READ, and a malformed one has to be `invalid_scope` rather than
+/// silently absent. Treating an unparseable scope as "none requested" would hand the client the
+/// registered DEFAULT scopes instead of refusing, which is a quiet upgrade of what it asked for.
+#[test]
+fn a_supplied_scope_is_parsed_and_a_malformed_one_is_invalid_scope() {
+    assert!(optional_scope(&parse_pairs("grant_type=x"))
+        .expect("absent is not an error")
+        .is_none());
+
+    let parsed = optional_scope(&parse_pairs("scope=read+write"))
+        .expect("a well-formed scope")
+        .expect("present");
+    assert_eq!(parsed.to_string(), "read write");
+
+    // RFC 6749 s3.3 scope tokens exclude the double quote and the backslash.
+    let err = optional_scope(&parse_pairs("scope=%22read%22")).expect_err("not a scope list");
+    assert_eq!(err.error, ErrorCode::InvalidScope);
+}
+
+/// Every [`RouterError`] is a host configuration mistake, and the message is the only thing that
+/// tells the host WHICH one. An empty message turns a five-second fix into a hunt.
+#[test]
+fn router_errors_name_the_endpoint_or_the_path_at_fault() {
+    let text = RouterError::EndpointOutsideIssuer {
+        endpoint: "token_endpoint",
+        url: "https://other.example/token".to_string(),
+    }
+    .to_string();
+    assert!(text.contains("token_endpoint"), "{text}");
+    assert!(text.contains("https://other.example/token"), "{text}");
+
+    let text = RouterError::DuplicatePath {
+        path: "/same".to_string(),
+    }
+    .to_string();
+    assert!(text.contains("/same"), "{text}");
+
+    let text = RouterError::MetadataNotSerializable {
+        detail: "serializer said no".to_string(),
+    }
+    .to_string();
+    assert!(text.contains("serializer said no"), "{text}");
+
+    #[cfg(feature = "jwt")]
+    {
+        let text = RouterError::JwksNotSerializable {
+            detail: "serializer said no".to_string(),
+        }
+        .to_string();
+        assert!(text.contains("serializer said no"), "{text}");
+    }
+}
+
+/// The message-only page is what every outcome and every refusal on the device verification
+/// endpoint is rendered through, so a page that does not contain its message is a user staring at
+/// a blank screen after approving access to their account.
+#[test]
+fn a_message_page_carries_its_message_and_escapes_it() {
+    let html = verification_message("Approved. You can return to your device.");
+    assert!(html.starts_with("<!DOCTYPE html"), "{html}");
+    assert!(
+        html.contains("Approved. You can return to your device."),
+        "{html}"
+    );
+    assert!(html.ends_with("</body></html>"), "{html}");
+
+    let html = verification_message("<script>alert(1)</script>");
+    assert!(!html.contains("<script>"), "{html}");
+    assert!(html.contains("&lt;script&gt;"), "{html}");
+}
