@@ -15,6 +15,22 @@ fn headers_with(auth: &str) -> HeaderMap {
     h
 }
 
+/// The refusal, or a panic naming what came back instead.
+///
+/// `Result::expect_err` cannot be used here: it formats the `Ok` value with `Debug`, and
+/// `Credentials` deliberately has none, because deriving one would put a live client secret into
+/// whatever formatted it. That is the point of the omission, so the tests work around it rather
+/// than reintroducing the derive to make an assertion tidier.
+fn refusal(result: Result<Credentials, ErrorResponse>) -> ErrorResponse {
+    match result {
+        Err(e) => e,
+        Ok(creds) => panic!(
+            "expected a refusal, got credentials for client_id {:?}",
+            creds.client_id
+        ),
+    }
+}
+
 #[test]
 fn decoding_borrows_when_there_is_nothing_to_decode() {
     // The efficiency claim in the module docs, held to: an opaque token is hex or base64url and
@@ -104,13 +120,46 @@ fn two_authentication_methods_are_refused() {
     // request."
     let raw = BASE64_STANDARD.encode("client:secret");
     let form = parse_pairs("client_id=client&client_secret=secret");
-    let err = credentials(&headers_with(&format!("Basic {raw}")), &form).expect_err("refused");
+    let err = refusal(credentials(&headers_with(&format!("Basic {raw}")), &form));
     assert_eq!(err.error, ErrorCode::InvalidRequest);
 
     // Even a bare client_id alongside Basic is two methods' worth of identity claims.
     let form = parse_pairs("client_id=client");
-    let err = credentials(&headers_with(&format!("Basic {raw}")), &form).expect_err("refused");
+    let err = refusal(credentials(&headers_with(&format!("Basic {raw}")), &form));
     assert_eq!(err.error, ErrorCode::InvalidRequest);
+}
+
+/// RFC 9126 s2.1 makes this the ONE endpoint where a form `client_id` alongside Basic is not two
+/// authentication methods: the pushed body carries the RFC 6749 s4.1.1 authorization request, in
+/// which `client_id` is REQUIRED, and the client also authenticates as it does at the token
+/// endpoint. Applying the token endpoint's rule here would make PAR unusable for every
+/// confidential client that authenticates with a header.
+#[cfg(feature = "par")]
+#[test]
+fn a_pushed_request_may_carry_client_id_alongside_basic() {
+    let raw = BASE64_STANDARD.encode("client:secret");
+    let headers = headers_with(&format!("Basic {raw}"));
+    let form = parse_pairs("client_id=client&response_type=code");
+
+    // The token endpoint's rule is unchanged.
+    assert_eq!(
+        refusal(credentials(&headers, &form)).error,
+        ErrorCode::InvalidRequest
+    );
+
+    // The PAR endpoint's is not, and the identity comes from the HEADER, which is the
+    // authenticated one. A mismatched body `client_id` is then caught by RFC 9126 s2.1's own
+    // check inside the server, not by pretending the parameter was a credential.
+    let creds = pushed_request_credentials(&headers, &form).expect("RFC 9126 s2.1 allows this");
+    assert_eq!(creds.client_id, "client");
+    assert_eq!(creds.client_secret.as_deref(), Some("secret"));
+
+    // A real second CREDENTIAL is still two methods.
+    let both = parse_pairs("client_id=client&client_secret=secret");
+    assert_eq!(
+        refusal(pushed_request_credentials(&headers, &both)).error,
+        ErrorCode::InvalidRequest
+    );
 }
 
 #[test]
@@ -124,7 +173,7 @@ fn a_public_client_may_present_a_bare_client_id() {
 #[test]
 fn no_credentials_at_all_is_invalid_client() {
     // RFC 6749 s5.2 lists "no client authentication included" under invalid_client by name.
-    let err = credentials(&HeaderMap::new(), &parse_pairs("grant_type=x")).expect_err("refused");
+    let err = refusal(credentials(&HeaderMap::new(), &parse_pairs("grant_type=x")));
     assert_eq!(err.error, ErrorCode::InvalidClient);
 }
 

@@ -415,6 +415,23 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         let verification =
             endpoint_path(&issuer, "verification_uri", &config.verification_uri).ok();
 
+        // RFC 9126 s5 `pushed_authorization_request_endpoint`. `from_config` advertises it exactly
+        // when the host set `ServerConfig::par`, and section 5 says its presence is sufficient for
+        // a client to decide it may use PAR. So an advertised endpoint that is not routed is not a
+        // convenience gap, it is the one lie a client had no way to check first: it would push its
+        // whole request, including the PKCE challenge, at a 404 and have nowhere to fall back to.
+        // Off-issuer is an error for the same reason introspection's is: these bytes are minted by
+        // this server and nothing else can mint them.
+        #[cfg(feature = "par")]
+        let par = match &meta.pushed_authorization_request_endpoint {
+            Some(u) => Some(endpoint_path(
+                &issuer,
+                "pushed_authorization_request_endpoint",
+                u,
+            )?),
+            None => None,
+        };
+
         // RFC 8414 s2 `jwks_uri`. `from_config` advertises it exactly when this server signs its
         // access tokens, so when it is present the key set is ours to serve and an off-issuer URL
         // is an error, exactly as it is for introspection and revocation. That is stricter than
@@ -472,6 +489,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         paths.extend(verification.as_deref());
         paths.extend(register.as_deref());
         paths.extend(manage.as_deref());
+        #[cfg(feature = "par")]
+        paths.extend(par.as_deref());
         #[cfg(feature = "jwt")]
         paths.extend(jwks_path.as_deref());
         for i in 0..paths.len() {
@@ -510,13 +529,38 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
                     .delete(delete_registration_handler::<S, C>),
             );
         }
+        #[cfg(feature = "par")]
+        if let Some(path) = &par {
+            router = router.route(path, post(pushed_authorization_handler::<S, C>));
+        }
         #[cfg(feature = "jwt")]
         if let Some(path) = &jwks_path {
             router = router.route(path, get(jwks_handler::<S, C>));
         }
-        Ok(router.with_state(inner))
+        // Every POST here is read into memory whole before it is parsed, and every one of these
+        // endpoints is reachable BEFORE the client is authenticated (authentication is in the body
+        // for `client_secret_post`, so it cannot be checked first). An unbounded body on such an
+        // endpoint is a memory exhaustion primitive available to anyone who can open a socket, so
+        // the cap is stated here rather than inherited: see [`MAX_BODY_BYTES`].
+        Ok(router
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .with_state(inner))
     }
 }
+
+/// The largest request body any endpoint this router serves will read.
+///
+/// 64 KiB, chosen against the largest legitimate body rather than picked round. The biggest is an
+/// RFC 7591 s2 client metadata document (a registration with many redirect URIs and a `jwks`), and
+/// after that an RFC 9126 push carrying an RFC 9101 signed request object; both are kilobytes, not
+/// tens of them. Every other body is a form of a dozen short parameters.
+///
+/// Stated rather than inherited from the framework's default, because a cap this file did not
+/// choose is a cap that can change under it, and this one is a security property: these endpoints
+/// buffer the whole body before parsing, and they are reachable before the client is
+/// authenticated, so the ceiling on "how much memory can an anonymous request make this server
+/// hold" is set here.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// The absolute request path an advertised URL occupies, measured from the ORIGIN's root.
 ///
@@ -704,15 +748,24 @@ type Pair<'a> = (Cow<'a, str>, Cow<'a, str>);
 /// Split a form body or query string into decoded pairs. A parameter with no `=` is kept with an
 /// empty value, which is how a client spells "present but empty" and must not be mistaken for
 /// absent.
+/// Sized up front rather than grown. `Split` has no `size_hint`, so `collect` starts from nothing
+/// and doubles: a six-parameter token body reallocates three times and memcpys 64 bytes per pair
+/// each time. Counting the separators is one linear pass over bytes that are about to be walked
+/// anyway, and it is an exact upper bound (empty segments are filtered out, so it can only
+/// overshoot). This runs on EVERY routed request, which is what makes a free win worth taking.
 fn parse_pairs(input: &str) -> Vec<Pair<'_>> {
-    input
-        .split('&')
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.split_once('=') {
-            Some((k, v)) => (decode_component(k), decode_component(v)),
-            None => (decode_component(part), Cow::Borrowed("")),
-        })
-        .collect()
+    let bound = input.bytes().filter(|b| *b == b'&').count() + 1;
+    let mut pairs = Vec::with_capacity(bound);
+    pairs.extend(
+        input
+            .split('&')
+            .filter(|part| !part.is_empty())
+            .map(|part| match part.split_once('=') {
+                Some((k, v)) => (decode_component(k), decode_component(v)),
+                None => (decode_component(part), Cow::Borrowed("")),
+            }),
+    );
+    pairs
 }
 
 /// The FIRST occurrence of a parameter.
@@ -764,7 +817,14 @@ fn optional_scope(pairs: &[Pair<'_>]) -> Result<Option<ScopeSet>, ErrorResponse>
 // ---------------------------------------------------------------------------------------------
 
 /// Authenticated (or merely identified) client credentials from one request.
-#[derive(Debug)]
+///
+/// DELIBERATELY NOT `Debug`, and not by omission. Every field but `client_id` is a live credential
+/// decoded straight off the wire (a shared secret, or an RFC 7523 assertion that is a bearer
+/// credential for as long as it is unexpired), and this value is in scope in five handlers. A
+/// derived `Debug` would put all of it verbatim into a host's logs the first time somebody wrote
+/// `tracing::debug!(?creds)`. A redacting `Debug` would make that line compile and print something
+/// safe; no `Debug` at all makes it fail to compile, which is the stronger guarantee and costs
+/// nothing, because nothing in this crate prints this type.
 struct Credentials {
     client_id: String,
     /// `None` for a public client, which has no secret to present.
@@ -787,6 +847,16 @@ impl Credentials {
             client_assertion_type: self.client_assertion_type.as_deref(),
             #[cfg(feature = "client_assertion")]
             client_assertion: self.client_assertion.as_deref(),
+            // ALWAYS `None`, and it has to be. This router is handed a parsed request; it
+            // does not terminate TLS and never sees the connection, so there is no
+            // certificate here that anybody verified. RFC 8705 clients reach the server
+            // through `ClientCredential::certificate` from a host that DID terminate the
+            // connection. Reading one out of a proxy header here would be the exact
+            // mistake `crate::mtls`'s trust boundary section warns about, and it would be
+            // made on every deployment's behalf rather than on the one host that knows
+            // whether its terminator can be trusted.
+            #[cfg(feature = "mtls")]
+            certificate: None,
         }
     }
 }
@@ -835,6 +905,40 @@ fn decode_basic(headers: &HeaderMap) -> Result<(String, String), ErrorResponse> 
 /// from the next server's, and the ambiguity is exactly what a request-smuggling intermediary
 /// would exploit.
 fn credentials(headers: &HeaderMap, form: &[Pair<'_>]) -> Result<Credentials, ErrorResponse> {
+    credentials_where(headers, form, false)
+}
+
+/// [`credentials`] for the RFC 9126 PAR endpoint, where a form `client_id` alongside header
+/// credentials is NOT a second authentication method.
+///
+/// This is the one endpoint where the distinction bites. RFC 9126 s2.1 says the pushed body
+/// carries the authorization request parameters of RFC 6749 s4.1.1, in which `client_id` is
+/// REQUIRED, AND that the client authenticates as it does at the token endpoint. A client using
+/// `client_secret_basic` therefore MUST send both, and this crate's token-endpoint rule (any
+/// `client_id` in the body alongside Basic is two methods) would make PAR unusable for every
+/// confidential client that authenticates with a header. The RFC settles it: there the parameter
+/// is a REQUEST parameter that happens to name the same client, and it carries no credential, so
+/// it cannot be a second authentication method.
+///
+/// Nothing is loosened about actual credentials: a `client_secret` or an assertion alongside Basic
+/// is still two methods and still refused. And the pushed `client_id` is not trusted either, it is
+/// checked against the AUTHENTICATED client inside
+/// [`AuthorizationServer::pushed_authorization_request`], which is RFC 9126 s2.1's own rule and
+/// what stops a client lodging a request under a victim's identity.
+#[cfg(feature = "par")]
+fn pushed_request_credentials(
+    headers: &HeaderMap,
+    form: &[Pair<'_>],
+) -> Result<Credentials, ErrorResponse> {
+    credentials_where(headers, form, true)
+}
+
+/// The shared body of the two above. `client_id_is_a_request_parameter` is the only difference.
+fn credentials_where(
+    headers: &HeaderMap,
+    form: &[Pair<'_>],
+    client_id_is_a_request_parameter: bool,
+) -> Result<Credentials, ErrorResponse> {
     let basic = basic_attempted(headers);
     let body_id = param(form, "client_id");
     let body_secret = param(form, "client_secret");
@@ -874,6 +978,21 @@ fn credentials(headers: &HeaderMap, form: &[Pair<'_>]) -> Result<Credentials, Er
     }
 
     match (basic, body_id, body_secret) {
+        // Header credentials, and no credential in the body. The `client_id` that may sit
+        // alongside them is IGNORED for authentication: whether it may be there at all was decided
+        // by the caller, and where it may, the endpoint checks it against the authenticated client
+        // itself rather than letting it select one.
+        (true, None, None) | (true, Some(_), None) if client_id_is_a_request_parameter => {
+            let (client_id, client_secret) = decode_basic(headers)?;
+            Ok(Credentials {
+                client_id,
+                client_secret: Some(client_secret),
+                #[cfg(feature = "client_assertion")]
+                client_assertion_type: None,
+                #[cfg(feature = "client_assertion")]
+                client_assertion: None,
+            })
+        }
         (true, None, None) => {
             let (client_id, client_secret) = decode_basic(headers)?;
             Ok(Credentials {
@@ -974,11 +1093,14 @@ async fn token_handler<S: Storage, C: Clock>(
         },
     };
 
-    let creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(&headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
-    let client_id = ClientId::new(creds.client_id.clone());
+    // TAKEN, not cloned. `creds` has to outlive this because `creds.credential()` borrows the
+    // secret fields below, but nothing reads `client_id` off it again, so moving the String out
+    // and leaving an empty one behind saves an allocation on every request to this endpoint.
+    let client_id = ClientId::new(std::mem::take(&mut creds.client_id));
     // NOT moved onto the TokenRequest variant any more: every credential this endpoint accepts now
     // travels together on the request CONTEXT, so there is one place a reader has to look to see
     // what the client presented, rather than one for secrets and another for everything else.
@@ -1191,24 +1313,77 @@ async fn device_authorization_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(&body);
     let form = parse_pairs(&text);
 
-    let creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(&headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
+    // TAKEN rather than cloned, for the reason the token endpoint gives: `creds` must
+    // outlive this call because `creds.credential()` borrows out of it, but its
+    // `client_id` is never read again.
+    let client_id = ClientId::new(std::mem::take(&mut creds.client_id));
     let scope = match optional_scope(&form) {
         Ok(s) => s,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
     match state
         .server
-        .device_authorization_with_credential(
-            &ClientId::new(creds.client_id.clone()),
-            &creds.credential(),
-            scope.as_ref(),
-        )
+        .device_authorization_with_credential(&client_id, &creds.credential(), scope.as_ref())
         .await
     {
         Ok(response) => ok_json(&response),
+        Err(e) => error_response(&e, via_header, &state.challenge),
+    }
+}
+
+/// RFC 9126 s2: the pushed authorization request endpoint.
+///
+/// It is on the TOKEN plane, not the authorization plane, and everything about this handler
+/// follows from that: the client authenticates here exactly as it does at the token endpoint
+/// (s2.1 step 1), so client authentication is resolved by the same [`credentials`] function and a
+/// failure gets the same RFC 6749 s5.2 shape with the same 401-versus-400 rule; and the response
+/// carries a capability handle, so it gets the same s5.1 caching directives. The one thing that
+/// differs is the success status, which s2.2 states rather than suggests: 201, not 200.
+#[cfg(feature = "par")]
+async fn pushed_authorization_handler<S: Storage, C: Clock>(
+    State(state): State<Arc<Inner<S, C>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let via_header = basic_attempted(&headers);
+    let text = String::from_utf8_lossy(&body);
+    let form = parse_pairs(&text);
+
+    let mut creds = match pushed_request_credentials(&headers, &form) {
+        Ok(c) => c,
+        Err(e) => return error_response(&e, via_header, &state.challenge),
+    };
+    // TAKEN rather than cloned, for the reason the token endpoint gives: `creds` must
+    // outlive this call because `creds.credential()` borrows out of it, but its
+    // `client_id` is never read again.
+    let client_id = ClientId::new(std::mem::take(&mut creds.client_id));
+    // The form EXACTLY as it arrived, with nothing filtered out. RFC 9126 s2.1 step 2 REFUSES a
+    // pushed `request_uri` and s3 treats a `request` as a signed request object, and both of those
+    // are decisions for the server: a router that quietly dropped either parameter would turn a
+    // refusal the RFC requires into a silent acceptance of a different request. Borrowed out of
+    // the parsed form, so passing it costs no allocation per parameter.
+    let parameters: Vec<(&str, &str)> =
+        form.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
+    match state
+        .server
+        .pushed_authorization_request_with_credential(&client_id, &creds.credential(), &parameters)
+        .await
+    {
+        Ok(response) => {
+            // s2.2: "with a 201 HTTP status code". Taken from the response type rather than
+            // written here twice, so the wire status and the type's own answer cannot drift.
+            let status =
+                StatusCode::from_u16(response.http_status()).unwrap_or(StatusCode::CREATED);
+            let mut resp = (status, json_body(&response)).into_response();
+            let h = resp.headers_mut();
+            h.insert(header::CONTENT_TYPE, json_content_type());
+            no_store(h);
+            resp
+        }
         Err(e) => error_response(&e, via_header, &state.challenge),
     }
 }
@@ -1223,21 +1398,21 @@ async fn introspect_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(&body);
     let form = parse_pairs(&text);
 
-    let creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(&headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
+    // TAKEN rather than cloned, for the reason the token endpoint gives: `creds` must
+    // outlive this call because `creds.credential()` borrows out of it, but its
+    // `client_id` is never read again.
+    let client_id = ClientId::new(std::mem::take(&mut creds.client_id));
     let token = match required(&form, "token") {
         Ok(v) => v,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
     match state
         .server
-        .introspection_response_with_credential(
-            &ClientId::new(creds.client_id.clone()),
-            &creds.credential(),
-            token,
-        )
+        .introspection_response_with_credential(&client_id, &creds.credential(), token)
         .await
     {
         Ok(response) => ok_json(&response),
@@ -1255,10 +1430,14 @@ async fn revoke_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(&body);
     let form = parse_pairs(&text);
 
-    let creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(&headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
+    // TAKEN rather than cloned, for the reason the token endpoint gives: `creds` must
+    // outlive this call because `creds.credential()` borrows out of it, but its
+    // `client_id` is never read again.
+    let client_id = ClientId::new(std::mem::take(&mut creds.client_id));
     let token = match required(&form, "token") {
         Ok(v) => v,
         Err(e) => return error_response(&e, via_header, &state.challenge),
@@ -1271,12 +1450,7 @@ async fn revoke_handler<S: Storage, C: Clock>(
 
     match state
         .server
-        .revoke(
-            &ClientId::new(creds.client_id),
-            creds.client_secret.as_deref(),
-            token,
-            hint,
-        )
+        .revoke(&client_id, creds.client_secret.as_deref(), token, hint)
         .await
     {
         Ok(()) => {
@@ -1341,12 +1515,21 @@ fn registration_error(failure: &crate::registration::RegistrationFailure) -> Res
 /// A body that is not JSON at all is `invalid_client_metadata`: s3.2.2 has no code for "your body
 /// was not JSON", and the client's problem is genuinely that the metadata it submitted is not
 /// metadata this server can read.
-fn client_metadata(body: &Bytes) -> Result<crate::registration::ClientMetadata, Response> {
+///
+/// The error half is BOXED. An `axum::Response` is a large value (a status, a header map and a
+/// body), and the `Ok` half here is the common one, so an unboxed `Result` would make every
+/// successful parse carry the error variant's footprint on the stack. That is what
+/// `clippy::result_large_err` is pointing at, and boxing is the fix it asks for rather than a
+/// lint to silence: the allocation happens only on the refusal path, which is the path that is
+/// about to write a response to a socket anyway.
+fn client_metadata(body: &Bytes) -> Result<crate::registration::ClientMetadata, Box<Response>> {
     serde_json::from_slice(body).map_err(|_| {
-        registration_error(&crate::registration::RegistrationFailure::Invalid(
-            crate::registration::RegistrationErrorResponse::new(
-                crate::registration::RegistrationErrorCode::InvalidClientMetadata,
-                "the request body is not an RFC 7591 s2 client metadata JSON object",
+        Box::new(registration_error(
+            &crate::registration::RegistrationFailure::Invalid(
+                crate::registration::RegistrationErrorResponse::new(
+                    crate::registration::RegistrationErrorCode::InvalidClientMetadata,
+                    "the request body is not an RFC 7591 s2 client metadata JSON object",
+                ),
             ),
         ))
     })
@@ -1360,7 +1543,7 @@ async fn register_handler<S: Storage, C: Clock>(
 ) -> Response {
     let metadata = match client_metadata(&body) {
         Ok(m) => m,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state
         .server
@@ -1407,7 +1590,7 @@ async fn update_registration_handler<S: Storage, C: Clock>(
 ) -> Response {
     let metadata = match client_metadata(&body) {
         Ok(m) => m,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let token = bearer_token(&headers).unwrap_or_default();
     match state
@@ -1441,6 +1624,94 @@ async fn delete_registration_handler<S: Storage, C: Clock>(
     }
 }
 
+/// Which of the ways an authorization request may arrive this one used, validated.
+///
+/// Three, and the two that are not query text exist because query text is the problem: it travels
+/// through the browser, its history, its `Referer` headers and every proxy in front of it, and
+/// anything able to rewrite the URL can change it before this server sees it.
+///
+/// - RFC 6749 s4.1.1, the parameters in the query.
+/// - RFC 9126 s4, `client_id` plus a `request_uri` this server minted at its own PAR endpoint.
+/// - RFC 9101 s5.1, `client_id` plus a signed `request` object.
+///
+/// For the latter two, EVERY other query parameter is ignored. That is not this function's choice
+/// to make and it is not made here: RFC 9101 s6.3 (which RFC 9126 s4 builds on) requires the
+/// server to use only the parameters carried by the reference or the object "even if the same
+/// parameter is provided in the query parameter", and the two server methods enforce it by not
+/// accepting any others, so there is no code path in which an appended `scope` could win.
+///
+/// With neither feature compiled in this is the plain query path and nothing else, which is what
+/// the crate did before either feature existed.
+async fn resolve_authorization_request<S: Storage, C: Clock>(
+    state: &Inner<S, C>,
+    pairs: &[Pair<'_>],
+) -> Result<crate::authorization::ValidatedAuthorizationRequest, AuthorizationError> {
+    #[cfg(any(feature = "par", feature = "jar"))]
+    {
+        // A `request_uri` this server cannot resolve (the `par` feature is off) is an UNKNOWN
+        // parameter, and RFC 6749 s3.1 says an unknown parameter is ignored. That is safe here
+        // only because a server without PAR compiled in never minted one, so there is no handle
+        // for the ignoring to downgrade.
+        #[cfg(feature = "par")]
+        let by_reference = param(pairs, "request_uri");
+        #[cfg(not(feature = "par"))]
+        let by_reference: Option<&str> = None;
+        #[cfg(feature = "jar")]
+        let by_value = param(pairs, "request");
+        #[cfg(not(feature = "jar"))]
+        let by_value: Option<&str> = None;
+
+        // RFC 9101 s5: "The client MUST NOT send both". Refused rather than resolved by
+        // precedence, for the reason RFC 6749 s2.3 gives about two client authentication methods:
+        // a server that picks one behaves differently from the next server, and that difference is
+        // what a smuggling intermediary exploits.
+        if by_reference.is_some() && by_value.is_some() {
+            return Err(AuthorizationError::Direct(
+                ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                    "request and request_uri must not both be sent (RFC 9101 s5)",
+                ),
+            ));
+        }
+
+        if by_reference.is_some() || by_value.is_some() {
+            // RFC 9126 s4 and RFC 9101 s5 both make `client_id` REQUIRED alongside the handle or
+            // the object, and it is load bearing rather than decorative: it selects the pushed
+            // record whose binding is then checked (s2.2, and s7.5 is the swapping attack), or the
+            // registered key the signature is verified with. Resolved once here rather than in a
+            // closure per branch, because a closure whose `Ok` is a `&str` and whose `Err` is a
+            // 128 byte `AuthorizationError` is exactly what `clippy::result_large_err` objects to.
+            let client_id = match param(pairs, "client_id") {
+                Some(id) => id,
+                None => {
+                    return Err(AuthorizationError::Direct(
+                        ErrorResponse::new(ErrorCode::InvalidRequest)
+                            .with_description("client_id is required (RFC 9126 s4, RFC 9101 s5)"),
+                    ))
+                }
+            };
+
+            #[cfg(feature = "par")]
+            if let Some(request_uri) = by_reference {
+                return state
+                    .server
+                    .validate_pushed_authorization_request(client_id, request_uri)
+                    .await;
+            }
+            #[cfg(feature = "jar")]
+            if let Some(request_object) = by_value {
+                return state
+                    .server
+                    .validate_signed_authorization_request(client_id, request_object)
+                    .await;
+            }
+        }
+    }
+
+    let request =
+        AuthorizationRequest::from_pairs(pairs.iter().map(|(k, v)| (k.as_ref(), v.clone())));
+    state.server.validate_authorization_request(&request).await
+}
+
 /// RFC 6749 s4.1.1: the authorization endpoint.
 async fn authorize_handler<S: Storage, C: Clock>(
     State(state): State<Arc<Inner<S, C>>>,
@@ -1448,10 +1719,8 @@ async fn authorize_handler<S: Storage, C: Clock>(
     uri: Uri,
 ) -> Response {
     let pairs = parse_pairs(uri.query().unwrap_or_default());
-    let request =
-        AuthorizationRequest::from_pairs(pairs.iter().map(|(k, v)| (k.as_ref(), v.clone())));
 
-    let validated = match state.server.validate_authorization_request(&request).await {
+    let validated = match resolve_authorization_request(&state, &pairs).await {
         Ok(v) => v,
         // RFC 6749 s4.1.2.1. `Direct` means the client or the redirect URI could not be
         // validated, so there is no address the server may safely send this to; it is rendered
