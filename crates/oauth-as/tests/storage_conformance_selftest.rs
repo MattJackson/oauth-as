@@ -57,6 +57,9 @@ struct Faults {
     drops_family_id: bool,
     /// `find_device_grant_by_user_code` normalizes the query on the caller's behalf.
     normalizes_user_codes: bool,
+    /// `put_token` persists every column except the RFC 9449 `jkt` binding.
+    #[cfg(feature = "dpop")]
+    drops_jkt: bool,
     /// `claim_replay_id` implemented as look-then-insert, with the suspension point a shared store
     /// has between the two. The RFC 7523 / RFC 9449 half of the same defect.
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
@@ -241,6 +244,14 @@ impl Storage for NaiveStore {
     }
 
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
+        #[cfg(feature = "dpop")]
+        let token = {
+            let mut token = token;
+            if self.faults.drops_jkt {
+                token.jkt = None;
+            }
+            token
+        };
         self.lock().tokens.insert(token.access_token.clone(), token);
         Ok(())
     }
@@ -661,6 +672,31 @@ async fn a_store_that_silently_drops_family_id_is_caught() {
     );
 }
 
+/// A dropped DPoP binding is the same quiet class of defect as a dropped `family_id`: every
+/// request works, and the sender-constrained token the deployment paid for is a bearer token
+/// again. RFC 9449 s6 puts the thumbprint in the token's confirmation claim, so losing it at rest
+/// is losing the binding for every resource server that introspects.
+#[cfg(feature = "dpop")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_dpop_binding_is_caught() {
+    let violations = run_against(Faults {
+        drops_jkt: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/token"],
+        "{violations:#?}"
+    );
+    let detail = detail_of(&violations, "round_trip/token");
+    assert!(
+        detail.contains("jkt") && detail.contains("did not survive the round trip"),
+        "the violation must name the field that was dropped: {detail}"
+    );
+}
+
 /// The RFC 7523 / RFC 9449 half of the headline defect. A look-then-insert claim tells two
 /// concurrent presentations of the SAME assertion that each of them was the first, which is the
 /// replay both RFCs exist to refuse, and nothing downstream notices: the replayed request is
@@ -732,6 +768,8 @@ async fn every_violation_names_a_published_check() {
         delete_token_errors_when_absent: true,
         drops_family_id: true,
         normalizes_user_codes: true,
+        #[cfg(feature = "dpop")]
+        drops_jkt: true,
         #[cfg(any(feature = "client_assertion", feature = "dpop"))]
         look_then_insert_claim: true,
     })

@@ -607,6 +607,9 @@ where
         // RFC 9700 section 4.14.2: without this, a detected reuse cannot reach the access tokens
         // the thief already minted.
         report.same(c, "family_id", &want.family_id, &got.family_id);
+        // RFC 9449 section 6: the DPoP binding. Dropped, the token is a bearer token again.
+        #[cfg(feature = "dpop")]
+        report.same(c, "jkt", &want.jkt, &got.jkt);
     }
 
     async fn round_trip_refresh_token(&self, report: &mut Report) {
@@ -643,6 +646,9 @@ where
         // `Spent` is the whole basis of reuse detection: a store that reads every record back as
         // `Active` turns the RFC 9700 section 4.14.2 remedy off.
         report.same(c, "state", &want.state, &got.state);
+        // RFC 9449 section 5: carried across rotation and checked on redemption.
+        #[cfg(feature = "dpop")]
+        report.same(c, "jkt", &want.jkt, &got.jkt);
     }
 
     // ------------------------------------------------------------------ atomicity
@@ -1985,6 +1991,12 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
         issued_at: at_before(10),
         expires_at: at(3600),
         family_id: family_id.map(str::to_string),
+        // RFC 9449 s6: the key this token is bound to. A store that drops it turns a
+        // sender-constrained token back into a bearer token, and nothing on the token plane
+        // notices, because a token that verifies with no binding is exactly what a bearer token
+        // is.
+        #[cfg(feature = "dpop")]
+        jkt: Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I".into()),
     }
 }
 
@@ -2001,6 +2013,11 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
         expires_at: Some(at(86_400)),
         family_id: family_id.to_string(),
         state: RefreshTokenState::Spent,
+        // RFC 9449 s5. Dropped here, a stolen refresh token can be re-bound to the thief's key on
+        // the next rotation, which leaves the attacker holding a provable token and the victim
+        // holding the key that gets refused.
+        #[cfg(feature = "dpop")]
+        jkt: Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I".into()),
     }
 }
 
