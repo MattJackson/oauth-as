@@ -636,13 +636,19 @@ fn core_public_types_stay_within_their_size_budget() {
     // IssuedToken carries the opaque token string, a ClientId, an Option<String> subject, a
     // ScopeSet (a BTreeSet, 1 pointer-ish word), and two SystemTime instants.
     //
-    // The `dpop` feature adds the RFC 9449 s6 key binding, an `Option<Box<str>>`. Budgeted
-    // SEPARATELY rather than by raising the number, so that a deployment which does not enable
-    // sender-constrained tokens still cannot be made to pay 16 bytes per issued token for them.
-    #[cfg(feature = "dpop")]
-    let issued_token_budget = 192;
-    #[cfg(not(feature = "dpop"))]
-    let issued_token_budget = 176;
+    // Each optional sender-constraining mechanism adds ONE field, and each is budgeted
+    // SEPARATELY and ADDITIVELY rather than by raising a single number: a deployment that
+    // enables neither must not be made to pay for either, and one that enables one must
+    // not be made to pay for the other.
+    //
+    // `dpop`: the RFC 9449 s6 key binding, an `Option<Box<str>>`, 16 bytes, because `str`
+    // is unsized and the pointer to it is fat.
+    // `mtls`: the RFC 8705 s3 certificate binding, an `Option<Box<CertificateThumbprint>>`,
+    // 8 bytes, because a thumbprint is a fixed `[u8; 32]` and the pointer to it is thin.
+    // The 32 bytes themselves are allocated only for a token that is certificate bound.
+    let issued_token_budget = 176
+        + if cfg!(feature = "dpop") { 16 } else { 0 }
+        + if cfg!(feature = "mtls") { 8 } else { 0 };
     assert!(
         size_of::<IssuedToken>() <= issued_token_budget,
         "IssuedToken grew past its size budget: {}",

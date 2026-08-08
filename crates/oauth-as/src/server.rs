@@ -413,6 +413,29 @@ pub struct ClientCredential<'a> {
     /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.
     #[cfg(feature = "client_assertion")]
     pub client_assertion: Option<&'a str>,
+    /// The RFC 8705 client certificate the HOST has ALREADY VERIFIED for this connection.
+    ///
+    /// READ [`crate::mtls`]'s trust boundary section before setting this. This library
+    /// never sees a socket, so it cannot validate a chain it did not negotiate: a host that
+    /// fills this in from an unverified source (an unstripped `X-Client-Cert` header, a
+    /// terminator that requests but does not require a certificate) has authenticated
+    /// nobody, and every comparison this crate then makes is against a value the caller
+    /// chose.
+    ///
+    /// It does two separate jobs, either of which can apply on its own:
+    ///
+    /// - section 2, AUTHENTICATION: a client registered with
+    ///   [`crate::client::ClientAuth::Mtls`] is authenticated by this certificate and by
+    ///   nothing else. Such a client cannot authenticate through a call that leaves this
+    ///   `None`, which is the point: a host that forgets to pass the certificate gets
+    ///   `invalid_client`, never a token.
+    /// - section 3, BINDING: the issued access token is bound to this certificate whatever
+    ///   the client's authentication method was, including a public client (section 4).
+    ///   Binding is not conditional on a per-client flag, because a bound token is never
+    ///   less safe than the unbound one it replaces, and a client that does not want
+    ///   binding does not present a certificate.
+    #[cfg(feature = "mtls")]
+    pub certificate: Option<&'a crate::mtls::ClientCertificate<'a>>,
 }
 
 impl<'a> ClientCredential<'a> {
@@ -425,6 +448,8 @@ impl<'a> ClientCredential<'a> {
             client_assertion_type: None,
             #[cfg(feature = "client_assertion")]
             client_assertion: None,
+            #[cfg(feature = "mtls")]
+            certificate: None,
         }
     }
 
@@ -435,6 +460,23 @@ impl<'a> ClientCredential<'a> {
             client_secret: None,
             client_assertion_type,
             client_assertion: Some(client_assertion),
+            #[cfg(feature = "mtls")]
+            certificate: None,
+        }
+    }
+
+    /// The RFC 8705 credential: the client certificate the host verified during the TLS
+    /// handshake, and no secret at all.
+    ///
+    /// For a client that authenticates some OTHER way and still wants its token bound
+    /// (RFC 8705 section 4, including a public client), set
+    /// [`ClientCredential::certificate`] on the credential it is already using rather than
+    /// replacing it with this one.
+    #[cfg(feature = "mtls")]
+    pub fn certificate(certificate: &'a crate::mtls::ClientCertificate<'a>) -> Self {
+        ClientCredential {
+            certificate: Some(certificate),
+            ..ClientCredential::secret(None)
         }
     }
 
@@ -762,6 +804,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Turn the freshly minted random token into what actually goes on the wire: itself when the
     /// format is opaque (the byte-for-byte pre-feature behaviour), or an RFC 9068 access token
     /// carrying it as `jti` when the host configured signing.
+    // Eight arguments, since the RFC 8705 binding is a property of the REQUEST rather than of the
+    // grant. Same allow and same reason as `issue` below: a private function with one call site,
+    // whose arguments would have to live across every await in the token future if they were
+    // bundled into a struct to satisfy a lint.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "jwt")]
     fn wire_access_token(
         &self,
@@ -771,7 +818,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         resource: &[String],
         now: SystemTime,
         jti: String,
+        bound: &Bound<'_>,
     ) -> Result<String, ErrorResponse> {
+        // Only the RFC 8705 binding is read out of it here; without that feature the
+        // signed claim set does not depend on how the client authenticated.
+        #[cfg(not(feature = "mtls"))]
+        let _ = bound;
         let jwt = match &self.config.access_token_format {
             AccessTokenFormat::Opaque => return Ok(jti),
             AccessTokenFormat::Jwt(jwt) => jwt,
@@ -811,6 +863,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
             jti,
             scope: (!scope.is_empty()).then(|| scope.to_string()),
+            // RFC 8705 s3.1: the same binding the AS-side record carries, in the form a
+            // resource server can check for itself without calling introspection at all.
+            #[cfg(feature = "mtls")]
+            cnf: bound.cred.certificate.map(|c| crate::token::Confirmation {
+                #[cfg(feature = "dpop")]
+                jkt: None,
+                x5t_s256: Some(*c.thumbprint()),
+            }),
         };
         jwt.sign_access_token(&claims).map_err(|e| {
             // The host sees the real error through its own logging of the config it supplied; the
@@ -1027,6 +1087,37 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         failure: ClientAuthFailure::AssertionInvalid,
                     });
                     Err(error)
+                }
+            };
+        }
+
+        // RFC 8705 s2 mutual-TLS client authentication, handled apart from the secret
+        // comparison below for the same reason the assertion above is: it is a different
+        // KIND of credential. There is nothing to compare; there is a certificate the HOST
+        // verified, matched against what the registration says it expects to see.
+        //
+        // Dispatched on the REGISTRATION, never on what the request happened to present.
+        // That direction is load bearing in both senses: a certificate presented by a
+        // secret-authenticating client never reaches this path (it is for section 3 binding
+        // only), and a mutual-TLS client can never fall through to the secret comparison
+        // below.
+        #[cfg(feature = "mtls")]
+        if matches!(client.auth, crate::client::ClientAuth::Mtls { .. }) {
+            return match crate::mtls::verify_certificate(&client, cred) {
+                Ok(()) => {
+                    self.hooks.record(attempt, AttemptOutcome::Succeeded);
+                    Ok(client)
+                }
+                Err(failure) => {
+                    self.hooks.record(attempt, AttemptOutcome::Failed);
+                    self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                        client_id: client_id.as_str(),
+                        failure,
+                    });
+                    // The same bare `invalid_client` every other refusal here returns: RFC
+                    // 6749 s5.2 collapses them on purpose, so a caller cannot probe a
+                    // registration. The host's audit channel was told which it was.
+                    Err(ErrorResponse::new(ErrorCode::InvalidClient))
                 }
             };
         }
@@ -2229,6 +2320,26 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .with_description("this refresh token is bound to a different DPoP key"));
         }
 
+        // RFC 8705 s3, and word for word the same argument as the DPoP check above: a chain
+        // issued over a client certificate stays bound to THAT certificate, and a rotation
+        // has to present it again. Without this the binding is decorative past the first
+        // access token, because a stolen refresh token could be re-bound to the thief's own
+        // certificate on the next rotation. Section 3 makes it a MUST for public clients
+        // specifically; applying it to every bound chain costs a confidential mutual-TLS
+        // client nothing, since it presents that certificate on every request anyway.
+        #[cfg(feature = "mtls")]
+        if record.x5t_s256.as_deref() != bound.cred.certificate.map(|c| c.thumbprint()) {
+            self.store
+                .put_refresh_token(record)
+                .await
+                .map_err(storage_error)?;
+            return Err(
+                ErrorResponse::new(ErrorCode::InvalidGrant).with_description(
+                    "this refresh token is bound to a different client certificate",
+                ),
+            );
+        }
+
         if let Some(expires_at) = record.expires_at {
             if self.clock.now() >= expires_at {
                 // Not put back: an expired chain can never become valid again, and keeping it
@@ -2411,6 +2522,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             &resource,
             now,
             access_token,
+            bound,
         )?;
         self.store
             .put_token(IssuedToken {
@@ -2419,6 +2531,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // without having to parse a token this server may have issued as opaque.
                 #[cfg(feature = "dpop")]
                 jkt: bound.jkt.map(Box::from),
+                // RFC 8705 s3, and the same argument as `jkt` immediately above: an opaque
+                // token carries its binding nowhere else, so s3.2 introspection could not
+                // report it if it were not written down here.
+                #[cfg(feature = "mtls")]
+                x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),
                 access_token: access_token.clone(),
                 client_id: client.client_id.clone(),
                 subject: subject.clone(),
@@ -2443,6 +2560,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // checks it. See the check in `refresh_token`.
                     #[cfg(feature = "dpop")]
                     jkt: bound.jkt.map(Box::from),
+                    // RFC 8705 s3: the chain remembers the certificate it was issued to, and
+                    // rotation checks it. See the check in `refresh_token`.
+                    #[cfg(feature = "mtls")]
+                    x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),
                     refresh_token: rt.clone(),
                     client_id: client.client_id.clone(),
                     subject,
@@ -2573,8 +2694,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // RFC 9449 s6.1 with RFC 7800 s3.1. A resource server that introspects must be
                 // able to confirm the binding, or the binding stops at this server and the RS is
                 // back to trusting a bearer string.
-                #[cfg(feature = "dpop")]
-                cnf: t.jkt.as_deref().map(crate::token::Confirmation::jkt),
+                // RFC 9449 s6.1 and RFC 8705 s3.2, in ONE RFC 7800 s3.1 object. Both
+                // mechanisms register a member of `cnf` and a token can carry both, so this
+                // is built from every binding the record has rather than from whichever one
+                // happens to be checked first. Omitted entirely when there is none.
+                #[cfg(any(feature = "dpop", feature = "mtls"))]
+                cnf: {
+                    let cnf = crate::token::Confirmation {
+                        #[cfg(feature = "dpop")]
+                        jkt: t.jkt.as_deref().map(str::to_string),
+                        #[cfg(feature = "mtls")]
+                        x5t_s256: t.x5t_s256.as_deref().copied(),
+                    };
+                    (!cnf.is_empty()).then_some(cnf)
+                },
             },
             // Unknown, expired, or somebody else's. All three are one answer on purpose.
             _ => IntrospectionResponse::inactive(),
