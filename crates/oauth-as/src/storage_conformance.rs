@@ -21,6 +21,11 @@
 //!   was spent once.
 //! - DEVICE GRANT DOUBLE ISSUANCE, the same shape at the RFC 8628 redemption.
 //!
+//! `Storage::claim_replay_id` (compiled in with `client_assertion` or `dpop`) is the same defect
+//! shape and is checked the same way: RFC 7523 section 3 and RFC 9449 section 4.3 both make a
+//! `jti` single use, and a read-then-write claim tells two concurrent presentations of the SAME
+//! assertion that each of them was the first.
+//!
 //! Nothing inside this crate can detect any of that: the server calls `take_*` and is entitled to
 //! believe the answer. So the check has to run where the host's store is, which is what this
 //! module is for.
@@ -142,6 +147,10 @@ impl fmt::Display for Violation {
 
 /// Every check name [`StorageConformance::run`] can report, so a host can assert that a name it
 /// filters on still exists rather than silently waiving a check that was renamed.
+///
+/// The `claim_replay_id` names are listed unconditionally even though the checks themselves only
+/// run when `client_assertion` or `dpop` is compiled in: a host's waiver list should not have to
+/// be feature-conditional to be valid.
 pub const CHECKS: &[&str] = &[
     HARNESS_RACE_SETUP,
     ROUND_TRIP_CLIENT,
@@ -167,6 +176,9 @@ pub const CHECKS: &[&str] = &[
     DELETE_CLIENT_CASCADES,
     DELETE_CLIENT_REPORTS,
     DELETE_TOKEN_IDEMPOTENT,
+    ATOMIC_CLAIM_REPLAY_ID,
+    CLAIM_REPLAY_ID_REFUSES_SECOND,
+    SWEEP_RECLAIMS_REPLAY_IDS,
 ];
 
 const HARNESS_RACE_SETUP: &str = "harness/race_setup";
@@ -193,6 +205,9 @@ const REVOKE_FAMILY_COUNT: &str = "revoke_token_family/count";
 const DELETE_CLIENT_CASCADES: &str = "delete_client/cascades";
 const DELETE_CLIENT_REPORTS: &str = "delete_client/reports_whether_it_removed";
 const DELETE_TOKEN_IDEMPOTENT: &str = "delete_token/idempotent";
+const ATOMIC_CLAIM_REPLAY_ID: &str = "atomic_claim/claim_replay_id";
+const CLAIM_REPLAY_ID_REFUSES_SECOND: &str = "claim_replay_id/refuses_a_second_claim";
+const SWEEP_RECLAIMS_REPLAY_IDS: &str = "sweep_expired/reclaims_replay_ids";
 
 /// A racer handed to the host's runtime by [`StorageConformance::with_spawn`].
 ///
@@ -279,7 +294,117 @@ where
         self.revoke_family(&mut report).await;
         self.delete_client(&mut report).await;
         self.delete_token(&mut report).await;
+        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        self.claim_replay_id(&mut report).await;
         report.violations
+    }
+
+    /// RFC 7523 section 3 and RFC 9449 section 4.3 both make a `jti` single use, and
+    /// `claim_replay_id` is the only thing enforcing it. Same defect shape as the `take_*`
+    /// operations, with a worse failure mode: a `take_*` that hands the value out twice at least
+    /// produces two token responses somebody might notice, while a claim-if-absent that answers
+    /// "you are first" to two callers produces exactly the request the client meant to send,
+    /// twice, and nothing anywhere records that it happened.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    async fn claim_replay_id(&self, report: &mut Report) {
+        let store = self.store().await;
+        let deadline = at(300);
+
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                Box::pin(async move {
+                    gate.wait().await;
+                    // Mapped to the shape `judge_race` reads: the caller that is told it claimed
+                    // the id is the winner, exactly as the caller that receives a taken record is.
+                    store
+                        .claim_replay_id("jti-race", deadline)
+                        .await
+                        .map(|claimed| if claimed { Some(()) } else { None })
+                })
+            })
+            .await;
+        self.judge_race(
+            report,
+            ATOMIC_CLAIM_REPLAY_ID,
+            "claim on a single-use jti",
+            results,
+        );
+
+        // Sequential, and it has to hold too: a store can be atomic under a race and still forget
+        // what it claimed a moment later.
+        let store = self.store().await;
+        let first = report.ok(
+            CLAIM_REPLAY_ID_REFUSES_SECOND,
+            "claim_replay_id",
+            store.claim_replay_id("jti-once", deadline).await,
+        );
+        if first == Some(false) {
+            report.fail(
+                CLAIM_REPLAY_ID_REFUSES_SECOND,
+                "the FIRST claim of an unseen id answered false, so every artifact carrying a jti \
+                 is refused as a replay of itself",
+            );
+        }
+        if let Some(second) = report.ok(
+            CLAIM_REPLAY_ID_REFUSES_SECOND,
+            "claim_replay_id (again)",
+            store.claim_replay_id("jti-once", deadline).await,
+        ) {
+            if second {
+                report.fail(
+                    CLAIM_REPLAY_ID_REFUSES_SECOND,
+                    "the SECOND claim of the same id also answered true: the id is not recorded, \
+                     so a client assertion or DPoP proof can be replayed by anyone who observed \
+                     one request",
+                );
+            }
+        }
+        // A DIFFERENT id must still be claimable: a store that answers false to everything after
+        // the first claim would pass the check above and refuse every subsequent request.
+        if let Some(other) = report.ok(
+            CLAIM_REPLAY_ID_REFUSES_SECOND,
+            "claim_replay_id (a different id)",
+            store.claim_replay_id("jti-other", deadline).await,
+        ) {
+            if !other {
+                report.fail(
+                    CLAIM_REPLAY_ID_REFUSES_SECOND,
+                    "a claim of an id that was never claimed answered false",
+                );
+            }
+        }
+
+        // Claims are records too, and the only thing that reclaims them is the host's sweep. A
+        // store that never expires them grows once per authenticated request, forever.
+        let store = self.store().await;
+        let now = at(0);
+        if report
+            .ok(
+                SWEEP_RECLAIMS_REPLAY_IDS,
+                "claim_replay_id",
+                store.claim_replay_id("jti-sweep", now).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if let Some(removed) = report.ok(
+            SWEEP_RECLAIMS_REPLAY_IDS,
+            "sweep_expired",
+            store.sweep_expired(now).await,
+        ) {
+            if removed != 1 {
+                report.fail(
+                    SWEEP_RECLAIMS_REPLAY_IDS,
+                    format!(
+                        "sweep_expired reported {removed} removed with exactly one dead replay id \
+                         in the store: claimed ids are records the sweep must reclaim, or the \
+                         table grows once per authenticated request forever"
+                    ),
+                );
+            }
+        }
     }
 
     async fn store(&self) -> Arc<S> {

@@ -57,6 +57,10 @@ struct Faults {
     drops_family_id: bool,
     /// `find_device_grant_by_user_code` normalizes the query on the caller's behalf.
     normalizes_user_codes: bool,
+    /// `claim_replay_id` implemented as look-then-insert, with the suspension point a shared store
+    /// has between the two. The RFC 7523 / RFC 9449 half of the same defect.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    look_then_insert_claim: bool,
 }
 
 #[derive(Default)]
@@ -67,6 +71,8 @@ struct Inner {
     codes: HashMap<String, AuthorizationCodeRecord>,
     tokens: HashMap<String, IssuedToken>,
     refresh: HashMap<String, RefreshTokenRecord>,
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    replay_ids: HashMap<String, SystemTime>,
 }
 
 struct NaiveStore {
@@ -297,16 +303,48 @@ impl Storage for NaiveStore {
         Ok(removed)
     }
 
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    async fn claim_replay_id(
+        &self,
+        id: &str,
+        expires_at: SystemTime,
+    ) -> Result<bool, StorageError> {
+        if self.faults.look_then_insert_claim {
+            let seen = self.lock().replay_ids.contains_key(id);
+            round_trip_to_the_store().await;
+            if seen {
+                return Ok(false);
+            }
+            self.lock().replay_ids.insert(id.to_string(), expires_at);
+            return Ok(true);
+        }
+        let mut g = self.lock();
+        if g.replay_ids.contains_key(id) {
+            return Ok(false);
+        }
+        g.replay_ids.insert(id.to_string(), expires_at);
+        Ok(true)
+    }
+
     async fn sweep_expired(&self, now: SystemTime) -> Result<u64, StorageError> {
         let mut g = self.lock();
+        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        let claimed = g.replay_ids.len();
+        #[cfg(not(any(feature = "client_assertion", feature = "dpop")))]
+        let claimed = 0usize;
         if self.faults.sweep_removes_everything {
-            let removed =
-                (g.device_by_code.len() + g.codes.len() + g.tokens.len() + g.refresh.len()) as u64;
+            let removed = (g.device_by_code.len()
+                + g.codes.len()
+                + g.tokens.len()
+                + g.refresh.len()
+                + claimed) as u64;
             g.device_by_code.clear();
             g.user_code_index.clear();
             g.codes.clear();
             g.tokens.clear();
             g.refresh.clear();
+            #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+            g.replay_ids.clear();
             return Ok(removed);
         }
         let mut removed = 0u64;
@@ -330,6 +368,14 @@ impl Storage for NaiveStore {
             None => true,
         });
         removed += (before - g.refresh.len()) as u64;
+
+        // Claimed replay ids are records like any other: the only thing that reclaims them is this
+        // sweep, and there is one per authenticated request.
+        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        {
+            g.replay_ids.retain(|_, exp| now < *exp);
+            removed += (claimed - g.replay_ids.len()) as u64;
+        }
         Ok(removed)
     }
 }
@@ -615,6 +661,31 @@ async fn a_store_that_silently_drops_family_id_is_caught() {
     );
 }
 
+/// The RFC 7523 / RFC 9449 half of the headline defect. A look-then-insert claim tells two
+/// concurrent presentations of the SAME assertion that each of them was the first, which is the
+/// replay both RFCs exist to refuse, and nothing downstream notices: the replayed request is
+/// exactly the request the client meant to send.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[tokio::test]
+async fn a_look_then_insert_replay_claim_is_caught() {
+    let violations = run_against(Faults {
+        look_then_insert_claim: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["atomic_claim/claim_replay_id"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "atomic_claim/claim_replay_id")
+            .contains("concurrent takes each received"),
+        "the violation must report the double claim it found"
+    );
+}
+
 // ---------------------------------------------------------------------- the harness's own limits
 
 /// A "spawner" that runs each racer to completion before returning is not concurrency, and an
@@ -661,6 +732,8 @@ async fn every_violation_names_a_published_check() {
         delete_token_errors_when_absent: true,
         drops_family_id: true,
         normalizes_user_codes: true,
+        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        look_then_insert_claim: true,
     })
     .await;
 

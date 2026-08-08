@@ -34,7 +34,7 @@ async fn yield_once() {
 
 #[tokio::test]
 async fn join_all_runs_every_future_and_returns_every_result() {
-    let futures: Vec<Pin<Box<dyn Future<Output = usize> + Send>>> = (0..5)
+    let futures: Vec<Pin<Box<dyn Future<Output = usize> + Send>>> = (0..5usize)
         .map(|i| {
             Box::pin(async move {
                 yield_once().await;
