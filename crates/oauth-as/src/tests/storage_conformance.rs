@@ -57,17 +57,13 @@ async fn join_all_interleaves_at_suspension_points() {
         .map(|name| {
             let log = Arc::clone(&log);
             Box::pin(async move {
-                log.lock().unwrap().push(if name == "a" {
-                    "a-read"
-                } else {
-                    "b-read"
-                });
+                log.lock()
+                    .unwrap()
+                    .push(if name == "a" { "a-read" } else { "b-read" });
                 yield_once().await;
-                log.lock().unwrap().push(if name == "a" {
-                    "a-delete"
-                } else {
-                    "b-delete"
-                });
+                log.lock()
+                    .unwrap()
+                    .push(if name == "a" { "a-delete" } else { "b-delete" });
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         })
         .collect();
@@ -101,7 +97,10 @@ async fn the_gate_opens_only_once_every_racer_has_arrived() {
 
     let seen = JoinAll::new(futures).await;
     assert_eq!(seen, vec![4, 4, 4, 4]);
-    assert!(!gate.unsatisfied(), "the gate was satisfiable and was satisfied");
+    assert!(
+        !gate.unsatisfied(),
+        "the gate was satisfiable and was satisfied"
+    );
 }
 
 /// A racer that is run alone must not hang the host's test suite forever. It gives up after its
@@ -139,8 +138,14 @@ async fn the_latch_completes_when_every_racer_reports_done() {
 #[test]
 fn the_fixtures_carry_the_fields_the_round_trip_checks_exist_for() {
     let token = sample_token("at", "client", Some("fam"));
-    assert!(token.family_id.is_some(), "family_id drives RFC 9700 s4.14.2 revocation");
-    assert!(!token.resource.is_empty(), "resource is the RFC 8707 audience restriction");
+    assert!(
+        token.family_id.is_some(),
+        "family_id drives RFC 9700 s4.14.2 revocation"
+    );
+    assert!(
+        !token.resource.is_empty(),
+        "resource is the RFC 8707 audience restriction"
+    );
     let refresh = sample_refresh("rt", "client", "fam");
     assert_eq!(refresh.state, RefreshTokenState::Spent);
     assert!(!refresh.resource.is_empty());

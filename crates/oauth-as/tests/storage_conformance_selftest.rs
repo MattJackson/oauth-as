@@ -147,7 +147,9 @@ impl Storage for NaiveStore {
         }
         if let Some(owner) = g.user_code_index.get(&normalized) {
             if owner != &grant.device_code {
-                return Err(StorageError::new("user code belongs to another device_code"));
+                return Err(StorageError::new(
+                    "user code belongs to another device_code",
+                ));
             }
         }
         if let Some(previous) = g.device_by_code.get(&grant.device_code) {
@@ -195,7 +197,8 @@ impl Storage for NaiveStore {
             if let Some(grant) = &grant {
                 let mut g = self.lock();
                 g.device_by_code.remove(device_code);
-                g.user_code_index.remove(&normalize_user_code(&grant.user_code));
+                g.user_code_index
+                    .remove(&normalize_user_code(&grant.user_code));
             }
             return Ok(grant);
         }
@@ -297,8 +300,8 @@ impl Storage for NaiveStore {
     async fn sweep_expired(&self, now: SystemTime) -> Result<u64, StorageError> {
         let mut g = self.lock();
         if self.faults.sweep_removes_everything {
-            let removed = (g.device_by_code.len() + g.codes.len() + g.tokens.len() + g.refresh.len())
-                as u64;
+            let removed =
+                (g.device_by_code.len() + g.codes.len() + g.tokens.len() + g.refresh.len()) as u64;
             g.device_by_code.clear();
             g.user_code_index.clear();
             g.codes.clear();

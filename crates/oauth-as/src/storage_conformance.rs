@@ -297,7 +297,11 @@ where
         let store = self.store().await;
         let want = sample_client("client-round-trip");
         if report
-            .ok(ROUND_TRIP_CLIENT, "put_client", store.put_client(want.clone()).await)
+            .ok(
+                ROUND_TRIP_CLIENT,
+                "put_client",
+                store.put_client(want.clone()).await,
+            )
             .is_none()
         {
             return;
@@ -317,8 +321,18 @@ where
         report.same(c, "auth", &want.auth, &got.auth);
         report.same(c, "grant_types", &want.grant_types, &got.grant_types);
         report.same(c, "redirect_uris", &want.redirect_uris, &got.redirect_uris);
-        report.same(c, "allowed_scopes", &want.allowed_scopes, &got.allowed_scopes);
-        report.same(c, "default_scopes", &want.default_scopes, &got.default_scopes);
+        report.same(
+            c,
+            "allowed_scopes",
+            &want.allowed_scopes,
+            &got.allowed_scopes,
+        );
+        report.same(
+            c,
+            "default_scopes",
+            &want.default_scopes,
+            &got.default_scopes,
+        );
         report.same(c, "name", &want.name, &got.name);
         report.same(c, "registration", &want.registration, &got.registration);
     }
@@ -400,8 +414,11 @@ where
         ) else {
             return;
         };
-        let Some(got) = report.some(ROUND_TRIP_AUTHORIZATION_CODE, "take_authorization_code", got)
-        else {
+        let Some(got) = report.some(
+            ROUND_TRIP_AUTHORIZATION_CODE,
+            "take_authorization_code",
+            got,
+        ) else {
             return;
         };
         let c = ROUND_TRIP_AUTHORIZATION_CODE;
@@ -410,7 +427,12 @@ where
         report.same(c, "redirect_uri", &want.redirect_uri, &got.redirect_uri);
         report.same(c, "scope", &want.scope, &got.scope);
         report.same(c, "subject", &want.subject, &got.subject);
-        report.same(c, "code_challenge", &want.code_challenge, &got.code_challenge);
+        report.same(
+            c,
+            "code_challenge",
+            &want.code_challenge,
+            &got.code_challenge,
+        );
         report.same(
             c,
             "code_challenge_method",
@@ -428,7 +450,11 @@ where
         let store = self.store().await;
         let want = sample_token("at-round-trip", "client-round-trip", Some("fam-round-trip"));
         if report
-            .ok(ROUND_TRIP_TOKEN, "put_token", store.put_token(want.clone()).await)
+            .ok(
+                ROUND_TRIP_TOKEN,
+                "put_token",
+                store.put_token(want.clone()).await,
+            )
             .is_none()
         {
             return;
@@ -625,10 +651,7 @@ where
         what: &str,
         results: Vec<Result<Option<T>, StorageError>>,
     ) {
-        let winners = results
-            .iter()
-            .filter(|r| matches!(r, Ok(Some(_))))
-            .count();
+        let winners = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
         let errors = results.iter().filter(|r| r.is_err()).count();
         if winners > 1 {
             report.fail(
@@ -669,7 +692,9 @@ where
     /// on this task. See the module docs for what each mode does and does not prove.
     async fn race<T, M>(&self, report: &mut Report, make: M) -> Vec<Result<Option<T>, StorageError>>
     where
-        T: Send + 'static,
+        // Every record this races over is a plain owned value; see `JoinAll` on why `Unpin` costs
+        // nothing here.
+        T: Send + Unpin + 'static,
         M: Fn(Arc<Gate>) -> BoxTake<T>,
     {
         let n = self.racers;
@@ -966,7 +991,11 @@ where
         }
         for record in [dead_refresh, live_refresh, endless_refresh] {
             planted &= report
-                .ok(c, "put_refresh_token", store.put_refresh_token(record).await)
+                .ok(
+                    c,
+                    "put_refresh_token",
+                    store.put_refresh_token(record).await,
+                )
                 .is_some();
         }
         if !planted {
@@ -1036,8 +1065,11 @@ where
         }
 
         let k = SWEEP_KEEPS_LIVE;
-        if let Some(found) = report.ok(k, "get_device_grant", store.get_device_grant("dc-live").await)
-        {
+        if let Some(found) = report.ok(
+            k,
+            "get_device_grant",
+            store.get_device_grant("dc-live").await,
+        ) {
             if found.is_none() {
                 report.fail(k, "the sweep removed a device grant that had not expired");
             }
@@ -1076,7 +1108,10 @@ where
             store.take_authorization_code("code-live").await,
         ) {
             if found.is_none() {
-                report.fail(k, "the sweep removed an authorization code that had not expired");
+                report.fail(
+                    k,
+                    "the sweep removed an authorization code that had not expired",
+                );
             }
         }
 
@@ -1141,8 +1176,11 @@ where
             return;
         }
 
-        let Some(removed) = report.ok(c, "revoke_token_family", store.revoke_token_family("fam-a").await)
-        else {
+        let Some(removed) = report.ok(
+            c,
+            "revoke_token_family",
+            store.revoke_token_family("fam-a").await,
+        ) else {
             return;
         };
         if removed != 4 {
@@ -1170,7 +1208,8 @@ where
             }
         }
         for key in ["rt-a1", "rt-a2"] {
-            if let Some(found) = report.ok(c, "get_refresh_token", store.get_refresh_token(key).await)
+            if let Some(found) =
+                report.ok(c, "get_refresh_token", store.get_refresh_token(key).await)
             {
                 if found.is_some() {
                     report.fail(
@@ -1187,13 +1226,17 @@ where
                 report.fail(s, "revoking one family removed an access token of another");
             }
         }
-        if let Some(found) = report.ok(s, "get_refresh_token", store.get_refresh_token("rt-b").await)
-        {
+        if let Some(found) = report.ok(
+            s,
+            "get_refresh_token",
+            store.get_refresh_token("rt-b").await,
+        ) {
             if found.is_none() {
                 report.fail(s, "revoking one family removed a refresh record of another");
             }
         }
-        if let Some(found) = report.ok(s, "get_token(no family)", store.get_token("at-nofam").await) {
+        if let Some(found) = report.ok(s, "get_token(no family)", store.get_token("at-nofam").await)
+        {
             if found.is_none() {
                 report.fail(
                     s,
@@ -1239,7 +1282,11 @@ where
                 .is_some();
             let mut grant = sample_device_grant(
                 &format!("dc-{}", id.as_str()),
-                if id == &doomed { "DOOM-AAAA" } else { "BYST-AAAA" },
+                if id == &doomed {
+                    "DOOM-AAAA"
+                } else {
+                    "BYST-AAAA"
+                },
             );
             grant.client_id = id.clone();
             planted &= report
@@ -1277,7 +1324,7 @@ where
                             id.as_str(),
                             "fam-cascade",
                         ))
-                        .await
+                        .await,
                 )
                 .is_some();
         }
@@ -1362,8 +1409,11 @@ where
 
         // The bystander is untouched: a cascade that matches too widely is as wrong as one that
         // matches too narrowly, and far harder to notice.
-        if let Some(found) = report.ok(c, "get_client(bystander)", store.get_client(&bystander).await)
-        {
+        if let Some(found) = report.ok(
+            c,
+            "get_client(bystander)",
+            store.get_client(&bystander).await,
+        ) {
             if found.is_none() {
                 report.fail(c, "delete_client removed a DIFFERENT client's registration");
             }
@@ -1684,7 +1734,10 @@ impl<T> JoinAll<T> {
     }
 }
 
-impl<T> Future for JoinAll<T> {
+// `T: Unpin` is not a restriction in practice: T is the take's `Result`, and the futures
+// themselves are boxed (and so `Unpin`) precisely so this combinator can be written without
+// unsafe code.
+impl<T: Unpin> Future for JoinAll<T> {
     type Output = Vec<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Vec<T>> {
