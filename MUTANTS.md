@@ -49,3 +49,27 @@ A plain `cargo mutants -p oauth-as` run reports a large number of missed mutants
 surface is behind the off-by-default `http` feature, so with default features the module is not
 compiled and its tests do not run, yet `cargo mutants` still lists mutants for it. Judge that module
 with `cargo mutants -p oauth-as --features http` instead.
+
+## Where this actually stands, so nobody reads the file above as "done"
+
+Last authoritative run, default features, `http.rs` and `metadata.rs` excluded:
+**369 mutants, 280 caught, 44 missed, 44 unviable, 1 timeout.**
+
+Of the 44 missed, exactly ONE is recorded above as equivalent. The other 43 are real, unclosed
+holes, and they are all in surface that arrived after that run was scoped:
+
+- 33 in `crates/oauth-as/src/jwt.rs`
+- 10 in `crates/oauth-as/src/server.rs`, in the jwt-only functions (`wire_access_token`, `jwks`,
+  `jwks_uri`)
+
+The one timeout is `user_code_symbol -> None`, a genuinely non-terminating mutant: rejection
+sampling that never accepts a byte loops forever. `cargo mutants` counts a timeout as caught,
+because the suite does not pass, and that is the right answer here.
+
+**The `http` surface has never been mutation tested at all**, for the feature-gating reason above.
+That is not a small gap: it is the module that terminates every request, holds the CSRF and consent
+seams, and parses attacker-controlled input.
+
+So Gate 4 in `GOAL.md` is NOT met yet. It is met when a run with `--features http,jwt` comes back
+with every survivor either killed or recorded here with its argument. Anyone tempted to tick that
+gate early should re-read the bar at the top of this file.
