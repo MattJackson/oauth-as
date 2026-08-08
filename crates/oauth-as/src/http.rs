@@ -700,6 +700,17 @@ fn required<'a>(pairs: &'a [Pair<'a>], name: &'static str) -> Result<&'a str, Er
     })
 }
 
+/// Every `resource` parameter, in wire order (RFC 8707 s2 permits repetition, so this is the one
+/// parameter [`param`]'s first-wins rule must not be applied to: dropping the second occurrence
+/// would silently issue a token for half of what the client asked for).
+fn resource_indicators(pairs: &[Pair<'_>]) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == "resource")
+        .map(|(_, v)| v.as_ref().to_string())
+        .collect()
+}
+
 /// Parse an optional `scope` parameter. A malformed scope is `invalid_scope` (RFC 6749 s5.2)
 /// rather than `invalid_request`: the parameter was supplied, it is its VALUE that is not a
 /// scope.
@@ -926,7 +937,10 @@ async fn token_handler<S: Storage, C: Clock>(
         }
     };
 
-    match state.server.token(request).await {
+    // RFC 8707 s2: `resource` is a parameter of the token request itself, independent of
+    // `grant_type`, so it is collected once here rather than inside each arm above.
+    let resources = resource_indicators(&form);
+    match state.server.token_with_resources(request, &resources).await {
         Ok(response) => ok_json(&response),
         Err(e) => error_response(&e, via_header, &state.challenge),
     }
@@ -1406,9 +1420,16 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
                 DeviceApprovalError::Expired => "That code has expired. Start again on the device.",
                 DeviceApprovalError::NotPending => "That code has already been used.",
                 DeviceApprovalError::Storage(_) => "Something went wrong. Try again.",
+                // The host's own limiter refused this before the code was even looked up
+                // (RFC 8628 section 5.1). Deliberately says nothing about whether the code was
+                // real: that is the question the throttle exists to stop being asked.
+                DeviceApprovalError::RateLimited => "Too many attempts. Wait and try again.",
             };
             let status = match e {
                 DeviceApprovalError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                // 429 is the honest status and the one a host's own reverse proxy metrics will
+                // already be counting.
+                DeviceApprovalError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
                 _ => StatusCode::BAD_REQUEST,
             };
             // The CSRF token was consumed above, so this re-render mints a fresh one; without

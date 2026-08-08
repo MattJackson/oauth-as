@@ -34,6 +34,13 @@ pub enum ErrorCode {
     AuthorizationPending,
     SlowDown,
     ExpiredToken,
+    /// RFC 8707 section 2: the `resource` parameter names a target this server will not issue a
+    /// token for, because the value is malformed, is not an absolute URI, or was never granted.
+    /// The code itself is registered by RFC 8693 section 2.2.2 and RFC 8707 section 2 is what
+    /// directs an authorization server to use it for resource indicators specifically. It is a
+    /// distinct code from `invalid_request` on purpose: the parameter was well formed AS A
+    /// PARAMETER, so a client that conflated the two would retry the same request.
+    InvalidTarget,
 }
 
 impl ErrorCode {
@@ -53,6 +60,7 @@ impl ErrorCode {
             ErrorCode::AuthorizationPending => "authorization_pending",
             ErrorCode::SlowDown => "slow_down",
             ErrorCode::ExpiredToken => "expired_token",
+            ErrorCode::InvalidTarget => "invalid_target",
         }
     }
 

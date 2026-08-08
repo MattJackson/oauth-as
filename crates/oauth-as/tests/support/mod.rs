@@ -177,6 +177,7 @@ pub async fn mint_code_token<S: Storage>(
 ) -> TokenResponse {
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
+        resource: Vec::new(),
         response_type: Some("code".to_string().into()),
         client_id: Some(client_id.to_string().into()),
         redirect_uri: Some(redirect_uri.to_string().into()),
@@ -216,6 +217,7 @@ pub async fn mint_code_token_keeping_code<S: Storage>(
 ) -> (TokenResponse, String) {
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
+        resource: Vec::new(),
         response_type: Some("code".to_string().into()),
         client_id: Some(client_id.to_string().into()),
         redirect_uri: Some(redirect_uri.to_string().into()),

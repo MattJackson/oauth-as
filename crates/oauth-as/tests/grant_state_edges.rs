@@ -63,6 +63,7 @@ async fn a_client_with_no_registered_redirect_uri_is_refused_without_redirecting
     let srv = server_with(clock, vec![no_redirect_client()]).await;
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
+        resource: Vec::new(),
         response_type: Some("code".into()),
         client_id: Some("no-redirect-app".into()),
         // Omitted, which is the only way to reach the branch: naming one would fail the exact-match
@@ -97,6 +98,7 @@ async fn several_registered_redirect_uris_require_the_request_to_name_one() {
     let srv = server_with(clock, vec![support::two_redirect_client()]).await;
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
+        resource: Vec::new(),
         response_type: Some("code".into()),
         client_id: Some("multi-redirect".into()),
         redirect_uri: None,
@@ -539,6 +541,7 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
     let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
     let token = |name: &str, family: Option<&str>| IssuedToken {
+        resource: Vec::new(),
         access_token: name.to_string(),
         client_id: ClientId::new("app"),
         subject: Some("user-1".to_string()),
@@ -548,6 +551,7 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
         family_id: family.map(str::to_string),
     };
     let refresh = |name: &str, family: &str| RefreshTokenRecord {
+        resource: Vec::new(),
         refresh_token: name.to_string(),
         client_id: ClientId::new("app"),
         subject: Some("user-1".to_string()),

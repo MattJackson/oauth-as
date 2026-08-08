@@ -71,6 +71,67 @@ fn c13_public_client_debug_format_is_unaffected() {
     assert_eq!(format!("{:?}", ClientAuth::Public), "Public");
 }
 
+/// The built-in verifier scheme is exactly "lower-case hex of SHA-256 over the secret's UTF-8
+/// bytes", so a host can compute it with `sha256sum` or with any other language's standard library
+/// and get a value this crate accepts. Pinned against the NIST one-block message vector for
+/// SHA-256 ("abc"), so a change of digest or encoding cannot pass unnoticed.
+#[test]
+fn the_builtin_hash_scheme_is_lower_case_hex_sha256() {
+    let hash = SecretHash::sha256("abc");
+    assert_eq!(hash.scheme(), SecretHash::SHA256_HEX);
+    assert_eq!(
+        hash.encoded(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(hash.encoded().len(), 64);
+    assert!(hash
+        .encoded()
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+}
+
+/// `verify_builtin` answers ONLY for the scheme it implements. A host scheme reaching it must be
+/// `false` and not, say, a comparison of the presented secret against a PHC string, which would be
+/// a silent way for an unverifiable registration to start authenticating.
+#[test]
+fn verify_builtin_refuses_a_scheme_it_does_not_implement() {
+    let hash = SecretHash::custom("argon2id", "$argon2id$v=19$m=65536$c2FsdA$aGFzaA");
+    assert!(!hash.verify_builtin("$argon2id$v=19$m=65536$c2FsdA$aGFzaA"));
+    assert!(!hash.verify_builtin("anything"));
+}
+
+/// The hashed comparison goes through [`constant_time_eq`], NOT through `==`. The property that
+/// matters is the one C9 was about: a length difference must not be observable, and the digest hex
+/// is fixed width so there is nothing length-dependent left. This pins the wiring, since a
+/// `self.encoded == computed` would pass every functional test in the suite and quietly reintroduce
+/// an early-exit comparison on a credential.
+#[test]
+fn the_hashed_path_compares_in_constant_time() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/client.rs"))
+        .expect("src/client.rs must be readable");
+    let start = source
+        .find("fn verify_builtin(")
+        .expect("verify_builtin must exist");
+    let body = &source[start..start + 400];
+    assert!(
+        body.contains("constant_time_eq("),
+        "the hashed verification path must use constant_time_eq, not =="
+    );
+}
+
+/// A hashed registration is confidential, and a public one is not. Three endpoints
+/// (`client_credentials`, introspection, revocation) refuse public clients, and they must keep
+/// refusing exactly the same set now that a second confidential storage form exists.
+#[test]
+fn confidentiality_is_asked_about_the_credential_not_the_variant() {
+    assert!(!ClientAuth::Public.is_confidential());
+    assert!(ClientAuth::ConfidentialSecret { secret: "s".into() }.is_confidential());
+    assert!(ClientAuth::ConfidentialSecretHash {
+        hash: SecretHash::sha256("s")
+    }
+    .is_confidential());
+}
+
 #[test]
 fn constant_time_eq_agrees_with_eq() {
     let cases: &[(&[u8], &[u8], bool)] = &[

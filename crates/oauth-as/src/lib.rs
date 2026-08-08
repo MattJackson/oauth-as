@@ -28,6 +28,23 @@
 //! its request/response types are already pinned in [`authorization`] so the wire shape cannot
 //! drift when it lands.
 //!
+//! # Host seams: observation, throttling, and secret storage
+//!
+//! Three things a real deployment needs that this library deliberately does not do itself, each
+//! installed on the server and each costing an uninstalled host nothing (see [`events::Hooks`]):
+//!
+//! - AUDIT EVENTS ([`events::EventSink`]). This crate logs nothing on its own. A host that wants
+//!   to see issuance, refusal, or the two compromise events (authorization code replay, refresh
+//!   token reuse) installs a sink. Events carry no credential of any kind; see the [`events`]
+//!   module docs for the rule and for why the refresh `family_id` is safe to carry.
+//! - RATE LIMITING ([`events::RateLimiter`]). THIS LIBRARY DOES NOT RATE LIMIT. It never sees a
+//!   request, so it has no caller, IP, session or user to count against. RFC 8628 section 5.1
+//!   makes the device user code's entropy adequate only IN COMBINATION WITH rate limiting of code
+//!   entry, so a deployment offering the device grant MUST install one.
+//! - CLIENT SECRET STORAGE ([`client::SecretHash`], [`client::SecretVerifier`]). Hosts should
+//!   store a one-way verifier, not the secret. The built-in scheme needs no host code; a host
+//!   whose policy names argon2id or an HSM installs a verifier.
+//!
 //! # Zero cost until enabled
 //!
 //! A host that compiles this crate in but never turns it on must pay nothing at runtime. The crate
@@ -48,6 +65,7 @@ pub mod authorization;
 pub mod client;
 pub mod device;
 pub mod error;
+pub mod events;
 pub mod grant;
 /// An OPTIONAL axum router over the server, behind the `http` cargo feature (off by default).
 #[cfg(feature = "http")]
@@ -70,9 +88,13 @@ pub use authorization::{
     AuthorizationErrorRedirect, AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod,
     ResponseType, ValidatedAuthorizationRequest,
 };
-pub use client::{Client, ClientAuth, ClientId};
+pub use client::{Client, ClientAuth, ClientId, SecretHash, SecretVerifier};
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 pub use error::{ErrorCode, ErrorResponse};
+pub use events::{
+    Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
+    RateLimiter,
+};
 pub use grant::GrantType;
 #[cfg(feature = "http")]
 pub use http::{
@@ -81,8 +103,12 @@ pub use http::{
 };
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
 pub use scope::{Scope, ScopeSet};
+// `DeviceApprovalError` is re-exported here as of 0.2.0: a host's verification UI has to match on
+// it to tell "unknown code" from "too many attempts", and having to reach into `server::` for the
+// error type of a re-exported method was an oversight rather than a decision.
 pub use server::{
-    AuthorizationServer, Clock, ServerConfig, SystemClock, TokenRequest, MIN_USER_CODE_LENGTH,
+    AuthorizationServer, Clock, DeviceApprovalError, ServerConfig, SystemClock, TokenRequest,
+    MIN_USER_CODE_LENGTH,
 };
 pub use store::{MemoryStorage, Storage, StorageError};
 pub use token::{

@@ -57,6 +57,7 @@ fn device_grant(device_code: &str, user_code: &str, expires_at: SystemTime) -> D
 
 fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRecord {
     AuthorizationCodeRecord {
+        resource: Vec::new(),
         code: code.to_string(),
         client_id: ClientId::new("some-client"),
         redirect_uri: "https://app.example/cb".into(),
@@ -74,6 +75,7 @@ fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRe
 
 fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
     IssuedToken {
+        resource: Vec::new(),
         access_token: token.to_string(),
         client_id: ClientId::new("some-client"),
         subject: Some("user-1".into()),
@@ -86,6 +88,7 @@ fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
 
 fn refresh_token(token: &str, expires_at: Option<SystemTime>) -> RefreshTokenRecord {
     RefreshTokenRecord {
+        resource: Vec::new(),
         refresh_token: token.to_string(),
         client_id: ClientId::new("some-client"),
         subject: Some("user-1".into()),

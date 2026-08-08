@@ -23,6 +23,26 @@ whatever version is current at each real crates.io release appear as published o
 - **The independent conformance harness passes completely**: 8 of 8 black box tests, 9 of 9
   hermetic RFC vector tests, and both pinned third party `oauth2 = "=5.0.0"` client drives. No
   file in the harness was modified to achieve it.
+- **RFC 9207 `iss` authorization response parameter**, the mix-up countermeasure RFC 9700 section
+  4.4 names, on BOTH the success redirect and every error redirect (RFC 9207 section 2 returns it
+  in the authorization response regardless of outcome). The value is the issuer identifier in the
+  same spelling the RFC 8414 metadata document publishes, because section 2.4 has the client
+  compare the two for equality. The metadata document advertises
+  `authorization_response_iss_parameter_supported: true` (section 3); it is a plain `bool`, not an
+  `Option`, and `AuthorizationResponse::iss` / `AuthorizationErrorRedirect::iss` are plain
+  `String`s, so the claim and the behaviour cannot drift apart. A directly rendered (non
+  redirecting) error carries no `iss`: RFC 6749 section 4.1.2.1 forbids redirecting there, so
+  there is no authorization response for section 2 to apply to.
+- **RFC 8707 resource indicators** at the authorization endpoint and the token endpoint. The
+  parameter may be repeated (section 2), each value must be an absolute URI with no fragment (a
+  query component is explicitly permitted), and a value this server will not honour is refused
+  with the new `ErrorCode::InvalidTarget` (`invalid_target`). The requested resources are recorded
+  on the authorization code, carried through issuance onto the access token and the refresh chain,
+  and a token request may NARROW that set but never widen it, the same rule and the same shape as
+  RFC 6749 section 6's scope rule for refresh. Introspection reports them as `aud` (RFC 7662
+  section 2.2, array form, omitted when there is no audience), and under the `jwt` feature they
+  REPLACE the configured audience in the RFC 9068 `aud` claim. RFC 8707 registers no metadata
+  member, so nothing new is advertised for it.
 - A CSRF seam, a consent seam, and a rate limiting obligation stated on the device approval API.
 - `Storage::get_refresh_token`, `Storage::revoke_token_family`, and `Storage::sweep_expired`.
 - Allocation and size gates, each proven able to fail before being trusted.
@@ -61,6 +81,24 @@ test that reproduced the attack and failed.
   floor that only holds without `--locked` is not a floor.
 - `Storage` gained required methods (breaking, and deliberately taken before anything is
   published rather than after).
+- **Breaking, for RFC 9207 and RFC 8707** (0.x, and nothing is published yet, so these are taken
+  now rather than later): `AuthorizationResponse` and `AuthorizationErrorRedirect` gained `iss`;
+  `AuthorizationRequest` gained `resource: Vec<Cow<str>>` (empty by default, so
+  `AuthorizationRequest::from_pairs` still allocates nothing on borrowed input);
+  `ValidatedAuthorizationRequest` gained `issuer` and `resource`; `AuthorizationCodeRecord`,
+  `IssuedToken` and `RefreshTokenRecord` gained `resource`; `IntrospectionResponse` gained `aud`;
+  `ErrorCode` gained `InvalidTarget`. `AuthorizationServer::token_with_resources` is new and
+  `token` now delegates to it with an empty list. The RFC 8707 parameter is an argument there
+  rather than a field on all four `TokenRequest` variants because section 2 defines it as a
+  parameter of the token request independent of `grant_type`: a field per variant would state the
+  same thing four times, grow an enum every host copies, and make every future grant repeat it.
+- RFC 7662 introspection now reports `iss` in the same trimmed spelling as the RFC 8414 metadata
+  `issuer` and the RFC 9207 `iss` parameter, rather than the raw configured string. One server,
+  one identity, in every place it states it.
+- `resource` is not accepted on the RFC 8628 device authorization request, so a device token poll
+  naming one is refused with `invalid_target` rather than silently ignored: there is nothing
+  granted for it to narrow to, and a client that believes it holds an audience restricted token
+  and does not is worse off than one told plainly it cannot have one.
 - `conformance-serve.sh` excluded from the published tarball: it resolves the workspace root as
   `../..` and cannot work from an unpacked crate.
 

@@ -95,6 +95,17 @@ pub struct IntrospectionResponse {
     /// The issuer of the token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iss: Option<String>,
+    /// The resource server(s) the token is for: the RFC 8707 resource indicators the grant was
+    /// narrowed to.
+    ///
+    /// RFC 7662 section 2.2 lists `aud` as OPTIONAL and defers its shape to RFC 7519 section 4.1.3,
+    /// which admits either a single string or an array. This crate always emits the ARRAY form when
+    /// it has an audience at all, because a caller that has to handle two shapes for one claim
+    /// eventually handles only one of them; and it omits the member entirely, rather than sending
+    /// an empty array, when no resource was requested. An empty array reads as "restricted to
+    /// nothing", which is the opposite of the truth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<Vec<String>>,
 }
 
 impl IntrospectionResponse {
@@ -109,6 +120,7 @@ impl IntrospectionResponse {
             exp: None,
             iat: None,
             iss: None,
+            aud: None,
         }
     }
 }
@@ -128,6 +140,10 @@ pub struct IssuedToken {
     pub subject: Option<String>,
     /// The granted scope.
     pub scope: ScopeSet,
+    /// The RFC 8707 resource indicators this token is restricted to; empty when the grant named
+    /// none. This is what RFC 7662 introspection reports as `aud`, and what the RFC 9068 `aud`
+    /// claim carries when the `jwt` feature signs the wire token.
+    pub resource: Vec<String>,
     /// Issuance instant.
     pub issued_at: SystemTime,
     /// Expiry instant; the token is dead at and after this instant.
@@ -153,6 +169,7 @@ impl fmt::Debug for IssuedToken {
             .field("client_id", &self.client_id)
             .field("subject", &self.subject)
             .field("scope", &self.scope)
+            .field("resource", &self.resource)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("family_id", &self.family_id)
@@ -194,6 +211,10 @@ pub struct RefreshTokenRecord {
     pub subject: Option<String>,
     /// The scope originally granted; refreshes may narrow, never widen.
     pub scope: ScopeSet,
+    /// The RFC 8707 resource indicators originally granted. Carried across rotation for the same
+    /// reason `scope` is: section 2 lets a token request narrow the set and never widen it, so the
+    /// chain has to remember what it started with. Empty when the grant named none.
+    pub resource: Vec<String>,
     /// Absolute chain expiry; `None` means the chain does not expire by time.
     ///
     /// On a `Spent` record this doubles as the RETENTION deadline: a spent token is kept only so
@@ -223,6 +244,7 @@ impl fmt::Debug for RefreshTokenRecord {
             .field("client_id", &self.client_id)
             .field("subject", &self.subject)
             .field("scope", &self.scope)
+            .field("resource", &self.resource)
             .field("expires_at", &self.expires_at)
             .field("family_id", &self.family_id)
             .field("state", &self.state)

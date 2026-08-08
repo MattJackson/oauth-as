@@ -76,6 +76,14 @@ pub struct AuthorizationRequest<'a> {
     pub code_challenge: Option<Cow<'a, str>>,
     /// The PKCE method; only `S256`.
     pub code_challenge_method: Option<Cow<'a, str>>,
+    /// RFC 8707 resource indicators: the resource server(s) the client intends the issued token to
+    /// be used at.
+    ///
+    /// A `Vec` rather than an `Option<Cow>` because RFC 8707 section 2 says the parameter MAY be
+    /// repeated, and a client naming two resource servers means both, not the last one. An empty
+    /// `Vec` allocates nothing, so a request that carries no `resource` still costs what it did
+    /// before this parameter existed.
+    pub resource: Vec<Cow<'a, str>>,
 }
 
 impl<'a> AuthorizationRequest<'a> {
@@ -93,6 +101,12 @@ impl<'a> AuthorizationRequest<'a> {
     {
         let mut req = AuthorizationRequest::default();
         for (k, v) in pairs {
+            // RFC 8707 section 2 is the one exception to the first-wins rule below: `resource` MAY
+            // legitimately appear more than once, and every occurrence is part of the request.
+            if k.as_ref() == "resource" {
+                req.resource.push(v.into());
+                continue;
+            }
             let slot = match k.as_ref() {
                 "response_type" => &mut req.response_type,
                 "client_id" => &mut req.client_id,
@@ -109,6 +123,47 @@ impl<'a> AuthorizationRequest<'a> {
         }
         req
     }
+}
+
+/// Whether one RFC 8707 `resource` value is a resource indicator this server will accept.
+///
+/// RFC 8707 section 2 states the rule in three parts, and all three are checked here:
+///
+/// 1. the value MUST be an absolute URI as defined by RFC 3986 section 4.3, so it carries a scheme
+///    (`scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) followed by `:`. A relative reference
+///    names nothing an audience restriction could be built from, since what it resolves against is
+///    the client's business and not the server's;
+/// 2. it MAY include a query component, so `?` is explicitly NOT a reason to refuse. That is worth
+///    stating because the obvious "strip everything after the first delimiter" implementation gets
+///    it wrong;
+/// 3. it MUST NOT include a fragment. A fragment is never transmitted to a server (RFC 3986
+///    section 3.5), so two indicators differing only in their fragment name the SAME resource while
+///    comparing unequal, which turns any later audience check into a string game.
+///
+/// Anything outside printable ASCII is refused as well: RFC 3986 section 2 requires characters
+/// outside its own grammar to be percent-encoded, so a raw space or control byte here is not a URI
+/// at all, and accepting one would let a value that cannot round-trip through a query string reach
+/// the token's audience.
+pub(crate) fn is_valid_resource_indicator(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    // Scheme: at least one character, the first alphabetic, terminated by the first `:`.
+    let colon = match value.find(':') {
+        Some(0) | None => return false,
+        Some(i) => i,
+    };
+    if !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    if !bytes[1..colon]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    // No fragment, and nothing that is not a legal URI character in the first place.
+    bytes
+        .iter()
+        .all(|&b| b != b'#' && (0x21..=0x7e).contains(&b))
 }
 
 /// A request that has passed validation: the client exists, is allowed this grant, the redirect
@@ -138,6 +193,18 @@ pub struct ValidatedAuthorizationRequest {
     pub code_challenge: String,
     /// The PKCE method (only `S256`).
     pub code_challenge_method: CodeChallengeMethod,
+    /// This server's issuer identifier, carried so that the authorization response can name its
+    /// author (RFC 9207 section 2).
+    ///
+    /// It is on the VALIDATED request rather than looked up at response time because
+    /// [`ValidatedAuthorizationRequest::denied`] is also an authorization response and has no
+    /// access to the server's configuration: a refusal that could not say who refused would be
+    /// exactly the gap RFC 9207 section 2.2 closes.
+    pub issuer: String,
+    /// The RFC 8707 resource indicators this request asked for, already validated. Empty when the
+    /// client named none, which means the issued token carries no audience restriction from this
+    /// mechanism.
+    pub resource: Vec<String>,
     /// Zero-sized witness, private to this module. Its only purpose is that it cannot be named
     /// (let alone constructed) outside `authorization.rs`, so a struct-literal expression cannot
     /// build a whole `ValidatedAuthorizationRequest` from anywhere else, in this crate or out of
@@ -168,6 +235,8 @@ impl ValidatedAuthorizationRequest {
         state: Option<String>,
         code_challenge: String,
         code_challenge_method: CodeChallengeMethod,
+        issuer: String,
+        resource: Vec<String>,
     ) -> Self {
         ValidatedAuthorizationRequest {
             client_id,
@@ -176,6 +245,8 @@ impl ValidatedAuthorizationRequest {
             state,
             code_challenge,
             code_challenge_method,
+            issuer,
+            resource,
             _sealed: Sealed,
         }
     }
@@ -188,6 +259,9 @@ impl ValidatedAuthorizationRequest {
             redirect_uri: self.redirect_uri.clone(),
             error: ErrorResponse::new(ErrorCode::AccessDenied),
             state: self.state.clone(),
+            // RFC 9207 section 2: the parameter belongs on the authorization response whatever the
+            // outcome, and a refusal is an outcome the client is entitled to attribute.
+            iss: self.issuer.clone(),
         }
     }
 }
@@ -200,10 +274,23 @@ pub struct AuthorizationResponse {
     /// The request's `state`, echoed verbatim; REQUIRED iff the request carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// RFC 9207 section 2: this server's issuer identifier, so a client talking to several
+    /// authorization servers can tell WHICH one answered.
+    ///
+    /// Not an `Option`: this server always supports RFC 9207 and its metadata says so
+    /// (`authorization_response_iss_parameter_supported`), and section 2 makes the parameter
+    /// mandatory for a server that does. A response that could omit it would be a response a
+    /// client cannot rely on, which defeats the mix-up countermeasure RFC 9700 section 4.4 is
+    /// asking for.
+    pub iss: String,
 }
 
 impl AuthorizationResponse {
     /// The `Location` header value for the success redirect.
+    ///
+    /// Parameter ORDER is not constrained by any RFC (RFC 6749 section 4.1.2 and RFC 9207
+    /// section 2 both describe an unordered set of query parameters), so `iss` is appended last
+    /// purely to keep the existing prefix of the URL unchanged.
     pub fn location(&self, redirect_uri: &str) -> String {
         let mut out = String::with_capacity(redirect_uri.len() + self.encoded_len());
         out.push_str(redirect_uri);
@@ -212,12 +299,17 @@ impl AuthorizationResponse {
         if let Some(state) = &self.state {
             append_param(&mut out, &mut sep, "state", state);
         }
+        append_param(&mut out, &mut sep, "iss", &self.iss);
         out
     }
 
     /// A worst-case size for the appended query, so `location` allocates exactly once.
     fn encoded_len(&self) -> usize {
-        6 + self.code.len() * 3 + self.state.as_ref().map_or(0, |s| 7 + s.len() * 3)
+        6 + self.code.len() * 3
+            + self.state.as_ref().map_or(0, |s| 7 + s.len() * 3)
+            // "&iss=" is 5 characters, and the issuer is percent-encoded like everything else.
+            + 5
+            + self.iss.len() * 3
     }
 }
 
@@ -231,12 +323,19 @@ pub struct AuthorizationErrorRedirect {
     pub error: ErrorResponse,
     /// The request's `state`, echoed so the client can correlate the failure.
     pub state: Option<String>,
+    /// RFC 9207 section 2: the issuer identifier, present on error responses exactly as on
+    /// successful ones. A client that cannot attribute a failure cannot tell a genuine refusal by
+    /// its own AS from one manufactured by an attacker's.
+    pub iss: String,
 }
 
 impl AuthorizationErrorRedirect {
     /// The `Location` header value for the error redirect.
     pub fn location(&self) -> String {
-        let mut out = String::with_capacity(self.redirect_uri.len() + 96);
+        // 96 covers the error code, the separators, and a short description; the issuer is sized
+        // properly because a host may run under a long issuer identifier and RFC 9207 section 2
+        // puts it on every one of these.
+        let mut out = String::with_capacity(self.redirect_uri.len() + 96 + self.iss.len() * 3);
         out.push_str(&self.redirect_uri);
         let mut sep = query_separator(&self.redirect_uri);
         append_param(&mut out, &mut sep, "error", self.error.error.as_str());
@@ -249,6 +348,7 @@ impl AuthorizationErrorRedirect {
         if let Some(state) = &self.state {
             append_param(&mut out, &mut sep, "state", state);
         }
+        append_param(&mut out, &mut sep, "iss", &self.iss);
         out
     }
 }
@@ -355,6 +455,12 @@ pub struct AuthorizationCodeRecord {
     pub code_challenge: String,
     /// The recorded PKCE method.
     pub code_challenge_method: CodeChallengeMethod,
+    /// The RFC 8707 resource indicators the authorization request named.
+    ///
+    /// Recorded on the code because the token request that redeems it MAY narrow this set but MUST
+    /// NOT widen it (RFC 8707 section 2), and "what was granted" is not knowable at the token
+    /// endpoint any other way. Empty means the client asked for no audience restriction.
+    pub resource: Vec<String>,
     /// Expiry instant; the code is dead at and after this instant.
     pub expires_at: SystemTime,
     /// Whether the code has been redeemed, and what it produced.
@@ -371,6 +477,7 @@ impl fmt::Debug for AuthorizationCodeRecord {
             .field("subject", &self.subject)
             .field("code_challenge", &self.code_challenge)
             .field("code_challenge_method", &self.code_challenge_method)
+            .field("resource", &self.resource)
             .field("expires_at", &self.expires_at)
             .field("state", &self.state)
             .finish()

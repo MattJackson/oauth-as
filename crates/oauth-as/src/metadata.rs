@@ -110,6 +110,20 @@ pub struct AuthorizationServerMetadata {
     /// OPTIONAL (section 2). A page of human-readable developer documentation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_documentation: Option<String>,
+    /// RFC 9207 section 3. Always `true` from this server, and NOT an `Option`.
+    ///
+    /// The member exists so a client can decide whether it is allowed to REQUIRE the `iss`
+    /// authorization response parameter, which is the mix-up countermeasure RFC 9700 section 4.4
+    /// names. RFC 9207 section 3 says its default when absent is `false`, so omitting it would tell
+    /// every client that the countermeasure is unavailable here even though this server always
+    /// sends the parameter. Publishing a constant `true` is only honest because
+    /// [`crate::authorization::AuthorizationResponse`] and
+    /// [`crate::authorization::AuthorizationErrorRedirect`] both carry `iss` unconditionally: the
+    /// claim and the behaviour cannot drift apart, because neither type can express its absence.
+    ///
+    /// RFC 8707 (resource indicators), which this server also implements, registers NO metadata
+    /// member of its own, so there is deliberately nothing here to advertise it.
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// Join an issuer and an absolute path without producing a double slash.
@@ -188,6 +202,7 @@ impl AuthorizationServerMetadata {
             ],
             code_challenge_methods_supported: vec!["S256".to_string()],
             service_documentation: config.service_documentation.clone(),
+            authorization_response_iss_parameter_supported: true,
         }
     }
 }

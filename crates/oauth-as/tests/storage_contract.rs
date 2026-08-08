@@ -44,6 +44,7 @@ fn sample_device_grant(device_code: &str, user_code: &str) -> DeviceGrant {
 
 fn sample_refresh_token(token: &str) -> RefreshTokenRecord {
     RefreshTokenRecord {
+        resource: Vec::new(),
         refresh_token: token.to_string(),
         client_id: ClientId::new("some-client"),
         subject: Some("user-1".into()),
@@ -56,6 +57,7 @@ fn sample_refresh_token(token: &str) -> RefreshTokenRecord {
 
 fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
     AuthorizationCodeRecord {
+        resource: Vec::new(),
         code: code.to_string(),
         client_id: ClientId::new("some-client"),
         redirect_uri: "https://app.example/cb".into(),

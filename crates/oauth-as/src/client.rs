@@ -34,6 +34,118 @@ impl fmt::Display for ClientId {
     }
 }
 
+/// A STORED VERIFIER for a client secret: enough to check a presented secret, never enough to
+/// present one.
+///
+/// This is what [`ClientAuth::ConfidentialSecretHash`] holds, and it is the shape a host should
+/// persist. RFC 6749 section 2.3.1 says the client secret is a password; a password at rest
+/// belongs in a one-way form, so that a dump of the client table is not a set of working
+/// credentials.
+///
+/// Two kinds of scheme:
+///
+/// - [`SecretHash::SHA256_HEX`], built by [`SecretHash::sha256`] and verified by this crate with
+///   no host code and no new dependency (`sha2` is already here for RFC 7636 PKCE). Plain SHA-256
+///   is the RIGHT primitive for this particular job and the wrong one for a user password: a
+///   client secret is high-entropy and host-generated, so there is no dictionary to run against
+///   it, and the offline-guessing threat that makes a slow KDF necessary for human-chosen
+///   passwords does not exist here. See [`constant_time_eq`], which makes the same argument.
+/// - Anything else, built by [`SecretHash::custom`] and verified by a host-supplied
+///   [`SecretVerifier`]. A host whose policy names argon2id, scrypt or bcrypt, or whose
+///   verification happens in an HSM, keeps that dependency in its own tree where it belongs. A
+///   custom scheme with NO verifier installed never authenticates: failing closed is the only
+///   safe reading of "the server cannot check this credential".
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretHash {
+    scheme: String,
+    encoded: String,
+}
+
+/// Hand-written for the same reason as [`ClientAuth`]'s: a stored verifier is not a credential a
+/// client can present, but it IS the input to an offline attack, so it must not turn up in a
+/// host's logs through `{:?}`. The SCHEME stays visible, because that is the field an operator
+/// needs when auditing which registrations still use a weak or retired one.
+impl fmt::Debug for SecretHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretHash")
+            .field("scheme", &self.scheme)
+            .field("encoded", &"[redacted]")
+            .finish()
+    }
+}
+
+impl SecretHash {
+    /// The scheme identifier for the built-in hash: lower-case hex of the SHA-256 digest of the
+    /// secret's UTF-8 bytes. Named on the wire-visible model of a `$scheme$` prefix so a host can
+    /// migrate registrations one at a time and tell which is which.
+    pub const SHA256_HEX: &'static str = "sha256-hex";
+
+    /// Hash `secret` with the built-in scheme. The result is what the host stores; the secret
+    /// itself is handed to the client once and never persisted here.
+    pub fn sha256(secret: &str) -> Self {
+        SecretHash {
+            scheme: SecretHash::SHA256_HEX.to_string(),
+            encoded: hex_lower(&Sha256::digest(secret.as_bytes())),
+        }
+    }
+
+    /// A stored verifier in a scheme this crate does not implement, to be checked by the host's
+    /// [`SecretVerifier`]. `encoded` is opaque here: a PHC string, a KMS key handle, whatever the
+    /// host's verifier understands.
+    pub fn custom(scheme: impl Into<String>, encoded: impl Into<String>) -> Self {
+        SecretHash {
+            scheme: scheme.into(),
+            encoded: encoded.into(),
+        }
+    }
+
+    /// The scheme identifier.
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    /// The stored verifier text, in whatever encoding the scheme defines.
+    pub fn encoded(&self) -> &str {
+        &self.encoded
+    }
+
+    /// Verify against the BUILT-IN scheme only; any other scheme is `false` here and is the host
+    /// verifier's business. Constant time via [`constant_time_eq`].
+    fn verify_builtin(&self, presented: &str) -> bool {
+        if self.scheme != SecretHash::SHA256_HEX {
+            return false;
+        }
+        let computed = hex_lower(&Sha256::digest(presented.as_bytes()));
+        constant_time_eq(computed.as_bytes(), self.encoded.as_bytes())
+    }
+}
+
+/// Lower-case hex of a digest. Written out rather than pulled in: the crate has no hex dependency
+/// and this is four lines.
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// The host's client-secret verifier, for [`SecretHash`] schemes this crate does not implement.
+///
+/// Installed on the server (`AuthorizationServer::with_secret_verifier`) and consulted by
+/// [`ClientAuth::verify_with`]. It is an ADDITION, never an override: a registration in the
+/// built-in scheme is always verified by this crate, so a permissive or buggy host verifier cannot
+/// weaken one.
+///
+/// Implementations MUST compare in constant time with respect to the presented secret, for the
+/// reasons set out on [`constant_time_eq`]. Every serious password-hashing crate already does.
+pub trait SecretVerifier: Send + Sync {
+    /// Whether `presented` is the secret behind `stored`.
+    fn verify(&self, stored: &SecretHash, presented: &str) -> bool;
+}
+
 /// How the client authenticates to the token endpoint (RFC 6749 section 2.3).
 ///
 /// `Debug` is hand-written rather than derived (see below) so that `ConfidentialSecret`'s secret
@@ -44,11 +156,24 @@ pub enum ClientAuth {
     /// A public client (native app, browser app, device): no secret exists, so possession of the
     /// `client_id` proves nothing and the flows compensate (PKCE, device-code user interaction).
     Public,
-    /// A confidential client holding a secret. The host decides how the secret at rest is
-    /// protected; this crate only compares, in constant time.
+    /// A confidential client whose SECRET ITSELF is stored here.
+    ///
+    /// PREFER [`ClientAuth::ConfidentialSecretHash`]. This variant means the plaintext credential
+    /// lives wherever the host persists a [`Client`], so a leak of that store is a leak of every
+    /// client's working credential, and the host cannot honestly tell a customer that their secret
+    /// is not recoverable. It stays supported because it is legitimately right for two cases: a
+    /// host that resolves secrets from a vault or KMS at request time and never writes them down,
+    /// and a host migrating registrations gradually. This crate only ever compares it, in constant
+    /// time, and never logs it.
     ConfidentialSecret {
         /// The shared secret the client presents.
         secret: String,
+    },
+    /// A confidential client stored as a one-way VERIFIER rather than as its secret. This is the
+    /// variant to reach for: see [`SecretHash`].
+    ConfidentialSecretHash {
+        /// The stored verifier.
+        hash: SecretHash,
     },
 }
 
@@ -64,28 +189,76 @@ impl fmt::Debug for ClientAuth {
                 .debug_struct("ConfidentialSecret")
                 .field("secret", &"[redacted]")
                 .finish(),
+            // `SecretHash`'s own Debug is already redacted; going through it keeps the scheme
+            // visible, which is the part an operator can act on.
+            ClientAuth::ConfidentialSecretHash { hash } => f
+                .debug_struct("ConfidentialSecretHash")
+                .field("hash", hash)
+                .finish(),
         }
     }
 }
 
 impl ClientAuth {
-    /// Verify a presented secret. Public clients accept `None` and reject any presented secret
-    /// (presenting a secret for a secretless registration is a client mixup worth failing loud
-    /// on). Confidential clients require the exact secret; the comparison is constant time
-    /// regardless of the length of either the registered or the presented secret (see
-    /// [`constant_time_eq`]).
+    /// Whether this registration is CONFIDENTIAL, meaning the client can prove possession of
+    /// something. RFC 6749 section 4.4 (client credentials), RFC 7662 section 2.1 (introspection)
+    /// and RFC 7009 section 2.1 (revocation) all require that, and the answer must not be "is this
+    /// variant `ConfidentialSecret`", because a new storage form for the same credential would
+    /// then silently read as public.
+    pub fn is_confidential(&self) -> bool {
+        !matches!(self, ClientAuth::Public)
+    }
+
+    /// Verify a presented secret with no host verifier installed. See [`ClientAuth::verify_with`],
+    /// which this delegates to; a [`ClientAuth::ConfidentialSecretHash`] in a scheme this crate
+    /// does not implement therefore never authenticates through this entry point.
+    pub fn verify(&self, presented: Option<&str>) -> bool {
+        self.verify_with(presented, None)
+    }
+
+    /// Verify a presented secret, consulting the host's [`SecretVerifier`] for hash schemes this
+    /// crate does not implement.
+    ///
+    /// Public clients accept `None` and reject any presented secret (presenting a secret for a
+    /// secretless registration is a client mixup worth failing loud on). Confidential clients
+    /// require the exact secret; the comparison is constant time regardless of the length of
+    /// either the registered or the presented secret (see [`constant_time_eq`]).
+    ///
+    /// ORDER OF PREFERENCE for a hashed registration: the crate's own scheme is checked by the
+    /// crate, and only an unrecognised scheme is passed to `verifier`. That way installing a
+    /// verifier can only ADD registrations that authenticate, never change the answer for one the
+    /// crate could already decide.
     ///
     /// What this does NOT cover: if the caller (see `server.rs`) returns early for an unknown
-    /// `client_id` before ever calling `verify`, an unknown client and a known client with a
-    /// wrong secret are distinguishable by timing even though `verify` itself leaks nothing.
-    /// Making those two paths cost the same wall time is the caller's responsibility, not this
-    /// function's; a caller that cares should call `verify` against some registered client (or an
-    /// equivalent-cost dummy) on the unknown-client path too.
-    pub fn verify(&self, presented: Option<&str>) -> bool {
+    /// `client_id` before ever calling this, an unknown client and a known client with a wrong
+    /// secret are distinguishable by timing even though this function leaks nothing. Making those
+    /// two paths cost the same wall time is the caller's responsibility, not this function's; a
+    /// caller that cares should verify against some registered client (or an equivalent-cost
+    /// dummy) on the unknown-client path too.
+    pub fn verify_with(
+        &self,
+        presented: Option<&str>,
+        verifier: Option<&dyn SecretVerifier>,
+    ) -> bool {
         match self {
             ClientAuth::Public => presented.is_none(),
             ClientAuth::ConfidentialSecret { secret } => match presented {
                 Some(p) => constant_time_eq(secret.as_bytes(), p.as_bytes()),
+                None => false,
+            },
+            ClientAuth::ConfidentialSecretHash { hash } => match presented {
+                Some(p) => {
+                    if hash.scheme() == SecretHash::SHA256_HEX {
+                        hash.verify_builtin(p)
+                    } else {
+                        // Fails closed with no verifier: the server cannot check this credential,
+                        // and "cannot check" must never read as "checked out".
+                        match verifier {
+                            Some(v) => v.verify(hash, p),
+                            None => false,
+                        }
+                    }
+                }
                 None => false,
             },
         }

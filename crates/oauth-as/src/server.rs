@@ -20,6 +20,10 @@ use crate::device::{
     normalize_user_code, DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState,
 };
 use crate::error::{ErrorCode, ErrorResponse};
+use crate::events::{
+    Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
+    RateLimiter,
+};
 use crate::grant::GrantType;
 #[cfg(feature = "jwt")]
 use crate::jwt::{AccessTokenClaims, AccessTokenFormat, Jwks};
@@ -321,6 +325,10 @@ pub enum DeviceApprovalError {
     Expired,
     /// The grant was already approved or denied.
     NotPending,
+    /// The host's own [`crate::events::RateLimiter`] refused the attempt before the code was
+    /// looked up at all. RFC 8628 section 5.1 makes throttling user-code entry a REQUIREMENT of
+    /// the deployment, not an optimisation, so this is a first-class answer and not an error.
+    RateLimited,
     /// The storage seam failed.
     Storage(StorageError),
 }
@@ -331,6 +339,7 @@ impl std::fmt::Display for DeviceApprovalError {
             DeviceApprovalError::UnknownUserCode => f.write_str("unknown user code"),
             DeviceApprovalError::Expired => f.write_str("the code has expired"),
             DeviceApprovalError::NotPending => f.write_str("the code was already used"),
+            DeviceApprovalError::RateLimited => f.write_str("too many attempts"),
             DeviceApprovalError::Storage(e) => write!(f, "{e}"),
         }
     }
@@ -442,6 +451,10 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
     config: ServerConfig,
     store: S,
     clock: C,
+    /// The host's optional seams (audit sink, rate limiter, secret verifier). ONE pointer wide and
+    /// null until the host installs something: see [`Hooks`] for why the three do not sit here as
+    /// three separate fields.
+    hooks: Hooks,
 }
 
 impl<S: Storage> AuthorizationServer<S, SystemClock> {
@@ -459,7 +472,45 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             config,
             store,
             clock,
+            hooks: Hooks::new(),
         }
+    }
+
+    /// Install the audit sink (RFC-agnostic; see [`crate::events`]). Builder-style so a host wires
+    /// it at construction: `AuthorizationServer::new(cfg, store).with_event_sink(Box::new(sink))`.
+    ///
+    /// This crate logs nothing by itself. Without a sink, the two events that are evidence of
+    /// compromise (authorization code replay, refresh token reuse) revoke silently, which means an
+    /// operator learns about a stolen grant from a support ticket rather than from a log line.
+    pub fn with_event_sink(mut self, sink: Box<dyn EventSink>) -> Self {
+        self.hooks.install_event_sink(sink);
+        self
+    }
+
+    /// Install the rate limiter. THIS LIBRARY DOES NOT RATE LIMIT: RFC 8628 section 5.1 makes user
+    /// code entropy adequate only IN COMBINATION WITH rate limiting of code entry, and only the
+    /// host has a caller, an IP or a session to count against. See
+    /// [`AuthorizationServer::approve_device`].
+    pub fn with_rate_limiter(mut self, limiter: Box<dyn RateLimiter>) -> Self {
+        self.hooks.install_rate_limiter(limiter);
+        self
+    }
+
+    /// Install the client secret verifier, for [`crate::client::SecretHash`] schemes this crate
+    /// does not implement (argon2id, scrypt, an HSM). The built-in scheme needs no verifier and is
+    /// never delegated to one.
+    pub fn with_secret_verifier(
+        mut self,
+        verifier: Box<dyn crate::client::SecretVerifier>,
+    ) -> Self {
+        self.hooks.install_secret_verifier(verifier);
+        self
+    }
+
+    /// The installed host seams, for a host that wants to emit its own events onto the same
+    /// channel (a consent decision, say) or to consult its own limiter.
+    pub fn hooks(&self) -> &Hooks {
+        &self.hooks
     }
 
     /// Turn the freshly minted random token into what actually goes on the wire: itself when the
@@ -471,6 +522,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client: &Client,
         subject: Option<&str>,
         scope: &ScopeSet,
+        resource: &[String],
         now: SystemTime,
         jti: String,
     ) -> Result<String, ErrorResponse> {
@@ -482,7 +534,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             iss: self.config.issuer.clone(),
             exp: crate::jwt::unix_seconds(now + self.config.access_token_ttl)
                 .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
-            aud: jwt.audience().clone(),
+            // RFC 8707 s2 with RFC 9068 s2.2: when the client named the resource server(s) it
+            // means to call, THAT is the audience, and the configured default is not. The default
+            // is a deployment-wide statement made before any request arrived; the resource
+            // indicator is this grant's own, and honouring the wider one would hand back a token
+            // valid somewhere the client did not ask for and the user did not approve. Single
+            // resource stays the plain-string form RFC 7519 s4.1.3 allows, because that is what
+            // most resource servers actually parse.
+            aud: match resource {
+                [] => jwt.audience().clone(),
+                [one] => crate::jwt::Audience::One(one.clone()),
+                many => crate::jwt::Audience::Many(many.to_vec()),
+            },
             // RFC 9068 section 2.2: `sub` is REQUIRED. Where there is no resource owner (a
             // client-only grant) the RFC's own answer is the client identifier, so the claim is
             // never absent and never invented.
@@ -529,6 +592,73 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self.config
     }
 
+    /// This server's issuer identifier, in the ONE spelling it publishes.
+    ///
+    /// RFC 9207 section 2.4 has the client compare the `iss` authorization response parameter
+    /// against the issuer it started the flow with, for EQUALITY, and the value it started from is
+    /// the RFC 8414 `issuer` metadata member. `AuthorizationServerMetadata::from_config` trims a
+    /// trailing slash off the configured issuer, so this trims it too: a host that wrote
+    /// `https://as.example/` must not end up with two spellings of its own identity, because the
+    /// mismatch would read to a conforming client as a mix-up attack in progress.
+    fn issuer_identifier(&self) -> &str {
+        self.config.issuer.trim_end_matches('/')
+    }
+
+    /// Validate one RFC 8707 `resource` list from the wire into the owned form the grant records.
+    ///
+    /// Section 2 gives `invalid_target` as the answer for a value this server will not issue a
+    /// token for, which covers both a malformed indicator and (at the token endpoint, see
+    /// [`AuthorizationServer::narrow_resources`]) one that was never granted.
+    fn validate_resources<'a>(
+        requested: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<String>, ErrorResponse> {
+        let mut out = Vec::new();
+        for value in requested {
+            if !crate::authorization::is_valid_resource_indicator(value) {
+                // The offending value is NOT echoed: RFC 6749 section 5.2 restricts
+                // error_description to a charset an attacker-supplied URI need not respect, and
+                // naming the parameter is enough for the developer who sent it.
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidTarget).with_description(
+                        "resource must be an absolute URI with no fragment (RFC 8707 s2)",
+                    ),
+                );
+            }
+            // A repeated identical indicator is the same request twice, not two audiences.
+            if !out.iter().any(|kept: &String| kept == value) {
+                out.push(value.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The resource set an issuance actually gets: the request may NARROW what the grant carries,
+    /// never widen it (RFC 8707 section 2).
+    ///
+    /// This is deliberately the same shape as the RFC 6749 section 6 scope rule that
+    /// [`AuthorizationServer::refresh_token`] applies, because it is the same argument: the user
+    /// approved a specific thing, and a later leg of the same grant asking for MORE than that is
+    /// either a client bug or an escalation attempt, and the AS cannot tell which.
+    ///
+    /// A grant that named no resource has nothing to narrow, so a token request that names one is
+    /// widening from nothing and is refused. Answering it any other way would let the token
+    /// endpoint mint an audience the authorization request never obtained.
+    fn narrow_resources(
+        granted: &[String],
+        requested: &[String],
+    ) -> Result<Vec<String>, ErrorResponse> {
+        if requested.is_empty() {
+            return Ok(granted.to_vec());
+        }
+        for want in requested {
+            if !granted.iter().any(|g| g == want) {
+                return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
+                    .with_description("resource was not granted by the authorization request"));
+            }
+        }
+        Ok(requested.to_vec())
+    }
+
     /// The storage seam, so the host can administer its own store.
     ///
     /// The one administrative operation this crate REQUIRES of the host is eviction:
@@ -551,20 +681,64 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
     /// Authenticate a client for a token-plane call: unknown id and failed secret verification
     /// collapse into the same `invalid_client` so an attacker cannot probe which ids exist.
+    ///
+    /// The WIRE keeps that collapse. The host's audit channel does NOT: an installed
+    /// [`crate::events::EventSink`] is told which of the two it actually was, because the host is
+    /// not the attacker and "a thousand unknown client ids" and "a thousand wrong secrets for one
+    /// real client" are different incidents.
+    ///
+    /// The host's [`RateLimiter`] is asked FIRST, before the store is touched, so a refused
+    /// attempt costs nothing and reveals nothing (RFC 9700 section 4.13 on credential stuffing at
+    /// the token endpoint).
     async fn authenticate_client(
         &self,
         client_id: &ClientId,
         client_secret: Option<&str>,
     ) -> Result<Client, ErrorResponse> {
-        let client = self
+        let attempt = Attempt::ClientAuthentication {
+            client_id: client_id.as_str(),
+        };
+        if self.hooks.check(attempt) == RateLimitDecision::Deny {
+            self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                client_id: client_id.as_str(),
+                failure: ClientAuthFailure::RateLimited,
+            });
+            // The same `invalid_client` a wrong secret gets. A distinct code would tell an
+            // attacker that they had found a live client id and merely hit the throttle.
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient));
+        }
+
+        let found = self
             .store
             .get_client(client_id)
             .await
-            .map_err(storage_error)?
-            .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidClient))?;
-        if !client.auth.verify(client_secret) {
+            .map_err(storage_error)?;
+        let client = match found {
+            Some(client) => client,
+            None => {
+                self.hooks.record(attempt, AttemptOutcome::Failed);
+                self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                    client_id: client_id.as_str(),
+                    failure: ClientAuthFailure::UnknownClient,
+                });
+                return Err(ErrorResponse::new(ErrorCode::InvalidClient));
+            }
+        };
+        // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this
+        // crate does not implement is decided by the host's verifier (see
+        // `crate::client::SecretVerifier`), and by nobody at all when none is installed.
+        if !client
+            .auth
+            .verify_with(client_secret, self.hooks.secret_verifier())
+        {
+            self.hooks.record(attempt, AttemptOutcome::Failed);
+            self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                client_id: client_id.as_str(),
+                failure: ClientAuthFailure::SecretMismatch,
+            });
             return Err(ErrorResponse::new(ErrorCode::InvalidClient));
         }
+        self.hooks.record(attempt, AttemptOutcome::Succeeded);
         Ok(client)
     }
 
@@ -663,8 +837,37 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .with_description("could not allocate an unused user code"))
     }
 
-    /// Fetch a still-live pending grant by entered user code, for the verification UI actions.
+    /// Fetch a still-live pending grant by entered user code, for the verification UI actions,
+    /// with the RFC 8628 section 5.1 throttle around it.
+    ///
+    /// `check` runs BEFORE the lookup, so a refused attempt learns nothing, and the outcome is
+    /// reported back afterwards because a guessing attack is visible in FAILURES, not in traffic.
+    /// Every rejection this can produce (unknown code, expired, already used) is counted the same
+    /// way: an attacker enumerating codes does not care which one they get.
     async fn pending_grant_by_user_code(
+        &self,
+        entered_user_code: &str,
+    ) -> Result<DeviceGrant, DeviceApprovalError> {
+        let attempt = Attempt::DeviceUserCodeEntry;
+        if self.hooks.check(attempt) == RateLimitDecision::Deny {
+            return Err(DeviceApprovalError::RateLimited);
+        }
+        let outcome = self
+            .lookup_pending_grant_by_user_code(entered_user_code)
+            .await;
+        self.hooks.record(
+            attempt,
+            if outcome.is_ok() {
+                AttemptOutcome::Succeeded
+            } else {
+                AttemptOutcome::Failed
+            },
+        );
+        outcome
+    }
+
+    /// The lookup itself, split out so the throttle above wraps every exit from it.
+    async fn lookup_pending_grant_by_user_code(
         &self,
         entered_user_code: &str,
     ) -> Result<DeviceGrant, DeviceApprovalError> {
@@ -706,13 +909,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         subject: impl Into<String>,
     ) -> Result<(), DeviceApprovalError> {
         let mut grant = self.pending_grant_by_user_code(entered_user_code).await?;
-        grant.state = DeviceGrantState::Approved {
-            subject: subject.into(),
-        };
+        let subject = subject.into();
+        // Cloned ONLY when a sink is installed: `grant` is consumed by the put below, so the
+        // event's fields have to be captured first, and an unobserved host must not pay for that.
+        let audit = self
+            .hooks
+            .is_observed()
+            .then(|| (grant.client_id.clone(), subject.clone()));
+        grant.state = DeviceGrantState::Approved { subject };
         self.store
             .put_device_grant(grant)
             .await
-            .map_err(DeviceApprovalError::Storage)
+            .map_err(DeviceApprovalError::Storage)?;
+        // Emitted AFTER the write: an approval that failed to persist did not happen, and an audit
+        // log that says otherwise is worse than none.
+        if let Some((client_id, subject)) = &audit {
+            self.hooks.emit(|| Event::DeviceGrantApproved {
+                client_id: client_id.as_str(),
+                subject,
+            });
+        }
+        Ok(())
     }
 
     /// The host's verification UI records the user's refusal.
@@ -722,15 +939,56 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// attacker enumerating codes does not care which of the two endpoints answers.
     pub async fn deny_device(&self, entered_user_code: &str) -> Result<(), DeviceApprovalError> {
         let mut grant = self.pending_grant_by_user_code(entered_user_code).await?;
+        let audit = self.hooks.is_observed().then(|| grant.client_id.clone());
         grant.state = DeviceGrantState::Denied;
         self.store
             .put_device_grant(grant)
             .await
-            .map_err(DeviceApprovalError::Storage)
+            .map_err(DeviceApprovalError::Storage)?;
+        if let Some(client_id) = &audit {
+            self.hooks.emit(|| Event::DeviceGrantDenied {
+                client_id: client_id.as_str(),
+            });
+        }
+        Ok(())
     }
 
-    /// The token endpoint (RFC 6749 section 3.2; device grant per RFC 8628 section 3.4/3.5).
+    /// The token endpoint (RFC 6749 section 3.2; device grant per RFC 8628 section 3.4/3.5), for a
+    /// request that names no RFC 8707 resource indicator.
+    ///
+    /// Equivalent to [`AuthorizationServer::token_with_resources`] with an empty list, which is
+    /// what a token request carrying no `resource` parameter means: no NARROWING is asked for, so
+    /// the issued token inherits whatever the grant already carries.
     pub async fn token(&self, request: TokenRequest) -> Result<TokenResponse, ErrorResponse> {
+        self.token_with_resources(request, &[]).await
+    }
+
+    /// The token endpoint with the RFC 8707 `resource` parameter.
+    ///
+    /// `resources` is the (possibly repeated) `resource` parameter from the token request, in wire
+    /// order. It is a separate argument rather than a field on every [`TokenRequest`] variant on
+    /// purpose: RFC 8707 section 2 defines `resource` as a parameter of the token REQUEST,
+    /// independent of `grant_type`, so putting it on each variant would state the same thing four
+    /// times, grow the enum every host copies around, and make every future grant type repeat it
+    /// again.
+    ///
+    /// What it does depends on the grant, and section 2 is what decides:
+    ///
+    /// - `authorization_code` and `refresh_token` may NARROW to a subset of what the authorization
+    ///   request obtained, and never widen it;
+    /// - `client_credentials` has no prior authorization request, so its resources are simply
+    ///   validated and used;
+    /// - `urn:ietf:params:oauth:grant-type:device_code` refuses any resource with `invalid_target`.
+    ///   The device authorization request (RFC 8628 section 3.1) does not accept `resource` in this
+    ///   crate yet, so there is nothing granted for a poll to narrow to, and inventing an audience
+    ///   at the token endpoint that the user never approved is exactly what the narrowing rule
+    ///   exists to prevent.
+    pub async fn token_with_resources(
+        &self,
+        request: TokenRequest,
+        resources: &[String],
+    ) -> Result<TokenResponse, ErrorResponse> {
+        let requested_resources = Self::validate_resources(resources.iter().map(|r| r.as_str()))?;
         match request {
             TokenRequest::AuthorizationCode {
                 client_id,
@@ -739,30 +997,54 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 redirect_uri,
                 code_verifier,
             } => {
-                self.authorization_code_token(
-                    &client_id,
-                    client_secret.as_deref(),
-                    &code,
-                    redirect_uri.as_deref(),
-                    code_verifier.as_deref(),
-                )
-                .await
+                let outcome = self
+                    .authorization_code_token(
+                        &client_id,
+                        client_secret.as_deref(),
+                        &code,
+                        redirect_uri.as_deref(),
+                        code_verifier.as_deref(),
+                        &requested_resources,
+                    )
+                    .await;
+                self.emit_refusal(&client_id, GrantType::AuthorizationCode, &outcome);
+                outcome
             }
             TokenRequest::ClientCredentials {
                 client_id,
                 client_secret,
                 scope,
             } => {
-                self.client_credentials_token(&client_id, client_secret.as_deref(), scope.as_ref())
-                    .await
+                let outcome = self
+                    .client_credentials_token(
+                        &client_id,
+                        client_secret.as_deref(),
+                        scope.as_ref(),
+                        requested_resources,
+                    )
+                    .await;
+                self.emit_refusal(&client_id, GrantType::ClientCredentials, &outcome);
+                outcome
             }
             TokenRequest::DeviceCode {
                 client_id,
                 client_secret,
                 device_code,
             } => {
-                self.device_token(&client_id, client_secret.as_deref(), &device_code)
-                    .await
+                // RFC 8707 s2: nothing was granted to narrow to, so a resource here would be an
+                // audience the user never approved. See `token_with_resources`.
+                if !requested_resources.is_empty() {
+                    return Err(
+                        ErrorResponse::new(ErrorCode::InvalidTarget).with_description(
+                            "the device authorization request granted no resource to narrow to",
+                        ),
+                    );
+                }
+                let outcome = self
+                    .device_token(&client_id, client_secret.as_deref(), &device_code)
+                    .await;
+                self.emit_refusal(&client_id, GrantType::DeviceCode, &outcome);
+                outcome
             }
             TokenRequest::RefreshToken {
                 client_id,
@@ -770,14 +1052,38 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 refresh_token,
                 scope,
             } => {
-                self.refresh_token(
-                    &client_id,
-                    client_secret.as_deref(),
-                    &refresh_token,
-                    scope.as_ref(),
-                )
-                .await
+                let outcome = self
+                    .refresh_token(
+                        &client_id,
+                        client_secret.as_deref(),
+                        &refresh_token,
+                        scope.as_ref(),
+                        &requested_resources,
+                    )
+                    .await;
+                self.emit_refusal(&client_id, GrantType::RefreshToken, &outcome);
+                outcome
             }
+        }
+    }
+
+    /// Emit [`Event::GrantRefused`] when a token-endpoint answer was an error.
+    ///
+    /// A non-async helper called from the arms of [`AuthorizationServer::token_with_resources`],
+    /// where the client id is already an owned local. Deliberately NOT a wrapper around the whole
+    /// endpoint: see the note in the 0.2.0 hook patch, and `tests/allocation.rs`.
+    fn emit_refusal(
+        &self,
+        client_id: &ClientId,
+        grant_type: GrantType,
+        outcome: &Result<TokenResponse, ErrorResponse>,
+    ) {
+        if let Err(error) = outcome {
+            self.hooks.emit(|| Event::GrantRefused {
+                client_id: client_id.as_str(),
+                grant_type,
+                error: error.error,
+            });
         }
     }
 
@@ -856,6 +1162,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 redirect_uri: redirect_uri.clone(),
                 error: ErrorResponse::new(code).with_description(why.to_string()),
                 state: state.clone(),
+                // RFC 9207 section 2: every authorization response, including this one, names the
+                // server that produced it.
+                iss: self.issuer_identifier().to_string(),
             })
         };
 
@@ -924,6 +1233,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
+        // 6. RFC 8707 resource indicators. Checked LAST of the redirectable checks because it is
+        //    the newest and least load-bearing of them: a request that is also missing PKCE should
+        //    hear about PKCE. A malformed indicator is `invalid_target` (section 2), reported to
+        //    the client rather than to the user, since by here the redirect URI is trusted.
+        let resource = Self::validate_resources(request.resource.iter().map(|r| r.as_ref()))
+            .map_err(|e| {
+                AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                    redirect_uri: redirect_uri.clone(),
+                    error: e,
+                    state: state.clone(),
+                    iss: self.issuer_identifier().to_string(),
+                })
+            })?;
+
         Ok(ValidatedAuthorizationRequest::new(
             client.client_id,
             redirect_uri,
@@ -931,6 +1254,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             state,
             code_challenge.to_string(),
             CodeChallengeMethod::S256,
+            self.issuer_identifier().to_string(),
+            resource,
         ))
     }
 
@@ -954,6 +1279,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             subject: subject.into(),
             code_challenge: request.code_challenge.clone(),
             code_challenge_method: request.code_challenge_method,
+            // RFC 8707 s2: what the token this code redeems into may be audience-restricted to.
+            resource: request.resource.clone(),
             expires_at: now + self.config.authorization_code_ttl,
             state: AuthorizationCodeState::Issued,
         };
@@ -965,11 +1292,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     redirect_uri: request.redirect_uri.clone(),
                     error: ErrorResponse::new(ErrorCode::ServerError),
                     state: request.state.clone(),
+                    iss: request.issuer.clone(),
                 })
             })?;
         Ok(AuthorizationResponse {
             code,
             state: request.state.clone(),
+            // RFC 9207 s2. Taken from the validated request rather than re-read from config so the
+            // success and error halves of one authorization request cannot disagree about who
+            // answered it.
+            iss: request.issuer.clone(),
         })
     }
 
@@ -981,6 +1313,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         code: &str,
         redirect_uri: Option<&str>,
         code_verifier: Option<&str>,
+        requested_resources: &[String],
     ) -> Result<TokenResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, client_secret).await?;
         if !client.allows_grant(GrantType::AuthorizationCode) {
@@ -1030,10 +1363,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // client has legitimately rotated since redemption dies too: the compromise is of the
             // grant, not of one token from it (RFC 9700 section 4.14.2).
             let mut revoked_family = false;
+            // MOVED out of the record rather than cloned: `rec` is a value this scope already owns
+            // and drops, so carrying its family id to the audit event below costs nothing.
+            let mut revoked_family_id: Option<String> = None;
             if let Some(rt) = refresh_token {
                 if let Ok(Some(rec)) = self.store.get_refresh_token(rt).await {
                     let _ = self.store.revoke_token_family(&rec.family_id).await;
                     revoked_family = true;
+                    revoked_family_id = Some(rec.family_id);
                 }
             }
             if !revoked_family {
@@ -1046,6 +1383,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // detection work more than once: taking it here would make the NEXT replay read as an
             // unknown code, which is the answer a typo gets.
             let _ = self.store.put_authorization_code(record).await;
+            // EVIDENCE OF COMPROMISE (RFC 6749 section 4.1.2, RFC 9700 section 4.1.1). The
+            // revocation above is silent without this: a host cannot investigate a stolen code it
+            // was never told about.
+            self.hooks.emit(|| Event::AuthorizationCodeReplayDetected {
+                client_id: client.client_id.as_str(),
+                family_id: revoked_family_id.as_deref(),
+                tokens_revoked: revoked_family,
+            });
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
 
@@ -1081,11 +1426,26 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .with_description("code_verifier does not match the recorded code_challenge"));
         }
 
+        // RFC 8707 s2: the token request may narrow the audience the authorization request
+        // obtained, never widen it. The code is put BACK on refusal, exactly as the scope and
+        // redirect_uri mismatches above do: asking for the wrong resource is a client bug, and
+        // burning a live code for a bug the client can fix on retry is a denial of service the
+        // attacker gets for free.
+        let resource = match Self::narrow_resources(&record.resource, requested_resources) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.store.put_authorization_code(record).await;
+                return Err(e);
+            }
+        };
+
         let issued = self
             .issue(
                 &client,
+                GrantType::AuthorizationCode,
                 Some(record.subject.clone()),
                 record.scope.clone(),
+                resource,
                 None,
                 true,
             )
@@ -1114,6 +1474,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client_id: &ClientId,
         client_secret: Option<&str>,
         requested_scope: Option<&ScopeSet>,
+        resource: Vec<String>,
     ) -> Result<TokenResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, client_secret).await?;
         // RFC 6749 section 4.4: this grant is for confidential clients. A public client has no
@@ -1129,7 +1490,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Section 4.4.3: a refresh token SHOULD NOT be included. The client holds its own
         // credentials and can mint another token whenever it likes, so a refresh token would be a
         // second long-lived secret bought for nothing.
-        self.issue(&client, None, scope, None, false).await
+        // RFC 8707 s2: there is no prior authorization request here, so there is nothing to
+        // narrow AGAINST. The client authenticated as itself and is naming the resource server it
+        // means to call, which is the whole of what the parameter says in this grant.
+        self.issue(
+            &client,
+            GrantType::ClientCredentials,
+            None,
+            scope,
+            resource,
+            None,
+            false,
+        )
+        .await
     }
 
     /// RFC 8628 sections 3.4/3.5: one device-token poll.
@@ -1206,8 +1579,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     .await
                     .map_err(storage_error)?
                     .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
-                self.issue(&client, Some(subject), taken.scope, None, true)
-                    .await
+                // No resource: the device authorization request does not carry one (see
+                // `token_with_resources`), and the poll above refuses any the client sends.
+                self.issue(
+                    &client,
+                    GrantType::DeviceCode,
+                    Some(subject),
+                    taken.scope,
+                    Vec::new(),
+                    None,
+                    true,
+                )
+                .await
             }
         }
     }
@@ -1219,6 +1602,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client_secret: Option<&str>,
         refresh_token: &str,
         requested_scope: Option<&ScopeSet>,
+        requested_resources: &[String],
     ) -> Result<TokenResponse, ErrorResponse> {
         let client = self.authenticate_client(client_id, client_secret).await?;
         if !client.allows_grant(GrantType::RefreshToken) {
@@ -1257,10 +1641,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // The family revocation removes every record carrying this id, including this one, so
         // there is nothing to put back.
         if record.state == RefreshTokenState::Spent {
-            self.store
+            let records_revoked = self
+                .store
                 .revoke_token_family(&record.family_id)
                 .await
                 .map_err(storage_error)?;
+            // EVIDENCE OF COMPROMISE, and the event most likely to be asked about after the fact:
+            // the family revocation also logs out the legitimate client.
+            self.hooks.emit(|| Event::RefreshTokenReuseDetected {
+                client_id: client.client_id.as_str(),
+                family_id: &record.family_id,
+                records_revoked,
+            });
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
                 .with_description("refresh token reuse detected; the grant has been revoked"));
         }
@@ -1290,11 +1682,26 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
+        // RFC 8707 s2, the same narrowing rule as the scope rule immediately above and refused the
+        // same way: the record goes back so a client that asked for the wrong resource can retry.
+        let resource = match Self::narrow_resources(&record.resource, requested_resources) {
+            Ok(r) => r,
+            Err(e) => {
+                self.store
+                    .put_refresh_token(record)
+                    .await
+                    .map_err(storage_error)?;
+                return Err(e);
+            }
+        };
+
         let issued = self
             .issue(
                 &client,
+                GrantType::RefreshToken,
                 record.subject.clone(),
                 scope,
+                resource,
                 Some(RefreshChain {
                     family_id: record.family_id.clone(),
                     expires_at: record.expires_at,
@@ -1328,11 +1735,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// `chain`: `None` starts a NEW family (a fresh grant); `Some(_)` continues an existing one,
     /// keeping both its family id and its absolute lifetime, which is what makes rotation a chain
     /// rather than a sequence of unrelated tokens.
+    // Eight arguments rather than seven, because the audit event has to name the grant that
+    // produced the token and `issue` is the only place that sees the whole issuance. Bundling them
+    // into a struct would be churn for its own sake on a private function with four call sites.
+    #[allow(clippy::too_many_arguments)]
     async fn issue(
         &self,
         client: &Client,
+        grant_type: GrantType,
         subject: Option<String>,
         scope: ScopeSet,
+        resource: Vec<String>,
         chain: Option<RefreshChain>,
         allow_refresh: bool,
     ) -> Result<TokenResponse, ErrorResponse> {
@@ -1353,6 +1766,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             (None, false) => None,
         };
 
+        // Cloned ONLY when a sink is installed: both values are consumed by the records written
+        // below, and an unobserved host must not pay two clones per issued token. BOXED because
+        // this local lives across every await in the issuance, and the token future is 1936 bytes
+        // against tokio's 2048-byte debug boxing threshold; 8 bytes here rather than 48 is 40
+        // bytes of headroom for every caller, bought with one small allocation paid only by a
+        // host that asked to be told about issuance.
+        let audit = self
+            .hooks
+            .is_observed()
+            .then(|| Box::new((subject.clone(), family_id.clone())));
+
         let access_token = random_hex(32);
         // RFC 9068, when the host configured it: the WIRE token becomes a signed JWT and the
         // random string above becomes its `jti`. The record below is persisted either way, keyed
@@ -1360,14 +1784,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // revocation keep working and a revoked JWT is genuinely dead at this AS rather than
         // merely deprecated.
         #[cfg(feature = "jwt")]
-        let access_token =
-            self.wire_access_token(client, subject.as_deref(), &scope, now, access_token)?;
+        let access_token = self.wire_access_token(
+            client,
+            subject.as_deref(),
+            &scope,
+            &resource,
+            now,
+            access_token,
+        )?;
         self.store
             .put_token(IssuedToken {
                 access_token: access_token.clone(),
                 client_id: client.client_id.clone(),
                 subject: subject.clone(),
                 scope: scope.clone(),
+                resource: resource.clone(),
                 issued_at: now,
                 expires_at: now + self.config.access_token_ttl,
                 family_id: family_id.clone(),
@@ -1387,6 +1818,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     client_id: client.client_id.clone(),
                     subject,
                     scope: scope.clone(),
+                    // The chain remembers what it may narrow from on the next rotation.
+                    resource,
                     expires_at,
                     // Present whenever a refresh token is: `issues_refresh` is what decided both.
                     family_id: family_id.unwrap_or_default(),
@@ -1398,6 +1831,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         } else {
             None
         };
+
+        // Emitted after BOTH records are persisted, so the event describes a token that exists.
+        if let Some(audit) = &audit {
+            self.hooks.emit(|| Event::TokenIssued {
+                client_id: client.client_id.as_str(),
+                grant_type,
+                subject: audit.0.as_deref(),
+                scope: &scope,
+                family_id: audit.1.as_deref(),
+                refresh_issued: refresh_token.is_some(),
+            });
+        }
 
         Ok(TokenResponse {
             access_token,
@@ -1458,7 +1903,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 token_type: Some(TokenType::Bearer),
                 exp: unix_seconds(t.expires_at),
                 iat: unix_seconds(t.issued_at),
-                iss: Some(self.config.issuer.clone()),
+                iss: Some(self.issuer_identifier().to_string()),
+                // RFC 7662 s2.2: `aud` is OPTIONAL, and this server has one to report exactly when
+                // the grant carried RFC 8707 resource indicators. Omitted rather than empty when it
+                // does not: see `IntrospectionResponse::aud`.
+                aud: (!t.resource.is_empty()).then(|| t.resource.clone()),
             },
             // Unknown, expired, or somebody else's. All three are one answer on purpose.
             _ => IntrospectionResponse::inactive(),
@@ -1504,6 +1953,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         .take_refresh_token(token)
                         .await
                         .map_err(storage_error)?;
+                    self.hooks.emit(|| Event::TokenRevoked {
+                        client_id: client.client_id.as_str(),
+                        token_type: TokenTypeHint::RefreshToken,
+                    });
                     Ok(true)
                 }
                 // Unknown, or somebody else's: nothing to do, and section 2.2 makes both a 200.
@@ -1518,6 +1971,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         .delete_token(token)
                         .await
                         .map_err(storage_error)?;
+                    self.hooks.emit(|| Event::TokenRevoked {
+                        client_id: client.client_id.as_str(),
+                        token_type: TokenTypeHint::AccessToken,
+                    });
                     Ok(true)
                 }
                 Ok(_) => Ok(false),

@@ -29,6 +29,7 @@ fn challenge() -> String {
 /// A complete, valid request from the public client.
 fn good_request(challenge: &str) -> AuthorizationRequest<'static> {
     AuthorizationRequest {
+        resource: Vec::new(),
         response_type: Some("code".into()),
         client_id: Some("public-app".into()),
         redirect_uri: Some(PUBLIC_REDIRECT.into()),

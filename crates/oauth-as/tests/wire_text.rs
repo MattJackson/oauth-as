@@ -198,6 +198,7 @@ fn authorization_error_display_surfaces_the_inner_error_from_either_arm() {
         redirect_uri: "https://app.example/cb".to_string(),
         error: ErrorResponse::new(ErrorCode::AccessDenied),
         state: None,
+        iss: "https://as.example".to_string(),
     });
     assert_eq!(format!("{redirect}"), "access_denied");
 }
@@ -226,6 +227,7 @@ fn authorization_error_http_status_separates_direct_redirect_and_server_error() 
             redirect_uri: "https://app.example/cb".to_string(),
             error: ErrorResponse::new(ErrorCode::AccessDenied),
             state: None,
+            iss: "https://as.example".to_string(),
         })
         .http_status(),
         302
@@ -354,23 +356,27 @@ fn authorization_response_location_encodes_and_separates_correctly() {
     let no_state = AuthorizationResponse {
         code: "abc".to_string(),
         state: None,
+        // RFC 9207 s2: every authorization response names its issuer, so every expected string
+        // below carries it. The value is percent-encoded like any other parameter.
+        iss: "https://as.example".to_string(),
     };
     assert_eq!(
         no_state.location("https://app.example/cb"),
-        "https://app.example/cb?code=abc"
+        "https://app.example/cb?code=abc&iss=https%3A%2F%2Fas.example"
     );
     assert_eq!(
         no_state.location("https://app.example/cb?tenant=acme"),
-        "https://app.example/cb?tenant=acme&code=abc"
+        "https://app.example/cb?tenant=acme&code=abc&iss=https%3A%2F%2Fas.example"
     );
 
     let with_state = AuthorizationResponse {
         code: "a&b".to_string(),
         state: Some("x=y#z".to_string()),
+        iss: "https://as.example".to_string(),
     };
     assert_eq!(
         with_state.location("https://app.example/cb"),
-        "https://app.example/cb?code=a%26b&state=x%3Dy%23z"
+        "https://app.example/cb?code=a%26b&state=x%3Dy%23z&iss=https%3A%2F%2Fas.example"
     );
 }
 
@@ -388,6 +394,7 @@ fn authorization_error_redirect_location_carries_every_present_member() {
             error_uri: Some("https://as.example/docs#scope".to_string()),
         },
         state: Some("s t".to_string()),
+        iss: "https://as.example".to_string(),
     };
     assert_eq!(
         full.location(),
@@ -395,17 +402,21 @@ fn authorization_error_redirect_location_carries_every_present_member() {
          &error=invalid_scope\
          &error_description=scope%20%5Ba%26b%5D%20exceeds\
          &error_uri=https%3A%2F%2Fas.example%2Fdocs%23scope\
-         &state=s%20t"
+         &state=s%20t\
+         &iss=https%3A%2F%2Fas.example"
     );
 
     let minimal = AuthorizationErrorRedirect {
         redirect_uri: "https://app.example/cb".to_string(),
         error: ErrorResponse::new(ErrorCode::AccessDenied),
         state: None,
+        iss: "https://as.example".to_string(),
     };
     assert_eq!(
         minimal.location(),
-        "https://app.example/cb?error=access_denied",
+        // RFC 9207 s2 puts iss on the error response too; absent OPTIONAL members still
+        // contribute nothing.
+        "https://app.example/cb?error=access_denied&iss=https%3A%2F%2Fas.example",
         "absent optional members must contribute no parameter at all"
     );
 }

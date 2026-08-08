@@ -300,16 +300,25 @@ fn authorization_response_location_allocates_exactly_once_at_the_exact_size() {
     let code = "&=#?";
     // 3 characters, likewise, so the encoded form is 9 characters.
     let state = " /+";
+    // Not a realistic issuer identifier, and deliberately so: RFC 9207 s2 puts `iss` on every
+    // authorization response, and this gate needs EVERY byte of every value to expand to three
+    // characters or the worst-case estimate stops being exact and the `bytes` assertion below
+    // stops constraining it in the over-estimate direction. A real `https://...` issuer is mostly
+    // unreserved characters; the length arithmetic is identical either way.
+    let iss = "^|`";
     let redirect_uri = "https://app.example/cb";
 
     let response = oauth_as::AuthorizationResponse {
         code: code.to_string(),
         state: Some(state.to_string()),
+        iss: iss.to_string(),
     };
     let (location, d) = measure(|| response.location(redirect_uri));
 
-    // "?code=" is 6 characters, "&state=" is 7: exactly the two constants the estimate carries.
-    let exact_len = redirect_uri.len() + 6 + code.len() * 3 + 7 + state.len() * 3;
+    // "?code=" is 6 characters, "&state=" is 7, "&iss=" is 5: exactly the three constants the
+    // estimate carries.
+    let exact_len =
+        redirect_uri.len() + 6 + code.len() * 3 + 7 + state.len() * 3 + 5 + iss.len() * 3;
     assert_eq!(
         location.len(),
         exact_len,
@@ -451,6 +460,7 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
         srv.register_client(code_test_client()).await.unwrap();
         let challenge = oauth_as::pkce::code_challenge_s256(verifier);
         let req = AuthorizationRequest {
+            resource: Vec::new(),
             response_type: Some("code".into()),
             client_id: Some("public-app".into()),
             redirect_uri: Some("https://app.example/cb".into()),
@@ -501,6 +511,7 @@ fn refresh_rotation_hot_path_allocation_bound() {
         srv.register_client(code_test_client()).await.unwrap();
         let challenge = oauth_as::pkce::code_challenge_s256(verifier);
         let req = AuthorizationRequest {
+            resource: Vec::new(),
             response_type: Some("code".into()),
             client_id: Some("public-app".into()),
             redirect_uri: Some("https://app.example/cb".into()),

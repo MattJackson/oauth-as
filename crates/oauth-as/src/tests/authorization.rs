@@ -56,6 +56,7 @@ fn c13_authorization_code_record_debug_format_redacts_code_and_tokens() {
         subject: "user-1".to_string(),
         code_challenge: "some-challenge".to_string(),
         code_challenge_method: CodeChallengeMethod::S256,
+        resource: vec!["https://rs.example/api".to_string()],
         expires_at: std::time::SystemTime::UNIX_EPOCH,
         state: AuthorizationCodeState::Consumed {
             access_token: "the-secret-access-token".to_string(),
@@ -100,9 +101,81 @@ fn c11_only_the_sealed_constructor_produces_a_validated_request() {
         None,
         "some-challenge".to_string(),
         CodeChallengeMethod::S256,
+        "https://as.example".to_string(),
+        Vec::new(),
     );
     assert_eq!(
         validated.redirect_uri,
         "https://registered.example/callback"
+    );
+}
+
+/// RFC 8707 s2 states three rules about a `resource` value and this function is where all three
+/// live, so it is checked exhaustively over the interesting shapes rather than only through the
+/// endpoint that calls it. The rules: an absolute URI (RFC 3986 s4.3, so a scheme and a `:`), a
+/// query component is PERMITTED, and a fragment is FORBIDDEN.
+#[test]
+fn rfc8707_resource_indicators_must_be_absolute_uris_without_a_fragment() {
+    for ok in [
+        "https://rs.example",
+        "https://rs.example/api",
+        "https://rs.example/api?tenant=1",
+        // Not every resource server is an https URL: RFC 8707 s2 says absolute URI, and a URN is
+        // one. Refusing it would exclude a shape the RFC explicitly admits.
+        "urn:example:resource",
+        "coap+tcp://rs.example/x",
+    ] {
+        assert!(
+            is_valid_resource_indicator(ok),
+            "RFC 8707 s2 admits {ok} as a resource indicator"
+        );
+    }
+
+    for bad in [
+        // No scheme at all: a relative reference names nothing the AS can restrict a token to.
+        "",
+        "/api",
+        "rs.example/api",
+        "//rs.example/api",
+        // A scheme must start with a letter (RFC 3986 s3.1) and must not be empty.
+        ":no-scheme",
+        "1http://rs.example",
+        "ht_tp://rs.example",
+        // Fragments are forbidden outright, wherever they appear.
+        "https://rs.example/#",
+        "https://rs.example/api#section",
+        "https://rs.example/api?q=1#f",
+        // Not URI characters at all: RFC 3986 s2 requires these to be percent-encoded, and a value
+        // that cannot survive a query string must not reach a token's audience.
+        "https://rs.example/a b",
+        "https://rs.example/\u{e9}",
+    ] {
+        assert!(
+            !is_valid_resource_indicator(bad),
+            "RFC 8707 s2 must refuse {bad:?} as a resource indicator"
+        );
+    }
+}
+
+/// RFC 8707 s2 permits `resource` to be repeated, so parsing keeps EVERY occurrence, in order.
+/// This is the one parameter exempt from the first-wins rule RFC 6749 s3.1 motivates for the rest:
+/// there, a duplicate is a smuggling attempt; here, it is the client naming a second audience.
+#[test]
+fn rfc8707_resource_is_the_one_repeatable_authorization_parameter() {
+    let req = AuthorizationRequest::from_pairs([
+        ("client_id", "app"),
+        ("resource", "https://a.example"),
+        ("client_id", "attacker"),
+        ("resource", "https://b.example"),
+    ]);
+    assert_eq!(
+        req.resource,
+        vec!["https://a.example", "https://b.example"],
+        "every resource occurrence is part of the request (RFC 8707 s2)"
+    );
+    assert_eq!(
+        req.client_id.as_deref(),
+        Some("app"),
+        "every OTHER parameter still keeps the first occurrence (RFC 6749 s3.1)"
     );
 }
