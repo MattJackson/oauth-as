@@ -3,9 +3,21 @@
 # environment-sensitive to run on every push" has been proven, before main is ever considered.
 #
 # HONESTY (what the conformance jobs are, and are not):
-#   There is no official OAuth 2.1 conformance suite, and the OpenID Foundation conformance
-#   suite ships only OIDC / FAPI profiles that presuppose OpenID Connect semantics; it cannot
-#   test a plain OAuth 2.1 + RFC 8628 AS and is therefore NOT run here. What runs instead:
+#   There is no official OAuth 2.1 conformance suite: OAuth 2.1 is still an Internet Draft, so
+#   no certification programme exists and no implementation can hold one.
+#
+#   CORRECTED for 0.9.0, and the earlier text in this file was WRONG. It said the OpenID
+#   Foundation suite "presupposes OpenID Connect semantics" and therefore could not test this
+#   crate. It can. The FAPI 2.0 Security Profile plans carry an `openid=plain_oauth` variant
+#   that discovers through /.well-known/oauth-authorization-server, never asks for an id_token,
+#   and yields a real certification profile name. It is still not run here, but for a list of
+#   specific missing pieces (a protected resource endpoint, HTTPS, two static clients with
+#   distinct keys, mandatory PAR, and a refresh-rotation policy that FAPI 2.0 s5.3.2.1-9 puts in
+#   genuine tension with OAuth 2.1 s6.1) rather than for a category error. The full verdict,
+#   with citations into the suite source and the specification, is in
+#   crates/oauth-as-conformance/EXTERNAL-TOOLING.md. Do not re-derive it; do challenge it.
+#
+#   What runs instead:
 #     1. Vendored RFC test vectors (RFC 7636 App B, RFC 7515 App A.1-A.3), byte-exact, plus
 #        validator self-checks for RFC 9068, RFC 8414, RFC 6749 s5.1/s5.2, RFC 8628 s3.2/s3.5.
 #     2. The conformance gate self-test: every gate is proven able to go RED (a corrupted
@@ -19,32 +31,39 @@
 #        rather than passing vacuously, and that RED is correct, expected behaviour, not a bug
 #        in this workflow. Do not make this job conditional on the shim's existence and do not
 #        add continue-on-error to it: a gate that can pass without the shim is a gate that lies.
-#     4. `authgent` was re-researched from primary sources (GitHub API, PyPI) on 2026-08-08 and
-#        this corrects KICKOFF.md: the project DOES exist (github.com/authgent/authgent, Apache
-#        2.0, PyPI package `authgent-server`, real git tags up to v0.3.4, a working composite
-#        action at `.github/actions/mcp-lint` documented in its own docs/ci-integration.md as
-#        `authgent/authgent/.github/actions/mcp-lint@v0.3.4`). It is still NOT wired in here,
-#        for a different reason than "unconfirmed": its scanner (server/authgent_server/scanner.py
-#        in that repo) hardcodes its target as an MCP resource server, not a bare OAuth AS. The
-#        entry point fetches RFC 9728 Protected Resource Metadata first and, if that is missing,
-#        returns a single critical "not an MCP server" finding and skips every other check,
-#        including the RFC 8414 / PKCE checks this project actually wants. There is no CLI flag
-#        to point it at an AS metadata document directly; the only way to reach the RFC 8414/PKCE
-#        checks is to stand up a throwaway RFC 9728 PRM document this crate has no reason to own,
-#        purely to satisfy the scanner's required discovery hop. That is the same "true but
-#        substantively misleading" trap KICKOFF.md warns about for bolting on OIDC, so it is
-#        skipped here too. Also note the tool's own marketplace README
-#        (marketplace/mcp-lint-action/README.md in that repo) advertises
-#        `authgent/mcp-lint-action@v1`, a repository that returns 404 from the GitHub API; the
-#        action reference that actually resolves is the one above, from that project's own
-#        ci-integration.md. No placeholder job is left for this: a disabled job that will never
-#        be enabled is dead YAML, so it has been removed rather than kept as decoration.
-#     5. OAuch (github.com/DistriNet/OAuch, MIT, 17 stars) was re-checked on 2026-08-08: its own
+#     4. A SECOND independent third-party client, in a different language and from a different
+#        author than the pinned Rust one: golang.org/x/oauth2 v0.36.0, pinned exactly with a
+#        committed go.sum. It covers the client credentials and refresh-with-rotation grants that
+#        the Rust drive does not, because a second opinion on the same question is worth less
+#        than a first opinion on a new one. scripts/oauth-interop.sh, --selftest first.
+#     5. `authgent` (github.com/authgent/authgent, Apache 2.0, PyPI `authgent-server`), NOW
+#        WIRED IN, which reverses the decision recorded here on 2026-08-08 and in KICKOFF.md.
+#        Nothing about the tool changed; this crate did. The scanner
+#        (server/authgent_server/scanner.py) fetches RFC 9728 Protected Resource Metadata first
+#        and, absent it, returns one critical "not an MCP server" finding and skips every
+#        remaining check. That blocker is now removable honestly: RFC 9728 landed in the crate at
+#        0.7.0, and crates/oauth-as/examples/protected_resource_fixture.rs stands up a loopback
+#        test resource publishing a TRUE document that names this AS. The full argument for why
+#        that is legitimate rather than the "true but substantively misleading" trap, and the
+#        per-finding reasoning for the accepted baseline, is at the top of
+#        scripts/oauth-mcp-lint.sh. Read it before changing this job.
+#        THIS PROJECT IS NOT AN MCP SERVER. The scanner's MCP verdict is quoted nowhere. What is
+#        quoted is that its RFC 8414, RFC 7636, RFC 9207, RFC 8707 and RFC 7591 checks were
+#        applied to this crate's metadata document by a tool nobody here wrote.
+#        The action reference `authgent/authgent/.github/actions/mcp-lint@v0.3.4` was verified
+#        directly: the raw action.yml at that tag returns 200 and is a composite action. Their
+#        marketplace README advertises `authgent/mcp-lint-action@v1`, a repository that does not
+#        exist, and that reference is deliberately not used. `scanner-version` is pinned so the
+#        action cannot silently install a newer scanner than the baseline was recorded against.
+#        Note also that the action declares a `fail-on` input it never passes to the CLI, so the
+#        threshold is always the default `error`; do not set `fail-on` here and expect it to do
+#        anything.
+#     6. OAuch (github.com/DistriNet/OAuch, MIT, 17 stars) was re-checked on 2026-08-08: its own
 #        README documents only a Visual-Studio build or a Docker image that serves the same
 #        interactive web UI on a local port. No CLI, no REST automation surface, no CI mode was
 #        found in the repository. It remains a human-driven web app and is not wired in here for
 #        that reason, matching KICKOFF.md's original assessment.
-#     6. No independent, CI-runnable RFC 8414 JSON Schema or metadata-validator tool (distinct
+#     7. No independent, CI-runnable RFC 8414 JSON Schema or metadata-validator tool (distinct
 #        from an OAuth/OIDC mock server, which tests the opposite direction) could be confirmed
 #        to exist as of 2026-08-08. If one surfaces later, wire it in following the same pinning
 #        discipline as every other job in this file.
@@ -211,6 +230,86 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Live conformance check against a served AS
         run: scripts/oauth-conformance.sh --check
+
+  # The SECOND independent client, in a second language. Same discipline as every other gate
+  # here: --selftest proves it can go red before --check's green is trusted, and the two are
+  # separate steps in one job rather than two jobs so the ordering cannot be lost to a missing
+  # `needs`. Nothing is conditional on the go toolchain being present: absent-is-FAIL, because a
+  # gate that skips when its judge is missing is a gate that reports green for an untested AS.
+  interop:
+    name: second third-party client (golang.org/x/oauth2, pinned)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The version the job actually runs is pinned in
+      # crates/oauth-as-conformance/interop/go/go.mod, with go.sum locking the module hashes.
+      # This only supplies a toolchain new enough to build it.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Prove the interop gate can go RED
+        run: scripts/oauth-interop.sh --selftest
+      - name: Drive the live AS with a second independent client
+        run: scripts/oauth-interop.sh --check
+
+  # The third-party MCP-OAuth scanner. Read the HONESTY block above and the header of
+  # scripts/oauth-mcp-lint.sh before touching this job; the argument for why the RFC 9728 fixture
+  # is legitimate, and the reason each accepted finding is accepted, both live there.
+  #
+  # Two mechanisms on purpose, and they are not redundant. The selftest step runs the scanner from
+  # a pinned pip install so the gate can be shown RED on both axes, which the composite action has
+  # no way to do. The scan step then runs the project's OWN published action, so that what gates
+  # this repository is the thing they ship rather than our reading of it.
+  mcp-lint:
+    name: authgent MCP-OAuth scanner (RFC 8414 / PKCE / RFC 9207 checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # RED first, on both axes: no RFC 9728 document must fail (so the gate cannot pass having
+      # silently lost its discovery hop), and an AS advertising `plain` PKCE and the implicit
+      # grant must fail NAMING those checks (so the RFC 8414 checks are provably the ones doing
+      # the work).
+      - name: Prove the scanner gate can go RED
+        run: scripts/oauth-mcp-lint.sh --selftest
+      - name: Build the AS and the RFC 9728 fixture resource
+        run: |
+          cargo build --locked -p oauth-as --features http,jwt,resource-metadata \
+            --example conformance_server --example protected_resource_fixture
+      # Backgrounded servers always redirect their output to a file, never to a command
+      # substitution, which would hang until the child closed its inherited stdout.
+      - name: Serve the AS and the fixture resource
+        run: |
+          OAUTH_AS_ADDR=127.0.0.1:8914 OAUTH_AS_CONFORMANCE_SEED=1 \
+            ./target/debug/examples/conformance_server > "$RUNNER_TEMP/as.log" 2>&1 &
+          OAUTH_RS_ADDR=127.0.0.1:8915 OAUTH_AS_ISSUER=http://127.0.0.1:8914 \
+            ./target/debug/examples/protected_resource_fixture > "$RUNNER_TEMP/rs.log" 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://127.0.0.1:8914/.well-known/oauth-authorization-server \
+               && curl -sf -o /dev/null \
+                  http://127.0.0.1:8915/.well-known/oauth-protected-resource; then
+              echo "AS and fixture are up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the AS or the RFC 9728 fixture never came up"
+          cat "$RUNNER_TEMP/as.log" "$RUNNER_TEMP/rs.log"
+          exit 1
+      # The scanner's own composite action, at the only reference that resolves. `baseline` puts
+      # it in --diff mode: it exits nonzero only for a finding NOT already recorded and explained
+      # in that file. A missing baseline fails safe rather than open, because the scanner treats
+      # an absent baseline as empty and every finding then counts as new.
+      - name: Scan the fixture resource, gating on anything new
+        uses: authgent/authgent/.github/actions/mcp-lint@v0.3.4
+        with:
+          url: http://127.0.0.1:8915
+          baseline: crates/oauth-as-conformance/authgent-baseline.json
+          scanner-version: 0.3.4
 
   # Packaging must stay green so a release is never blocked by a stale manifest. Prints the
   # tarball file list to the job log so the published contents can be reviewed by a human
