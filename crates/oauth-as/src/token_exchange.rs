@@ -77,7 +77,7 @@ use crate::error::{ErrorCode, ErrorResponse};
 use crate::events::Event;
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
-use crate::server::{AuthorizationServer, Clock};
+use crate::server::{AuthorizationServer, Bound, Clock};
 use crate::store::{Storage, StorageError};
 use crate::token::TokenType;
 
@@ -443,8 +443,12 @@ async fn exchange<S: Storage, C: Clock>(
     };
 
     // 2. The client. See `TokenExchange::exchange_token` for why confidential only.
+    // RFC 8693 s2.1 authenticates the client the same way every other grant does, so it goes
+    // through the same value. No RFC 9449 binding: this surface is not handed a proof, and a token
+    // that claimed a binding nobody proved would be worse than an honest bearer token.
+    let bound = Bound::secret(request.client_secret);
     let client = server
-        .authenticate_client(request.client_id, request.client_secret)
+        .authenticate_client(request.client_id, &bound.cred)
         .await?;
     if !client.auth.is_confidential() {
         return Err(ErrorResponse::new(ErrorCode::InvalidClient)
@@ -559,9 +563,7 @@ async fn exchange<S: Storage, C: Clock>(
     //    and refresh grants use. That is deliberate and is the point: a second implementation of
     //    "may narrow, never widen" is a second thing to get wrong, and this one would be the one
     //    nobody reviews.
-    let mut targets = AuthorizationServer::<S, C>::validate_resources(
-        request.resource.iter().map(|r| r.as_str()),
-    )?;
+    let mut targets = server.validate_resources(request.resource.iter().map(|r| r.as_str()))?;
     // Section 2.1.1: `audience` names the same thing as `resource` in a form that need not be a
     // URI. It is NOT run through `validate_resources`, which requires an absolute URI, because
     // that would report a well-formed logical name as malformed; it goes to the same ceiling
@@ -585,6 +587,7 @@ async fn exchange<S: Storage, C: Clock>(
     let issued = server
         .issue(
             &client,
+            &bound,
             GrantType::TokenExchange,
             subject.subject.clone(),
             scope,

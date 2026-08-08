@@ -65,6 +65,7 @@
 use crate::client::SecretVerifier;
 use crate::error::ErrorCode;
 use crate::grant::GrantType;
+use crate::registration::RegistrationPolicy;
 use crate::scope::ScopeSet;
 use crate::token::TokenTypeHint;
 
@@ -84,6 +85,15 @@ pub enum ClientAuthFailure {
     SecretMismatch,
     /// The host's own [`RateLimiter`] refused the attempt before it was evaluated.
     RateLimited,
+    /// The registration exists and an RFC 7523 client assertion was presented that did not verify:
+    /// a bad signature, an `alg` the registration does not use, an audience naming another server,
+    /// an expired assertion, or a `jti` that had already been spent.
+    ///
+    /// Separated from [`ClientAuthFailure::SecretMismatch`] because the responses differ. A run of
+    /// wrong secrets is credential stuffing; a run of REPLAYED assertions is somebody who has
+    /// captured a client's traffic, which is a different incident and a much worse one.
+    #[cfg(feature = "client_assertion")]
+    AssertionInvalid,
 }
 
 /// Something the authorization server did, or refused to do, worth recording.
@@ -173,6 +183,31 @@ pub enum Event<'a> {
         /// Which kind was removed.
         token_type: TokenTypeHint,
     },
+    /// A client registered itself through RFC 7591 dynamic client registration.
+    ///
+    /// Worth watching even in a deployment that meant to enable this: RFC 7591 section 5 is
+    /// explicit that an open registration endpoint lets anyone create clients, so the RATE of this
+    /// event is the signal that an abuse policy is not holding. Carries no credential, so neither
+    /// the issued client secret nor the registration access token reaches the host's logs.
+    ClientRegistered {
+        /// The identifier the server minted.
+        client_id: &'a str,
+    },
+    /// A registration was rewritten through RFC 7592 section 2.2.
+    ///
+    /// An update can change the redirect URIs, which is the whole of where this client's
+    /// authorization codes may be delivered, so it deserves the same attention as the original
+    /// registration.
+    ClientRegistrationUpdated {
+        /// The registration that changed.
+        client_id: &'a str,
+    },
+    /// A registration was deleted through RFC 7592 section 2.3, taking with it every token,
+    /// refresh chain and outstanding authorization code it held.
+    ClientRegistrationDeleted {
+        /// The registration that is now gone.
+        client_id: &'a str,
+    },
 }
 
 /// Where events go. The host implements this; the library never logs anything itself.
@@ -244,13 +279,14 @@ pub trait RateLimiter: Send + Sync {
     }
 }
 
-/// The three installed seams. Boxed as a unit (see [`Hooks`]) so that installing none of them
-/// allocates nothing at all.
+/// The installed seams. Boxed as a unit (see [`Hooks`]) so that installing none of them allocates
+/// anything at all.
 #[derive(Default)]
 struct Installed {
     events: Option<Box<dyn EventSink>>,
     rate_limiter: Option<Box<dyn RateLimiter>>,
     secret_verifier: Option<Box<dyn SecretVerifier>>,
+    registration_policy: Option<Box<dyn RegistrationPolicy>>,
 }
 
 /// The server's slot for the host seams: exactly one pointer wide, and null until the host
@@ -288,6 +324,11 @@ impl Hooks {
     /// Install the client secret verifier, replacing any previous one.
     pub fn install_secret_verifier(&mut self, verifier: Box<dyn SecretVerifier>) {
         self.installed().secret_verifier = Some(verifier);
+    }
+
+    /// Install the RFC 7591 registration policy, replacing any previous one.
+    pub fn install_registration_policy(&mut self, policy: Box<dyn RegistrationPolicy>) {
+        self.installed().registration_policy = Some(policy);
     }
 
     /// Whether an event sink is installed.
@@ -345,6 +386,22 @@ impl Hooks {
     pub fn secret_verifier(&self) -> Option<&dyn SecretVerifier> {
         match &self.0 {
             Some(installed) => installed.secret_verifier.as_deref(),
+            None => None,
+        }
+    }
+
+    /// The installed RFC 7591 registration policy.
+    ///
+    /// `None` means the host installed none, and that is NOT read as "allow": see
+    /// [`RegistrationPolicy`]. It is the opposite of the [`RateLimiter`] default above, and
+    /// deliberately so. An absent limiter means the host has not written a throttling policy yet,
+    /// and refusing every request would break a host that never asked for throttling. An absent
+    /// registration policy means the host turned on an endpoint that mints clients and said
+    /// nothing about who may use it, and RFC 7591 section 5 is explicit about what an open one
+    /// costs.
+    pub fn registration_policy(&self) -> Option<&dyn RegistrationPolicy> {
+        match &self.0 {
+            Some(installed) => installed.registration_policy.as_deref(),
             None => None,
         }
     }

@@ -21,6 +21,12 @@ pub enum TokenType {
     /// RFC 6750 bearer token.
     #[serde(rename = "Bearer")]
     Bearer,
+    /// RFC 9449 section 5 sender-constrained token, bound to the key the client proved possession
+    /// of. The spelling is `DPoP`, exactly, because RFC 9449 section 7.1 makes it the HTTP
+    /// authentication scheme name the client will present the token under.
+    #[cfg(feature = "dpop")]
+    #[serde(rename = "DPoP")]
+    Dpop,
 }
 
 /// The RFC 6749 section 5.1 successful token response.
@@ -62,6 +68,27 @@ impl fmt::Debug for TokenResponse {
             .field("refresh_token", &redact_opt(&self.refresh_token))
             .field("scope", &self.scope)
             .finish()
+    }
+}
+
+/// The RFC 7800 section 3.1 confirmation claim, in the one shape this server produces: the
+/// RFC 9449 section 6.1 `jkt`, a JWK thumbprint.
+///
+/// This is what a resource server checks the binding against, and it is the whole reason DPoP is
+/// worth anything at introspection time: without it the binding is known only to the authorization
+/// server, and an RS that introspects is back to trusting a bearer string.
+#[cfg(feature = "dpop")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmation {
+    /// The RFC 7638 SHA-256 thumbprint of the client's proof key, base64url without padding.
+    pub jkt: String,
+}
+
+#[cfg(feature = "dpop")]
+impl Confirmation {
+    /// Wrap a thumbprint.
+    pub fn jkt(jkt: impl Into<String>) -> Self {
+        Confirmation { jkt: jkt.into() }
     }
 }
 
@@ -130,6 +157,16 @@ pub struct IntrospectionResponse {
     /// nothing", which is the opposite of the truth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<Vec<String>>,
+    /// RFC 9449 section 6.1: the key this token is bound to, present exactly when it is bound to
+    /// one.
+    ///
+    /// RFC 7662 section 2.2 lets a server return any claim it likes here, and RFC 9449 section 5
+    /// is explicit that a resource server has to be able to confirm the binding. Omitted rather
+    /// than sent as `null` for an unbound token, because `"cnf": null` reads to a careless RS as a
+    /// confirmation it has already checked.
+    #[cfg(feature = "dpop")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
 }
 
 impl IntrospectionResponse {
@@ -145,6 +182,8 @@ impl IntrospectionResponse {
             iat: None,
             iss: None,
             aud: None,
+            #[cfg(feature = "dpop")]
+            cnf: None,
         }
     }
 }
@@ -172,6 +211,16 @@ pub struct IssuedToken {
     pub issued_at: SystemTime,
     /// Expiry instant; the token is dead at and after this instant.
     pub expires_at: SystemTime,
+    /// RFC 9449 section 6: the RFC 7638 thumbprint of the DPoP key this token is bound to, or
+    /// `None` for an ordinary bearer token.
+    ///
+    /// `Option<Box<str>>` rather than `Option<String>`, and feature gated, because this record is
+    /// written and read on every token-plane request and `tests/allocation.rs` holds it to a size
+    /// budget: the box is 16 bytes against a `String`'s 24, and a deployment without the `dpop`
+    /// feature pays neither. The value is a fixed 43-character base64url digest that is never
+    /// appended to, so the growable capacity a `String` carries would be dead weight.
+    #[cfg(feature = "dpop")]
+    pub jkt: Option<Box<str>>,
     /// The authorization grant this token belongs to (see [`RefreshTokenRecord::family_id`]).
     ///
     /// RFC 9700 section 4.14.2 requires that detecting refresh token reuse revokes "the tokens
@@ -247,6 +296,15 @@ pub struct RefreshTokenRecord {
     /// never-expiring chain with `now + ServerConfig::refresh_reuse_window`, which is what makes
     /// [`crate::store::Storage::sweep_expired`] able to reclaim it.
     pub expires_at: Option<SystemTime>,
+    /// RFC 9449 section 5: the RFC 7638 thumbprint of the DPoP key this refresh chain is bound
+    /// to, or `None` for an unbound chain.
+    ///
+    /// Carried across rotation and CHECKED on redemption. Without it the binding would be
+    /// decorative for anything but the first access token: a stolen refresh token could simply be
+    /// re-bound to the thief's key on the next rotation, leaving the attacker holding a token they
+    /// can prove possession for and the victim's key the one that gets refused.
+    #[cfg(feature = "dpop")]
+    pub jkt: Option<Box<str>>,
     /// The FAMILY this token belongs to: one identifier shared by every token, access or refresh,
     /// minted from the same authorization grant, and carried across rotation unchanged.
     ///

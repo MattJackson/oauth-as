@@ -115,6 +115,24 @@ pub struct AuthorizationServerMetadata {
     pub grant_types_supported: Vec<String>,
     /// OPTIONAL (section 2). Exactly the methods the token endpoint accepts.
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// RFC 8414 section 2. The signing algorithms the token endpoint accepts on an RFC 7523
+    /// client assertion.
+    ///
+    /// Section 2 makes this REQUIRED whenever `token_endpoint_auth_methods_supported` contains
+    /// `client_secret_jwt` or `private_key_jwt`, and the requirement is not bureaucratic: a client
+    /// cannot construct an assertion at all without knowing which algorithm the server will accept,
+    /// and guessing wrong is indistinguishable from a wrong key. Absent when this build does not
+    /// have the `client_assertion` feature, in which case neither method is advertised either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_signing_alg_values_supported: Option<Vec<String>>,
+    /// RFC 9449 section 5.1: the JWS algorithms this server will verify a DPoP proof under.
+    ///
+    /// Its PRESENCE is how a client learns DPoP is available here at all, so it appears only when
+    /// this build can actually verify a proof. Advertising it on a server that would refuse every
+    /// proof is worse than omitting it, because a client that acts on it has no way to discover the
+    /// mistake except by failing to get a token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dpop_signing_alg_values_supported: Option<Vec<String>>,
     /// RFC 7636 / RFC 8414 section 2. Always exactly `["S256"]`: `plain` is not implemented, and
     /// advertising it would invite a downgrade this server cannot honor.
     pub code_challenge_methods_supported: Vec<String>,
@@ -229,13 +247,44 @@ impl AuthorizationServerMetadata {
             response_modes_supported: vec!["query".to_string()],
             // Exactly the grants AuthorizationServer::token will honor.
             grant_types_supported,
-            token_endpoint_auth_methods_supported: vec![
-                "client_secret_basic".to_string(),
-                "client_secret_post".to_string(),
-                // RFC 8414 s2: the registered value a public client uses. This server accepts
-                // public clients, so omitting it would understate what it does.
-                "none".to_string(),
-            ],
+            token_endpoint_auth_methods_supported: {
+                // `mut` only matters under `client_assertion`, which is what the allow is for. The
+                // alternative is two copies of the list, which is how two lists drift apart.
+                #[allow(unused_mut)]
+                let mut methods = vec![
+                    "client_secret_basic".to_string(),
+                    "client_secret_post".to_string(),
+                    // RFC 8414 s2: the registered value a public client uses. This server accepts
+                    // public clients, so omitting it would understate what it does.
+                    "none".to_string(),
+                ];
+                // RFC 7523 s2.2, advertised exactly when this build can verify an assertion. The
+                // list and the verifier are derived from the same feature, so they cannot drift.
+                #[cfg(feature = "client_assertion")]
+                {
+                    methods.push(crate::client_assertion::CLIENT_SECRET_JWT.to_string());
+                    methods.push(crate::client_assertion::PRIVATE_KEY_JWT.to_string());
+                }
+                methods
+            },
+            #[cfg(feature = "client_assertion")]
+            token_endpoint_auth_signing_alg_values_supported: Some(
+                crate::client_assertion::ASSERTION_SIGNING_ALGS
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            ),
+            #[cfg(not(feature = "client_assertion"))]
+            token_endpoint_auth_signing_alg_values_supported: None,
+            #[cfg(feature = "dpop")]
+            dpop_signing_alg_values_supported: Some(
+                crate::dpop::DPOP_SIGNING_ALG_VALUES_SUPPORTED
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            ),
+            #[cfg(not(feature = "dpop"))]
+            dpop_signing_alg_values_supported: None,
             code_challenge_methods_supported: vec!["S256".to_string()],
             service_documentation: config.service_documentation.clone(),
             #[cfg(feature = "resource-metadata")]

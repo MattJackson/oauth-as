@@ -75,6 +75,8 @@ fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRe
 
 fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
     IssuedToken {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         resource: Vec::new(),
         access_token: token.to_string(),
         client_id: ClientId::new("some-client"),
@@ -88,6 +90,8 @@ fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
 
 fn refresh_token(token: &str, expires_at: Option<SystemTime>) -> RefreshTokenRecord {
     RefreshTokenRecord {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         resource: Vec::new(),
         refresh_token: token.to_string(),
         client_id: ClientId::new("some-client"),

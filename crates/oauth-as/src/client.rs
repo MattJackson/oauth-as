@@ -118,6 +118,31 @@ impl SecretHash {
         let computed = hex_lower(&Sha256::digest(presented.as_bytes()));
         constant_time_eq(computed.as_bytes(), self.encoded.as_bytes())
     }
+
+    /// Whether `presented` is the secret behind this stored verifier, consulting `verifier` for a
+    /// scheme this crate does not implement.
+    ///
+    /// The same ORDER OF PREFERENCE, and the same fail-closed rule, as
+    /// [`ClientAuth::verify_with`], which delegates here: the crate's own scheme is decided by the
+    /// crate, an unrecognised one is decided by the host, and an unrecognised one with no host
+    /// verifier installed never verifies.
+    ///
+    /// Public because a [`SecretHash`] is no longer only a client secret. RFC 7592 section 2 makes
+    /// the registration access token a bearer credential the server has to check on every
+    /// management request, and it is stored the same one-way way for the same reason (see
+    /// [`crate::registration`]), so it needs the same comparison rather than a second copy of it.
+    pub fn verify(&self, presented: &str, verifier: Option<&dyn SecretVerifier>) -> bool {
+        if self.scheme == SecretHash::SHA256_HEX {
+            self.verify_builtin(presented)
+        } else {
+            // Fails closed with no verifier: the server cannot check this credential, and "cannot
+            // check" must never read as "checked out".
+            match verifier {
+                Some(v) => v.verify(self, presented),
+                None => false,
+            }
+        }
+    }
 }
 
 /// Lower-case hex of a digest. Written out rather than pulled in: the crate has no hex dependency
@@ -175,6 +200,23 @@ pub enum ClientAuth {
         /// The stored verifier.
         hash: SecretHash,
     },
+    /// A confidential client that authenticates with an RFC 7523 signed assertion rather than by
+    /// presenting a secret: `private_key_jwt` or `client_secret_jwt`.
+    ///
+    /// The keys are held INLINE rather than behind a `Box`, unlike `Client::registration`. A
+    /// `Client` is cloned out of the store on every token-plane request, so the question is what
+    /// this costs a deployment that does not use it, and the answer is nothing: the widest existing
+    /// variant is `ConfidentialSecretHash` (two `String`s), and
+    /// [`crate::client_assertion::AssertionKeys`] is narrower than that, so `ClientAuth` does not
+    /// grow by a byte. Boxing would have ADDED an allocation to every clone of a client that does
+    /// use it, to save a struct size that was already paid for.
+    #[cfg(feature = "client_assertion")]
+    ConfidentialAssertion {
+        /// What the registration expects the assertion to be signed with. This, and never the
+        /// token's own header, is what decides the algorithm: see
+        /// [`crate::client_assertion::verify_assertion`].
+        keys: crate::client_assertion::AssertionKeys,
+    },
 }
 
 /// Hand-written so `ConfidentialSecret { secret }` never prints the secret. An AS library that
@@ -194,6 +236,13 @@ impl fmt::Debug for ClientAuth {
             ClientAuth::ConfidentialSecretHash { hash } => f
                 .debug_struct("ConfidentialSecretHash")
                 .field("hash", hash)
+                .finish(),
+            // `AssertionKeys`'s own Debug redacts a `client_secret_jwt` secret and prints the
+            // PUBLIC keys of a `private_key_jwt` registration, which are public.
+            #[cfg(feature = "client_assertion")]
+            ClientAuth::ConfidentialAssertion { keys } => f
+                .debug_struct("ConfidentialAssertion")
+                .field("keys", keys)
                 .finish(),
         }
     }
@@ -247,20 +296,17 @@ impl ClientAuth {
                 None => false,
             },
             ClientAuth::ConfidentialSecretHash { hash } => match presented {
-                Some(p) => {
-                    if hash.scheme() == SecretHash::SHA256_HEX {
-                        hash.verify_builtin(p)
-                    } else {
-                        // Fails closed with no verifier: the server cannot check this credential,
-                        // and "cannot check" must never read as "checked out".
-                        match verifier {
-                            Some(v) => v.verify(hash, p),
-                            None => false,
-                        }
-                    }
-                }
+                Some(p) => hash.verify(p, verifier),
                 None => false,
             },
+            // NEVER, and not because it is unimplemented. This registration's credential is a
+            // SIGNATURE over a claim set (RFC 7523 section 3), and there is no presented string
+            // that is the right answer here. Returning `true` for any input would let a client
+            // registered for `private_key_jwt` be authenticated by the `client_secret_post` path
+            // instead, which is the downgrade the registration exists to forbid; the assertion path
+            // is `AuthorizationServer::authenticate_client` and it does not come through here.
+            #[cfg(feature = "client_assertion")]
+            ClientAuth::ConfidentialAssertion { .. } => false,
         }
     }
 }
@@ -316,6 +362,44 @@ pub struct Client {
     pub default_scopes: ScopeSet,
     /// Human-readable name for consent and admin surfaces.
     pub name: Option<String>,
+    /// Present exactly when this registration was created by RFC 7591 dynamic client
+    /// registration, and absent for one the host provisioned itself.
+    ///
+    /// BOXED, and this is not a style choice. A `Client` is cloned out of the store on every
+    /// single token-plane request (see `AuthorizationServer::authenticate_client`), so every byte
+    /// added here is paid by every deployment on every request, including the great majority that
+    /// never turn registration on. One null pointer costs 8 bytes and allocates nothing; the
+    /// record itself is allocated only for a client that actually has one.
+    ///
+    /// It lives on the client rather than in a table of its own because it IS the client: RFC
+    /// 7592 section 2 manages a registration through the same identifier the token endpoint
+    /// authenticates, and splitting the two across two stores would make deletion a
+    /// two-phase problem the host has to get right.
+    pub registration: Option<Box<DynamicRegistration>>,
+}
+
+/// What a dynamically registered client carries beyond an ordinary registration: the RFC 7592
+/// section 2 management credential, and the RFC 7591 section 3.2.1 members that are not
+/// recoverable from the rest of the [`Client`].
+///
+/// The registration access token is held as a one-way [`SecretHash`], never as itself. It is a
+/// bearer credential that reads, rewrites and DELETES a registration, so it is at least as
+/// sensitive as the client secret next to it, and it is stored the same way for the same reason:
+/// a dump of the client table must not be a set of working credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicRegistration {
+    /// The stored verifier for the RFC 7592 section 2 registration access token.
+    pub registration_access_token_hash: SecretHash,
+    /// RFC 7591 section 3.2.1 `client_id_issued_at`: seconds since the Unix epoch.
+    pub client_id_issued_at: Option<u64>,
+    /// RFC 7591 section 3.2.1 `client_secret_expires_at`: seconds since the Unix epoch, or `0`
+    /// for a secret that never expires. `None` when no secret was issued.
+    pub client_secret_expires_at: Option<u64>,
+    /// RFC 7591 section 2 `token_endpoint_auth_method`, as registered. Kept verbatim because
+    /// [`ClientAuth`] deliberately does not distinguish `client_secret_basic` from
+    /// `client_secret_post` (RFC 6749 section 2.3.1 lets a confidential client use either), so the
+    /// value the client registered cannot be recovered from it.
+    pub token_endpoint_auth_method: String,
 }
 
 impl Client {

@@ -16,9 +16,13 @@ use crate::authorization::{
     ValidatedAuthorizationRequest,
 };
 use crate::client::{Client, ClientId};
+#[cfg(feature = "client_assertion")]
+use crate::client_assertion::{verify_assertion, CLIENT_ASSERTION_TYPE};
 use crate::device::{
     normalize_user_code, DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState,
 };
+#[cfg(feature = "dpop")]
+use crate::dpop::verify_proof;
 use crate::error::{ErrorCode, ErrorResponse};
 use crate::events::{
     Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
@@ -103,6 +107,23 @@ pub struct ServerConfig {
     /// RFC 8414 `scopes_supported`. `None` omits the member rather than claiming an empty
     /// catalogue.
     pub scopes_supported: Option<Vec<String>>,
+    /// The RFC 8707 resource indicators this server is WILLING to issue tokens for.
+    ///
+    /// EMPTY (the default) means no restriction, which is the pre-existing behaviour and is why
+    /// it is the default: turning refusal on by default would break every deployment already
+    /// using resource indicators. It is also why an empty value is a real risk rather than a
+    /// neutral one, and the risk is worth stating here rather than in a changelog.
+    ///
+    /// RFC 8707 section 2 requires `invalid_target` when the server "is unwilling or unable to
+    /// issue an access token" for a requested resource. With this empty, the server has no notion
+    /// of unwilling: any syntactically valid absolute URI is accepted. Under the `jwt` feature the
+    /// requested resource then REPLACES the configured audience in the RFC 9068 `aud` claim, so
+    /// any client can obtain a token this server signed, carrying another resource server's
+    /// identifier in `aud`. That server verifies the signature against our JWKS, sees its own
+    /// identifier, and authorises.
+    ///
+    /// A deployment serving more than one resource server should set this.
+    pub allowed_resources: Vec<String>,
     /// RFC 8414 `service_documentation`.
     pub service_documentation: Option<String>,
     /// RFC 9728 section 4 `protected_resources`: the resource identifiers of the protected
@@ -148,6 +169,15 @@ pub struct ServerConfig {
     /// presentation reads as an unknown token. When the chain HAS an absolute expiry, that expiry
     /// is used instead: there is nothing left to protect once the chain itself is dead.
     pub refresh_reuse_window: Duration,
+    /// RFC 9449: whether EVERY token request must carry a DPoP proof.
+    ///
+    /// `false` by default, which means "DPoP is available, and a client that wants a
+    /// sender-constrained token asks for one by presenting a proof". `true` is the FAPI 2.0
+    /// posture: it refuses every token request without a proof, which is a breaking change for
+    /// every existing client of the deployment and therefore a sentence somebody has to write on
+    /// purpose rather than a default anybody inherits.
+    #[cfg(feature = "dpop")]
+    pub require_dpop: bool,
     /// User code length in symbols, excluding the display hyphen. Default
     /// [`MIN_USER_CODE_LENGTH`] (about 34 bits over the 20-symbol alphabet, the RFC 8628 section
     /// 6.1 example shape).
@@ -192,6 +222,7 @@ impl ServerConfig {
             // OFF. See the field's own docs, and RFC 7591 section 5.
             registration: None,
             scopes_supported: None,
+            allowed_resources: Vec::new(),
             service_documentation: None,
             #[cfg(feature = "resource-metadata")]
             protected_resources: None,
@@ -208,6 +239,8 @@ impl ServerConfig {
             // 30 days: long enough that a chain abandoned by a client that later comes back with
             // a stale token is still recognised as reuse rather than as noise.
             refresh_reuse_window: Duration::from_secs(30 * 24 * 60 * 60),
+            #[cfg(feature = "dpop")]
+            require_dpop: false,
             user_code_length: MIN_USER_CODE_LENGTH,
         }
     }
@@ -339,6 +372,119 @@ impl fmt::Debug for TokenRequest {
     }
 }
 
+/// How a client is authenticating on one request.
+///
+/// A value of its own rather than more fields on every [`TokenRequest`] variant, for the same
+/// reason RFC 8707's `resource` is a separate argument: client authentication is a property of the
+/// REQUEST and is identical across every grant, so putting it on each variant would state the same
+/// thing four times, grow an enum every host copies around, and make each future grant repeat it
+/// again.
+///
+/// [`Default`] is a PUBLIC client: no secret, no assertion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientCredential<'a> {
+    /// The RFC 6749 section 2.3.1 shared secret, from `Authorization: Basic` or from the form body.
+    /// `None` for a public client, and `None` when an assertion is presented instead.
+    pub client_secret: Option<&'a str>,
+    /// RFC 7521 section 4.2 `client_assertion_type`. It MUST be
+    /// [`crate::client_assertion::CLIENT_ASSERTION_TYPE`]; any other value is refused rather than
+    /// ignored, because an assertion format this server does not implement is a credential it
+    /// cannot check, and "cannot check" must never read as "checked out".
+    #[cfg(feature = "client_assertion")]
+    pub client_assertion_type: Option<&'a str>,
+    /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.
+    #[cfg(feature = "client_assertion")]
+    pub client_assertion: Option<&'a str>,
+}
+
+impl<'a> ClientCredential<'a> {
+    /// The credential of a client presenting a shared secret, or of a public client presenting
+    /// none.
+    pub fn secret(client_secret: Option<&'a str>) -> Self {
+        ClientCredential {
+            client_secret,
+            #[cfg(feature = "client_assertion")]
+            client_assertion_type: None,
+            #[cfg(feature = "client_assertion")]
+            client_assertion: None,
+        }
+    }
+
+    /// The RFC 7523 credential: the assertion, and the type that names its format.
+    #[cfg(feature = "client_assertion")]
+    pub fn assertion(client_assertion_type: Option<&'a str>, client_assertion: &'a str) -> Self {
+        ClientCredential {
+            client_secret: None,
+            client_assertion_type,
+            client_assertion: Some(client_assertion),
+        }
+    }
+
+    /// Fall back to the secret carried on the [`TokenRequest`] variant when the context named none,
+    /// so a host may present it either way and neither is silently ignored.
+    fn or_secret(mut self, secret: Option<&'a str>) -> Self {
+        if self.client_secret.is_none() {
+            self.client_secret = secret;
+        }
+        self
+    }
+}
+
+/// Everything about a token request that is not part of the grant itself.
+///
+/// Passed by reference to [`AuthorizationServer::token_with_context`]. Growing this struct is
+/// cheap; growing [`TokenRequest`] is not, because a host copies that around and
+/// `tests/allocation.rs` holds it to a size budget.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenRequestContext<'a> {
+    /// How the client is authenticating.
+    pub credential: ClientCredential<'a>,
+    /// The RFC 8707 `resource` parameters, in wire order.
+    pub resources: &'a [String],
+    /// The RFC 9449 `DPoP` request header, verbatim and unparsed.
+    ///
+    /// `None` means the client sent none, which is refused only when
+    /// [`ServerConfig::require_dpop`] is set. When it is present and valid, the issued token is
+    /// BOUND to the proof's key: `token_type` becomes `DPoP` and RFC 7662 introspection reports
+    /// `cnf.jkt`.
+    #[cfg(feature = "dpop")]
+    pub dpop_proof: Option<&'a str>,
+}
+
+/// What each grant helper needs about the REQUEST rather than about the grant.
+///
+/// One reference wide at every call site, which is actually SMALLER than the `Option<&str>` client
+/// secret it replaces there. That is not incidental: these helpers are the token future, and
+/// `tests/allocation.rs` fails if that future crosses tokio's 2048-byte debug boxing threshold.
+pub(crate) struct Bound<'a> {
+    /// The credential to authenticate with.
+    pub(crate) cred: ClientCredential<'a>,
+    /// The RFC 9449 section 6.1 thumbprint the issued token must be bound to, when the request
+    /// carried a valid proof.
+    #[cfg(feature = "dpop")]
+    pub(crate) jkt: Option<&'a str>,
+}
+
+impl<'a> Bound<'a> {
+    /// A request authenticating with a shared secret and asking for no RFC 9449 binding.
+    ///
+    /// For the grant surfaces that reach `issue` from outside this module (RFC 8693 token
+    /// exchange). They get an unbound token, which is honest: they have not been given a proof to
+    /// bind one to. Wiring DPoP into them is a matter of threading a `Bound` in, not of changing
+    /// anything here.
+    ///
+    /// `dead_code` because its only caller is behind another slice's cargo feature, and gating it
+    /// on that feature by name would tie this module to a flag it has no other business knowing.
+    #[allow(dead_code)]
+    pub(crate) fn secret(client_secret: Option<&'a str>) -> Self {
+        Bound {
+            cred: ClientCredential::secret(client_secret),
+            #[cfg(feature = "dpop")]
+            jkt: None,
+        }
+    }
+}
+
 /// Rejections for the host-driven verification-UI actions ([`AuthorizationServer::approve_device`]
 /// / [`AuthorizationServer::deny_device`]). These are NOT wire errors: the RFC leaves the
 /// verification interaction to the implementation, and the host renders these however its UI
@@ -456,6 +602,27 @@ fn challenge_is_well_formed(challenge: &str) -> bool {
         && challenge
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// The storage key one single-use identifier is claimed under.
+///
+/// NAMESPACED, and both halves matter. `kind` keeps an RFC 7523 assertion's `jti` from colliding
+/// with an RFC 9449 proof's, which are different credentials with different lifetimes that a client
+/// may well number from the same counter. `owner` (the client id for an assertion, the key
+/// thumbprint for a proof) keeps one client from locking another out by choosing its `jti` values:
+/// without it, an attacker could spend a victim's future `jti` values in advance, which is a denial
+/// of service bought for the price of a refused request.
+///
+/// One allocation per assertion or proof, on a path that only exists when the feature is on.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+fn replay_key(kind: &str, owner: &str, jti: &str) -> String {
+    let mut key = String::with_capacity(kind.len() + owner.len() + jti.len() + 2);
+    key.push_str(kind);
+    key.push(':');
+    key.push_str(owner);
+    key.push(':');
+    key.push_str(jti);
+    key
 }
 
 fn storage_error(e: StorageError) -> ErrorResponse {
@@ -656,6 +823,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// token for, which covers both a malformed indicator and (at the token endpoint, see
     /// [`AuthorizationServer::narrow_resources`]) one that was never granted.
     pub(crate) fn validate_resources<'a>(
+        &self,
         requested: impl IntoIterator<Item = &'a str>,
     ) -> Result<Vec<String>, ErrorResponse> {
         let mut out = Vec::new();
@@ -669,6 +837,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         "resource must be an absolute URI with no fragment (RFC 8707 s2)",
                     ),
                 );
+            }
+            // SYNTAX IS NOT AUTHORISATION. RFC 8707 section 2 requires `invalid_target` when the
+            // server "is unwilling or unable to issue an access token" for a named resource, and
+            // until this check existed the server had no notion of unwilling: any well-formed URI
+            // was accepted. That matters most with the `jwt` feature on, where the requested
+            // resource REPLACES the configured audience in the RFC 9068 `aud` claim, so a client
+            // registered for one resource server could name another and receive a token this
+            // server had signed, with that other server's identifier in `aud`. The second server
+            // fetches our JWKS, the signature verifies, `aud` names it, and it authorises on a
+            // scope string the two happen to share. Scope-name collision between resource servers
+            // is the ordinary case, not an exotic one.
+            //
+            // An EMPTY allowlist keeps the previous behaviour rather than refusing everything,
+            // because refusing would break every deployment that already relies on resource
+            // indicators. That means this check protects only hosts that configure it, which is
+            // stated plainly on the config field rather than left for someone to discover.
+            if !self.config.allowed_resources.is_empty()
+                && !self.config.allowed_resources.iter().any(|a| a == value)
+            {
+                return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
+                    .with_description("this server does not issue tokens for that resource"));
             }
             // A repeated identical indicator is the same request twice, not two audiences.
             if !out.iter().any(|kept: &String| kept == value) {
@@ -739,7 +928,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     pub(crate) async fn authenticate_client(
         &self,
         client_id: &ClientId,
-        client_secret: Option<&str>,
+        cred: &ClientCredential<'_>,
     ) -> Result<Client, ErrorResponse> {
         let attempt = Attempt::ClientAuthentication {
             client_id: client_id.as_str(),
@@ -770,12 +959,41 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 return Err(ErrorResponse::new(ErrorCode::InvalidClient));
             }
         };
+        // RFC 7523 client authentication, when the request presented an assertion. Handled apart
+        // from the secret comparison below because it is a different KIND of credential: there is
+        // nothing to compare, there is a signature to verify against the REGISTRATION's key and a
+        // `jti` to spend so the request cannot be repeated.
+        #[cfg(feature = "client_assertion")]
+        if cred.client_assertion.is_some() {
+            // BOXED at the call site, and this is a measurement rather than a style. `authenticate_client`
+            // is inlined into all four grant helpers and so into the token future, which
+            // `tests/allocation.rs` holds under tokio's 2048-byte debug boxing threshold. Inlining
+            // the assertion state (a claim set, two owned Strings, a storage future) into every
+            // token request, including the overwhelming majority that carry no assertion, pushed it
+            // over: the gate caught it. One allocation, paid only on the path that actually
+            // presents an assertion.
+            return match Box::pin(self.authenticate_by_assertion(&client, cred)).await {
+                Ok(()) => {
+                    self.hooks.record(attempt, AttemptOutcome::Succeeded);
+                    Ok(client)
+                }
+                Err(error) => {
+                    self.hooks.record(attempt, AttemptOutcome::Failed);
+                    self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                        client_id: client_id.as_str(),
+                        failure: ClientAuthFailure::AssertionInvalid,
+                    });
+                    Err(error)
+                }
+            };
+        }
+
         // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this
         // crate does not implement is decided by the host's verifier (see
         // `crate::client::SecretVerifier`), and by nobody at all when none is installed.
         if !client
             .auth
-            .verify_with(client_secret, self.hooks.secret_verifier())
+            .verify_with(cred.client_secret, self.hooks.secret_verifier())
         {
             self.hooks.record(attempt, AttemptOutcome::Failed);
             self.hooks.emit(|| Event::ClientAuthenticationFailed {
@@ -786,6 +1004,136 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         }
         self.hooks.record(attempt, AttemptOutcome::Succeeded);
         Ok(client)
+    }
+
+    /// RFC 7523 section 3, plus the single-use claim that makes it worth anything.
+    ///
+    /// Returns `Ok(())` for an authenticated client. Every refusal is the SAME bare
+    /// `invalid_client` the wrong-secret path returns, with no description: this function is only
+    /// reached once the client id is known to exist, so a description naming which check failed
+    /// would be the difference between "this client id is real" and "it is not", which is exactly
+    /// the distinction `authenticate_client` collapses on purpose. The host's audit channel is
+    /// told (`ClientAuthFailure::AssertionInvalid`); the wire is not.
+    #[cfg(feature = "client_assertion")]
+    async fn authenticate_by_assertion(
+        &self,
+        client: &Client,
+        cred: &ClientCredential<'_>,
+    ) -> Result<(), ErrorResponse> {
+        let refused = || ErrorResponse::new(ErrorCode::InvalidClient);
+        let assertion = cred.client_assertion.ok_or_else(refused)?;
+
+        // RFC 7521 section 4.2: the type is what says which assertion format this is, and this
+        // server implements exactly one. An absent or unrecognised type is refused rather than
+        // assumed, because assuming would mean verifying a credential in a format nobody declared.
+        if cred.client_assertion_type != Some(CLIENT_ASSERTION_TYPE) {
+            return Err(refused());
+        }
+        // RFC 6749 section 2.3: "The client MUST NOT use more than one authentication method in
+        // each request." A request carrying both a secret and an assertion has not said which
+        // credential it means, and a server that picks one behaves differently from the next
+        // server, which is exactly the ambiguity an intermediary would exploit.
+        if cred.client_secret.is_some() {
+            return Err(refused());
+        }
+
+        // THE REGISTRATION DECIDES, and this is where that starts. A client registered for
+        // `client_secret_basic` cannot promote itself to `private_key_jwt` by sending an assertion,
+        // because there is no key here that anybody vouched for on its behalf.
+        let keys = match &client.auth {
+            crate::client::ClientAuth::ConfidentialAssertion { keys } => keys,
+            _ => return Err(refused()),
+        };
+
+        // RFC 7523 section 3 (3) admits either the token endpoint URL or, by long-established
+        // practice (OpenID Connect Core section 9), the issuer identifier.
+        let token_endpoint = self.token_endpoint();
+        let verified = verify_assertion(
+            keys,
+            assertion,
+            client.client_id.as_str(),
+            &[token_endpoint.as_str(), self.issuer_identifier()],
+            self.clock.now(),
+        )
+        .map_err(|_| refused())?;
+
+        // RFC 7523 section 3: the `jti` is single use within the assertion's validity. THIS is the
+        // check that makes an observed request unrepeatable, and it is the whole difference between
+        // an authentication mechanism and a bearer credential that happens to be signed. It is
+        // namespaced by client id so that two clients choosing the same `jti` (a counter, a
+        // timestamp) cannot lock each other out.
+        let claimed = self
+            .store
+            .claim_replay_id(
+                &replay_key("ca", client.client_id.as_str(), &verified.jti),
+                verified.expires_at,
+            )
+            .await
+            // FAILING CLOSED. A claim that could not be recorded is a claim that did not happen,
+            // and treating a storage outage as "probably fine" would turn every assertion into a
+            // replayable one for the duration of the outage.
+            .map_err(|_| refused())?;
+        if !claimed {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    /// The token endpoint URL this server answers on, which is what RFC 7523 section 3 (3) and RFC
+    /// 9449 section 4.3 (7) compare against.
+    ///
+    /// Derived the same way `AuthorizationServerMetadata::from_config` derives it, and it MUST stay
+    /// that way: the document tells a client where to send its request and what to put in `aud` and
+    /// `htu`, so a server whose own idea of its token endpoint differs from the one it published
+    /// refuses every conforming client.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    fn token_endpoint(&self) -> String {
+        match &self.config.token_endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => format!("{}/token", self.issuer_identifier()),
+        }
+    }
+
+    /// RFC 9449 section 4.3, and the single-use claim on the proof's `jti`.
+    ///
+    /// The proof is checked BEFORE the grant is looked at, because it binds to the REQUEST rather
+    /// than to the grant: a proof that does not verify means this request is refused whatever it
+    /// asked for, and spending its `jti` here means a replayed proof costs the attacker a lookup
+    /// and gains them nothing.
+    ///
+    /// `htm` is `POST` because RFC 6749 section 3.2 makes the token endpoint POST-only, and `htu`
+    /// is this server's own token endpoint rather than something the host passes in. That is
+    /// deliberate: the value a conforming client puts in `htu` is the one it read from the RFC 8414
+    /// document, which is exactly what `token_endpoint` returns, so taking it from the host would
+    /// add a seam whose only possible use is to get it wrong.
+    #[cfg(feature = "dpop")]
+    async fn verify_dpop(&self, proof: Option<&str>) -> Result<Option<Box<str>>, ErrorResponse> {
+        let proof = match proof {
+            Some(proof) => proof,
+            None if self.config.require_dpop => {
+                return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                    .with_description("this server requires a DPoP proof on every token request"))
+            }
+            None => return Ok(None),
+        };
+        let verified = verify_proof(proof, "POST", &self.token_endpoint(), self.clock.now())
+            .map_err(|_| ErrorResponse::new(ErrorCode::InvalidDpopProof))?;
+        // Namespaced by THUMBPRINT rather than by client id: a proof is bound to a key, not to a
+        // registration (a public client's proof arrives before anything has authenticated), so the
+        // key is the only identity available at this point that an attacker cannot choose freely.
+        let claimed = self
+            .store
+            .claim_replay_id(
+                &replay_key("dpop", &verified.jkt, &verified.jti),
+                verified.replay_until,
+            )
+            .await
+            .map_err(storage_error)?;
+        if !claimed {
+            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                .with_description("this DPoP proof has already been used"));
+        }
+        Ok(Some(verified.jkt.into_boxed_str()))
     }
 
     /// Resolve the scope a request will be granted: the client default when the request names
@@ -811,7 +1159,28 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client_secret: Option<&str>,
         requested_scope: Option<&ScopeSet>,
     ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        self.device_authorization_with_credential(
+            client_id,
+            &ClientCredential::secret(client_secret),
+            requested_scope,
+        )
+        .await
+    }
+
+    /// RFC 8628 section 3.1/3.2 for a client authenticating with any credential this server
+    /// accepts, including an RFC 7523 assertion.
+    ///
+    /// Added ALONGSIDE [`AuthorizationServer::device_authorization`] rather than replacing it: the
+    /// three-argument form is what every existing host already calls and a shared secret remains
+    /// the commonest credential. Both go through the same `authenticate_client`, so there is one
+    /// authentication path and not two.
+    pub async fn device_authorization_with_credential(
+        &self,
+        client_id: &ClientId,
+        cred: &ClientCredential<'_>,
+        requested_scope: Option<&ScopeSet>,
+    ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {
+        let client = self.authenticate_client(client_id, cred).await?;
         if !client.allows_grant(GrantType::DeviceCode) {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient)
                 .with_description("client registration does not include the device_code grant"));
@@ -1005,8 +1374,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Equivalent to [`AuthorizationServer::token_with_resources`] with an empty list, which is
     /// what a token request carrying no `resource` parameter means: no NARROWING is asked for, so
     /// the issued token inherits whatever the grant already carries.
-    pub async fn token(&self, request: TokenRequest) -> Result<TokenResponse, ErrorResponse> {
-        self.token_with_resources(request, &[]).await
+    pub fn token(
+        &self,
+        request: TokenRequest,
+    ) -> impl std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + '_ {
+        self.token_with_resources(request, &[])
     }
 
     /// The token endpoint with the RFC 8707 `resource` parameter.
@@ -1029,12 +1401,45 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ///   crate yet, so there is nothing granted for a poll to narrow to, and inventing an audience
     ///   at the token endpoint that the user never approved is exactly what the narrowing rule
     ///   exists to prevent.
-    pub async fn token_with_resources(
+    pub fn token_with_resources<'a>(
+        &'a self,
+        request: TokenRequest,
+        resources: &'a [String],
+    ) -> impl std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + 'a {
+        self.token_with_context(
+            request,
+            TokenRequestContext {
+                resources,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The token endpoint with everything about the request that does not belong inside
+    /// [`TokenRequest`]: the RFC 8707 resource indicators, the RFC 7523 client assertion, and the
+    /// RFC 9449 DPoP proof.
+    ///
+    /// [`AuthorizationServer::token`] and [`AuthorizationServer::token_with_resources`] are this
+    /// with an emptier context, so there is one implementation of the token endpoint and not three.
+    /// Both of them are plain functions returning THIS future rather than `async fn`s that await
+    /// it, and that is a measurement rather than a style: an `async fn` wrapper is a second
+    /// generator frame holding its own copy of the 160-byte [`TokenRequest`] while the inner future
+    /// holds another, and adding one pushed the token future over tokio's 2048-byte debug boxing
+    /// threshold. `tests/allocation.rs` caught it.
+    ///
+    /// The client secret may be presented EITHER on the [`TokenRequest`] variant (where it has
+    /// always lived) or on [`TokenRequestContext::credential`]; the context wins when both are set,
+    /// and neither is silently dropped.
+    pub async fn token_with_context(
         &self,
         request: TokenRequest,
-        resources: &[String],
+        context: TokenRequestContext<'_>,
     ) -> Result<TokenResponse, ErrorResponse> {
-        let requested_resources = Self::validate_resources(resources.iter().map(|r| r.as_str()))?;
+        let requested_resources =
+            self.validate_resources(context.resources.iter().map(|r| r.as_str()))?;
+        // RFC 9449 s4.3, before anything else touches the store: see `verify_dpop`.
+        #[cfg(feature = "dpop")]
+        let jkt = Box::pin(self.verify_dpop(context.dpop_proof)).await?;
         match request {
             TokenRequest::AuthorizationCode {
                 client_id,
@@ -1043,10 +1448,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 redirect_uri,
                 code_verifier,
             } => {
+                let bound = Bound {
+                    cred: context.credential.or_secret(client_secret.as_deref()),
+                    #[cfg(feature = "dpop")]
+                    jkt: jkt.as_deref(),
+                };
                 let outcome = self
                     .authorization_code_token(
                         &client_id,
-                        client_secret.as_deref(),
+                        &bound,
                         &code,
                         redirect_uri.as_deref(),
                         code_verifier.as_deref(),
@@ -1061,10 +1471,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 client_secret,
                 scope,
             } => {
+                let bound = Bound {
+                    cred: context.credential.or_secret(client_secret.as_deref()),
+                    #[cfg(feature = "dpop")]
+                    jkt: jkt.as_deref(),
+                };
                 let outcome = self
                     .client_credentials_token(
                         &client_id,
-                        client_secret.as_deref(),
+                        &bound,
                         scope.as_ref(),
                         requested_resources,
                     )
@@ -1086,9 +1501,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         ),
                     );
                 }
-                let outcome = self
-                    .device_token(&client_id, client_secret.as_deref(), &device_code)
-                    .await;
+                let bound = Bound {
+                    cred: context.credential.or_secret(client_secret.as_deref()),
+                    #[cfg(feature = "dpop")]
+                    jkt: jkt.as_deref(),
+                };
+                let outcome = self.device_token(&client_id, &bound, &device_code).await;
                 self.emit_refusal(&client_id, GrantType::DeviceCode, &outcome);
                 outcome
             }
@@ -1098,10 +1516,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 refresh_token,
                 scope,
             } => {
+                let bound = Bound {
+                    cred: context.credential.or_secret(client_secret.as_deref()),
+                    #[cfg(feature = "dpop")]
+                    jkt: jkt.as_deref(),
+                };
                 let outcome = self
                     .refresh_token(
                         &client_id,
-                        client_secret.as_deref(),
+                        &bound,
                         &refresh_token,
                         scope.as_ref(),
                         &requested_resources,
@@ -1283,7 +1706,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         //    the newest and least load-bearing of them: a request that is also missing PKCE should
         //    hear about PKCE. A malformed indicator is `invalid_target` (section 2), reported to
         //    the client rather than to the user, since by here the redirect URI is trusted.
-        let resource = Self::validate_resources(request.resource.iter().map(|r| r.as_ref()))
+        let resource = self
+            .validate_resources(request.resource.iter().map(|r| r.as_ref()))
             .map_err(|e| {
                 AuthorizationError::Redirect(AuthorizationErrorRedirect {
                     redirect_uri: redirect_uri.clone(),
@@ -1355,13 +1779,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     async fn authorization_code_token(
         &self,
         client_id: &ClientId,
-        client_secret: Option<&str>,
+        bound: &Bound<'_>,
         code: &str,
         redirect_uri: Option<&str>,
         code_verifier: Option<&str>,
         requested_resources: &[String],
     ) -> Result<TokenResponse, ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        let client = self.authenticate_client(client_id, &bound.cred).await?;
         if !client.allows_grant(GrantType::AuthorizationCode) {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
         }
@@ -1486,8 +1910,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
 
         let issued = self
-            .issue(
+            .issue_boxed(
                 &client,
+                bound,
                 GrantType::AuthorizationCode,
                 Some(record.subject.clone()),
                 record.scope.clone(),
@@ -1518,11 +1943,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     async fn client_credentials_token(
         &self,
         client_id: &ClientId,
-        client_secret: Option<&str>,
+        bound: &Bound<'_>,
         requested_scope: Option<&ScopeSet>,
         resource: Vec<String>,
     ) -> Result<TokenResponse, ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        let client = self.authenticate_client(client_id, &bound.cred).await?;
         // RFC 6749 section 4.4: this grant is for confidential clients. A public client has no
         // secret, so "the client itself" is not an identity anyone has proven.
         if matches!(client.auth, crate::client::ClientAuth::Public) {
@@ -1539,8 +1964,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // RFC 8707 s2: there is no prior authorization request here, so there is nothing to
         // narrow AGAINST. The client authenticated as itself and is naming the resource server it
         // means to call, which is the whole of what the parameter says in this grant.
-        self.issue(
+        self.issue_boxed(
             &client,
+            bound,
             GrantType::ClientCredentials,
             None,
             scope,
@@ -1555,10 +1981,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     async fn device_token(
         &self,
         client_id: &ClientId,
-        client_secret: Option<&str>,
+        bound: &Bound<'_>,
         device_code: &str,
     ) -> Result<TokenResponse, ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        let client = self.authenticate_client(client_id, &bound.cred).await?;
         if !client.allows_grant(GrantType::DeviceCode) {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
         }
@@ -1627,8 +2053,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
                 // No resource: the device authorization request does not carry one (see
                 // `token_with_resources`), and the poll above refuses any the client sends.
-                self.issue(
+                self.issue_boxed(
                     &client,
+                    bound,
                     GrantType::DeviceCode,
                     Some(subject),
                     taken.scope,
@@ -1645,12 +2072,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     async fn refresh_token(
         &self,
         client_id: &ClientId,
-        client_secret: Option<&str>,
+        bound: &Bound<'_>,
         refresh_token: &str,
         requested_scope: Option<&ScopeSet>,
         requested_resources: &[String],
     ) -> Result<TokenResponse, ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        let client = self.authenticate_client(client_id, &bound.cred).await?;
         if !client.allows_grant(GrantType::RefreshToken) {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
         }
@@ -1703,6 +2130,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .with_description("refresh token reuse detected; the grant has been revoked"));
         }
 
+        // RFC 9449 s5: a refresh chain issued to a DPoP-bound grant stays bound to the SAME key,
+        // and a rotation has to prove possession of it. Without this the binding would be
+        // decorative past the first access token: a stolen refresh token could simply be re-bound
+        // to the thief's key on the next rotation, leaving the attacker holding a token they can
+        // prove possession for while the victim's key is the one refused. The record goes BACK, as
+        // for every other judgement here that is not evidence of compromise.
+        #[cfg(feature = "dpop")]
+        if record.jkt.as_deref() != bound.jkt {
+            self.store
+                .put_refresh_token(record)
+                .await
+                .map_err(storage_error)?;
+            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                .with_description("this refresh token is bound to a different DPoP key"));
+        }
+
         if let Some(expires_at) = record.expires_at {
             if self.clock.now() >= expires_at {
                 // Not put back: an expired chain can never become valid again, and keeping it
@@ -1742,8 +2185,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
 
         let issued = self
-            .issue(
+            .issue_boxed(
                 &client,
+                bound,
                 GrantType::RefreshToken,
                 record.subject.clone(),
                 scope,
@@ -1785,9 +2229,50 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     // produced the token and `issue` is the only place that sees the whole issuance. Bundling them
     // into a struct would be churn for its own sake on a private function with four call sites.
     #[allow(clippy::too_many_arguments)]
+    /// [`AuthorizationServer::issue`] behind one heap allocation.
+    ///
+    /// Every caller of `issue` goes through here, and the reason is a measurement rather than a
+    /// preference. `issue` is the widest frame on the token path: it holds a whole `IssuedToken`
+    /// and a whole `RefreshTokenRecord` across its storage awaits, and because a generator's size
+    /// is the MAXIMUM over all of its states, that width is paid by every token request including
+    /// the polls and refusals that never issue anything. Inlined, it puts the token future over
+    /// tokio's 2048-byte debug boxing threshold as soon as `dpop` adds a binding to both records,
+    /// and tokio's answer to that is to box the WHOLE token future on every single request.
+    ///
+    /// So: one allocation, paid only when a token is actually issued, instead of one allocation the
+    /// size of the entire token future paid on every request that reaches this endpoint. The
+    /// allocation gates in `tests/allocation.rs` are what settled this, and they measure both.
+    #[allow(clippy::too_many_arguments)]
+    fn issue_boxed<'a>(
+        &'a self,
+        client: &'a Client,
+        bound: &'a Bound<'_>,
+        grant_type: GrantType,
+        subject: Option<String>,
+        scope: ScopeSet,
+        resource: Vec<String>,
+        chain: Option<RefreshChain>,
+        allow_refresh: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + Send + 'a>,
+    > {
+        Box::pin(self.issue(
+            client,
+            bound,
+            grant_type,
+            subject,
+            scope,
+            resource,
+            chain,
+            allow_refresh,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn issue(
         &self,
         client: &Client,
+        bound: &Bound<'_>,
         grant_type: GrantType,
         subject: Option<String>,
         scope: ScopeSet,
@@ -1795,6 +2280,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         chain: Option<RefreshChain>,
         allow_refresh: bool,
     ) -> Result<TokenResponse, ErrorResponse> {
+        // `bound` carries only the RFC 9449 key binding, so with that feature off it is genuinely
+        // unused HERE. It stays in the signature regardless, so the four call sites do not have to
+        // differ by feature: a call site that differs by feature is a call site that gets it wrong
+        // under the configuration nobody builds locally.
+        #[cfg(not(feature = "dpop"))]
+        let _ = bound;
         let now = self.clock.now();
 
         let issues_refresh = allow_refresh
@@ -1840,6 +2331,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         )?;
         self.store
             .put_token(IssuedToken {
+                // RFC 9449 s6: the binding is recorded on the AS side too, not only in the token,
+                // so that RFC 7662 introspection can report it and a resource server can check it
+                // without having to parse a token this server may have issued as opaque.
+                #[cfg(feature = "dpop")]
+                jkt: bound.jkt.map(Box::from),
                 access_token: access_token.clone(),
                 client_id: client.client_id.clone(),
                 subject: subject.clone(),
@@ -1860,6 +2356,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             let rt = random_hex(32);
             self.store
                 .put_refresh_token(RefreshTokenRecord {
+                    // RFC 9449 s5: the chain remembers the key it was issued to, and rotation
+                    // checks it. See the check in `refresh_token`.
+                    #[cfg(feature = "dpop")]
+                    jkt: bound.jkt.map(Box::from),
                     refresh_token: rt.clone(),
                     client_id: client.client_id.clone(),
                     subject,
@@ -1892,6 +2392,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
         Ok(TokenResponse {
             access_token,
+            // RFC 9449 s5: a token bound to a proof key is a `DPoP` token and not a `Bearer` one,
+            // and the difference is exactly what tells the client, and any resource server reading
+            // the response, that the token must be presented with a proof.
+            #[cfg(feature = "dpop")]
+            token_type: match bound.jkt {
+                Some(_) => TokenType::Dpop,
+                None => TokenType::Bearer,
+            },
+            #[cfg(not(feature = "dpop"))]
             token_type: TokenType::Bearer,
             expires_in: self.config.access_token_ttl.as_secs(),
             refresh_token,
@@ -1927,7 +2436,25 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client_secret: Option<&str>,
         token: &str,
     ) -> Result<IntrospectionResponse, ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        self.introspection_response_with_credential(
+            client_id,
+            &ClientCredential::secret(client_secret),
+            token,
+        )
+        .await
+    }
+
+    /// RFC 7662 introspection for a caller authenticating with any credential this server accepts,
+    /// including an RFC 7523 assertion. See
+    /// [`AuthorizationServer::device_authorization_with_credential`] on why this is an addition
+    /// rather than a replacement.
+    pub async fn introspection_response_with_credential(
+        &self,
+        client_id: &ClientId,
+        cred: &ClientCredential<'_>,
+        token: &str,
+    ) -> Result<IntrospectionResponse, ErrorResponse> {
+        let client = self.authenticate_client(client_id, cred).await?;
         // RFC 7662 section 2.1 requires the endpoint to be protected, and section 4 says it MUST
         // NOT be publicly available, because it otherwise describes any token an attacker has
         // merely obtained a copy of. A PUBLIC client has no secret to verify, so "authenticated as
@@ -1946,6 +2473,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 scope: (!t.scope.is_empty()).then(|| t.scope.to_string()),
                 client_id: Some(t.client_id.as_str().to_string()),
                 sub: t.subject.clone(),
+                #[cfg(feature = "dpop")]
+                token_type: Some(match t.jkt {
+                    Some(_) => TokenType::Dpop,
+                    None => TokenType::Bearer,
+                }),
+                #[cfg(not(feature = "dpop"))]
                 token_type: Some(TokenType::Bearer),
                 exp: unix_seconds(t.expires_at),
                 iat: unix_seconds(t.issued_at),
@@ -1954,6 +2487,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // the grant carried RFC 8707 resource indicators. Omitted rather than empty when it
                 // does not: see `IntrospectionResponse::aud`.
                 aud: (!t.resource.is_empty()).then(|| t.resource.clone()),
+                // RFC 9449 s6.1 with RFC 7800 s3.1. A resource server that introspects must be
+                // able to confirm the binding, or the binding stops at this server and the RS is
+                // back to trusting a bearer string.
+                #[cfg(feature = "dpop")]
+                cnf: t.jkt.as_deref().map(crate::token::Confirmation::jkt),
             },
             // Unknown, expired, or somebody else's. All three are one answer on purpose.
             _ => IntrospectionResponse::inactive(),
@@ -1976,7 +2514,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         token: &str,
         token_type_hint: Option<TokenTypeHint>,
     ) -> Result<(), ErrorResponse> {
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        self.revoke_with_credential(
+            client_id,
+            &ClientCredential::secret(client_secret),
+            token,
+            token_type_hint,
+        )
+        .await
+    }
+
+    /// RFC 7009 revocation for a caller authenticating with any credential this server accepts,
+    /// including an RFC 7523 assertion. See
+    /// [`AuthorizationServer::device_authorization_with_credential`] on why this is an addition
+    /// rather than a replacement.
+    pub async fn revoke_with_credential(
+        &self,
+        client_id: &ClientId,
+        cred: &ClientCredential<'_>,
+        token: &str,
+        token_type_hint: Option<TokenTypeHint>,
+    ) -> Result<(), ErrorResponse> {
+        let client = self.authenticate_client(client_id, cred).await?;
         // RFC 7009 section 2.1 requires client authentication here and requires the server to
         // verify the token was issued to the requesting client. A public client cannot satisfy the
         // first, so it cannot be held to the second: anyone may name a public client id, which

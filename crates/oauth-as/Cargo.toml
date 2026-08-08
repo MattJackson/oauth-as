@@ -36,6 +36,21 @@ http = ["dep:axum", "dep:tokio"]
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
 # servers are separate processes that should not have to call introspection on every request.
 jwt = ["dep:p256"]
+# RFC 7523 JWT client authentication: `private_key_jwt` (asymmetric, ES256) and `client_secret_jwt`
+# (HMAC, HS256), so that a deployment whose security policy forbids transmitting a shared secret can
+# use this crate at all. It is also required by FAPI 2.0.
+#
+# IMPLIES `jwt`, and that is a decision rather than an accident. This and `dpop` both rest on JWS
+# VERIFICATION, and this crate holds exactly ONE copy of that code (see the VERIFICATION banner in
+# src/jwt.rs). Two half-built verifiers behind two independent feature flags is how a codebase ends
+# up with an algorithm-confusion bug in whichever half nobody reviewed. Neither feature adds a
+# dependency: ES256 verification is the `p256` that `jwt` already pulls in, and HMAC-SHA-256 is
+# twenty lines over the `sha2` that PKCE already required.
+client_assertion = ["jwt"]
+# RFC 9449 DPoP: sender-constrained access tokens, bound to a key the client proves possession of on
+# every request. Without it every token this crate issues is a bearer token, so a stolen one is
+# usable by whoever stole it; this changes what a leak costs. IMPLIES `jwt` for the reason above.
+dpop = ["jwt"]
 # RFC 9728 protected resource metadata. This crate is an AUTHORIZATION SERVER, not a
 # resource server, so what this feature adds is the TYPE a host publishes for its OWN
 # resource, plus the section 4 `protected_resources` member on the AS metadata document.

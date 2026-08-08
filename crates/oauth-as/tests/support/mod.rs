@@ -55,6 +55,7 @@ pub fn public_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write admin").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: Some("Public app".into()),
+        registration: None,
     }
 }
 
@@ -68,6 +69,7 @@ pub fn two_redirect_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -83,6 +85,7 @@ pub fn device_only_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -124,6 +127,7 @@ pub fn confidential_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write admin").unwrap(),
         default_scopes: ScopeSet::parse("read write").unwrap(),
         name: Some("Confidential app".into()),
+        registration: None,
     }
 }
 
@@ -143,6 +147,7 @@ pub fn other_confidential_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: Some("Other app".into()),
+        registration: None,
     }
 }
 
@@ -161,6 +166,7 @@ pub fn client_credentials_client() -> Client {
         allowed_scopes: ScopeSet::parse("api:read api:write api:admin").unwrap(),
         default_scopes: ScopeSet::parse("api:read api:write").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -297,6 +303,10 @@ impl Storage for FaultStorage {
         self.inner.put_client(client).await
     }
 
+    async fn delete_client(&self, client_id: &ClientId) -> Result<bool, StorageError> {
+        self.inner.delete_client(client_id).await
+    }
+
     async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
         self.inner.put_device_grant(grant).await
     }
@@ -380,6 +390,15 @@ impl Storage for FaultStorage {
 
     async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
         self.inner.revoke_token_family(family_id).await
+    }
+
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    async fn claim_replay_id(
+        &self,
+        id: &str,
+        expires_at: SystemTime,
+    ) -> Result<bool, StorageError> {
+        self.inner.claim_replay_id(id, expires_at).await
     }
 
     async fn sweep_expired(&self, now: SystemTime) -> Result<u64, StorageError> {

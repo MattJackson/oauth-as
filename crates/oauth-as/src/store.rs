@@ -18,6 +18,10 @@
 //!   [`Storage::put_device_grant`].
 //! - User-code lookups are by NORMALIZED code (see [`crate::device::normalize_user_code`]); the
 //!   store indexes what it is given and does not normalize.
+//! - `claim_replay_id` is an ATOMIC claim-if-absent, and it is what makes RFC 7523 client
+//!   assertions and RFC 9449 DPoP proofs single use. A store that implements it as "look, then
+//!   insert" has reintroduced exactly the replay the two RFCs require to be prevented, and unlike
+//!   the `take_*` operations the damage is silent: nothing else in the system notices.
 //! - Nothing in this crate evicts anything on a timer: there is no background task, by design.
 //!   Expired records are reclaimed only when the HOST calls [`Storage::sweep_expired`]. A host
 //!   that never calls it has a store that only grows.
@@ -63,6 +67,28 @@ pub trait Storage: Send + Sync {
 
     /// Insert or replace a client registration.
     fn put_client(&self, client: Client) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Remove a client registration AND everything it was issued, returning whether a
+    /// registration was actually removed.
+    ///
+    /// The second half is a REQUIREMENT, not a convenience, and it is why this is one operation
+    /// rather than two. RFC 7592 section 2.3 deletes a registration and invalidates what that
+    /// registration holds; a store that removed only the row would leave every access token,
+    /// refresh chain and outstanding authorization code of a deleted client live until its own
+    /// expiry, which is a client that no longer exists still calling resource servers. Doing it
+    /// here rather than in the server is what lets a real database do it in ONE transaction: a
+    /// delete that half succeeded, in either order, is either an orphaned credential set or a
+    /// registration nobody can reach.
+    ///
+    /// "Everything it was issued" means, for `client_id`: access tokens, refresh records, device
+    /// grants (with their user-code index entries) and authorization codes whose `client_id` is
+    /// this one.
+    ///
+    /// Removing a client that is already gone is `Ok(false)`, not an error.
+    fn delete_client(
+        &self,
+        client_id: &ClientId,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
 
     /// Insert or replace a device grant, keyed by `device_code`, maintaining the user-code index.
     ///
@@ -191,6 +217,41 @@ pub trait Storage: Send + Sync {
         family_id: &str,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
 
+    /// Atomically CLAIM a single-use identifier, returning `true` when this caller is the first
+    /// to claim it and `false` when it has already been claimed.
+    ///
+    /// This is the replay-prevention primitive behind two REQUIREMENTS, not two optimisations:
+    /// RFC 7523 section 3 makes a client assertion's `jti` single use within the assertion's
+    /// validity, and RFC 9449 section 4.3 makes a DPoP proof's `jti` single use within the proof's
+    /// acceptance window. An implementation that verifies the signature and skips this has built a
+    /// credential that anybody who observed one request can send again, which is the whole of what
+    /// those two mechanisms exist to prevent.
+    ///
+    /// `expires_at` is when the claim may be reclaimed by [`Storage::sweep_expired`], and it is the
+    /// caller's job to pass the instant past which the artifact would be refused on time alone
+    /// (the assertion's `exp`, the proof's `iat` plus the acceptance window). Reclaiming EARLIER
+    /// than that reopens the replay window; the two callers in this crate both derive it from the
+    /// artifact rather than from a policy of their own.
+    ///
+    /// ATOMICITY IS THE CONTRACT, exactly as for the `take_*` operations above. A shared multi-node
+    /// store must implement this with a genuinely atomic primitive (`INSERT ... ON CONFLICT DO
+    /// NOTHING` and check the row count, `SET NX`, a compare-and-set); a read-then-write lets two
+    /// concurrent presentations of the SAME assertion both be told they were first, which is the
+    /// replay this method exists to refuse. Failing CLOSED on a storage error is the caller's job
+    /// and this crate does it: a claim that could not be recorded is treated as a claim that
+    /// failed.
+    ///
+    /// Claiming an id that is already present but EXPIRED is at the store's discretion: this crate
+    /// never presents such an id, because the artifact carrying it would have been refused on time
+    /// first. [`MemoryStorage`] treats a live entry as claimed regardless of its deadline and lets
+    /// `sweep_expired` do the reclaiming, which is the conservative reading.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    fn claim_replay_id(
+        &self,
+        id: &str,
+        expires_at: std::time::SystemTime,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+
     /// Remove every record that is dead at `now`, and return how many were removed.
     ///
     /// The HOST must call this, on whatever schedule it likes; this crate has no background task
@@ -206,6 +267,7 @@ pub trait Storage: Send + Sync {
     /// - device grants with `expires_at <= now`
     /// - authorization codes with `expires_at <= now` (in either state)
     /// - access tokens with `expires_at <= now`
+    /// - claimed replay identifiers (see [`Storage::claim_replay_id`]) with `expires_at <= now`
     /// - refresh records with `Some(expires_at) <= now`. A record with `expires_at: None` is a
     ///   chain with no absolute lifetime and is NOT dead; the server gives a spent record a
     ///   retention deadline precisely so this method can reclaim it.
@@ -227,6 +289,11 @@ struct MemoryInner {
     codes: HashMap<String, AuthorizationCodeRecord>,
     tokens: HashMap<String, IssuedToken>,
     refresh: HashMap<String, RefreshTokenRecord>,
+    /// Claimed RFC 7523 / RFC 9449 single-use identifiers, mapped to when they may be reclaimed.
+    /// Present only under the features that produce them, so a default build's store is byte for
+    /// byte the store it was before.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    replay_ids: HashMap<String, std::time::SystemTime>,
 }
 
 /// The in-memory [`Storage`]: a mutexed set of maps. Reference implementation for the trait's
@@ -260,6 +327,30 @@ impl Storage for MemoryStorage {
             .clients
             .insert(client.client_id.as_str().to_string(), client);
         Ok(())
+    }
+
+    async fn delete_client(&self, client_id: &ClientId) -> Result<bool, StorageError> {
+        let mut g = self.lock();
+        let existed = g.clients.remove(client_id.as_str()).is_some();
+        // Every credential the registration holds goes with it (see the trait doc). Under the one
+        // mutex, so no request can observe a half-deleted client.
+        g.tokens.retain(|_, t| &t.client_id != client_id);
+        g.refresh.retain(|_, r| &r.client_id != client_id);
+        g.codes.retain(|_, c| &c.client_id != client_id);
+        g.device_by_code.retain(|_, d| &d.client_id != client_id);
+        // The index is a pointer to a grant, not a record of its own; a dangling entry would make
+        // a reaped user code resolve to nothing. Same pass `sweep_expired` makes.
+        let live = &g.device_by_code;
+        let stale: Vec<String> = g
+            .user_code_index
+            .iter()
+            .filter(|(_, dc)| !live.contains_key(*dc))
+            .map(|(uc, _)| uc.clone())
+            .collect();
+        for uc in stale {
+            g.user_code_index.remove(&uc);
+        }
+        Ok(existed)
     }
 
     async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
@@ -383,6 +474,24 @@ impl Storage for MemoryStorage {
         Ok((before - (g.tokens.len() + g.refresh.len())) as u64)
     }
 
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    async fn claim_replay_id(
+        &self,
+        id: &str,
+        expires_at: std::time::SystemTime,
+    ) -> Result<bool, StorageError> {
+        // Atomic by construction: the whole claim happens under the one mutex, so two concurrent
+        // presentations of the same identifier cannot both observe it absent. The `id` is only
+        // allocated when the claim is actually taken, which keeps a replayed request from costing
+        // an allocation as well as a lookup.
+        let mut g = self.lock();
+        if g.replay_ids.contains_key(id) {
+            return Ok(false);
+        }
+        g.replay_ids.insert(id.to_string(), expires_at);
+        Ok(true)
+    }
+
     async fn sweep_expired(&self, now: std::time::SystemTime) -> Result<u64, StorageError> {
         let mut g = self.lock();
         let mut removed = 0u64;
@@ -421,6 +530,17 @@ impl Storage for MemoryStorage {
             None => true,
         });
         removed += (before - g.refresh.len()) as u64;
+
+        // The replay set is the one collection here that an unauthenticated caller can grow: every
+        // refused-but-well-formed assertion or proof adds an entry. It is bounded by the artifact
+        // lifetime caps in `client_assertion.rs` and `dpop.rs`, but only a sweep actually reclaims
+        // it, exactly as for everything else in this store.
+        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        {
+            let before = g.replay_ids.len();
+            g.replay_ids.retain(|_, exp| now < *exp);
+            removed += (before - g.replay_ids.len()) as u64;
+        }
 
         Ok(removed)
     }

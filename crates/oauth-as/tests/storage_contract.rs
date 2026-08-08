@@ -44,6 +44,8 @@ fn sample_device_grant(device_code: &str, user_code: &str) -> DeviceGrant {
 
 fn sample_refresh_token(token: &str) -> RefreshTokenRecord {
     RefreshTokenRecord {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         resource: Vec::new(),
         refresh_token: token.to_string(),
         client_id: ClientId::new("some-client"),

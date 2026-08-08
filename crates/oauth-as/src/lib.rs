@@ -69,7 +69,17 @@
 
 pub mod authorization;
 pub mod client;
+/// RFC 7523 JWT client authentication (`private_key_jwt`, `client_secret_jwt`), behind the
+/// `client_assertion` cargo feature (off by default, and implying `jwt`). Without it a deployment
+/// whose security policy forbids transmitting a shared secret cannot use this crate at all.
+#[cfg(feature = "client_assertion")]
+pub mod client_assertion;
 pub mod device;
+/// RFC 9449 DPoP sender-constrained access tokens, behind the `dpop` cargo feature (off by
+/// default, and implying `jwt`). Without it every token this crate issues is a bearer token, so a
+/// stolen one is usable by whoever stole it.
+#[cfg(feature = "dpop")]
+pub mod dpop;
 pub mod error;
 pub mod events;
 pub mod grant;
@@ -104,7 +114,14 @@ pub use authorization::{
     ResponseType, ValidatedAuthorizationRequest,
 };
 pub use client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash, SecretVerifier};
+#[cfg(feature = "client_assertion")]
+pub use client_assertion::{
+    AssertionFailure, AssertionKeys, VerifiedAssertion, CLIENT_ASSERTION_TYPE, CLIENT_SECRET_JWT,
+    PRIVATE_KEY_JWT,
+};
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
+#[cfg(feature = "dpop")]
+pub use dpop::{DpopFailure, VerifiedProof, DPOP_HEADER, DPOP_TOKEN_TYPE};
 pub use error::{ErrorCode, ErrorResponse};
 pub use events::{
     Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
@@ -132,10 +149,12 @@ pub use scope::{Scope, ScopeSet};
 // it to tell "unknown code" from "too many attempts", and having to reach into `server::` for the
 // error type of a re-exported method was an oversight rather than a decision.
 pub use server::{
-    AuthorizationServer, Clock, DeviceApprovalError, ServerConfig, SystemClock, TokenRequest,
-    MIN_USER_CODE_LENGTH,
+    AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ServerConfig, SystemClock,
+    TokenRequest, TokenRequestContext, MIN_USER_CODE_LENGTH,
 };
 pub use store::{MemoryStorage, Storage, StorageError};
+#[cfg(feature = "dpop")]
+pub use token::Confirmation;
 pub use token::{
     IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,
     TokenType, TokenTypeHint,

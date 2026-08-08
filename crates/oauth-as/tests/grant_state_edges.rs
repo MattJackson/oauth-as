@@ -45,6 +45,7 @@ fn no_redirect_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -135,6 +136,7 @@ fn code_only_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -541,6 +543,8 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
     let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
     let token = |name: &str, family: Option<&str>| IssuedToken {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         resource: Vec::new(),
         access_token: name.to_string(),
         client_id: ClientId::new("app"),
@@ -551,6 +555,8 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
         family_id: family.map(str::to_string),
     };
     let refresh = |name: &str, family: &str| RefreshTokenRecord {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         resource: Vec::new(),
         refresh_token: name.to_string(),
         client_id: ClientId::new("app"),

@@ -41,6 +41,15 @@ pub enum ErrorCode {
     /// distinct code from `invalid_request` on purpose: the parameter was well formed AS A
     /// PARAMETER, so a client that conflated the two would retry the same request.
     InvalidTarget,
+    /// RFC 9449 section 5: the DPoP proof on this request is missing, malformed, does not bind to
+    /// this request, or has already been used. Registered by RFC 9449 section 12.3.
+    ///
+    /// A DISTINCT code from `invalid_client` on purpose, and the distinction is actionable: the
+    /// client's credential may be perfectly good and only its proof wrong, and a client told
+    /// `invalid_client` would go and check the wrong thing. Feature gated, so a build without
+    /// `dpop` has exactly the code set it had before.
+    #[cfg(feature = "dpop")]
+    InvalidDpopProof,
 }
 
 impl ErrorCode {
@@ -61,6 +70,8 @@ impl ErrorCode {
             ErrorCode::SlowDown => "slow_down",
             ErrorCode::ExpiredToken => "expired_token",
             ErrorCode::InvalidTarget => "invalid_target",
+            #[cfg(feature = "dpop")]
+            ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
         }
     }
 

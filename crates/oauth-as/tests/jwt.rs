@@ -67,6 +67,7 @@ fn device_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: Some("Test device".into()),
+        registration: None,
     }
 }
 
@@ -382,6 +383,8 @@ async fn subject_falls_back_to_client_id_when_there_is_no_resource_owner() {
     let srv = jwt_server(ManualClock::at_epoch(), signing_key()).await;
     srv.store()
         .put_refresh_token(RefreshTokenRecord {
+            #[cfg(feature = "dpop")]
+            jkt: None,
             resource: Vec::new(),
             refresh_token: "seeded-refresh".into(),
             client_id: ClientId::new("device-client"),

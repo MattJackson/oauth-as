@@ -386,6 +386,27 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
             Some(u) => Some(endpoint_path(&issuer, "revocation_endpoint", u)?),
             None => None,
         };
+        // RFC 7591 s3 / RFC 8414 s2. `from_config` advertises this exactly when the host enabled
+        // dynamic registration, so an off-issuer value is an error for the same reason
+        // introspection's is: these bytes are produced by this server and nothing else can produce
+        // them. A host that never enabled registration routes nothing here at all, which is the
+        // only way an endpoint that mints clients should ever come to exist.
+        let register = match &meta.registration_endpoint {
+            Some(u) => Some(endpoint_path(&issuer, "registration_endpoint", u)?),
+            None => None,
+        };
+        // RFC 7592 s3 `registration_client_uri`: `{registration_endpoint}/{client_id}`, which is
+        // exactly what `registration::register_dynamic_client` hands the client, so the URL it is
+        // told to use is the URL this router answers on.
+        let manage = register
+            .as_ref()
+            .filter(|_| {
+                config
+                    .registration
+                    .as_ref()
+                    .is_some_and(|r| r.management_enabled)
+            })
+            .map(|p| format!("{p}/{{client_id}}"));
         // The verification URI is NOT part of the RFC 8414 document (it is announced in each RFC
         // 8628 s3.2 response), and a host may legitimately host its device page on a different
         // origin entirely. So an off-issuer verification URI is not an error, it just means the
@@ -448,6 +469,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         paths.extend(introspect.as_deref());
         paths.extend(revoke.as_deref());
         paths.extend(verification.as_deref());
+        paths.extend(register.as_deref());
+        paths.extend(manage.as_deref());
         #[cfg(feature = "jwt")]
         paths.extend(jwks_path.as_deref());
         for i in 0..paths.len() {
@@ -473,6 +496,17 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
             router = router.route(
                 path,
                 get(verification_page_handler::<S, C>).post(verification_submit_handler::<S, C>),
+            );
+        }
+        if let Some(path) = &register {
+            router = router.route(path, post(register_handler::<S, C>));
+        }
+        if let Some(path) = &manage {
+            router = router.route(
+                path,
+                get(read_registration_handler::<S, C>)
+                    .put(update_registration_handler::<S, C>)
+                    .delete(delete_registration_handler::<S, C>),
             );
         }
         #[cfg(feature = "jwt")]
@@ -734,6 +768,26 @@ struct Credentials {
     client_id: String,
     /// `None` for a public client, which has no secret to present.
     client_secret: Option<String>,
+    /// RFC 7521 s4.2 `client_assertion_type`, verbatim.
+    #[cfg(feature = "client_assertion")]
+    client_assertion_type: Option<String>,
+    /// RFC 7523 `client_assertion`, verbatim.
+    #[cfg(feature = "client_assertion")]
+    client_assertion: Option<String>,
+}
+
+impl Credentials {
+    /// The borrowed form the server takes. Borrowed rather than owned so that reading a credential
+    /// off the wire costs the same as it did before these two parameters existed.
+    fn credential(&self) -> crate::server::ClientCredential<'_> {
+        crate::server::ClientCredential {
+            client_secret: self.client_secret.as_deref(),
+            #[cfg(feature = "client_assertion")]
+            client_assertion_type: self.client_assertion_type.as_deref(),
+            #[cfg(feature = "client_assertion")]
+            client_assertion: self.client_assertion.as_deref(),
+        }
+    }
 }
 
 /// Whether the request offered HTTP Basic credentials at all. Decided before any parsing, because
@@ -783,12 +837,51 @@ fn credentials(headers: &HeaderMap, form: &[Pair<'_>]) -> Result<Credentials, Er
     let basic = basic_attempted(headers);
     let body_id = param(form, "client_id");
     let body_secret = param(form, "client_secret");
+
+    // RFC 7523 s2.2 / RFC 7521 s4.2. Handled BEFORE the three older methods, because an assertion
+    // is a complete client authentication on its own and s2.2 makes `client_id` OPTIONAL alongside
+    // it: the assertion already names the client, so requiring the parameter would refuse a
+    // conforming client over a redundancy.
+    #[cfg(feature = "client_assertion")]
+    if let Some(assertion) = param(form, "client_assertion") {
+        // RFC 6749 s2.3: one authentication method per request. Basic credentials or a
+        // `client_secret` alongside an assertion is two, and a server that resolves the ambiguity
+        // by precedence is a server whose behaviour differs from the next one's.
+        if basic || body_secret.is_some() {
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequest)
+                .with_description("more than one client authentication method (RFC 6749 s2.3)"));
+        }
+        // UNVERIFIED, and only used to LOCATE the registration. The registration then decides the
+        // algorithm and the key, and `verify_assertion` re-checks `iss`/`sub` against the client id
+        // resolved here, so nothing is trusted on the strength of this read. A form `client_id`
+        // wins when present, because that is the value the client explicitly asserted.
+        let client_id = match body_id {
+            Some(id) => id.to_string(),
+            None => crate::client_assertion::unverified_subject(assertion)
+                .ok_or_else(|| {
+                    ErrorResponse::new(ErrorCode::InvalidClient)
+                        .with_description("the client assertion names no client")
+                })?
+                .to_string(),
+        };
+        return Ok(Credentials {
+            client_id,
+            client_secret: None,
+            client_assertion_type: param(form, "client_assertion_type").map(str::to_string),
+            client_assertion: Some(assertion.to_string()),
+        });
+    }
+
     match (basic, body_id, body_secret) {
         (true, None, None) => {
             let (client_id, client_secret) = decode_basic(headers)?;
             Ok(Credentials {
                 client_id,
                 client_secret: Some(client_secret),
+                #[cfg(feature = "client_assertion")]
+                client_assertion_type: None,
+                #[cfg(feature = "client_assertion")]
+                client_assertion: None,
             })
         }
         (true, _, _) => Err(ErrorResponse::new(ErrorCode::InvalidRequest)
@@ -798,6 +891,10 @@ fn credentials(headers: &HeaderMap, form: &[Pair<'_>]) -> Result<Credentials, Er
         (false, Some(id), secret) => Ok(Credentials {
             client_id: id.to_string(),
             client_secret: secret.map(str::to_string),
+            #[cfg(feature = "client_assertion")]
+            client_assertion_type: None,
+            #[cfg(feature = "client_assertion")]
+            client_assertion: None,
         }),
         // RFC 6749 s5.2 names this case explicitly under `invalid_client`: "no client
         // authentication included".
@@ -880,8 +977,11 @@ async fn token_handler<S: Storage, C: Clock>(
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
-    let client_id = ClientId::new(creds.client_id);
-    let client_secret = creds.client_secret;
+    let client_id = ClientId::new(creds.client_id.clone());
+    // NOT moved onto the TokenRequest variant any more: every credential this endpoint accepts now
+    // travels together on the request CONTEXT, so there is one place a reader has to look to see
+    // what the client presented, rather than one for secrets and another for everything else.
+    let client_secret: Option<String> = None;
 
     let request = match grant {
         GrantType::AuthorizationCode => {
@@ -935,13 +1035,147 @@ async fn token_handler<S: Storage, C: Clock>(
                 scope,
             }
         }
+        // RFC 8693 s2 shares the token endpoint with the RFC 6749 grants but NOT their
+        // response body (s2.2.1 adds a REQUIRED member), so it answers from here rather
+        // than producing a `TokenRequest`. Serving it matters beyond convenience: the RFC
+        // 8414 document advertises the grant when this feature is on, and an advertised
+        // grant this router refused would be exactly the lie that document exists to
+        // avoid.
+        #[cfg(feature = "token-exchange")]
+        GrantType::TokenExchange => {
+            return token_exchange_response(&state, &form, client_id, client_secret, via_header)
+                .await
+        }
     };
 
     // RFC 8707 s2: `resource` is a parameter of the token request itself, independent of
     // `grant_type`, so it is collected once here rather than inside each arm above.
     let resources = resource_indicators(&form);
-    match state.server.token_with_resources(request, &resources).await {
+
+    // RFC 9449 s4.3 (1): there must be exactly ONE `DPoP` header. Several is not a request this
+    // server may pick a favourite from: an intermediary that appended one, or a client that sent
+    // two, leaves it ambiguous which proof the client meant to bind the token to.
+    #[cfg(feature = "dpop")]
+    let dpop_proof = {
+        let mut values = headers.get_all(crate::dpop::DPOP_HEADER).iter();
+        let first = values.next();
+        if values.next().is_some() {
+            return error_response(
+                &ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                    .with_description("more than one DPoP header (RFC 9449 s4.3)"),
+                via_header,
+                &state.challenge,
+            );
+        }
+        match first.map(|v| v.to_str()) {
+            None => None,
+            Some(Ok(value)) => Some(value),
+            // A header that is not visible ASCII cannot be a compact JWS, so this is a malformed
+            // proof rather than an absent one, and answering "absent" would silently downgrade a
+            // client that asked for a bound token to a bearer one.
+            Some(Err(_)) => {
+                return error_response(
+                    &ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                        .with_description("the DPoP header is not a compact JWS"),
+                    via_header,
+                    &state.challenge,
+                )
+            }
+        }
+    };
+
+    let context = crate::server::TokenRequestContext {
+        credential: creds.credential(),
+        resources: &resources,
+        #[cfg(feature = "dpop")]
+        dpop_proof,
+    };
+    match state.server.token_with_context(request, context).await {
         Ok(response) => ok_json(&response),
+        Err(e) => error_response(&e, via_header, &state.challenge),
+    }
+}
+
+/// RFC 8693 s2: the token exchange grant.
+///
+/// The router serves the WIRE response only. A host that needs to know whether the exchange
+/// was delegation or impersonation (s1.1), or that needs the s4.1 `act` claim to put into a
+/// token of its own, calls [`crate::token_exchange::TokenExchange::exchange_token`] directly:
+/// neither is a response parameter RFC 8693 defines, so neither belongs in this body.
+#[cfg(feature = "token-exchange")]
+async fn token_exchange_response<S: Storage, C: Clock>(
+    state: &Inner<S, C>,
+    form: &[Pair<'_>],
+    client_id: ClientId,
+    client_secret: Option<String>,
+    via_header: bool,
+) -> Response {
+    fn token_type(
+        name: &'static str,
+        value: &str,
+    ) -> Result<crate::token_exchange::TokenTypeIdentifier, ErrorResponse> {
+        // The VALUE is not echoed, for the reason `grant_type` is not echoed above: RFC
+        // 6749 s5.2 restricts error_description to a charset an attacker-supplied URN need
+        // not respect, and naming the parameter is enough for the developer who sent it.
+        value.parse().map_err(|_| {
+            ErrorResponse::new(ErrorCode::InvalidRequest)
+                .with_description(format!("{name} is not a token type RFC 8693 s3 registers"))
+        })
+    }
+
+    let subject_token = match required(form, "subject_token") {
+        Ok(v) => v,
+        Err(e) => return error_response(&e, via_header, &state.challenge),
+    };
+    let subject_token_type = match required(form, "subject_token_type")
+        .and_then(|v| token_type("subject_token_type", v))
+    {
+        Ok(v) => v,
+        Err(e) => return error_response(&e, via_header, &state.challenge),
+    };
+    let actor_token = param(form, "actor_token");
+    let actor_token_type = match param(form, "actor_token_type")
+        .map(|v| token_type("actor_token_type", v))
+        .transpose()
+    {
+        Ok(v) => v,
+        Err(e) => return error_response(&e, via_header, &state.challenge),
+    };
+    let requested_token_type = match param(form, "requested_token_type")
+        .map(|v| token_type("requested_token_type", v))
+        .transpose()
+    {
+        Ok(v) => v,
+        Err(e) => return error_response(&e, via_header, &state.challenge),
+    };
+    let scope = match optional_scope(form) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e, via_header, &state.challenge),
+    };
+    // Both target parameters may repeat (RFC 8693 s2.1, RFC 8707 s2), so neither may go
+    // through `param`'s first-wins rule: dropping the second occurrence would silently
+    // narrow the request to half of what the client asked for.
+    let resource = resource_indicators(form);
+    let audience: Vec<String> = form
+        .iter()
+        .filter(|(k, _)| k == "audience")
+        .map(|(_, v)| v.as_ref().to_string())
+        .collect();
+
+    let request = crate::token_exchange::TokenExchangeRequest {
+        client_id: &client_id,
+        client_secret: client_secret.as_deref(),
+        subject_token,
+        subject_token_type,
+        actor_token,
+        actor_token_type,
+        resource: &resource,
+        audience: &audience,
+        scope: scope.as_ref(),
+        requested_token_type,
+    };
+    match crate::token_exchange::TokenExchange::exchange_token(&*state.server, &request).await {
+        Ok(exchanged) => ok_json(&exchanged.response),
         Err(e) => error_response(&e, via_header, &state.challenge),
     }
 }
@@ -966,9 +1200,9 @@ async fn device_authorization_handler<S: Storage, C: Clock>(
     };
     match state
         .server
-        .device_authorization(
-            &ClientId::new(creds.client_id),
-            creds.client_secret.as_deref(),
+        .device_authorization_with_credential(
+            &ClientId::new(creds.client_id.clone()),
+            &creds.credential(),
             scope.as_ref(),
         )
         .await
@@ -998,9 +1232,9 @@ async fn introspect_handler<S: Storage, C: Clock>(
     };
     match state
         .server
-        .introspection_response(
-            &ClientId::new(creds.client_id),
-            creds.client_secret.as_deref(),
+        .introspection_response_with_credential(
+            &ClientId::new(creds.client_id.clone()),
+            &creds.credential(),
             token,
         )
         .await
@@ -1050,6 +1284,159 @@ async fn revoke_handler<S: Storage, C: Clock>(
             resp
         }
         Err(e) => error_response(&e, via_header, &state.challenge),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// RFC 7591 registration and RFC 7592 management
+// ---------------------------------------------------------------------------------------------
+
+/// The RFC 6750 s2.1 bearer token from the `Authorization` header, if the request carried one.
+///
+/// Used for BOTH credentials this pair of RFCs defines: the RFC 7591 s1.2 initial access token and
+/// the RFC 7592 s2 registration access token. Both are access tokens presented the same way, so
+/// there is one parser rather than two that could disagree.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?;
+    // Case-insensitive scheme (RFC 9110 s11.1), then the token68 with its surrounding space
+    // trimmed. An empty remainder is `None`: a header that names the scheme and supplies nothing
+    // presented no credential.
+    if raw.len() < 7 || !raw[..7].eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    let token = raw[7..].trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Turn an RFC 7591 s3.2.2 / RFC 7592 s2 refusal into a response.
+///
+/// A 401 carries an RFC 6750 s3 `Bearer` challenge rather than the `Basic` one the token plane
+/// uses: this endpoint authenticates with a bearer token, and telling a client to retry with a
+/// scheme it cannot use here would be worse than saying nothing. Only the `Invalid` case has a
+/// body, because it is the only one with something a client can act on; a 401 that described what
+/// was wrong with the token would be describing somebody else's credential.
+fn registration_error(failure: &crate::registration::RegistrationFailure) -> Response {
+    let status =
+        StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut resp = match failure {
+        crate::registration::RegistrationFailure::Invalid(body) => {
+            (status, json_body(body)).into_response()
+        }
+        _ => status.into_response(),
+    };
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, json_content_type());
+    no_store(headers);
+    if status == StatusCode::UNAUTHORIZED {
+        headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    resp
+}
+
+/// Parse an RFC 7591 s2 metadata document out of a request body.
+///
+/// A body that is not JSON at all is `invalid_client_metadata`: s3.2.2 has no code for "your body
+/// was not JSON", and the client's problem is genuinely that the metadata it submitted is not
+/// metadata this server can read.
+fn client_metadata(body: &Bytes) -> Result<crate::registration::ClientMetadata, Response> {
+    serde_json::from_slice(body).map_err(|_| {
+        registration_error(&crate::registration::RegistrationFailure::Invalid(
+            crate::registration::RegistrationErrorResponse::new(
+                crate::registration::RegistrationErrorCode::InvalidClientMetadata,
+                "the request body is not an RFC 7591 s2 client metadata JSON object",
+            ),
+        ))
+    })
+}
+
+/// RFC 7591 s3.1: the client registration request. Success is a 201 (s3.2.1).
+async fn register_handler<S: Storage, C: Clock>(
+    State(state): State<Arc<Inner<S, C>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let metadata = match client_metadata(&body) {
+        Ok(m) => m,
+        Err(response) => return response,
+    };
+    match state
+        .server
+        .register_dynamic_client(&metadata, bearer_token(&headers))
+        .await
+    {
+        Ok(info) => {
+            // s3.2.1: "201 Created", and the body carries a client secret and a registration
+            // access token, so the s5.1 caching rules of RFC 6749 apply exactly as they do to a
+            // token response.
+            let mut resp = (StatusCode::CREATED, json_body(&info)).into_response();
+            let h = resp.headers_mut();
+            h.insert(header::CONTENT_TYPE, json_content_type());
+            no_store(h);
+            resp
+        }
+        Err(e) => registration_error(&e),
+    }
+}
+
+/// RFC 7592 s2.1: read a registration.
+async fn read_registration_handler<S: Storage, C: Clock>(
+    State(state): State<Arc<Inner<S, C>>>,
+    axum::extract::Path(client_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let token = bearer_token(&headers).unwrap_or_default();
+    match state
+        .server
+        .read_registration(&ClientId::new(client_id), token)
+        .await
+    {
+        Ok(info) => ok_json(&info),
+        Err(e) => registration_error(&e),
+    }
+}
+
+/// RFC 7592 s2.2: replace a registration's metadata.
+async fn update_registration_handler<S: Storage, C: Clock>(
+    State(state): State<Arc<Inner<S, C>>>,
+    axum::extract::Path(client_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let metadata = match client_metadata(&body) {
+        Ok(m) => m,
+        Err(response) => return response,
+    };
+    let token = bearer_token(&headers).unwrap_or_default();
+    match state
+        .server
+        .update_registration(&ClientId::new(client_id), token, &metadata)
+        .await
+    {
+        Ok(info) => ok_json(&info),
+        Err(e) => registration_error(&e),
+    }
+}
+
+/// RFC 7592 s2.3: delete a registration. Success is a 204 with no body.
+async fn delete_registration_handler<S: Storage, C: Clock>(
+    State(state): State<Arc<Inner<S, C>>>,
+    axum::extract::Path(client_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let token = bearer_token(&headers).unwrap_or_default();
+    match state
+        .server
+        .delete_registration(&ClientId::new(client_id), token)
+        .await
+    {
+        Ok(()) => {
+            let mut resp = StatusCode::NO_CONTENT.into_response();
+            no_store(resp.headers_mut());
+            resp
+        }
+        Err(e) => registration_error(&e),
     }
 }
 

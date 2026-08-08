@@ -359,6 +359,7 @@ fn device_test_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -443,6 +444,7 @@ fn code_test_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -615,8 +617,16 @@ fn core_public_types_stay_within_their_size_budget() {
     );
     // IssuedToken carries the opaque token string, a ClientId, an Option<String> subject, a
     // ScopeSet (a BTreeSet, 1 pointer-ish word), and two SystemTime instants.
+    //
+    // The `dpop` feature adds the RFC 9449 s6 key binding, an `Option<Box<str>>`. Budgeted
+    // SEPARATELY rather than by raising the number, so that a deployment which does not enable
+    // sender-constrained tokens still cannot be made to pay 16 bytes per issued token for them.
+    #[cfg(feature = "dpop")]
+    let issued_token_budget = 192;
+    #[cfg(not(feature = "dpop"))]
+    let issued_token_budget = 176;
     assert!(
-        size_of::<IssuedToken>() <= 176,
+        size_of::<IssuedToken>() <= issued_token_budget,
         "IssuedToken grew past its size budget: {}",
         size_of::<IssuedToken>()
     );

@@ -14,6 +14,8 @@ use std::time::{Duration, UNIX_EPOCH};
 #[test]
 fn c13_issued_token_debug_redacts_the_access_token() {
     let record = IssuedToken {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         access_token: "at-secret-value".into(),
         client_id: ClientId::new("app"),
         subject: Some("alice".into()),
@@ -43,6 +45,8 @@ fn c13_issued_token_debug_redacts_the_access_token() {
 #[test]
 fn c13_refresh_token_record_debug_redacts_the_refresh_token() {
     let record = RefreshTokenRecord {
+        #[cfg(feature = "dpop")]
+        jkt: None,
         refresh_token: "rt-secret-value".into(),
         client_id: ClientId::new("app"),
         subject: Some("alice".into()),
