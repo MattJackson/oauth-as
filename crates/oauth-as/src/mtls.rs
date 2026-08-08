@@ -445,7 +445,9 @@ impl RegisteredCertificates {
             .get("keys")
             .and_then(|k| k.as_array())
             .ok_or(MtlsRegistrationError::MalformedJwks)?;
-        let mut thumbprints = Vec::new();
+        // Sized from the key count: at most one certificate per key, and this runs at
+        // registration time where the count is already in hand.
+        let mut thumbprints = Vec::with_capacity(keys.len());
         for key in keys {
             let chain = match key.get("x5c").and_then(|c| c.as_array()) {
                 Some(chain) => chain,

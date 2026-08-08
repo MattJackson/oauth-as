@@ -565,6 +565,17 @@ EDITS.append(
                 "        };\n",
             ),
             (
+                # `bound` takes this to eight arguments, so it takes the same allow, and the same
+                # kind of justification, that `issue` already carries: a private function with one
+                # call site, whose arguments would have to live across every await in the token
+                # future if they were bundled into a struct to satisfy a lint.
+                '    #[cfg(feature = "jwt")]\n'
+                "    fn wire_access_token(\n",
+                "    #[allow(clippy::too_many_arguments)]\n"
+                '    #[cfg(feature = "jwt")]\n'
+                "    fn wire_access_token(\n",
+            ),
+            (
                 "        now: SystemTime,\n        jti: String,\n    ) -> Result<String, ErrorResponse> {\n",
                 "        now: SystemTime,\n"
                 "        jti: String,\n"
@@ -806,6 +817,38 @@ EDITS.append(
                 "        introspected.cnf.unwrap().jkt,\n"
                 "        Some(key.to_public_jwk().thumbprint())\n",
             ),
+        ],
+    )
+)
+
+# A new field on a hot record updates the size budget in the SAME change that adds it.
+EDITS.append(
+    (
+        "crates/oauth-as/tests/allocation.rs",
+        "mtls",
+        [
+            (
+                "    // The `dpop` feature adds the RFC 9449 s6 key binding, an `Option<Box<str>>`. Budgeted\n"
+                "    // SEPARATELY rather than by raising the number, so that a deployment which does not enable\n"
+                "    // sender-constrained tokens still cannot be made to pay 16 bytes per issued token for them.\n"
+                '    #[cfg(feature = "dpop")]\n'
+                "    let issued_token_budget = 192;\n"
+                '    #[cfg(not(feature = "dpop"))]\n'
+                "    let issued_token_budget = 176;\n",
+                "    // Each optional sender-constraining mechanism adds ONE field, and each is budgeted\n"
+                "    // SEPARATELY and ADDITIVELY rather than by raising a single number: a deployment that\n"
+                "    // enables neither must not be made to pay for either, and one that enables one must\n"
+                "    // not be made to pay for the other.\n"
+                "    //\n"
+                "    // `dpop`: the RFC 9449 s6 key binding, an `Option<Box<str>>`, 16 bytes, because `str`\n"
+                "    // is unsized and the pointer to it is fat.\n"
+                "    // `mtls`: the RFC 8705 s3 certificate binding, an `Option<Box<CertificateThumbprint>>`,\n"
+                "    // 8 bytes, because a thumbprint is a fixed `[u8; 32]` and the pointer to it is thin.\n"
+                "    // The 32 bytes themselves are allocated only for a token that is certificate bound.\n"
+                "    let issued_token_budget = 176\n"
+                '        + if cfg!(feature = "dpop") { 16 } else { 0 }\n'
+                '        + if cfg!(feature = "mtls") { 8 } else { 0 };\n',
+            )
         ],
     )
 )
