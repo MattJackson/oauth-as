@@ -12,7 +12,149 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
-### Added
+Nothing yet.
+
+## [0.9.0] - 2026-08-08 (release candidate; not yet published to crates.io)
+
+**0.9.0 adds no new protocol surface. It exists to prove the crate against the outside world**
+(`ROADMAP.md`), and the most valuable thing in it is an honest account of what could and could not
+be proven. Everything between 0.1.0 and 0.8.0 is folded in here, because those versions were built
+and promoted but never published: from crates.io's point of view this is the first release with an
+implementation in it.
+
+### Added: external verification (the point of this release)
+
+- **A SECOND independent third-party client**, in a different language and from a different
+  author: `golang.org/x/oauth2 v0.36.0`, maintained by the Go project, pinned exactly with a
+  committed `go.sum`. It is deliberately not a second opinion on the same questions: it drives the
+  RFC 6749 section 4.4 client credentials grant and the section 6 refresh grant with rotation,
+  neither of which the pinned Rust `oauth2 = "=5.0.0"` drive covers, as well as the device grant
+  and authorization code with PKCE. Lives in `crates/oauth-as-conformance/interop/go`, run by
+  `scripts/oauth-interop.sh`, whose `--selftest` shows the gate red on both axes before any green
+  is trusted. Two independently written client libraries now accept this server's wire bytes.
+- **A third-party scanner now reaches this crate's RFC 8414 document**: the `authgent` MCP-OAuth
+  scanner, pinned at `authgent-server==0.3.4` and wired into `qa.yml` through its own composite
+  action `authgent/authgent/.github/actions/mcp-lint@v0.3.4`. `KICKOFF.md` recorded that this
+  scanner bails without RFC 9728 protected resource metadata; RFC 9728 landed in the crate, so the
+  blocker is now removable honestly, with a loopback fixture resource that publishes a document
+  that is TRUE about the deployment under test. **This project is not an MCP server and does not
+  claim to be one; the scanner's MCP verdict is quoted nowhere.** What is claimed is exactly that
+  its RFC 8414, RFC 7636, RFC 9207, RFC 8707 and RFC 7591 checks were applied to this crate's
+  metadata document by a tool nobody here wrote. The full argument for why the fixture is
+  legitimate rather than a dodge is at the top of `scripts/oauth-mcp-lint.sh`.
+- **The scanner's findings are recorded, not silenced.** `crates/oauth-as-conformance/authgent-baseline.json`
+  holds three accepted findings with the reason for each, and the gate is on anything NEW rather
+  than on zero: `MCP-AUD-001` (error) wants a `resource_indicators_supported` metadata member that
+  RFC 8707 does not register and this crate does not emit; `MCP-DCR-001` and `MCP-REFRESH-001`
+  (warnings) want a registration endpoint and DPoP algorithms, both implemented in the crate and
+  both deliberately off in the conformance example.
+- `crates/oauth-as/examples/protected_resource_fixture.rs`, a worked example of the RFC 9728 host
+  seam: where the document goes (section 3.1 INSERTS the well-known string between host and path),
+  and the section 5.1 `WWW-Authenticate: Bearer resource_metadata="..."` challenge an
+  unauthenticated request gets. `ProtectedResourceMetadata` previously had no consumer anywhere in
+  the tree.
+- **`crates/oauth-as-conformance/EXTERNAL-TOOLING.md`**, the written record of what external
+  tooling was run, what was refused, and why. It includes the FAPI 2.0 verdict below.
+
+### Changed: the FAPI 2.0 record, which was wrong
+
+- **The OpenID Foundation suite CAN test a non-OIDC authorization server, and the previous claim
+  in `qa.yml` and `crates/oauth-as-conformance/Cargo.toml` that it "presupposes OpenID Connect
+  semantics" is corrected.** The FAPI 2.0 Security Profile plans carry an `openid=plain_oauth`
+  variant that discovers through `/.well-known/oauth-authorization-server`, never asks for an
+  `id_token`, and yields a real certification profile name. A run is achievable headless, entirely
+  on localhost, with a self-signed certificate: the suite trusts all server certificates and
+  drives its browser steps through an in-JVM HtmlUnit driver.
+- **It is still not run**, and the reasons are now a finite written list rather than a category
+  error: the plan requires a protected resource endpoint that verifies a sender-constrained token,
+  HTTPS, two static clients with distinct keys, mandatory PAR, and
+  `require_pushed_authorization_requests` present as a boolean. Citations in
+  `EXTERNAL-TOOLING.md`.
+- One genuine conflict, recorded rather than resolved: **FAPI 2.0 section 5.3.2.1-9 says the
+  authorization server shall NOT use refresh token rotation**, while OAuth 2.1 section 6.1 and RFC
+  9700 section 4.14.2 are why this crate rotates and revokes the family on reuse. A FAPI 2.0 run
+  would need rotation configurable off. Neither side is wrong; they are optimising different
+  things.
+- One thing could not be confirmed from any primary source and is stated as unknown: whether the
+  OpenID Foundation accepts logs from a locally deployed suite for a certification submission.
+
+### Added: protocol surface, 0.2.0 through 0.8.0
+
+Folded in here because none of those versions was published. See `ROADMAP.md` for the slice each
+belongs to.
+
+- **RFC 7523 JWT client assertions**: `private_key_jwt` (ES256) and `client_secret_jwt` (HS256),
+  behind an off-by-default `client_assertion` feature. Until this landed, a deployment whose
+  security policy forbids transmitting a shared secret could not use this crate at all. The
+  feature IMPLIES `jwt` on purpose: this and `dpop` both rest on JWS verification, and the crate
+  holds exactly one copy of that code, because two half-built verifiers behind two independent
+  flags is how a codebase acquires an algorithm-confusion bug in whichever half nobody reviewed.
+- **RFC 9449 DPoP** sender-constrained access tokens, behind an off-by-default `dpop` feature.
+  This is the change that alters what a token leak costs: without it every token this crate issues
+  is a bearer token, usable by whoever stole it.
+- **RFC 8705 mutual-TLS client authentication and certificate-bound access tokens**, with a seam
+  for the host to pass in the verified client certificate, since TLS termination is the host's job
+  in this design.
+- **RFC 9126 pushed authorization requests** and **RFC 9101 signed request objects**, behind
+  off-by-default `par` and `jar` features, so authorization parameters need never traverse the
+  browser.
+- **RFC 9728 protected resource metadata**, behind an off-by-default `resource-metadata` feature.
+  What it adds is the TYPE a host publishes for its OWN resource, plus the section 4
+  `protected_resources` member on the RFC 8414 document. It does NOT make this crate a resource
+  server, does not route anything, and does not validate access tokens; section 3.1 places that
+  document under the resource's identifier, not the issuer's.
+- **RFC 8693 token exchange**, behind an off-by-default `token-exchange` feature. Off by default
+  because it is a grant that mints a token from a token, and a deployment that has not decided its
+  delegation policy should not have the endpoint compiled in.
+- **RFC 9396 rich authorization requests**, structured authorization detail beyond scope strings.
+- **An exportable `Storage` conformance harness** (`storage_conformance`), so a host can prove its
+  own `Storage` implementation satisfies the atomicity contract. This matters more than it sounds:
+  a host implementing `take_*` as read-then-delete gets undetectable refresh token double spend on
+  a multi-node deployment, and nothing else in the crate can catch that. It is proven able to go
+  red against a no-op implementation, and covers `claim_replay_id` atomicity and the RFC 9449
+  `jkt` binding at rest.
+- **A client secret verifier seam** (`SecretHash`), so a host stores a one-way verifier rather than
+  the secret, compared in constant time. Registration access tokens are stored the same way.
+
+### Fixed (security), 0.2.0 through 0.8.0
+
+Each began as a test that reproduced the attack and failed.
+
+- **An allowlist for RFC 8707 `resource` values (HIGH).** Syntactic validity is not authorisation:
+  accepting any well-formed absolute URI let a client name a resource server this AS was never
+  meant to mint for.
+- **The RFC 7592 registration policy is consulted on UPDATE, not only on registration (HIGH).** A
+  client could otherwise register within policy and then update itself out of it.
+- **One issuer spelling everywhere (MEDIUM)**, and a throttle on device code lookup.
+- Parser-level holes exposed by a mutation run over the HTTP surface, closed.
+
+### Added: the earlier slices, in the detail they were written with
+
+- **RFC 7591 dynamic client registration** and **RFC 7592 registration management**, OFF by
+  default. Enabling them is two explicit acts, not one: `ServerConfig::registration` must be set,
+  AND a `RegistrationPolicy` must be installed, or every registration is refused. RFC 7591 section
+  5 is the reason: an open registration endpoint lets anyone on the internet mint a client, which
+  weakens every threat model that assumed controlling a registered client was hard. What a
+  registrant may obtain is bounded by `RegistrationConfig`, whose defaults are the narrow ones (the
+  authorization code grant with refresh, no `client_credentials`, no device grant, no scopes).
+  Validation uses the section 3.2.2 error registry (`invalid_redirect_uri`,
+  `invalid_client_metadata`, `invalid_software_statement`), which is modelled separately from the
+  RFC 6749 section 5.2 token codes because it is a separate registry. Redirect URIs are validated
+  on the way in with the strictness the authorization endpoint applies on the way out (RFC 6749
+  section 3.1.2: absolute, no fragment), since exact-match comparison makes anything else a
+  registration that can never be used. The RFC 8414 `registration_endpoint` member is advertised
+  exactly when registration is enabled. Registration, update and deletion each emit an audit event
+  carrying no credential.
+- **Registration access tokens** (RFC 7592 section 2), stored as one-way `SecretHash` verifiers and
+  compared in constant time, exactly as client secrets now are. Consequence, stated rather than
+  buried: a read or update response cannot return `registration_access_token` or `client_secret`,
+  because this server keeps a verifier and not the credential. Both are returned exactly once, by
+  the registration that minted them. Software statements (section 2.3) are not evaluated and are
+  refused with `invalid_software_statement` rather than silently ignored.
+- `Storage::delete_client`, which removes a registration AND every access token, refresh record,
+  device grant and authorization code issued to it, in one operation so a real store can do it in
+  one transaction. RFC 7592 section 2.3: a deleted client that still has live tokens is a client
+  that no longer exists still calling resource servers.
 
 - **RFC 9068 JWT access tokens** (`at+jwt`, ES256) with an RFC 7517 JWKS document, behind an
   off-by-default `jwt` feature. Opaque tokens remain the default: RFC 9068 is an optional profile,
@@ -47,7 +189,7 @@ whatever version is current at each real crates.io release appear as published o
 - `Storage::get_refresh_token`, `Storage::revoke_token_family`, and `Storage::sweep_expired`.
 - Allocation and size gates, each proven able to fail before being trusted.
 
-### Fixed (security)
+### Fixed (security): the adversarial review
 
 An adversarial security review traced seventeen findings through the code. Each fix began as a
 test that reproduced the attack and failed.
@@ -73,7 +215,7 @@ test that reproduced the attack and failed.
 - `ValidatedAuthorizationRequest` is now genuinely unconstructible outside validation, which its
   documentation had already claimed.
 
-### Changed
+### Changed: everything else
 
 - **MSRV lowered from a declared 1.86 to a measured 1.75.** 1.74 fails only on return position
   `impl Trait` in the `Storage` trait; 1.75 compiles clean. `Cargo.lock` moved to format v3, and
@@ -101,6 +243,19 @@ test that reproduced the attack and failed.
   and does not is worse off than one told plainly it cannot have one.
 - `conformance-serve.sh` excluded from the published tarball: it resolves the workspace root as
   `../..` and cannot work from an unpacked crate.
+
+### Notes
+
+- `cargo publish --dry-run --locked` passes at 0.9.0: 101 files, 1.7 MiB (446.9 KiB compressed).
+  The tarball carries no absolute path, no machine-specific string and no credential beyond the
+  conformance fixtures, which are labelled as fixtures in their own module docs; the one packaged
+  test that reads a repo-only file (`tests/jwt.rs`, the vendored RFC vectors) already detects its
+  absence and says so rather than pretending to have checked something.
+- There is still **no OAuth 2.1 certification programme in existence**, so no implementation can
+  hold one, including this one. The independent judges of this release are the vendored RFC
+  vectors, two pinned third-party client libraries in two languages, and one third-party scanner
+  whose checks of an RFC 8414 document reached this crate for the first time. That is a real bar,
+  it is not certification, and nothing here implies otherwise.
 
 ## [0.1.0] - 2026-08-08 (built and tested, not published to crates.io)
 
