@@ -354,11 +354,14 @@ impl ExpectedSubject {
             if value.is_empty() {
                 return Err(MtlsRegistrationError::EmptySubjectValue);
             }
-            // TEMPORARY HOLE (red-before-green): section 2.1.2's "only one" rule is not enforced
-            // yet, so a registration naming two parameters silently keeps the first.
-            if found.is_none() {
-                found = Some(candidate);
+            // Section 2.1.2. Refused rather than resolved: there is no correct way to pick, and
+            // every way of picking is weaker than what the operator wrote down. Note this fires on
+            // the SECOND parameter whichever order they arrived in, so the answer does not depend
+            // on how the host happened to iterate its own registration document.
+            if found.is_some() {
+                return Err(MtlsRegistrationError::MoreThanOneSubjectValue);
             }
+            found = Some(candidate);
         }
         found.ok_or(MtlsRegistrationError::NoSubjectValue)
     }
@@ -640,10 +643,16 @@ pub(crate) fn verify_client_credentials(
                 return Err(ClientAuthFailure::SecretMismatch);
             }
             let certificate = certificate.ok_or(ClientAuthFailure::NoCertificatePresented)?;
-            // TEMPORARY HOLE (red-before-green): the registration is not consulted at all, so any
-            // verified certificate authenticates any mutual-TLS client.
-            let _ = registration;
-            Ok(())
+            // The registration decides, and it is the ONLY thing that decides. "The host verified
+            // this certificate" says the chain is good, not that it belongs to this client: every
+            // deployment that trusts a CA for client certificates has more than one certificate
+            // under it, and for the section 2.2 self-signed method a certificate is something the
+            // caller can mint for themselves in a second.
+            if registration.accepts(certificate) {
+                Ok(())
+            } else {
+                Err(ClientAuthFailure::CertificateMismatch)
+            }
         }
         _ => {
             if client.auth.verify_with(presented_secret, verifier) {

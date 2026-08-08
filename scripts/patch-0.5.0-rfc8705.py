@@ -289,15 +289,34 @@ EDITS = [
                 "    /// The RFC 8707 resource indicators this token is restricted to; empty when the grant named\n"
                 "    /// none.",
             ),
+            # The whole body, not one line of it: a `#[cfg]` cannot sit inside a method-call
+            # chain (it would have to attach to an expression, which the grammar does not allow),
+            # so the chain becomes a binding the optional field can be added to.
             (
+                '        f.debug_struct("IssuedToken")\n'
+                '            .field("access_token", &"[redacted]")\n'
+                '            .field("client_id", &self.client_id)\n'
+                '            .field("subject", &self.subject)\n'
+                '            .field("scope", &self.scope)\n'
                 '            .field("resource", &self.resource)\n'
-                '            .field("issued_at", &self.issued_at)\n',
+                '            .field("issued_at", &self.issued_at)\n'
+                '            .field("expires_at", &self.expires_at)\n'
+                '            .field("family_id", &self.family_id)\n'
+                "            .finish()\n",
+                '        let mut out = f.debug_struct("IssuedToken");\n'
+                '        out.field("access_token", &"[redacted]")\n'
+                '            .field("client_id", &self.client_id)\n'
+                '            .field("subject", &self.subject)\n'
+                '            .field("scope", &self.scope)\n'
                 '            .field("resource", &self.resource)\n'
-                "            // Not a credential: a thumbprint is a hash of a public document, and it is\n"
-                "            // exactly what an operator needs when a bound token is being refused.\n"
-                '            #[cfg(feature = "mtls")]\n'
-                '            .field("cnf", &self.cnf)\n'
-                '            .field("issued_at", &self.issued_at)\n',
+                '            .field("issued_at", &self.issued_at)\n'
+                '            .field("expires_at", &self.expires_at)\n'
+                '            .field("family_id", &self.family_id);\n'
+                "        // Not a credential: a thumbprint is a hash of a public document, and it is\n"
+                "        // exactly what an operator needs when a bound token is being refused.\n"
+                '        #[cfg(feature = "mtls")]\n'
+                '        out.field("cnf", &self.cnf);\n'
+                "        out.finish()\n",
             ),
         ],
     ),
