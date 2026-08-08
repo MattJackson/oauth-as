@@ -133,8 +133,8 @@ fn depth_counts_containers_and_the_member_budget_is_exact() {
     assert_eq!(depth(&serde_json::json!({"a": {"b": 1}})), 3);
     assert_eq!(
         depth(&serde_json::json!({"a": 1, "b": [[[2]]]})),
-        4,
-        "the deepest child decides, not the first"
+        5,
+        "the deepest child decides, not the first: the object plus three arrays plus the scalar"
     );
 
     let nest = |n: usize| format!(r#"[{{"type":"t","n":{}1{}}}]"#, "[".repeat(n), "]".repeat(n));

@@ -44,7 +44,7 @@ use oauth_as::rar::{
 use oauth_as::{
     AuthorizationError, AuthorizationRequest, AuthorizationServer, AuthorizationServerMetadata,
     Client, ClientAuth, ClientId, ErrorCode, GrantType, MemoryStorage, ScopeSet, ServerConfig,
-    TokenRequest,
+    TokenRequest, TokenRequestContext,
 };
 use support::{ManualClock, RFC7636_VERIFIER};
 
@@ -97,7 +97,10 @@ async fn rar_server(clock: ManualClock) -> AuthorizationServer<MemoryStorage, Ma
 
 /// An authorization request carrying `authorization_details`, built from wire pairs exactly as a
 /// host feeds its parsed query string in.
-fn request_with_details<'a>(challenge: &'a str, details: Option<&'a str>) -> AuthorizationRequest<'a> {
+fn request_with_details<'a>(
+    challenge: &'a str,
+    details: Option<&'a str>,
+) -> AuthorizationRequest<'a> {
     let mut pairs: Vec<(&str, &str)> = vec![
         ("response_type", "code"),
         ("client_id", "rar-app"),
@@ -140,14 +143,31 @@ fn redeem(code: &str) -> TokenRequest {
     }
 }
 
+/// A token request carrying `authorization_details`. RFC 9396 section 6 makes it a parameter of
+/// the token request itself, so this crate carries it on [`TokenRequestContext`] alongside the RFC
+/// 8707 `resource` indicators rather than on any one grant.
+async fn token_asking_for(
+    srv: &AuthorizationServer<MemoryStorage, ManualClock>,
+    request: TokenRequest,
+    requested: &str,
+) -> Result<oauth_as::TokenResponse, oauth_as::ErrorResponse> {
+    srv.token_with_context(
+        request,
+        TokenRequestContext {
+            authorization_details: Some(requested),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 /// Redeem `code` while asking the token endpoint for `requested` details.
 async fn redeem_asking_for(
     srv: &AuthorizationServer<MemoryStorage, ManualClock>,
     code: &str,
     requested: &str,
 ) -> Result<oauth_as::TokenResponse, oauth_as::ErrorResponse> {
-    srv.token_with_authorization_details(redeem(code), &[], Some(requested))
-        .await
+    token_asking_for(srv, redeem(code), requested).await
 }
 
 /// The details recorded against an issued access token, read back the way a resource server would
@@ -157,14 +177,13 @@ async fn introspected_details(
     access_token: &str,
 ) -> AuthorizationDetails {
     let response = srv
-        .introspection_response(
-            &ClientId::new("rar-app"),
-            Some(SECRET),
-            access_token,
-        )
+        .introspection_response(&ClientId::new("rar-app"), Some(SECRET), access_token)
         .await
         .expect("introspection of the server's own token");
-    assert!(response.active, "the token this suite just minted must be active");
+    assert!(
+        response.active,
+        "the token this suite just minted must be active"
+    );
     response.authorization_details
 }
 
@@ -185,7 +204,10 @@ async fn a_requested_detail_is_recorded_on_the_code_and_reaches_the_token() {
     let element = &details.as_slice()[0];
     assert_eq!(element.detail_type, PAYMENT);
     assert_eq!(element.identifier.as_deref(), Some("acct-1"));
-    assert_eq!(element.actions, vec!["initiate".to_string(), "status".to_string()]);
+    assert_eq!(
+        element.actions,
+        vec!["initiate".to_string(), "status".to_string()]
+    );
 }
 
 /// THE QUIET ATTACK. RFC 9396 s2 makes `type` the definition of every other member, so an AS that
@@ -245,18 +267,17 @@ async fn an_unknown_type_is_refused_at_the_authorization_endpoint() {
 #[tokio::test]
 async fn an_unknown_type_is_refused_at_the_token_endpoint() {
     let srv = rar_server(ManualClock::at_epoch()).await;
-    let error = srv
-        .token_with_authorization_details(
-            TokenRequest::ClientCredentials {
-                client_id: ClientId::new("rar-app"),
-                client_secret: Some(SECRET.to_string()),
-                scope: None,
-            },
-            &[],
-            Some(r#"[{"type":"nuclear_launch"}]"#),
-        )
-        .await
-        .expect_err("an unknown type must be refused");
+    let error = token_asking_for(
+        &srv,
+        TokenRequest::ClientCredentials {
+            client_id: ClientId::new("rar-app"),
+            client_secret: Some(SECRET.to_string()),
+            scope: None,
+        },
+        r#"[{"type":"nuclear_launch"}]"#,
+    )
+    .await
+    .expect_err("an unknown type must be refused");
     assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
 }
 
@@ -414,19 +435,18 @@ async fn a_refresh_cannot_widen_the_authorization_details() {
     let refresh_token = first.refresh_token.expect("a refresh token");
 
     let widened = r#"[{"type":"payment_initiation","actions":["initiate","status","cancel"],"locations":["https://rs.example/payments"],"identifier":"acct-1","instructedAmount":{"currency":"EUR","amount":"50.00"}}]"#;
-    let error = srv
-        .token_with_authorization_details(
-            TokenRequest::RefreshToken {
-                client_id: ClientId::new("rar-app"),
-                client_secret: Some(SECRET.to_string()),
-                refresh_token: refresh_token.clone(),
-                scope: None,
-            },
-            &[],
-            Some(widened),
-        )
-        .await
-        .expect_err("a refresh may narrow the detail, never widen it");
+    let error = token_asking_for(
+        &srv,
+        TokenRequest::RefreshToken {
+            client_id: ClientId::new("rar-app"),
+            client_secret: Some(SECRET.to_string()),
+            refresh_token: refresh_token.clone(),
+            scope: None,
+        },
+        widened,
+    )
+    .await
+    .expect_err("a refresh may narrow the detail, never widen it");
     assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
 
     // The chain is intact: a widening attempt is a client bug, and burning the refresh token for
@@ -457,7 +477,11 @@ async fn the_token_endpoint_may_narrow_to_less_than_was_granted() {
         .expect("narrowing must be allowed");
 
     let details = introspected_details(&srv, &token.access_token).await;
-    assert_eq!(details.len(), 1, "the token carries only what was asked for");
+    assert_eq!(
+        details.len(),
+        1,
+        "the token carries only what was asked for"
+    );
     let element = &details.as_slice()[0];
     assert_eq!(element.detail_type, PAYMENT);
     assert_eq!(element.actions, vec!["status".to_string()]);
@@ -474,34 +498,32 @@ async fn a_narrowed_refresh_narrows_the_chain_too() {
     let first = srv.token(redeem(&code)).await.expect("redemption");
 
     let narrowed = r#"[{"type":"account_information","actions":["read"]}]"#;
-    let second = srv
-        .token_with_authorization_details(
-            TokenRequest::RefreshToken {
-                client_id: ClientId::new("rar-app"),
-                client_secret: Some(SECRET.to_string()),
-                refresh_token: first.refresh_token.expect("a refresh token"),
-                scope: None,
-            },
-            &[],
-            Some(narrowed),
-        )
-        .await
-        .expect("narrowing on refresh must be allowed");
+    let second = token_asking_for(
+        &srv,
+        TokenRequest::RefreshToken {
+            client_id: ClientId::new("rar-app"),
+            client_secret: Some(SECRET.to_string()),
+            refresh_token: first.refresh_token.expect("a refresh token"),
+            scope: None,
+        },
+        narrowed,
+    )
+    .await
+    .expect("narrowing on refresh must be allowed");
 
     // Now try to climb back to the payment detail on the next rotation.
-    let error = srv
-        .token_with_authorization_details(
-            TokenRequest::RefreshToken {
-                client_id: ClientId::new("rar-app"),
-                client_secret: Some(SECRET.to_string()),
-                refresh_token: second.refresh_token.expect("a rotated refresh token"),
-                scope: None,
-            },
-            &[],
-            Some(two),
-        )
-        .await
-        .expect_err("the chain must remember the narrowed set");
+    let error = token_asking_for(
+        &srv,
+        TokenRequest::RefreshToken {
+            client_id: ClientId::new("rar-app"),
+            client_secret: Some(SECRET.to_string()),
+            refresh_token: second.refresh_token.expect("a rotated refresh token"),
+            scope: None,
+        },
+        two,
+    )
+    .await
+    .expect_err("the chain must remember the narrowed set");
     assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
 }
 
@@ -545,13 +567,10 @@ async fn excessive_nesting_is_refused() {
     assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
 }
 
-/// RFC 9396 s2: the parameter is an ARRAY of OBJECTS and `type` is REQUIRED. None of the three
-/// refusals may quote the input back, because RFC 6749 s5.2 fixes a charset for
-/// `error_description` that arbitrary JSON does not respect.
+/// RFC 9396 s2: the parameter is an ARRAY of OBJECTS and `type` is REQUIRED. Each of these is a
+/// shape the RFC does not admit, and each must be refused rather than coerced into something.
 #[tokio::test]
-async fn malformed_authorization_details_is_refused_without_echoing_it() {
-    // The last entry is the one the echo half of this test is about: a type whose text carries the
-    // two characters RFC 6749 s5.2 excludes from `error_description`.
+async fn malformed_authorization_details_is_refused() {
     for raw in [
         "not json at all",
         r#"{"type":"payment_initiation"}"#,
@@ -559,13 +578,48 @@ async fn malformed_authorization_details_is_refused_without_echoing_it() {
         r#"[{"type":""}]"#,
         r#"[{"type":42}]"#,
         r#"[{"type":"payment_initiation","actions":"read"}]"#,
-        r#"[{"type":"quote\" backslash\\ injection"}]"#,
+        r#"[{"type":"payment_initiation","identifier":["acct-1"]}]"#,
+        r#"["payment_initiation"]"#,
     ] {
         let error = match AuthorizationDetails::parse(raw) {
             Err(e) => e,
             Ok(parsed) => panic!("{raw} must be refused, parsed as {parsed:?}"),
         };
         assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails, "{raw}");
+    }
+}
+
+/// No refusal may quote the request back. RFC 6749 s5.2 fixes a charset for `error_description`
+/// that excludes the double quote and the backslash, and `authorization_details` is
+/// attacker-controlled text that need not respect it: a description built by interpolating the
+/// offending value would put an unescapable byte into a JSON error body, which is how an error
+/// message becomes an injection vector.
+///
+/// The type below carries both excluded characters, and is refused twice over: once as an unknown
+/// type (s5) and once for exceeding the byte bound.
+#[tokio::test]
+async fn a_refusal_never_echoes_the_request_back() {
+    // Built through serde_json so the two characters are correctly ESCAPED on the wire and
+    // therefore genuinely reach the parser as part of the type, rather than making the JSON
+    // malformed and being refused for the wrong reason.
+    let poison = "quote\" backslash\\ injection";
+    let raw = serde_json::to_string(&serde_json::json!([{"type": poison}])).unwrap();
+    let parsed = AuthorizationDetails::parse(&raw).expect("this one is well formed, just unknown");
+
+    let oversized = serde_json::to_string(&serde_json::json!([{
+        "type": poison,
+        "n": "x".repeat(MAX_AUTHORIZATION_DETAILS_BYTES),
+    }]))
+    .unwrap();
+    let errors = [
+        parsed
+            .require_supported_types(Some(&[PAYMENT.to_string()]))
+            .expect_err("an unknown type must be refused"),
+        AuthorizationDetails::parse(&oversized).expect_err("oversize must be refused"),
+    ];
+
+    for error in errors {
+        assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
         let description = error.error_description.unwrap_or_default();
         assert!(
             !description.contains('"') && !description.contains('\\'),
@@ -602,7 +656,10 @@ fn the_metadata_document_advertises_the_supported_types() {
         Some(vec![PAYMENT.to_string()])
     );
     let json = serde_json::to_string(&doc).unwrap();
-    assert!(json.contains(r#""authorization_details_types_supported":["payment_initiation"]"#), "{json}");
+    assert!(
+        json.contains(r#""authorization_details_types_supported":["payment_initiation"]"#),
+        "{json}"
+    );
 }
 
 // ------------------------------------------------------- section 9.1: the RFC 9068 JWT claim
@@ -633,10 +690,9 @@ async fn the_jwt_access_token_carries_the_authorization_details_claim() {
         .split('.')
         .nth(1)
         .expect("a JWS compact serialization has three parts");
-    let claims: serde_json::Value = serde_json::from_slice(
-        &base64_url_decode(payload).expect("the payload must be base64url"),
-    )
-    .expect("the payload must be JSON");
+    let claims: serde_json::Value =
+        serde_json::from_slice(&base64_url_decode(payload).expect("the payload must be base64url"))
+            .expect("the payload must be JSON");
     let details = claims
         .get("authorization_details")
         .expect("RFC 9396 s9.1: the claim must be present when the grant carries details");
@@ -680,8 +736,7 @@ async fn a_grant_with_no_details_signs_no_claim() {
 /// dev-dependency set for one call.
 #[cfg(feature = "jwt")]
 fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
