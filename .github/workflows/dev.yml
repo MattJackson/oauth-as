@@ -1,0 +1,39 @@
+# Fast gate for the oauth-as repository. Runs on every push to dev and on every pull
+# request, so it is deliberately kept quick: fmt, clippy, and the workspace test suite only.
+# The full suite (MSRV, conformance, packaging, third-party tooling) lives in qa.yml and runs
+# only on the qa branch, where speed matters less than thoroughness.
+#
+# NO continue-on-error anywhere: every step is load-bearing and a failure is RED.
+
+name: dev fast gate
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+concurrency:
+  group: dev-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint-and-test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: tests
+        run: cargo test --workspace --locked

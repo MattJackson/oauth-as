@@ -1,0 +1,112 @@
+# PUBLISH stage: crates.io publish of oauth-as. This is deliberately NOT triggered by any push,
+# including a push to main. There is no crates.io credential on the owner's machine (it was
+# rotated after the 0.0.1 placeholder went out, on purpose), and a crates.io publish is
+# PERMANENT: a version can be yanked, never deleted. This workflow must be impossible to
+# trigger by accident, so it requires BOTH:
+#   1. workflow_dispatch, a manual trigger the owner fires by hand, with the version he intends
+#      to publish typed in explicitly; and
+#   2. a GitHub Environment ("crates-io-publish") configured with required reviewers, so the
+#      run pauses for manual approval even after workflow_dispatch is fired.
+# See the bottom of this file for exactly what the owner must configure by hand; none of it can
+# be set from inside a workflow file.
+#
+# NO continue-on-error anywhere: every step is load-bearing and a failure is RED.
+
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact version to publish (must match crates/oauth-as/Cargo.toml and the git tag on this commit, e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  publish:
+    name: crates.io publish (manual, gated)
+    runs-on: ubuntu-latest
+    # This environment must exist in the repository settings with required reviewers
+    # configured. Without that, this "gate" is decorative. See the notes at the end of this
+    # file for exactly what to configure.
+    environment: crates-io-publish
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify Cargo.toml version matches the requested version
+        run: |
+          manifest_version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="oauth-as"))')"
+          requested_version="${{ inputs.version }}"
+          echo "manifest version: $manifest_version"
+          echo "requested version: $requested_version"
+          if [ "$manifest_version" != "$requested_version" ]; then
+            echo "::error::requested version ($requested_version) does not match crates/oauth-as/Cargo.toml ($manifest_version)"
+            exit 1
+          fi
+
+      - name: Verify a git tag for this version exists on this commit
+        run: |
+          requested_version="${{ inputs.version }}"
+          tag="v${requested_version}"
+          if ! git tag --points-at HEAD | grep -Fxq "$tag"; then
+            echo "::error::no tag '$tag' points at the commit being published (HEAD = $(git rev-parse HEAD))"
+            echo "Tags pointing at HEAD:"
+            git tag --points-at HEAD || true
+            exit 1
+          fi
+          echo "confirmed: tag $tag points at HEAD"
+
+      - name: Full gate before publish (fmt, clippy, test)
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+      - name: publish dry run (final check before the real thing)
+        run: cargo publish --dry-run --locked -p oauth-as
+
+      - name: package file list (final human-reviewable record)
+        run: cargo package --list --locked -p oauth-as
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p oauth-as
+
+# WHAT THE OWNER MUST CONFIGURE BY HAND (none of this can be done from inside a workflow file):
+#
+# 1. Repository secret CARGO_REGISTRY_TOKEN, holding a crates.io API token scoped to publish
+#    oauth-as. There is deliberately no such credential on the owner's machine today; it must
+#    be generated on crates.io and stored as a secret (Settings > Secrets and variables >
+#    Actions) before this workflow can succeed.
+#
+# 2. A GitHub Environment named "crates-io-publish" (Settings > Environments > New
+#    environment), with "Required reviewers" turned on and the owner listed as a reviewer. This
+#    is what makes workflow_dispatch alone insufficient to publish: the run will pause and wait
+#    for the owner to approve it, even though he is the one who dispatched it. Consider also
+#    restricting the environment to the main branch only (Deployment branches and tags rule).
+#
+# 3. Branch protection on main (Settings > Branches) is recommended so that main can only
+#    advance via reviewed, promoted changes from qa, keeping "a push to main" and "a publish"
+#    decoupled: this workflow never runs on push, only on an explicit, approved dispatch.
+#
+# 4. Before dispatching: create and push the git tag matching the version being published
+#    (e.g. `git tag v0.1.0 && git push origin v0.1.0`) on the exact commit on main that should
+#    be published. The "Verify a git tag for this version exists on this commit" step refuses
+#    to publish otherwise.

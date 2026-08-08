@@ -1,0 +1,208 @@
+# Full suite for the oauth-as repository. Runs on every push to the qa branch, which exists
+# so promotion here means "everything dev proved, plus everything that is too slow or too
+# environment-sensitive to run on every push" has been proven, before main is ever considered.
+#
+# HONESTY (what the conformance jobs are, and are not):
+#   There is no official OAuth 2.1 conformance suite, and the OpenID Foundation conformance
+#   suite ships only OIDC / FAPI profiles that presuppose OpenID Connect semantics; it cannot
+#   test a plain OAuth 2.1 + RFC 8628 AS and is therefore NOT run here. What runs instead:
+#     1. Vendored RFC test vectors (RFC 7636 App B, RFC 7515 App A.1-A.3), byte-exact, plus
+#        validator self-checks for RFC 9068, RFC 8414, RFC 6749 s5.1/s5.2, RFC 8628 s3.2/s3.5.
+#     2. The conformance gate self-test: every gate is proven able to go RED (a corrupted
+#        vector expectation must fail the suite; a deliberately nonconformant stub AS must
+#        fail the black-box suite) before any green from it is trusted.
+#     3. The live black-box run (scripts/oauth-conformance.sh --check), which starts the AS
+#        via crates/oauth-as/conformance-serve.sh and drives it as a black box, including the
+#        pinned third-party `oauth2 = "=5.0.0"` client. That shim is being built by another
+#        workstream and may not exist in a given tree yet. This job is wired unconditionally:
+#        if the shim is absent, the script fails loudly by design (see scripts/oauth-conformance.sh)
+#        rather than passing vacuously, and that RED is correct, expected behaviour, not a bug
+#        in this workflow. Do not make this job conditional on the shim's existence and do not
+#        add continue-on-error to it: a gate that can pass without the shim is a gate that lies.
+#     4. `authgent` was re-researched from primary sources (GitHub API, PyPI) on 2026-08-08 and
+#        this corrects KICKOFF.md: the project DOES exist (github.com/authgent/authgent, Apache
+#        2.0, PyPI package `authgent-server`, real git tags up to v0.3.4, a working composite
+#        action at `.github/actions/mcp-lint` documented in its own docs/ci-integration.md as
+#        `authgent/authgent/.github/actions/mcp-lint@v0.3.4`). It is still NOT wired in here,
+#        for a different reason than "unconfirmed": its scanner (server/authgent_server/scanner.py
+#        in that repo) hardcodes its target as an MCP resource server, not a bare OAuth AS. The
+#        entry point fetches RFC 9728 Protected Resource Metadata first and, if that is missing,
+#        returns a single critical "not an MCP server" finding and skips every other check,
+#        including the RFC 8414 / PKCE checks this project actually wants. There is no CLI flag
+#        to point it at an AS metadata document directly; the only way to reach the RFC 8414/PKCE
+#        checks is to stand up a throwaway RFC 9728 PRM document this crate has no reason to own,
+#        purely to satisfy the scanner's required discovery hop. That is the same "true but
+#        substantively misleading" trap KICKOFF.md warns about for bolting on OIDC, so it is
+#        skipped here too. Also note the tool's own marketplace README
+#        (marketplace/mcp-lint-action/README.md in that repo) advertises
+#        `authgent/mcp-lint-action@v1`, a repository that returns 404 from the GitHub API; the
+#        action reference that actually resolves is the one above, from that project's own
+#        ci-integration.md. No placeholder job is left for this: a disabled job that will never
+#        be enabled is dead YAML, so it has been removed rather than kept as decoration.
+#     5. OAuch (github.com/DistriNet/OAuch, MIT, 17 stars) was re-checked on 2026-08-08: its own
+#        README documents only a Visual-Studio build or a Docker image that serves the same
+#        interactive web UI on a local port. No CLI, no REST automation surface, no CI mode was
+#        found in the repository. It remains a human-driven web app and is not wired in here for
+#        that reason, matching KICKOFF.md's original assessment.
+#     6. No independent, CI-runnable RFC 8414 JSON Schema or metadata-validator tool (distinct
+#        from an OAuth/OIDC mock server, which tests the opposite direction) could be confirmed
+#        to exist as of 2026-08-08. If one surfaces later, wire it in following the same pinning
+#        discipline as every other job in this file.
+#
+# NO continue-on-error anywhere: every step is load-bearing and a failure is RED. The
+# cargo-mutants job is a deliberate exception to "failure is RED" in spirit only: it is a
+# reporting job by design (see that job's comment), and it achieves non-blocking behaviour by
+# never letting a step fail rather than by using continue-on-error, per house rule.
+
+name: qa full suite
+
+on:
+  push:
+    branches: [qa]
+
+concurrency:
+  group: qa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Everything dev.yml proves, re-run here because a push to qa is not required to have gone
+  # through dev.yml first (e.g. a fast-forward or a direct promotion), so qa must be self-contained.
+  lint-and-test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: tests
+        run: cargo test --workspace --locked
+
+  # MSRV verification. crates/oauth-as declares rust-version = "1.86" and that floor is only
+  # real if something in CI actually builds and tests on exactly that toolchain, not "stable".
+  msrv:
+    name: MSRV (1.86) build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.86 toolchain
+        uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.86
+      - name: build on 1.86
+        run: cargo build --workspace --locked
+      - name: test on 1.86
+        run: cargo test --workspace --locked
+
+  # Hermetic half of the independent harness: RFC vectors and validator self-checks.
+  rfc-vectors:
+    name: RFC vectors (hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # RED first: a corrupted expectation must fail the suite, or the suite proves nothing.
+      - name: Prove the vector suite can fail (deliberate corruption)
+        run: |
+          set +e
+          OAUTH_CONFORMANCE_SELFTEST_BREAK=pkce \
+            cargo test --locked -p oauth-as-conformance --test rfc_vectors
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::vector suite passed with a corrupted PKCE expectation; gate is dead"
+            exit 1
+          fi
+          echo "vector suite failed as required under deliberate corruption (exit $rc)"
+      - name: RFC vector suite
+        run: cargo test --locked -p oauth-as-conformance --test rfc_vectors
+
+  # Gate self-test: RED-A (corrupted vector expectation fails), GREEN-A (clean vectors pass),
+  # RED-B (black-box suite fails against a deliberately nonconformant stub AS). This must be
+  # shown to pass BEFORE the live conformance-check job is trusted, hence the "needs" ordering
+  # below.
+  conformance-selftest:
+    name: conformance gate self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Conformance gate self-test (must go RED on a nonconformant AS)
+        run: scripts/oauth-conformance.sh --selftest
+
+  # The live black-box half. Wired unconditionally and on purpose: if
+  # crates/oauth-as/conformance-serve.sh does not exist yet in this tree, --check fails loudly
+  # by design (see scripts/oauth-conformance.sh), and that RED is the correct outcome, not a
+  # workflow bug. Includes the pinned third-party `oauth2 = "=5.0.0"` client drive.
+  conformance-check:
+    name: live black-box conformance
+    runs-on: ubuntu-latest
+    needs: [conformance-selftest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Live conformance check against a served AS
+        run: scripts/oauth-conformance.sh --check
+
+  # Packaging must stay green so a release is never blocked by a stale manifest. Prints the
+  # tarball file list to the job log so the published contents can be reviewed by a human
+  # before any real publish (see the separate publish.yml, which is manually gated).
+  package:
+    name: cargo publish --dry-run and package listing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: publish dry run
+        run: cargo publish --dry-run --locked -p oauth-as
+      - name: package file list (review before any real publish)
+        run: cargo package --list --locked -p oauth-as
+
+  # Reporting job, not a hard gate, by explicit house instruction: mutation runs are slow and
+  # this is scoped to crates/oauth-as (the published library) rather than the whole workspace
+  # or the conformance harness. Non-blocking behaviour is achieved by never letting a step
+  # fail (the run's own exit code is captured and reported, but not propagated), NOT via
+  # continue-on-error, per the "no continue-on-error anywhere" house rule. This is intended to
+  # become a hard gate later, once a sensible survived-mutant baseline exists; until then it is
+  # informative only, and its summary belongs in the job log for a human to read.
+  mutants:
+    name: cargo-mutants (reporting only, not a hard gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+      - name: install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: run cargo-mutants over crates/oauth-as (informative, does not fail the job)
+        run: |
+          set +e
+          cargo mutants --package oauth-as --timeout 300 --no-shuffle
+          rc=$?
+          set -e
+          echo "cargo-mutants exit code: $rc (0 = no survivors, nonzero = survivors or error)"
+          echo "This job is reporting-only by design; see the job comment in qa.yml. A"
+          echo "nonzero exit here is informative and does NOT fail this job or the workflow."
+          exit 0

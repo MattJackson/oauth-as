@@ -99,9 +99,33 @@ JWKS endpoint, a UserInfo endpoint, a claims model, a user profile store and a l
 which are host concerns this design deliberately pushed out. The badge would be true and
 substantively misleading. Certify OIDC only if this actually becomes an identity provider.
 
-**Cheap and worth doing** once the metadata document exists: `authgent` ships a GitHub Action that
-lints an RFC 8414 discovery document and flags things like `plain` PKCE. Small project, pin the
-version.
+**CORRECTED 2026-08-08, this claim was wrong.** The original text said: "Cheap and worth doing once
+the metadata document exists: `authgent` ships a GitHub Action that lints an RFC 8414 discovery
+document and flags things like `plain` PKCE. Small project, pin the version."
+
+`authgent/authgent` does exist (Apache-2.0, PyPI `authgent-server`, tags through `v0.3.4`, a real
+composite action at `authgent/authgent/.github/actions/mcp-lint@v0.3.4`). It is NOT a generic
+RFC 8414 discovery linter. It is an MCP-OAuth conformance scanner: `scanner.py` fetches RFC 9728
+Protected Resource Metadata FIRST, and when that is absent, which it always will be for a plain
+OAuth AS that has no PRM endpoint, it returns one critical "not an MCP server" finding and SKIPS
+every remaining check, including the RFC 8414 and PKCE checks this project wanted. There is no flag
+to aim it at bare AS metadata.
+
+The only way to unlock those checks would be to stand up a throwaway RFC 9728 PRM document this
+project has no reason to own. That is the same "true but substantively misleading" trap this
+document already warns about for OIDC bolt-ons, so it was not done. Not wired into CI.
+
+(Their own marketplace README advertises `authgent/mcp-lint-action@v1`, a repository that 404s.
+The reference that actually resolves is the one in their `docs/ci-integration.md`.)
+
+OAuch was re-checked and KICKOFF's original assessment holds: interactive web UI only, no CLI, no
+REST automation surface, no headless mode. A search for standalone RFC 8414 metadata validators,
+OIDC discovery linters and conformance CLIs turned up only mock SERVERS, which test the opposite
+direction. NOTHING additional could be confirmed and wired up honestly.
+
+So the independent judges of this AS remain exactly two: the vendored RFC vectors with the
+gate-goes-red self-test, and the pinned third-party `oauth2 = "=5.0.0"` client driving it as a
+black box. The README must not imply otherwise.
 
 ## HOUSE RULES
 
