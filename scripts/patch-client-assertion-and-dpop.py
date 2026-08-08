@@ -691,6 +691,10 @@ impl<'a> Bound<'a> {
     /// exchange). They get an unbound token, which is honest: they have not been given a proof to
     /// bind one to. Wiring DPoP into them is a matter of threading a `Bound` in, not of changing
     /// anything here.
+    ///
+    /// `dead_code` because its only caller is behind another slice's cargo feature, and gating it
+    /// on that feature by name would tie this module to a flag it has no other business knowing.
+    #[allow(dead_code)]
     pub(crate) fn secret(client_secret: Option<&'a str>) -> Self {
         Bound {
             cred: ClientCredential::secret(client_secret),
