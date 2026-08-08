@@ -113,10 +113,22 @@ jobs:
       # dependency versions is not a floor anyone can rely on. Note this also requires every
       # entry in Cargo.lock to be PARSEABLE by this cargo, which is why base64ct and zeroize are
       # pinned below the versions that moved to edition 2024.
+      # BUILD, not test, and the distinction is the whole point of the job.
+      #
+      # An MSRV is a promise to a CONSUMER: "your toolchain can compile this library". A consumer
+      # compiles the library and its RUNTIME dependencies. They never compile our dev-dependencies,
+      # because dev-dependencies are not part of the dependency graph of anyone who depends on us.
+      #
+      # Ours (jsonschema, url, oauth2) legitimately require far newer toolchains: jsonschema-regex
+      # and idna_adapter are on edition 2024, which cargo 1.75 cannot even parse. Running the test
+      # suite here would therefore measure OUR tooling choices, not the consumer's constraint, and
+      # would push the declared floor up for a reason no consumer ever experiences. Chasing pins to
+      # drag every dev-dependency back to 1.75 would trade real test quality for a number.
+      #
+      # So the floor is verified the way a consumer meets it: the library compiles. Behaviour is
+      # verified by the full test suite on stable, in the fmt/clippy/test job above.
       - name: build on 1.75, default features
         run: cargo build -p oauth-as --locked
-      - name: test on 1.75, default features
-        run: cargo test -p oauth-as --locked
       # The jwt feature holds the same floor: p256 and its tree build on 1.75.
       - name: build on 1.75, jwt feature
         run: cargo build -p oauth-as --locked --features jwt

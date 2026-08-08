@@ -5,6 +5,7 @@
 //! response, and the grant record whose state machine [`crate::server::AuthorizationServer`]
 //! drives (`Pending` to `Approved`/`Denied`, expiry by clock, single-use redemption by removal).
 
+use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,12 @@ use crate::client::ClientId;
 use crate::scope::ScopeSet;
 
 /// The RFC 8628 section 3.2 device authorization response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see below) rather than derived: `device_code` and `user_code` are both
+/// credentials (RFC 8628 section 5.1 discusses guessing the user code; the device code is the
+/// bearer credential the device polls with), and `verification_uri_complete` EMBEDS the user code
+/// by construction, so it needs the same treatment or redacting `user_code` alone is theater.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceAuthorizationResponse {
     /// The device verification code the device polls the token endpoint with.
     pub device_code: String,
@@ -28,6 +34,31 @@ pub struct DeviceAuthorizationResponse {
     pub expires_in: u64,
     /// Minimum seconds between token-endpoint polls (the RFC default is 5).
     pub interval: u64,
+}
+
+/// Hand-written so `device_code` and `user_code` never print, and so
+/// `verification_uri_complete` (which embeds `user_code` verbatim, per RFC 8628 section 3.3.1)
+/// does not leak the code back out through a field that looks like plain metadata. Only the
+/// `Some`/`None` shape of `verification_uri_complete` is kept, for the same reason an `Option`
+/// credential elsewhere in this crate keeps its shape: whether the AS offered a complete-URI form
+/// is diagnostic, the URI's contents are not.
+impl fmt::Debug for DeviceAuthorizationResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceAuthorizationResponse")
+            .field("device_code", &"[redacted]")
+            .field("user_code", &"[redacted]")
+            .field("verification_uri", &self.verification_uri)
+            .field(
+                "verification_uri_complete",
+                &self
+                    .verification_uri_complete
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 /// Where a device grant stands in its lifecycle. Expiry is not a stored state: it is derived from
@@ -48,7 +79,12 @@ pub enum DeviceGrantState {
 }
 
 /// One device grant, persisted through [`crate::store::Storage`] keyed by `device_code`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see below) rather than derived: `device_code` is the bearer credential
+/// the device polls with, and `user_code` is the credential RFC 8628 section 5.1 discusses an
+/// attacker guessing (anyone who learns a live one can approve or deny a stranger's grant), so
+/// neither may print through a host's `tracing::debug!(?grant)`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceGrant {
     /// The device verification code (the storage key; high-entropy, never shown to the user).
     pub device_code: String,
@@ -74,6 +110,25 @@ pub struct DeviceGrant {
     /// When the device last polled; `None` until the first poll. The first poll is never
     /// `slow_down`.
     pub last_poll_at: Option<SystemTime>,
+}
+
+/// Hand-written so `device_code` and `user_code` never print. Everything else is metadata ABOUT
+/// the grant, including `state`, which for `Approved` carries a `subject` that is an identifier,
+/// not a credential, and stays visible so the record is still debuggable.
+impl fmt::Debug for DeviceGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceGrant")
+            .field("device_code", &"[redacted]")
+            .field("user_code", &"[redacted]")
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("interval", &self.interval)
+            .field("last_poll_at", &self.last_poll_at)
+            .finish()
+    }
 }
 
 /// Normalize a user-typed code for lookup: uppercase, with hyphens and whitespace removed

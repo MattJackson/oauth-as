@@ -24,7 +24,12 @@ pub enum TokenType {
 }
 
 /// The RFC 6749 section 5.1 successful token response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see below) rather than derived: `access_token` and `refresh_token` are
+/// bearer credentials (RFC 6750 section 1 for the access token; RFC 9700 section 4.14.2 for the
+/// refresh token), so a host doing the obvious `tracing::debug!(?response)` must not thereby write
+/// either to its logs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenResponse {
     /// The opaque access token.
     pub access_token: String,
@@ -39,6 +44,25 @@ pub struct TokenResponse {
     /// satisfies the section 3.3 requirement to report a scope differing from the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+/// Hand-written so neither `access_token` nor `refresh_token` ever prints. `refresh_token` keeps
+/// its `Some`/`None` shape (via `redact_opt`, mirrored from [`crate::server::TokenRequest`]'s
+/// hand-written `Debug`): whether a refresh token was issued at all is diagnostic, not secret, and
+/// collapsing `Some("[redacted]")` and `None` to the same output would hide that.
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn redact_opt<T>(value: &Option<T>) -> Option<&'static str> {
+            value.as_ref().map(|_| "[redacted]")
+        }
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[redacted]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_token", &redact_opt(&self.refresh_token))
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// The RFC 7009 section 2.1 `token_type_hint`. A hint the server disagrees with is not an error:
