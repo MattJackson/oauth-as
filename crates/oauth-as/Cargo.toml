@@ -36,6 +36,16 @@ http = ["dep:axum", "dep:tokio"]
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
 # servers are separate processes that should not have to call introspection on every request.
 jwt = ["dep:p256"]
+# RFC 9728 protected resource metadata. This crate is an AUTHORIZATION SERVER, not a
+# resource server, so what this feature adds is the TYPE a host publishes for its OWN
+# resource, plus the section 4 `protected_resources` member on the AS metadata document.
+# It does not make this crate a resource server and does not serve anything by itself.
+# No dependency: it is serde shapes over the serde that is already here.
+resource-metadata = []
+# RFC 8693 token exchange: delegation and impersonation for service-to-service calls.
+# OFF by default because it is a grant that mints a token from a token, and a deployment
+# that has not decided its delegation policy should not have the endpoint compiled in.
+token-exchange = []
 
 # DEPENDENCY POLICY: the runtime dependency set is deliberately tiny, and none of these
 # implies an async runtime, an HTTP stack, or a persistence layer; the HOST owns all three.

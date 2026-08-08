@@ -44,6 +44,12 @@
 //! - CLIENT SECRET STORAGE ([`client::SecretHash`], [`client::SecretVerifier`]). Hosts should
 //!   store a one-way verifier, not the secret. The built-in scheme needs no host code; a host
 //!   whose policy names argon2id or an HSM installs a verifier.
+//! - WHO MAY REGISTER ([`registration::RegistrationPolicy`]). RFC 7591 dynamic client registration
+//!   is OFF unless [`server::ServerConfig::registration`] is set, and even then every registration
+//!   is REFUSED until a policy is installed. RFC 7591 section 5: an open registration endpoint
+//!   lets anyone on the internet mint a client, which weakens every threat model that assumed
+//!   controlling a registered client was hard. See the [`registration`] module docs before
+//!   enabling it.
 //!
 //! # Zero cost until enabled
 //!
@@ -78,17 +84,26 @@ pub mod http;
 pub mod jwt;
 pub mod metadata;
 pub mod pkce;
+pub mod registration;
+/// RFC 9728 protected resource metadata, behind the `resource-metadata` cargo feature
+/// (off by default). Read the module docs before using it: the document RFC 9728 defines
+/// is published by a RESOURCE server, which this crate is not.
+#[cfg(feature = "resource-metadata")]
+pub mod resource_metadata;
 pub mod scope;
 pub mod server;
 pub mod store;
 pub mod token;
+/// RFC 8693 token exchange, behind the `token-exchange` cargo feature (off by default).
+#[cfg(feature = "token-exchange")]
+pub mod token_exchange;
 
 pub use authorization::{
     AuthorizationCodeRecord, AuthorizationCodeState, AuthorizationError,
     AuthorizationErrorRedirect, AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod,
     ResponseType, ValidatedAuthorizationRequest,
 };
-pub use client::{Client, ClientAuth, ClientId, SecretHash, SecretVerifier};
+pub use client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash, SecretVerifier};
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 pub use error::{ErrorCode, ErrorResponse};
 pub use events::{
@@ -102,6 +117,16 @@ pub use http::{
     SubjectResolver,
 };
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
+pub use registration::{
+    ClientInformation, ClientMetadata, RegistrationAttempt, RegistrationConfig,
+    RegistrationDecision, RegistrationErrorCode, RegistrationErrorResponse, RegistrationFailure,
+    RegistrationPolicy,
+};
+#[cfg(feature = "resource-metadata")]
+pub use resource_metadata::{
+    BearerMethod, ProtectedResourceConfig, ProtectedResourceMetadata,
+    PROTECTED_RESOURCE_WELL_KNOWN_PATH,
+};
 pub use scope::{Scope, ScopeSet};
 // `DeviceApprovalError` is re-exported here as of 0.2.0: a host's verification UI has to match on
 // it to tell "unknown code" from "too many attempts", and having to reach into `server::` for the
@@ -114,4 +139,9 @@ pub use store::{MemoryStorage, Storage, StorageError};
 pub use token::{
     IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,
     TokenType, TokenTypeHint,
+};
+#[cfg(feature = "token-exchange")]
+pub use token_exchange::{
+    ActClaim, ExchangeSemantics, ExchangedToken, TokenExchange, TokenExchangeRequest,
+    TokenExchangeResponse, TokenTypeIdentifier, TOKEN_EXCHANGE_GRANT_URN,
 };

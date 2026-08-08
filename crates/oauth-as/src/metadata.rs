@@ -87,6 +87,17 @@ pub struct AuthorizationServerMetadata {
     /// RFC 7009 section 2. Present when this server serves revocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revocation_endpoint: Option<String>,
+    /// RFC 7591 section 3 / RFC 8414 section 2. Present ONLY when the host enabled dynamic client
+    /// registration, and absent otherwise.
+    ///
+    /// The conditional is the whole point of the member. RFC 8414 section 2 makes it optional, and
+    /// a client reads its presence as "I may register here"; advertising it on a server that
+    /// refuses every registration would be an endpoint that 404s or 401s for reasons a client
+    /// cannot act on. The reverse is worse: RFC 7591 section 5 makes an unadvertised open endpoint
+    /// no safer than an advertised one, so this must not become the thing a host relies on to keep
+    /// registration private. It reports the configuration; it does not enforce it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
     /// RFC 8414 section 2. Present only when the server issues signed (JWT) access tokens; an
     /// AS with opaque tokens has no keys to publish and must not pretend otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +121,17 @@ pub struct AuthorizationServerMetadata {
     /// OPTIONAL (section 2). A page of human-readable developer documentation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_documentation: Option<String>,
+    /// RFC 9728 section 4. The resource identifiers of the protected resources this AS
+    /// issues tokens for, so a client that fetched a resource's own RFC 9728 document can
+    /// cross-check that the AS agrees the relationship exists (section 7.6: an
+    /// `authorization_servers` entry is a claim made by the RESOURCE, and believing it
+    /// unchecked is how a resource points clients at an AS that never heard of it).
+    ///
+    /// OPTIONAL, and omitted rather than empty when the host declared none: an empty array
+    /// would state that this AS protects nothing, which is a different claim from silence.
+    #[cfg(feature = "resource-metadata")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_resources: Option<Vec<String>>,
     /// RFC 9207 section 3. Always `true` from this server, and NOT an `Option`.
     ///
     /// The member exists so a client can decide whether it is allowed to REQUIRE the `iss`
@@ -167,6 +189,21 @@ impl AuthorizationServerMetadata {
     /// host that configures only an issuer still publishes a coherent, self-consistent document.
     pub fn from_config(config: &ServerConfig) -> Self {
         let iss = config.issuer.trim_end_matches('/').to_string();
+        // Exactly the grants AuthorizationServer::token will honor. `mut` only when the
+        // optional exchange grant is compiled in, which is what the allow below is for:
+        // advertising a grant this build does not implement is the lie this document exists
+        // to avoid, so the list is built rather than written out once for each feature set.
+        #[allow(unused_mut)]
+        let mut grant_types_supported = vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+            "client_credentials".to_string(),
+            DEVICE_CODE_GRANT_URN.to_string(),
+        ];
+        // RFC 8693 s2.1 registers the URN; RFC 8414 s2 is what makes advertising it the way a
+        // client learns the grant is available without probing.
+        #[cfg(feature = "token-exchange")]
+        grant_types_supported.push(crate::grant::TOKEN_EXCHANGE_GRANT_URN.to_string());
         let endpoint = |override_: &Option<String>, path: &str| {
             override_
                 .clone()
@@ -181,18 +218,17 @@ impl AuthorizationServerMetadata {
             ),
             introspection_endpoint: Some(endpoint(&config.introspection_endpoint, "/introspect")),
             revocation_endpoint: Some(endpoint(&config.revocation_endpoint, "/revoke")),
+            registration_endpoint: config
+                .registration
+                .as_ref()
+                .map(|r| endpoint(&r.registration_endpoint, "/register")),
             jwks_uri: advertised_jwks_uri(config),
             scopes_supported: config.scopes_supported.clone(),
             issuer: iss,
             response_types_supported: vec!["code".to_string()],
             response_modes_supported: vec!["query".to_string()],
             // Exactly the grants AuthorizationServer::token will honor.
-            grant_types_supported: vec![
-                "authorization_code".to_string(),
-                "refresh_token".to_string(),
-                "client_credentials".to_string(),
-                DEVICE_CODE_GRANT_URN.to_string(),
-            ],
+            grant_types_supported,
             token_endpoint_auth_methods_supported: vec![
                 "client_secret_basic".to_string(),
                 "client_secret_post".to_string(),
@@ -202,6 +238,8 @@ impl AuthorizationServerMetadata {
             ],
             code_challenge_methods_supported: vec!["S256".to_string()],
             service_documentation: config.service_documentation.clone(),
+            #[cfg(feature = "resource-metadata")]
+            protected_resources: config.protected_resources.clone(),
             authorization_response_iss_parameter_supported: true,
         }
     }

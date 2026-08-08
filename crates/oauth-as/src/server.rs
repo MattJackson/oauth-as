@@ -37,7 +37,7 @@ use crate::token::{
 /// Seconds since the Unix epoch, for the RFC 7519 `exp` / `iat` style claims RFC 7662 reuses.
 /// A pre-epoch instant is not representable in that encoding, so it is reported as absent rather
 /// than wrapped into a misleading number.
-fn unix_seconds(t: SystemTime) -> Option<u64> {
+pub(crate) fn unix_seconds(t: SystemTime) -> Option<u64> {
     t.duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
@@ -86,11 +86,33 @@ pub struct ServerConfig {
     /// RFC 8414 `jwks_uri`. `None` (the default) means this server publishes no keys, which is
     /// the truth for opaque access tokens.
     pub jwks_uri: Option<String>,
+    /// RFC 7591 dynamic client registration. `None` is the DEFAULT and means registration is OFF:
+    /// no `registration_endpoint` is advertised, no route is served, and
+    /// [`AuthorizationServer::register_dynamic_client`] answers
+    /// [`crate::registration::RegistrationFailure::Disabled`].
+    ///
+    /// Turning it on is meant to be a sentence somebody wrote and a reviewer can find:
+    /// `config.registration = Some(Box::new(RegistrationConfig::new()))`. RFC 7591 section 5 is
+    /// why (an open registration endpoint lets anyone mint a client), and enabling it is still not
+    /// sufficient: a [`crate::registration::RegistrationPolicy`] must also be installed or every
+    /// registration is refused. See the [`crate::registration`] module docs.
+    ///
+    /// BOXED so that the overwhelmingly common `None` costs one null pointer on every
+    /// [`ServerConfig`] rather than the whole struct, and allocates nothing.
+    pub registration: Option<Box<crate::registration::RegistrationConfig>>,
     /// RFC 8414 `scopes_supported`. `None` omits the member rather than claiming an empty
     /// catalogue.
     pub scopes_supported: Option<Vec<String>>,
     /// RFC 8414 `service_documentation`.
     pub service_documentation: Option<String>,
+    /// RFC 9728 section 4 `protected_resources`: the resource identifiers of the protected
+    /// resources this AS issues tokens for. `None` (the default) omits the member; see
+    /// [`crate::metadata::AuthorizationServerMetadata::protected_resources`], and note that
+    /// this is the AS half only. The DOCUMENT each of those resources publishes is
+    /// [`crate::resource_metadata::ProtectedResourceMetadata`], and publishing it is the
+    /// resource's own job, not this server's.
+    #[cfg(feature = "resource-metadata")]
+    pub protected_resources: Option<Vec<String>>,
     /// What the client receives as its `access_token`. Defaults to [`AccessTokenFormat::Opaque`],
     /// which is the behaviour of this crate without the `jwt` feature; setting
     /// [`AccessTokenFormat::Jwt`] makes the wire token an RFC 9068 `at+jwt` while the AS-side
@@ -167,8 +189,12 @@ impl ServerConfig {
             introspection_endpoint: None,
             revocation_endpoint: None,
             jwks_uri: None,
+            // OFF. See the field's own docs, and RFC 7591 section 5.
+            registration: None,
             scopes_supported: None,
             service_documentation: None,
+            #[cfg(feature = "resource-metadata")]
+            protected_resources: None,
             #[cfg(feature = "jwt")]
             access_token_format: AccessTokenFormat::Opaque,
             authorization_code_ttl: Duration::from_secs(60),
@@ -353,7 +379,7 @@ const USER_CODE_ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 
 /// Fresh OS randomness, hex encoded: `n` bytes of entropy, `2n` characters. Used for device codes
 /// and tokens; 32 bytes = 256 bits, far past any brute-force horizon for a 10-minute artifact.
-fn random_hex(n_bytes: usize) -> String {
+pub(crate) fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
     let mut out = String::with_capacity(n_bytes * 2);
@@ -441,7 +467,7 @@ fn storage_error(e: StorageError) -> ErrorResponse {
 /// The refresh chain an issuance CONTINUES: carried from the redeemed record to its replacement,
 /// so that rotation preserves both the family (RFC 9700 section 4.14.2 revokes by grant) and the
 /// absolute lifetime (a chain must not slide its own expiry forward every time it rotates).
-struct RefreshChain {
+pub(crate) struct RefreshChain {
     family_id: String,
     expires_at: Option<SystemTime>,
 }
@@ -507,10 +533,30 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         self
     }
 
+    /// Install the RFC 7591 registration policy: who may create a client here.
+    ///
+    /// Required, not optional, for any host that sets [`ServerConfig::registration`]: with no
+    /// policy installed every registration is refused, because an endpoint that mints clients and
+    /// has been told nothing about who may use it is the abuse vector RFC 7591 section 5
+    /// describes. See [`crate::registration::RegistrationPolicy`].
+    pub fn with_registration_policy(
+        mut self,
+        policy: Box<dyn crate::registration::RegistrationPolicy>,
+    ) -> Self {
+        self.hooks.install_registration_policy(policy);
+        self
+    }
+
     /// The installed host seams, for a host that wants to emit its own events onto the same
     /// channel (a consent decision, say) or to consult its own limiter.
     pub fn hooks(&self) -> &Hooks {
         &self.hooks
+    }
+
+    /// This server's clock, for the parts of the crate that live in other modules
+    /// ([`crate::registration`]) and cannot reach the private field.
+    pub(crate) fn now(&self) -> SystemTime {
+        self.clock.now()
     }
 
     /// Turn the freshly minted random token into what actually goes on the wire: itself when the
@@ -609,7 +655,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Section 2 gives `invalid_target` as the answer for a value this server will not issue a
     /// token for, which covers both a malformed indicator and (at the token endpoint, see
     /// [`AuthorizationServer::narrow_resources`]) one that was never granted.
-    fn validate_resources<'a>(
+    pub(crate) fn validate_resources<'a>(
         requested: impl IntoIterator<Item = &'a str>,
     ) -> Result<Vec<String>, ErrorResponse> {
         let mut out = Vec::new();
@@ -643,7 +689,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// A grant that named no resource has nothing to narrow, so a token request that names one is
     /// widening from nothing and is refused. Answering it any other way would let the token
     /// endpoint mint an audience the authorization request never obtained.
-    fn narrow_resources(
+    pub(crate) fn narrow_resources(
         granted: &[String],
         requested: &[String],
     ) -> Result<Vec<String>, ErrorResponse> {
@@ -690,7 +736,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The host's [`RateLimiter`] is asked FIRST, before the store is touched, so a refused
     /// attempt costs nothing and reveals nothing (RFC 9700 section 4.13 on credential stuffing at
     /// the token endpoint).
-    async fn authenticate_client(
+    pub(crate) async fn authenticate_client(
         &self,
         client_id: &ClientId,
         client_secret: Option<&str>,
@@ -1739,7 +1785,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     // produced the token and `issue` is the only place that sees the whole issuance. Bundling them
     // into a struct would be churn for its own sake on a private function with four call sites.
     #[allow(clippy::too_many_arguments)]
-    async fn issue(
+    pub(crate) async fn issue(
         &self,
         client: &Client,
         grant_type: GrantType,

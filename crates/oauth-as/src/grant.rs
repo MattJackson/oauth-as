@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 /// The RFC 8628 `grant_type` URN, verbatim.
 pub const DEVICE_CODE_GRANT_URN: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
+/// The RFC 8693 section 2.1 `grant_type` URN, verbatim.
+#[cfg(feature = "token-exchange")]
+pub const TOKEN_EXCHANGE_GRANT_URN: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
 /// A grant type a client may be allowed to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GrantType {
@@ -28,6 +32,13 @@ pub enum GrantType {
     /// RFC 8628.
     #[serde(rename = "urn:ietf:params:oauth:grant-type:device_code")]
     DeviceCode,
+    /// RFC 8693 token exchange. A registration carries this exactly when the deployment has
+    /// decided this client may exchange a token it holds for another one; see
+    /// [`crate::token_exchange`], and note that the grant can only ever NARROW what the
+    /// subject token already carries.
+    #[cfg(feature = "token-exchange")]
+    #[serde(rename = "urn:ietf:params:oauth:grant-type:token-exchange")]
+    TokenExchange,
 }
 
 impl GrantType {
@@ -38,6 +49,8 @@ impl GrantType {
             GrantType::RefreshToken => "refresh_token",
             GrantType::ClientCredentials => "client_credentials",
             GrantType::DeviceCode => DEVICE_CODE_GRANT_URN,
+            #[cfg(feature = "token-exchange")]
+            GrantType::TokenExchange => TOKEN_EXCHANGE_GRANT_URN,
         }
     }
 }
@@ -69,6 +82,8 @@ impl FromStr for GrantType {
             "refresh_token" => Ok(GrantType::RefreshToken),
             "client_credentials" => Ok(GrantType::ClientCredentials),
             DEVICE_CODE_GRANT_URN => Ok(GrantType::DeviceCode),
+            #[cfg(feature = "token-exchange")]
+            TOKEN_EXCHANGE_GRANT_URN => Ok(GrantType::TokenExchange),
             other => Err(UnknownGrantType(other.to_string())),
         }
     }
