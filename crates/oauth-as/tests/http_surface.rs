@@ -637,7 +637,7 @@ async fn device_flow_over_http() {
     assert_eq!(pending.status, 400);
     assert_eq!(pending.json()["error"], "authorization_pending");
 
-    let form = request(addr, "GET", "/device", &[], None).await;
+    let (form, csrf) = verification_form(addr, "").await;
     assert_eq!(form.status, 200);
     assert!(
         form.body.contains("name=\"user_code\""),
@@ -645,12 +645,20 @@ async fn device_flow_over_http() {
         form.body
     );
 
+    // The user's own browser: same origin, the CSRF token from the form it was served, and an
+    // affirmative Approve (RFC 6749 s10.12, RFC 8628 s3.3).
     let approve = request(
         addr,
         "POST",
         "/device",
-        &[],
-        Some(&format!("user_code={}", user_code.replace('-', "%2D"))),
+        &[
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", &format!("http://{addr}")),
+        ],
+        Some(&format!(
+            "user_code={}&csrf_token={csrf}&action=approve",
+            user_code.replace('-', "%2D")
+        )),
     )
     .await;
     assert_eq!(approve.status, 200, "body: {}", approve.body);
@@ -951,16 +959,23 @@ async fn c1_verification_form_is_not_rendered_without_a_csrf_seam() {
 /// as a cross-origin "simple request" from a form or a no-preflight `fetch`.
 #[tokio::test]
 async fn c1_device_approval_requires_form_urlencoded_content_type() {
-    let addr = start(true).await;
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
     let (device_code, user_code) = begin_device_grant(addr).await;
+    // Everything else about this request is correct, so the content type is the only thing that
+    // can be refusing it.
+    let (_page, csrf) = verification_form(addr, "").await;
 
     let forced = request(
         addr,
         "POST",
         "/device",
-        &[("Content-Type", "text/plain;charset=UTF-8")],
+        &[
+            ("Content-Type", "text/plain;charset=UTF-8"),
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", &format!("http://{addr}")),
+        ],
         Some(&format!(
-            "user_code={}&action=approve",
+            "user_code={}&csrf_token={csrf}&action=approve",
             user_code.replace('-', "%2D")
         )),
     )
@@ -986,15 +1001,13 @@ async fn c1_device_approval_requires_form_urlencoded_content_type() {
 /// notice, so it must name the client and the scope being asked for.
 #[tokio::test]
 async fn c2_verification_page_names_the_client_and_the_scope() {
-    let addr = start(true).await;
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
     let (_device_code, user_code) = begin_device_grant(addr).await;
 
-    let page = request(
+    // The deep link RFC 8628 s3.3.1 defines, which is the phishing vector s5.4 describes.
+    let (page, _csrf) = verification_form(
         addr,
-        "GET",
-        &format!("/device?user_code={}", user_code.replace('-', "%2D")),
-        &[],
-        None,
+        &format!("?user_code={}", user_code.replace('-', "%2D")),
     )
     .await;
     assert_eq!(page.status, 200, "body: {}", page.body);
@@ -1022,17 +1035,32 @@ async fn c2_verification_page_names_the_client_and_the_scope() {
 /// approval action is not consent and must not approve.
 #[tokio::test]
 async fn c2_approval_requires_an_affirmative_action() {
-    let addr = start(true).await;
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
     let (device_code, user_code) = begin_device_grant(addr).await;
+    let (_page, csrf) = verification_form(addr, "").await;
 
+    // A correct, same-origin, CSRF-token-bearing submission that carries no decision: this is
+    // stage one of the form, "I have typed my code", and it must approve nothing.
     let bare = request(
         addr,
         "POST",
         "/device",
-        &[],
-        Some(&format!("user_code={}", user_code.replace('-', "%2D"))),
+        &[
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", &format!("http://{addr}")),
+        ],
+        Some(&format!(
+            "user_code={}&csrf_token={csrf}",
+            user_code.replace('-', "%2D")
+        )),
     )
     .await;
+    // What it does instead is show the user what they would be approving.
+    assert!(
+        bare.body.contains("Acme") && bare.body.contains("read write"),
+        "stage one must answer with the consent screen: {}",
+        bare.body
+    );
     assert_eq!(
         poll_device(addr, &device_code).await.json()["error"],
         "authorization_pending",
@@ -1051,7 +1079,9 @@ async fn c2_approval_requires_an_affirmative_action() {
 /// the user agreed to issue it.
 #[tokio::test]
 async fn c4_authorization_endpoint_must_not_issue_a_code_without_consent() {
-    let addr = start(true).await;
+    // A host that wired identity and nothing else: the exact configuration that used to be a
+    // silently auto-approving authorization server.
+    let (addr, _sessions) = start_wired(Wiring::subject_only()).await;
     let resp = request(
         addr,
         "GET",
@@ -1109,6 +1139,145 @@ async fn c12_well_known_document_lives_under_the_issuer_path() {
     // And the endpoints it advertises are served at their own full paths, not at the bare ones.
     let token = request(addr, "POST", "/tenant1/token", &[], Some("junk=junk")).await;
     assert_ne!(token.status, 404, "advertised token_endpoint 404s");
+}
+
+/// C1. The other side of the rule: a real browser submission of the form this server rendered
+/// approves, and the token it carried does not work a second time.
+///
+/// Single use is what stops a token captured once (a shared machine, a leaked log, a referrer)
+/// from being replayed later, which is why RFC 6749 s10.12's protection is specified as bound to
+/// the session rather than merely secret.
+#[tokio::test]
+async fn c1_a_same_origin_submission_with_the_issued_token_approves_exactly_once() {
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
+    let (device_code, user_code) = begin_device_grant(addr).await;
+    let (_page, csrf) = verification_form(addr, "").await;
+
+    let body = format!(
+        "user_code={}&csrf_token={csrf}&action=approve",
+        user_code.replace('-', "%2D")
+    );
+    let headers = [
+        ("Cookie", VICTIM_SESSION),
+        ("Origin", &format!("http://{addr}")),
+    ];
+    let approve = request(addr, "POST", "/device", &headers, Some(&body)).await;
+    assert_eq!(approve.status, 200, "body: {}", approve.body);
+
+    // A second grant, and a REPLAY of the same token: the host consumed it, so it is spent.
+    let (second_device_code, second_user_code) = begin_device_grant(addr).await;
+    let replay = request(
+        addr,
+        "POST",
+        "/device",
+        &headers,
+        Some(&format!(
+            "user_code={}&csrf_token={csrf}&action=approve",
+            second_user_code.replace('-', "%2D")
+        )),
+    )
+    .await;
+    assert_eq!(
+        replay.status, 403,
+        "a consumed CSRF token must not work twice: {}",
+        replay.body
+    );
+    assert_eq!(
+        poll_device(addr, &second_device_code).await.json()["error"],
+        "authorization_pending"
+    );
+
+    // The first approval did take effect.
+    let issued = poll_device(addr, &device_code).await;
+    assert!(
+        issued.status == 200 || issued.json()["error"] == "slow_down",
+        "unexpected post-approval poll: {} {}",
+        issued.status,
+        issued.body
+    );
+}
+
+/// C1/C2. Deny is available and terminal (RFC 8628 s3.3 leaves the deny path to the
+/// implementation; a user who did not start the flow needs a way to say so, and RFC 8628 s3.5
+/// then requires `access_denied` at the device's next poll).
+#[tokio::test]
+async fn a_denied_device_grant_reports_access_denied() {
+    let (addr, _sessions) = start_wired(Wiring::full()).await;
+    let (device_code, user_code) = begin_device_grant(addr).await;
+    let (_page, csrf) = verification_form(addr, "").await;
+
+    let deny = request(
+        addr,
+        "POST",
+        "/device",
+        &[
+            ("Cookie", VICTIM_SESSION),
+            ("Origin", &format!("http://{addr}")),
+        ],
+        Some(&format!(
+            "user_code={}&csrf_token={csrf}&action=deny",
+            user_code.replace('-', "%2D")
+        )),
+    )
+    .await;
+    assert_eq!(deny.status, 200, "body: {}", deny.body);
+    assert_eq!(
+        poll_device(addr, &device_code).await.json()["error"],
+        "access_denied"
+    );
+}
+
+/// C4. The consent seam's three answers, each doing what RFC 6749 s4.1.2 / s4.1.2.1 says it
+/// should: approve issues a code, deny is `access_denied` AT THE REDIRECT URI (a refusal is an
+/// answer the client is entitled to), and a rendered screen issues nothing at all.
+#[tokio::test]
+async fn c4_the_consent_seam_decides_what_the_authorization_endpoint_does() {
+    let query = format!(
+        "/authorize?response_type=code&client_id={PUBLIC_ID}\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&state=s1\
+         &code_challenge={CHALLENGE}&code_challenge_method=S256"
+    );
+
+    let (approve_addr, _a) = start_wired(Wiring::full()).await;
+    let approved = request(approve_addr, "GET", &query, &[], None).await;
+    assert_eq!(approved.status, 302, "body: {}", approved.body);
+    assert!(approved
+        .header("location")
+        .is_some_and(|l| l.contains("code=")));
+
+    let (deny_addr, _d) = start_wired(Wiring {
+        subject: true,
+        consent: Consent::Deny,
+        csrf: false,
+    })
+    .await;
+    let denied = request(deny_addr, "GET", &query, &[], None).await;
+    assert_eq!(denied.status, 302, "body: {}", denied.body);
+    let location = denied.header("location").expect("Location").to_string();
+    assert!(location.starts_with(REDIRECT_URI), "{location}");
+    assert!(location.contains("error=access_denied"), "{location}");
+    assert!(
+        location.contains("state=s1"),
+        "the client must be able to correlate its own refusal: {location}"
+    );
+    assert!(!location.contains("code="), "{location}");
+
+    // A host that renders its own consent screen: the router serves it unchanged and mints
+    // nothing, so the flow finishes on a later request when the user has actually answered.
+    let (screen_addr, _s) = start_wired(Wiring {
+        subject: true,
+        consent: Consent::Screen,
+        csrf: false,
+    })
+    .await;
+    let screen = request(screen_addr, "GET", &query, &[], None).await;
+    assert_eq!(screen.status, 200, "body: {}", screen.body);
+    assert!(screen.header("location").is_none(), "nothing was issued");
+    assert!(
+        screen.body.contains(PUBLIC_ID) && screen.body.contains("read write"),
+        "the host's own screen is served unchanged: {}",
+        screen.body
+    );
 }
 
 /// Base64 (standard alphabet, padded) as RFC 7617 requires for the Basic scheme.

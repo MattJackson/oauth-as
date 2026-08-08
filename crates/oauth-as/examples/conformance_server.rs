@@ -18,15 +18,26 @@
 //! * `OAUTH_AS_ISSUER` (default `http://{OAUTH_AS_ADDR}`): the RFC 8414 `issuer`. RFC 8414 s3.3
 //!   requires it to equal the URL the metadata document is fetched from, so the default is
 //!   derived from the bind address and an override exists only for a host behind a proxy.
-//! * `OAUTH_AS_CONFORMANCE_SEED=1`: register the deterministic fixtures below and treat every
-//!   request as coming from the signed-in user `conformance-user`. WITHOUT it this example is an
-//!   empty AS with no clients and no logged-in user, which is what any other reader should see.
+//! * `OAUTH_AS_CONFORMANCE_SEED=1`: register the deterministic fixtures below, treat every
+//!   request as coming from the signed-in user `conformance-user`, auto-approve consent, and
+//!   disable the device verification form's CSRF protection. WITHOUT it this example is an empty
+//!   AS with no clients, no logged-in user, no consent step and no device approvals, which is
+//!   what any other reader should see.
+//!
+//! # The seeded mode is NOT a template
+//!
+//! Under the seed flag this example turns off two protections a real authorization server must
+//! have: the RFC 6749 s10.12 consent step, and the CSRF protection on the RFC 8628 verification
+//! form. They are off because the harness is not a browser, and they are spelled out by name at
+//! the wiring site below so that copying them is a deliberate act rather than an accident. Do not
+//! copy them. See `RouterBuilder::with_consent_resolver` and `RouterBuilder::with_csrf_tokens`
+//! for what a production host wires instead.
 
 use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::RouterBuilder;
+use oauth_as::http::{ConsentDecision, RouterBuilder};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
 use oauth_as::store::MemoryStorage;
@@ -63,10 +74,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut builder = RouterBuilder::new(Arc::clone(&server));
     if seed {
-        // The seeded AS stands in for "a host whose user is already signed in": every
-        // interactive request resolves to the same test subject, which is what makes the
-        // harness's auto-approval and its device-approval POST work without a browser.
-        builder = builder.with_subject_resolver(|_headers| Some(SEEDED_SUBJECT.to_string()));
+        // ############################################################################
+        // # CONFORMANCE FIXTURE ONLY. NEVER COPY ANY OF THIS INTO A PRODUCTION HOST.  #
+        // ############################################################################
+        //
+        // The black-box harness drives this AS with an HTTP client and no browser, so it has no
+        // session, cannot hold a CSRF token, and cannot click anything. Its launch contract
+        // therefore requires the seeded AS to auto-approve a valid authorization request and to
+        // approve a device grant on a bare `user_code` POST. Both of those are behaviours a real
+        // AS must NOT have, so they are opted into BY NAME here rather than being what a host
+        // gets by leaving something unwired.
+        //
+        // What each line would cost in production:
+        //
+        // * `with_subject_resolver` returning a constant: every request is the same user. Real
+        //   hosts read their own session.
+        // * `with_consent_resolver` returning `Approve`: RFC 6749 s10.12 consent, deleted. Any
+        //   cross-site navigation would silently issue a code for a logged-in user. A real host
+        //   returns `ConsentDecision::Respond` with a consent screen and approves only after the
+        //   user has answered it.
+        // * `dangerously_disable_verification_protections`: RFC 6749 s10.12 CSRF protection on
+        //   the device verification form, deleted. On a browser-reachable endpoint that is the
+        //   complete cross-site forced-approval chain, which is account takeover.
+        builder = builder
+            .with_subject_resolver(|_headers| Some(SEEDED_SUBJECT.to_string()))
+            .with_consent_resolver(|_request| ConsentDecision::Approve)
+            .dangerously_disable_verification_protections();
     }
     let router = builder.build()?;
 

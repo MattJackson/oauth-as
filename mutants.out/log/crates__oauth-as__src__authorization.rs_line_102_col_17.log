@@ -1,0 +1,30 @@
+
+*** crates/oauth-as/src/authorization.rs:102:17: delete match arm "code_challenge" in AuthorizationRequest<'a>::from_pairs
+
+*** mutation diff:
+--- crates/oauth-as/src/authorization.rs
++++ delete match arm "code_challenge" in AuthorizationRequest<'a>::from_pairs
+@@ -94,17 +94,17 @@
+         let mut req = AuthorizationRequest::default();
+         for (k, v) in pairs {
+             let slot = match k.as_ref() {
+                 "response_type" => &mut req.response_type,
+                 "client_id" => &mut req.client_id,
+                 "redirect_uri" => &mut req.redirect_uri,
+                 "scope" => &mut req.scope,
+                 "state" => &mut req.state,
+-                "code_challenge" => &mut req.code_challenge,
++                 /* ~ changed by cargo-mutants ~ */
+                 "code_challenge_method" => &mut req.code_challenge_method,
+                 _ => continue,
+             };
+             if slot.is_none() {
+                 *slot = Some(v.into());
+             }
+         }
+         req
+
+
+*** /Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo test --no-run --verbose --package=oauth-as@0.1.0
+   Compiling proc-macro2 v1.0.107
+     Running `/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2021 /Users/matthew/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="proc-macro"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "nightly", "proc-macro", "span-locations"))' -C metadata=affaa5e9eb722599 -C extra-filename=-c42521f94553881f --out-dir /private/var/folders/cx/c26_xdfx49jglkgh8vhrwp8r0000gn/T/cargo-mutants-oauth-as-ZfkmCm.tmp/target/debug/build/proc-macro2-c42521f94553881f -L dependency=/private/var/folders/cx/c26_xdfx49jglkgh8vhrwp8r0000gn/T/cargo-mutants-oauth-as-ZfkmCm.tmp/target/debug/deps --cap-lints allow`

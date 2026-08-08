@@ -25,7 +25,8 @@ Two crates:
 - Branches `main`, `dev`, `qa` all start at the same commit. Work on `dev`.
 - Dual licensed `MIT OR Apache-2.0` from the first release, so there is no licence change to
   explain later. Every source file carries the SPDX header, copyright Matthew Jackson.
-- `crates/oauth-as` declares `rust-version = "1.86"` and this is VERIFIED to build and test there.
+- `crates/oauth-as` declared `rust-version = "1.86"`. That figure was declared, not measured, and
+  has since been corrected to the true floor of 1.75. See the MSRV entry under HOUSE RULES below.
 
 ## WHAT EXISTS
 
@@ -133,9 +134,24 @@ black box. The README must not imply otherwise.
 - Full gate before every commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
   --locked -- -D warnings`, `cargo test --workspace --locked`.
 - A gate you have not seen go RED is a gate you cannot trust. Keep the selftest-first discipline.
-- Keep the MSRV floor at 1.86 for the published crate. A library that forces consumers onto current
-  stable is a library people cannot adopt. One use of `is_multiple_of` already became `% 2 == 0` to
-  buy that floor. The harness may require newer, since nobody depends on it.
+- Keep the MSRV floor as LOW as the code genuinely allows. A library that forces consumers onto
+  current stable is a library people cannot adopt. One use of `is_multiple_of` already became
+  `% 2 == 0` to buy that floor. The harness may require newer, since nobody depends on it.
+
+  **CORRECTED 2026-08-08: the floor is 1.75, not 1.86.** The 1.86 figure was declared rather than
+  measured. Measured: 1.74 fails, and fails for exactly one reason, `impl Trait` in the `Storage`
+  trait's return position (RPITIT), stabilised in 1.75. 1.75 and 1.80 both compile and test clean,
+  with default features, with `--features http`, and with `--features jwt`.
+
+  Going BELOW 1.75 would mean `Box<dyn Future>` in the `Storage` trait, which is a heap allocation
+  on every storage call. That is a permanent cost to every consumer, paid to support toolchains
+  older than December 2023, so 1.75 is both the true floor and the right one.
+
+  One practical trap worth recording: a `--locked` build at the floor also requires every
+  transitive dependency in `Cargo.lock` to be parseable by that cargo. `base64ct` 1.8.3 and
+  `zeroize` 1.9.0, pulled in through the optional `jwt` feature, use edition 2024, which cargo 1.75
+  cannot even parse. They are pinned back (1.7.3 and 1.8.1) for that reason. An MSRV that only
+  holds without `--locked` is not an MSRV anyone can rely on.
 - Do NOT force a web framework on a consumer who wants only the library. Any HTTP surface is an
   optional feature or an example binary, and the no-server default stays intact.
 - No em dashes, no en dashes, no non-ASCII.

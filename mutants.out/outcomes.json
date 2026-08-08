@@ -1,0 +1,239 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 262.912429667,
+          "process_status": "Success",
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.095790834,
+          "process_status": "Success",
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/oauth-as/src/authorization.rs:94:9: replace AuthorizationRequest<'a>::from_pairs -> Self with Default::default()",
+          "package": "oauth-as",
+          "file": "crates/oauth-as/src/authorization.rs",
+          "function": {
+            "function_name": "AuthorizationRequest<'a>::from_pairs",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 82,
+                "column": 5
+              },
+              "end": {
+                "line": 111,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 94,
+              "column": 9
+            },
+            "end": {
+              "line": 110,
+              "column": 12
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__oauth-as__src__authorization.rs_line_94_col_9.log",
+      "diff_path": "diff/crates__oauth-as__src__authorization.rs_line_94_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 13.103523375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 3.746846959,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/oauth-as/src/authorization.rs:97:17: delete match arm \"response_type\" in AuthorizationRequest<'a>::from_pairs",
+          "package": "oauth-as",
+          "file": "crates/oauth-as/src/authorization.rs",
+          "function": {
+            "function_name": "AuthorizationRequest<'a>::from_pairs",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 82,
+                "column": 5
+              },
+              "end": {
+                "line": 111,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 97,
+              "column": 17
+            },
+            "end": {
+              "line": 97,
+              "column": 59
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__oauth-as__src__authorization.rs_line_97_col_17.log",
+      "diff_path": "diff/crates__oauth-as__src__authorization.rs_line_97_col_17.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 12.448098209,
+          "process_status": "Success",
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 4.368226583,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/oauth-as/src/authorization.rs:98:17: delete match arm \"client_id\" in AuthorizationRequest<'a>::from_pairs",
+          "package": "oauth-as",
+          "file": "crates/oauth-as/src/authorization.rs",
+          "function": {
+            "function_name": "AuthorizationRequest<'a>::from_pairs",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 82,
+                "column": 5
+              },
+              "end": {
+                "line": 111,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 98,
+              "column": 17
+            },
+            "end": {
+              "line": 98,
+              "column": 51
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__oauth-as__src__authorization.rs_line_98_col_17.log",
+      "diff_path": "diff/crates__oauth-as__src__authorization.rs_line_98_col_17.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 12.784499541,
+          "process_status": "Success",
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.7851475409999997,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/matthew/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=oauth-as@0.1.0"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 3,
+  "missed": 0,
+  "caught": 3,
+  "timeout": 0,
+  "unviable": 0,
+  "success": 0,
+  "start_time": "2026-08-08T17:09:59.592987Z",
+  "end_time": null,
+  "cargo_mutants_version": "27.1.0"
+}

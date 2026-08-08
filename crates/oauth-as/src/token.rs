@@ -6,6 +6,7 @@
 //! random strings; structured (JWT) access tokens are a possible later addition and would slot in
 //! at issuance without changing these shapes.
 
+use std::fmt;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -113,7 +114,11 @@ impl IntrospectionResponse {
 }
 
 /// A persisted access token: what introspection needs to answer for an opaque token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see below) rather than derived: `access_token` is a bearer credential
+/// (RFC 6750 section 1: possession of the string is the whole of the authorization), so a host
+/// doing the obvious `tracing::debug!(?record)` must not thereby write a live token to its logs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedToken {
     /// The opaque access token string (the storage key).
     pub access_token: String,
@@ -137,6 +142,24 @@ pub struct IssuedToken {
     pub family_id: Option<String>,
 }
 
+/// Hand-written so the opaque `access_token` never prints. Everything else is metadata ABOUT the
+/// token rather than the credential itself, and stays visible so the record is still debuggable:
+/// `family_id` in particular is what makes an RFC 9700 section 4.14.2 family revocation traceable,
+/// and it is an internal grouping identifier, not a bearer credential.
+impl fmt::Debug for IssuedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedToken")
+            .field("access_token", &"[redacted]")
+            .field("client_id", &self.client_id)
+            .field("subject", &self.subject)
+            .field("scope", &self.scope)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("family_id", &self.family_id)
+            .finish()
+    }
+}
+
 /// Whether a persisted refresh token is still redeemable.
 ///
 /// Rotated tokens are RETAINED in the `Spent` state rather than deleted, exactly as consumed
@@ -156,7 +179,11 @@ pub enum RefreshTokenState {
 /// A persisted refresh token. Single use: redemption goes through
 /// [`crate::store::Storage::take_refresh_token`], and rotation issues a replacement carrying the
 /// SAME `expires_at`, so a chain has an absolute lifetime rather than a sliding one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (see below) rather than derived: `refresh_token` is a bearer credential
+/// whose leak is exactly the compromise RFC 9700 section 4.14.2 defends against, so it must not
+/// reach a host's logs through `{:?}`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshTokenRecord {
     /// The opaque refresh token string (the storage key).
     pub refresh_token: String,
@@ -184,6 +211,23 @@ pub struct RefreshTokenRecord {
     pub family_id: String,
     /// Whether this link is still redeemable, or is a retained rotated one.
     pub state: RefreshTokenState,
+}
+
+/// Hand-written so the opaque `refresh_token` never prints. `state` and `family_id` stay visible
+/// because they are precisely what an operator debugging an RFC 9700 section 4.14.2 family
+/// revocation needs to see, and neither is a credential.
+impl fmt::Debug for RefreshTokenRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RefreshTokenRecord")
+            .field("refresh_token", &"[redacted]")
+            .field("client_id", &self.client_id)
+            .field("subject", &self.subject)
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .field("family_id", &self.family_id)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[cfg(test)]

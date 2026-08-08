@@ -88,22 +88,41 @@ jobs:
       - name: tests
         run: cargo test --workspace --locked
 
-  # MSRV verification. crates/oauth-as declares rust-version = "1.86" and that floor is only
-  # real if something in CI actually builds and tests on exactly that toolchain, not "stable".
+  # MSRV verification. The floor is 1.75, and it is MEASURED rather than declared: 1.74 fails on
+  # return-position impl Trait in the Storage trait, and 1.75 compiles clean. A declared floor
+  # nobody builds on is a guess, so this job builds and tests on exactly that toolchain.
+  #
+  # Scoped to -p oauth-as ON PURPOSE, not --workspace. crates/oauth-as-conformance is the
+  # independent harness: it is never published, nothing depends on it, and it is deliberately free
+  # to require a much newer toolchain than the library. Building it here would make the harness's
+  # dependencies silently dictate the library's MSRV, which is exactly backwards.
+  #
+  # Every feature combination is checked, because an optional dependency is perfectly capable of
+  # raising the floor for the consumers who enable it while the default build stays fine.
   msrv:
-    name: MSRV (1.86) build and test
+    name: MSRV (1.75) build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust 1.86 toolchain
-        uses: dtolnay/rust-toolchain@1.86
+      - name: Install Rust 1.75 toolchain
+        uses: dtolnay/rust-toolchain@1.75
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-1.86
-      - name: build on 1.86
-        run: cargo build --workspace --locked
-      - name: test on 1.86
-        run: cargo test --workspace --locked
+          key: msrv-1.75
+      # --locked throughout: an MSRV that only holds when cargo is free to pick different
+      # dependency versions is not a floor anyone can rely on. Note this also requires every
+      # entry in Cargo.lock to be PARSEABLE by this cargo, which is why base64ct and zeroize are
+      # pinned below the versions that moved to edition 2024.
+      - name: build on 1.75, default features
+        run: cargo build -p oauth-as --locked
+      - name: test on 1.75, default features
+        run: cargo test -p oauth-as --locked
+      - name: build on 1.75, http feature
+        run: cargo build -p oauth-as --locked --features http
+      - name: build on 1.75, jwt feature
+        run: cargo build -p oauth-as --locked --features jwt
+      - name: build on 1.75, all features
+        run: cargo build -p oauth-as --locked --all-features
 
   # Hermetic half of the independent harness: RFC vectors and validator self-checks.
   rfc-vectors:

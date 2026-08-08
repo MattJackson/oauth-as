@@ -2,7 +2,11 @@
 name = "oauth-as"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86"
+# MEASURED, not declared. 1.74 fails on return-position impl Trait in the Storage trait (RPITIT,
+# stabilised in 1.75); 1.75 compiles and tests clean. Going lower would mean Box<dyn Future> in
+# Storage, a heap allocation on every storage call, paid forever by every consumer to support
+# toolchains older than December 2023. See KICKOFF.md's MSRV entry.
+rust-version = "1.75"
 description = "An embeddable OAuth 2.1 Authorization Server library: spec-mirroring types (RFC 6749, RFC 8628, RFC 7636), a full device-authorization-grant state machine, and a storage trait the host implements. Deliberately host-agnostic with a tiny dependency set; nothing is allocated until the host constructs an AuthorizationServer, so an embedding host pays zero memory until its config enables the feature."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MattJackson/oauth-as"

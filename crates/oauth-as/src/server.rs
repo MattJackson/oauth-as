@@ -7,6 +7,7 @@
 //! enabled): a host that never constructs [`AuthorizationServer`] pays nothing. There is no
 //! background task; every state transition happens inside a host-driven call.
 
+use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use crate::authorization::{
@@ -174,7 +175,15 @@ impl ServerConfig {
 
 /// A parsed token-endpoint request (RFC 6749 section 3.2). The host parses the form body and the
 /// `Authorization` header into this; `client_secret` is `None` for public clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written (see below) rather than derived. Every variant of this type is built
+/// directly out of an inbound request and every variant carries at least one credential: RFC 6749
+/// section 2.3.1 makes `client_secret` a password, and section 4.1.2, section 6 and RFC 8628
+/// section 3.4 each make the grant artifact (`code`, `refresh_token`, `device_code`) a bearer
+/// credential in its own right. This is the type a host is most likely to debug-print, since it is
+/// the request it just parsed, so a derived `Debug` here would be the single easiest way to end up
+/// with plaintext credentials in a host's logs.
+#[derive(Clone, PartialEq, Eq)]
 pub enum TokenRequest {
     /// RFC 6749 section 4.1.3: `grant_type=authorization_code`, with the RFC 7636 `code_verifier`
     /// that OAuth 2.1 makes mandatory.
@@ -220,6 +229,74 @@ pub enum TokenRequest {
         /// Optional narrowing scope; widening is `invalid_scope`.
         scope: Option<ScopeSet>,
     },
+}
+
+/// Hand-written so no credential reaches a debug format, while everything that identifies WHICH
+/// request this is stays visible: the variant name (so the grant type is readable), `client_id`
+/// (RFC 6749 section 2.2 makes it explicitly not a secret), `redirect_uri` and `scope`.
+///
+/// `client_secret` and `code_verifier` are `Option`s, and the Some/None distinction is kept: it is
+/// not a credential, it is the difference between "a secret was presented" and "none was", which
+/// is exactly what someone debugging an `invalid_client` (RFC 6749 section 5.2) or a missing-PKCE
+/// rejection needs, and it can be read off the request's shape without the value.
+impl fmt::Debug for TokenRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Option<&str>` rather than a bare string, so `Some("[redacted]")` / `None` prints and
+        // the presence of the credential stays legible while its value does not.
+        fn redact_opt<T>(value: &Option<T>) -> Option<&'static str> {
+            value.as_ref().map(|_| "[redacted]")
+        }
+        match self {
+            TokenRequest::AuthorizationCode {
+                client_id,
+                client_secret,
+                code: _,
+                redirect_uri,
+                code_verifier,
+            } => f
+                .debug_struct("AuthorizationCode")
+                .field("client_id", client_id)
+                .field("client_secret", &redact_opt(client_secret))
+                .field("code", &"[redacted]")
+                .field("redirect_uri", redirect_uri)
+                .field("code_verifier", &redact_opt(code_verifier))
+                .finish(),
+            TokenRequest::ClientCredentials {
+                client_id,
+                client_secret,
+                scope,
+            } => f
+                .debug_struct("ClientCredentials")
+                .field("client_id", client_id)
+                .field("client_secret", &redact_opt(client_secret))
+                .field("scope", scope)
+                .finish(),
+            TokenRequest::DeviceCode {
+                client_id,
+                client_secret,
+                device_code: _,
+            } => f
+                .debug_struct("DeviceCode")
+                .field("client_id", client_id)
+                .field("client_secret", &redact_opt(client_secret))
+                // RFC 8628 section 3.4 redeems the device code with no further proof from a public
+                // client, so it is as much a bearer credential as an authorization code is.
+                .field("device_code", &"[redacted]")
+                .finish(),
+            TokenRequest::RefreshToken {
+                client_id,
+                client_secret,
+                refresh_token: _,
+                scope,
+            } => f
+                .debug_struct("RefreshToken")
+                .field("client_id", client_id)
+                .field("client_secret", &redact_opt(client_secret))
+                .field("refresh_token", &"[redacted]")
+                .field("scope", scope)
+                .finish(),
+        }
+    }
 }
 
 /// Rejections for the host-driven verification-UI actions ([`AuthorizationServer::approve_device`]

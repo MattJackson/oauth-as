@@ -1,0 +1,3 @@
+crates/oauth-as/src/authorization.rs:94:9: replace AuthorizationRequest<'a>::from_pairs -> Self with Default::default()
+crates/oauth-as/src/authorization.rs:97:17: delete match arm "response_type" in AuthorizationRequest<'a>::from_pairs
+crates/oauth-as/src/authorization.rs:98:17: delete match arm "client_id" in AuthorizationRequest<'a>::from_pairs
