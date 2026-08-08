@@ -23,12 +23,12 @@ fn parse_accepts_the_rfc_shape_and_keeps_the_common_fields() {
     .expect("the RFC's own shape must parse");
     assert_eq!(details.len(), 1);
     let d = &details.as_slice()[0];
-    assert_eq!(d.detail_type, "payment_initiation");
-    assert_eq!(d.locations, vec!["https://rs.example/".to_string()]);
-    assert_eq!(d.actions, vec!["initiate".to_string()]);
-    assert_eq!(d.datatypes, vec!["contacts".to_string()]);
+    assert_eq!(&*d.detail_type, "payment_initiation");
+    assert_eq!(&*d.locations, ["https://rs.example/".into()]);
+    assert_eq!(&*d.actions, ["initiate".into()]);
+    assert_eq!(&*d.datatypes, ["contacts".into()]);
     assert_eq!(d.identifier.as_deref(), Some("acct-1"));
-    assert_eq!(d.privileges, vec!["admin".to_string()]);
+    assert_eq!(&*d.privileges, ["admin".into()]);
     assert!(
         d.other.is_empty(),
         "the section 2.2 common fields must not also land in `other`, or they would be compared \
@@ -137,7 +137,13 @@ fn depth_counts_containers_and_the_member_budget_is_exact() {
         "the deepest child decides, not the first: the object plus three arrays plus the scalar"
     );
 
-    let nest = |n: usize| format!(r#"[{{"type":"t","n":{}1{}}}]"#, "[".repeat(n), "]".repeat(n));
+    let nest = |n: usize| {
+        format!(
+            r#"[{{"type":"t","n":{}1{}}}]"#,
+            "[".repeat(n),
+            "]".repeat(n)
+        )
+    };
     // n nested arrays around a scalar is depth n + 1.
     let at_limit = nest(MAX_MEMBER_DEPTH - 1);
     assert!(
@@ -162,7 +168,10 @@ fn no_declared_types_means_no_type_is_supported() {
         ErrorCode::InvalidAuthorizationDetails
     );
     assert_eq!(
-        details.require_supported_types(Some(&[])).unwrap_err().error,
+        details
+            .require_supported_types(Some(&[]))
+            .unwrap_err()
+            .error,
         ErrorCode::InvalidAuthorizationDetails
     );
     assert!(details
@@ -310,12 +319,13 @@ fn narrow_covers_every_requested_element_against_the_whole_granted_set() {
 /// inferring from the set-theoretic name.
 #[test]
 fn is_subset_handles_empties_and_duplicates() {
-    let l1 = vec!["a".to_string()];
-    let l2 = vec!["a".to_string(), "b".to_string()];
+    let l1: Vec<Box<str>> = vec!["a".into()];
+    let l2: Vec<Box<str>> = vec!["a".into(), "b".into()];
     assert!(is_subset(&[], &[]));
     assert!(is_subset(&[], &l2));
     assert!(is_subset(&l1, &l2));
     assert!(!is_subset(&l2, &l1));
     // A repeated value asks for the same thing twice, which is not more than once.
-    assert!(is_subset(&["a".to_string(), "a".to_string()], &l1));
+    let twice: Vec<Box<str>> = vec!["a".into(), "a".into()];
+    assert!(is_subset(&twice, &l1));
 }

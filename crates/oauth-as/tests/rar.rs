@@ -202,12 +202,9 @@ async fn a_requested_detail_is_recorded_on_the_code_and_reaches_the_token() {
 
     assert_eq!(details.len(), 1, "exactly the one element that was granted");
     let element = &details.as_slice()[0];
-    assert_eq!(element.detail_type, PAYMENT);
+    assert_eq!(&*element.detail_type, PAYMENT);
     assert_eq!(element.identifier.as_deref(), Some("acct-1"));
-    assert_eq!(
-        element.actions,
-        vec!["initiate".to_string(), "status".to_string()]
-    );
+    assert_eq!(&*element.actions, ["initiate".into(), "status".into()]);
 }
 
 /// THE QUIET ATTACK. RFC 9396 s2 makes `type` the definition of every other member, so an AS that
@@ -483,8 +480,8 @@ async fn the_token_endpoint_may_narrow_to_less_than_was_granted() {
         "the token carries only what was asked for"
     );
     let element = &details.as_slice()[0];
-    assert_eq!(element.detail_type, PAYMENT);
-    assert_eq!(element.actions, vec!["status".to_string()]);
+    assert_eq!(&*element.detail_type, PAYMENT);
+    assert_eq!(&*element.actions, ["status".into()]);
 }
 
 /// The refresh leg, narrowing correctly, and the chain remembering the NARROWED set afterwards:

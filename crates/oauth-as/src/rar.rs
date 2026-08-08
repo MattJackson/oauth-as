@@ -90,6 +90,12 @@ const MAX_MEMBER_DEPTH: usize = MAX_AUTHORIZATION_DETAILS_DEPTH - 2;
 
 /// One element of `authorization_details` (RFC 9396 section 2).
 ///
+/// Every field is WRITE ONCE, so each is a `Box<str>` or a `Box<[Box<str>]>` rather than a `String`
+/// or a `Vec`: nothing here is ever pushed to or truncated after parsing, and the capacity word a
+/// growable type carries would be 8 bytes of nothing, per field, in every stored authorization
+/// code, access token and refresh record for the life of the grant. That is 48 bytes an element
+/// against roughly 190, and a store holds one of these per live grant, not one per process.
+///
 /// `type` is REQUIRED (section 2) and is what gives every other member its meaning. The named
 /// fields below are the section 2.2 COMMON data fields, which are common precisely because their
 /// meaning does not depend on the type; everything else lands in [`AuthorizationDetail::other`]
@@ -107,24 +113,24 @@ pub struct AuthorizationDetail {
     /// this object is written in. Named `detail_type` in Rust because `type` is a keyword; the
     /// wire spelling is pinned by the `serde` rename and is the only spelling that exists off-host.
     #[serde(rename = "type")]
-    pub detail_type: String,
+    pub detail_type: Box<str>,
     /// RFC 9396 section 2.2 `locations`: the resource server(s) this detail is for. Empty means
     /// the member was absent.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_empty_list")]
+    pub locations: Box<[Box<str>]>,
     /// RFC 9396 section 2.2 `actions`: the actions taken at the resource.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_empty_list")]
+    pub actions: Box<[Box<str>]>,
     /// RFC 9396 section 2.2 `datatypes`: the kinds of data being asked for.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub datatypes: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_empty_list")]
+    pub datatypes: Box<[Box<str>]>,
     /// RFC 9396 section 2.2 `identifier`: the specific resource this detail is about. A string,
     /// not an array: section 2.2 defines exactly one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<String>,
+    pub identifier: Option<Box<str>>,
     /// RFC 9396 section 2.2 `privileges`: the level of access asked for.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub privileges: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_empty_list")]
+    pub privileges: Box<[Box<str>]>,
     /// Every other member, exactly as it arrived. See the type's doc comment: this is preservation,
     /// not tolerance.
     ///
@@ -181,8 +187,15 @@ impl AuthorizationDetail {
 /// A linear scan rather than a set: these lists are bounded by
 /// [`MAX_AUTHORIZATION_DETAILS_BYTES`] and are in practice two or three entries, so building a
 /// `BTreeSet` per comparison would allocate more than it saved.
-fn is_subset(subset: &[String], superset: &[String]) -> bool {
+fn is_subset(subset: &[Box<str>], superset: &[Box<str>]) -> bool {
     subset.iter().all(|want| superset.iter().any(|g| g == want))
+}
+
+/// `skip_serializing_if` for the section 2.2 list members. A named function rather than
+/// `<[_]>::is_empty` because `skip_serializing_if` takes a path and the `Box<[T]>` receiver has to
+/// reach `&[T]` by deref coercion, which only happens at a call site.
+fn is_empty_list(list: &[Box<str>]) -> bool {
+    list.is_empty()
 }
 
 /// The `authorization_details` array (RFC 9396 section 2).
@@ -196,8 +209,10 @@ fn is_subset(subset: &[String], superset: &[String]) -> bool {
 pub struct AuthorizationDetails(Vec<AuthorizationDetail>);
 
 impl AuthorizationDetails {
-    /// The empty set: no rich authorization detail at all.
-    pub fn none() -> Self {
+    /// The empty set: no rich authorization detail at all. `const`, and allocation-free: an empty
+    /// `Vec` has no heap block, so the overwhelmingly common "this grant carries no rich
+    /// authorization detail" costs nothing at all.
+    pub const fn none() -> Self {
         AuthorizationDetails(Vec::new())
     }
 
@@ -211,7 +226,9 @@ impl AuthorizationDetails {
         // SIZE FIRST, before the parser is handed anything. This is the bound that makes every
         // other cost in this function finite.
         if raw.len() > MAX_AUTHORIZATION_DETAILS_BYTES {
-            return Err(invalid("authorization_details is larger than this server accepts"));
+            return Err(invalid(
+                "authorization_details is larger than this server accepts",
+            ));
         }
         let details: Vec<AuthorizationDetail> = serde_json::from_str(raw).map_err(|e| {
             // The parser's message can quote the input, so it is dropped rather than forwarded.
@@ -253,14 +270,15 @@ impl AuthorizationDetails {
     /// told which vocabularies it speaks cannot be said to know one, and section 5's MUST is not
     /// satisfied by hoping. That is also what makes the feature safe to compile in before it is
     /// configured.
-    pub fn require_supported_types(&self, supported: Option<&[String]>) -> Result<(), ErrorResponse> {
+    pub fn require_supported_types(
+        &self,
+        supported: Option<&[String]>,
+    ) -> Result<(), ErrorResponse> {
         let supported = supported.unwrap_or(&[]);
         for detail in &self.0 {
-            if !supported.iter().any(|s| *s == detail.detail_type) {
+            if !supported.iter().any(|s| s.as_str() == &*detail.detail_type) {
                 // The type is NOT echoed, for the reason `parse` gives.
-                return Err(invalid(
-                    "unknown authorization_details type (RFC 9396 s5)",
-                ));
+                return Err(invalid("unknown authorization_details type (RFC 9396 s5)"));
             }
         }
         Ok(())
@@ -279,7 +297,10 @@ impl AuthorizationDetails {
     /// that carries NO details has nothing to narrow, so any request against it is widening from
     /// nothing and is refused; answering otherwise would let the token endpoint mint authorization
     /// detail that no authorization request ever obtained.
-    pub fn narrow(&self, requested: &AuthorizationDetails) -> Result<AuthorizationDetails, ErrorResponse> {
+    pub fn narrow(
+        &self,
+        requested: &AuthorizationDetails,
+    ) -> Result<AuthorizationDetails, ErrorResponse> {
         if requested.is_empty() {
             return Ok(self.clone());
         }
@@ -330,8 +351,11 @@ impl AuthorizationDetails {
 
 /// `invalid_authorization_details` (RFC 9396 section 5) with a developer-facing reason.
 ///
-/// The reason never contains any part of the request. See [`AuthorizationDetails::parse`].
-fn invalid(why: &str) -> ErrorResponse {
+/// `&'static str`, and every caller passes a literal. That is not only tidiness: the refusal path
+/// here is one an attacker sets the rate of, so a description built by copying a string constant
+/// onto the heap would be one allocation per refused request, bought for nothing. The reason also
+/// never contains any part of the request; see [`AuthorizationDetails::parse`].
+fn invalid(why: &'static str) -> ErrorResponse {
     ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails).with_description(why)
 }
 

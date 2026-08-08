@@ -34,6 +34,10 @@ src/token.rs
   may narrow from on the next rotation), and on `IntrospectionResponse` (RFC 9396 section 9.2 makes
   it a top-level member of the introspection response).
 
+src/jwt.rs
+  The RFC 9396 section 9.1 `authorization_details` claim on the RFC 9068 access token, so a
+  resource server holding a JWT can read what the token authorizes without an introspection call.
+
 src/metadata.rs
   `authorization_details_types_supported` (RFC 9396 section 10), so a client learns which types it
   may ask for rather than probing for them.
@@ -73,14 +77,15 @@ The test files
   rather than being raised for everybody: a budget raised for a build that did not grow is a budget
   that has stopped gating.
 
-WHAT IT DELIBERATELY DOES NOT CHANGE:
-
-src/par.rs is not touched. RFC 9126 and RFC 9101 are not in the compiled module tree in the state
-this slice was built against (scripts/patch-0.6.0-rfc9126-rfc9101.py is unapplied), so any edit
-there would be code nobody can compile, let alone test. When that slice lands,
-`PushedAuthorizationRequest` needs an `authorization_details` field of its own; its doc comment
-already says so in as many words, and the missing field in `as_request` is a compile error rather
-than a silent drop, which is what that comment promises.
+src/par.rs
+  RFC 9126 PAR persists the pushed `authorization_details` on the record and hands it back at the
+  authorization endpoint. Storing it, rather than validating it at push time and dropping it, is
+  the whole point: RFC 9101 section 6.3 says the authorization endpoint MUST use only the pushed
+  parameters, so a dropped one is a parameter the client was told was acceptable and then did not
+  get. RFC 9101 JAR extracts the same parameter from a signed request object, where section 2 of
+  RFC 9396 keeps it a JSON array rather than a string, and re-serializes it so that both paths
+  reach exactly one validation rather than two nearly identical ones. (par.rs's own doc comment
+  already named `authorization_details` as the next parameter to add here.)
 
 Rules this script holds itself to:
   * every edit is anchored on surrounding TEXT, never on a line number;
@@ -271,10 +276,7 @@ EDITS = [
                 "    /// this type exists so that only validation can produce one, and a public setter for a\n"
                 "    /// field that decides what a token authorizes would hand that back.\n"
                 '    #[cfg(feature = "rar")]\n'
-                "    pub(crate) fn set_authorization_details(\n"
-                "        &mut self,\n"
-                "        details: crate::rar::AuthorizationDetails,\n"
-                "    ) {\n"
+                "    pub(crate) fn set_authorization_details(&mut self, details: crate::rar::AuthorizationDetails) {\n"
                 "        self.authorization_details = details;\n"
                 "    }\n"
                 "\n"
@@ -357,7 +359,10 @@ EDITS = [
                 "    /// an empty array reads as \"authorized for nothing in particular\", which is a statement,\n"
                 "    /// and the truth here is silence.\n"
                 '    #[cfg(feature = "rar")]\n'
-                '    #[serde(default, skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty")]\n'
+                "    #[serde(\n"
+                "        default,\n"
+                '        skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty"\n'
+                "    )]\n"
                 "    pub authorization_details: crate::rar::AuthorizationDetails,\n",
                 1,
             ),
@@ -460,6 +465,37 @@ EDITS = [
                 "}\n",
                 1,
             ),
+        ],
+    ),
+    # --------------------------------------------------------------------------------- jwt.rs
+    (
+        "crates/oauth-as/src/jwt.rs",
+        "authorization_details",
+        [
+            (
+                "    /// Space-delimited granted scope, omitted when empty (RFC 9068 section 2.2.3 makes it\n"
+                "    /// conditional, not required).\n"
+                '    #[serde(skip_serializing_if = "Option::is_none")]\n'
+                "    pub scope: Option<String>,\n",
+                "    /// Space-delimited granted scope, omitted when empty (RFC 9068 section 2.2.3 makes it\n"
+                "    /// conditional, not required).\n"
+                '    #[serde(skip_serializing_if = "Option::is_none")]\n'
+                "    pub scope: Option<String>,\n"
+                "    /// RFC 9396 section 9.1: the authorization details this token carries, as a top-level\n"
+                "    /// claim, so a resource server holding the JWT can read what the token authorizes\n"
+                "    /// without calling introspection for it.\n"
+                "    ///\n"
+                "    /// Omitted rather than sent empty when the grant carried none, exactly as `scope` is: a\n"
+                "    /// claim present and empty is a statement about the token, and the truth here is that\n"
+                "    /// there is nothing to state.\n"
+                '    #[cfg(feature = "rar")]\n'
+                "    #[serde(\n"
+                "        default,\n"
+                '        skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty"\n'
+                "    )]\n"
+                "    pub authorization_details: crate::rar::AuthorizationDetails,\n",
+                1,
+            )
         ],
     ),
     # ----------------------------------------------------------------------------- metadata.rs
@@ -566,25 +602,50 @@ EDITS = [
                 "/// boxing threshold costs an allocation on every request that reaches the endpoint.\n"
                 "#[derive(Debug, Clone, Default, PartialEq, Eq)]\n"
                 "pub(crate) struct GrantedDetails {\n"
+                "    /// BOXED, and an `Option` so that the common case is a null pointer. The token future\n"
+                "    /// is 1976 bytes against tokio's 2048-byte debug boxing threshold, and this value is\n"
+                "    /// live in it at six points; carrying the details inline (three words) crossed the\n"
+                "    /// threshold and cost a 2 KB allocation on EVERY token request, which is exactly the\n"
+                "    /// regression `tests/allocation.rs` was written to catch, and it caught this one. One\n"
+                "    /// word costs 48 bytes of the future instead of 144, and the allocation behind the\n"
+                "    /// `Some` is paid only by a request that actually carries authorization details.\n"
                 '    #[cfg(feature = "rar")]\n'
-                "    inner: crate::rar::AuthorizationDetails,\n"
+                "    inner: Option<Box<crate::rar::AuthorizationDetails>>,\n"
                 "}\n"
                 "\n"
                 "impl GrantedDetails {\n"
+                "    /// Wrap details read off a grant record, keeping the empty case a null pointer.\n"
+                '    #[cfg(feature = "rar")]\n'
+                "    fn of(details: &crate::rar::AuthorizationDetails) -> Self {\n"
+                "        GrantedDetails {\n"
+                "            inner: (!details.is_empty()).then(|| Box::new(details.clone())),\n"
+                "        }\n"
+                "    }\n"
+                "\n"
                 "    /// What an authorization code granted (RFC 9396 section 7: the details as approved by\n"
                 "    /// the resource owner and assigned to the token this code mints).\n"
                 "    fn of_code(record: &AuthorizationCodeRecord) -> Self {\n"
-                "        GrantedDetails {\n"
-                '            #[cfg(feature = "rar")]\n'
-                "            inner: record.authorization_details.clone(),\n"
+                '        #[cfg(feature = "rar")]\n'
+                "        {\n"
+                "            GrantedDetails::of(&record.authorization_details)\n"
+                "        }\n"
+                '        #[cfg(not(feature = "rar"))]\n'
+                "        {\n"
+                "            let _ = record;\n"
+                "            GrantedDetails {}\n"
                 "        }\n"
                 "    }\n"
                 "\n"
                 "    /// What a refresh chain carries, which is what the previous leg narrowed it to.\n"
                 "    fn of_refresh(record: &RefreshTokenRecord) -> Self {\n"
-                "        GrantedDetails {\n"
-                '            #[cfg(feature = "rar")]\n'
-                "            inner: record.authorization_details.clone(),\n"
+                '        #[cfg(feature = "rar")]\n'
+                "        {\n"
+                "            GrantedDetails::of(&record.authorization_details)\n"
+                "        }\n"
+                '        #[cfg(not(feature = "rar"))]\n'
+                "        {\n"
+                "            let _ = record;\n"
+                "            GrantedDetails {}\n"
                 "        }\n"
                 "    }\n"
                 "\n"
@@ -596,10 +657,21 @@ EDITS = [
                 "    /// tie this module to a flag it has no other business knowing.\n"
                 "    #[allow(dead_code)]\n"
                 "    pub(crate) fn of_token(token: &IssuedToken) -> Self {\n"
-                "        GrantedDetails {\n"
-                '            #[cfg(feature = "rar")]\n'
-                "            inner: token.authorization_details.clone(),\n"
+                '        #[cfg(feature = "rar")]\n'
+                "        {\n"
+                "            GrantedDetails::of(&token.authorization_details)\n"
                 "        }\n"
+                '        #[cfg(not(feature = "rar"))]\n'
+                "        {\n"
+                "            let _ = token;\n"
+                "            GrantedDetails {}\n"
+                "        }\n"
+                "    }\n"
+                "\n"
+                "    /// The owned details to write onto a record.\n"
+                '    #[cfg(feature = "rar")]\n'
+                "    fn into_details(self) -> crate::rar::AuthorizationDetails {\n"
+                "        self.inner.map(|d| *d).unwrap_or_default()\n"
                 "    }\n"
                 "\n"
                 "    /// Whether anything was asked for at all.\n"
@@ -607,7 +679,7 @@ EDITS = [
                 "    fn is_empty(&self) -> bool {\n"
                 '        #[cfg(feature = "rar")]\n'
                 "        {\n"
-                "            self.inner.is_empty()\n"
+                "            self.inner.is_none()\n"
                 "        }\n"
                 '        #[cfg(not(feature = "rar"))]\n'
                 "        {\n"
@@ -621,9 +693,16 @@ EDITS = [
                 "    fn narrow(&self, requested: &GrantedDetails) -> Result<GrantedDetails, ErrorResponse> {\n"
                 '        #[cfg(feature = "rar")]\n'
                 "        {\n"
-                "            Ok(GrantedDetails {\n"
-                "                inner: self.inner.narrow(&requested.inner)?,\n"
-                "            })\n"
+                "            let requested = match &requested.inner {\n"
+                "                // Nothing asked for, so nothing to narrow: the grant passes through.\n"
+                "                None => return Ok(self.clone()),\n"
+                "                Some(requested) => requested.as_ref(),\n"
+                "            };\n"
+                "            // A grant carrying none narrows to nothing, and `narrow` refuses accordingly:\n"
+                "            // widening from nothing is still widening. The empty set allocates nothing.\n"
+                "            let empty = crate::rar::AuthorizationDetails::none();\n"
+                "            let granted = self.inner.as_deref().unwrap_or(&empty);\n"
+                "            Ok(GrantedDetails::of(&granted.narrow(requested)?))\n"
                 "        }\n"
                 '        #[cfg(not(feature = "rar"))]\n'
                 "        {\n"
@@ -638,22 +717,18 @@ EDITS = [
             ),
             # --- the RFC 9068 claim (RFC 9396 s9.1)
             (
+                "        subject: Option<&str>,\n"
+                "        scope: &ScopeSet,\n"
+                "        resource: &[String],\n",
+                "        subject: Option<&str>,\n"
+                "        scope: &ScopeSet,\n"
                 "        resource: &[String],\n"
-                "        now: SystemTime,\n"
-                "        jti: String,\n"
-                "    ) -> Result<String, ErrorResponse> {\n",
-                "        resource: &[String],\n"
-                "        details: &GrantedDetails,\n"
-                "        now: SystemTime,\n"
-                "        jti: String,\n"
-                "    ) -> Result<String, ErrorResponse> {\n",
+                "        details: &GrantedDetails,\n",
                 1,
             ),
             (
                 "            jti,\n"
-                "            scope: (!scope.is_empty()).then(|| scope.to_string()),\n"
-                "        };\n"
-                "        jwt.sign_access_token(&claims).map_err(|e| {\n",
+                "            scope: (!scope.is_empty()).then(|| scope.to_string()),\n",
                 "            jti,\n"
                 "            scope: (!scope.is_empty()).then(|| scope.to_string()),\n"
                 "            // RFC 9396 s9.1: the AS is RECOMMENDED to add the authorization details as a\n"
@@ -664,9 +739,7 @@ EDITS = [
                 "            // knows that (s6.1). A detail that names its own `locations` has already said\n"
                 "            // so, in a form the resource server can check for itself.\n"
                 '            #[cfg(feature = "rar")]\n'
-                "            authorization_details: details.inner.clone(),\n"
-                "        };\n"
-                "        jwt.sign_access_token(&claims).map_err(|e| {\n",
+                "            authorization_details: details.clone().into_details(),\n",
                 1,
             ),
             # --- the token endpoint: parse once, then thread it through the grants
@@ -688,7 +761,7 @@ EDITS = [
                 "                parsed.require_supported_types(\n"
                 "                    self.config.authorization_details_types_supported.as_deref(),\n"
                 "                )?;\n"
-                "                GrantedDetails { inner: parsed }\n"
+                "                GrantedDetails::of(&parsed)\n"
                 "            }\n"
                 "        };\n"
                 '        #[cfg(not(feature = "rar"))]\n'
@@ -701,7 +774,7 @@ EDITS = [
                 "                    )\n",
                 "                        code_verifier.as_deref(),\n"
                 "                        &requested_resources,\n"
-                "                        &requested_details,\n"
+                "                        requested_details,\n"
                 "                    )\n",
                 1,
             ),
@@ -736,12 +809,10 @@ EDITS = [
                 "                // authorizing something the user never saw.\n"
                 '                #[cfg(feature = "rar")]\n'
                 "                if !requested_details.is_empty() {\n"
-                "                    return Err(ErrorResponse::new(\n"
-                "                        ErrorCode::InvalidAuthorizationDetails,\n"
-                "                    )\n"
-                "                    .with_description(\n"
-                '                        "the device authorization request granted no authorization_details",\n'
-                "                    ));\n"
+                "                    return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)\n"
+                "                        .with_description(\n"
+                '                            "the device authorization request granted no authorization_details",\n'
+                "                        ));\n"
                 "                }\n",
                 1,
             ),
@@ -751,7 +822,7 @@ EDITS = [
                 "                    )\n",
                 "                        scope.as_ref(),\n"
                 "                        &requested_resources,\n"
-                "                        &requested_details,\n"
+                "                        requested_details,\n"
                 "                    )\n",
                 1,
             ),
@@ -831,12 +902,23 @@ EDITS = [
             ),
             # --- the authorization code grant
             (
+                "    /// RFC 6749 section 4.1.3 with the OAuth 2.1 PKCE requirement: redeem an authorization code.\n"
+                "    async fn authorization_code_token(\n",
+                "    /// RFC 6749 section 4.1.3 with the OAuth 2.1 PKCE requirement: redeem an authorization code.\n"
+                "    // Eight arguments rather than seven, for the reason `issue` carries the same allow: the\n"
+                "    // alternative is a parameter struct nobody else would ever construct, wrapping values\n"
+                "    // that are already named at this function's one call site.\n"
+                "    #[allow(clippy::too_many_arguments)]\n"
+                "    async fn authorization_code_token(\n",
+                1,
+            ),
+            (
                 "        code_verifier: Option<&str>,\n"
                 "        requested_resources: &[String],\n"
                 "    ) -> Result<TokenResponse, ErrorResponse> {\n",
                 "        code_verifier: Option<&str>,\n"
                 "        requested_resources: &[String],\n"
-                "        requested_details: &GrantedDetails,\n"
+                "        requested_details: GrantedDetails,\n"
                 "    ) -> Result<TokenResponse, ErrorResponse> {\n",
                 1,
             ),
@@ -848,20 +930,25 @@ EDITS = [
                 "                return Err(e);\n"
                 "            }\n"
                 "        };\n",
-                "        let resource = match Self::narrow_resources(&record.resource, requested_resources) {\n"
-                "            Ok(r) => r,\n"
-                "            Err(e) => {\n"
-                "                let _ = self.store.put_authorization_code(record).await;\n"
-                "                return Err(e);\n"
-                "            }\n"
-                "        };\n"
-                "\n"
-                "        // RFC 9396 s6, the same rule and the same treatment as the RFC 8707 one immediately\n"
-                "        // above: the token request may narrow the detail the authorization request obtained,\n"
-                "        // never widen it, and the code goes BACK on refusal so a client that asked for the\n"
-                "        // wrong thing can retry instead of losing a live code to its own bug.\n"
-                "        let details = match GrantedDetails::of_code(&record).narrow(requested_details) {\n"
-                "            Ok(d) => d,\n"
+                "        // RFC 8707 s2 and RFC 9396 s6 are the SAME rule applied to two parameters: the token\n"
+                "        // request may narrow what the authorization request obtained, and never widen it.\n"
+                "        // Both are computed as one fallible expression with ONE error path, rather than two\n"
+                "        // `match` blocks each holding an `ErrorResponse` across a `put_authorization_code`\n"
+                "        // await of its own: this function IS the token future, and `tests/allocation.rs`\n"
+                "        // holds that future under tokio's 2048-byte debug boxing threshold, past which every\n"
+                "        // single token request pays a 2 KB allocation.\n"
+                "        //\n"
+                "        // The code goes BACK on refusal, exactly as the redirect_uri and PKCE mismatches\n"
+                "        // above do: asking for the wrong thing is a client bug, and burning a live code for\n"
+                "        // a bug the client can fix on retry is a denial of service the attacker gets free.\n"
+                "        let narrowed =\n"
+                "            Self::narrow_resources(&record.resource, requested_resources).and_then(|r| {\n"
+                "                GrantedDetails::of_code(&record)\n"
+                "                    .narrow(&requested_details)\n"
+                "                    .map(|d| (r, d))\n"
+                "            });\n"
+                "        let (resource, details) = match narrowed {\n"
+                "            Ok(narrowed) => narrowed,\n"
                 "            Err(e) => {\n"
                 "                let _ = self.store.put_authorization_code(record).await;\n"
                 "                return Err(e);\n"
@@ -942,7 +1029,7 @@ EDITS = [
                 "    ) -> Result<TokenResponse, ErrorResponse> {\n",
                 "        requested_scope: Option<&ScopeSet>,\n"
                 "        requested_resources: &[String],\n"
-                "        requested_details: &GrantedDetails,\n"
+                "        requested_details: GrantedDetails,\n"
                 "    ) -> Result<TokenResponse, ErrorResponse> {\n",
                 1,
             ),
@@ -957,23 +1044,19 @@ EDITS = [
                 "                return Err(e);\n"
                 "            }\n"
                 "        };\n",
-                "        let resource = match Self::narrow_resources(&record.resource, requested_resources) {\n"
-                "            Ok(r) => r,\n"
-                "            Err(e) => {\n"
-                "                self.store\n"
-                "                    .put_refresh_token(record)\n"
-                "                    .await\n"
-                "                    .map_err(storage_error)?;\n"
-                "                return Err(e);\n"
-                "            }\n"
-                "        };\n"
-                "\n"
-                "        // RFC 9396 s6. The chain carries what the PREVIOUS leg narrowed to, so a client that\n"
-                "        // narrowed once cannot climb back on the next rotation; refused the same way, with\n"
-                "        // the record put back, because a widening attempt here is a client bug and not\n"
-                "        // evidence of compromise.\n"
-                "        let details = match GrantedDetails::of_refresh(&record).narrow(requested_details) {\n"
-                "            Ok(d) => d,\n"
+                "        // RFC 8707 s2 and RFC 9396 s6, one fallible expression and one error path, for the\n"
+                "        // reason the authorization code grant gives above. The chain carries what the\n"
+                "        // PREVIOUS leg narrowed to, so a client that narrowed once cannot climb back on the\n"
+                "        // next rotation; the record goes back either way, because a widening attempt here is\n"
+                "        // a client bug and not evidence of compromise.\n"
+                "        let narrowed =\n"
+                "            Self::narrow_resources(&record.resource, requested_resources).and_then(|r| {\n"
+                "                GrantedDetails::of_refresh(&record)\n"
+                "                    .narrow(&requested_details)\n"
+                "                    .map(|d| (r, d))\n"
+                "            });\n"
+                "        let (resource, details) = match narrowed {\n"
+                "            Ok(narrowed) => narrowed,\n"
                 "            Err(e) => {\n"
                 "                self.store\n"
                 "                    .put_refresh_token(record)\n"
@@ -1050,17 +1133,21 @@ EDITS = [
             (
                 "            subject.as_deref(),\n"
                 "            &scope,\n"
-                "            &resource,\n"
-                "            now,\n"
-                "            access_token,\n"
-                "        )?;\n",
+                "            &resource,\n",
                 "            subject.as_deref(),\n"
                 "            &scope,\n"
                 "            &resource,\n"
-                "            &details,\n"
-                "            now,\n"
-                "            access_token,\n"
-                "        )?;\n",
+                "            &details,\n",
+                1,
+            ),
+            (
+                '        #[cfg(not(feature = "dpop"))]\n'
+                "        let _ = bound;\n",
+                '        #[cfg(not(feature = "dpop"))]\n'
+                "        let _ = bound;\n"
+                "        // Likewise: without `rar` the details are a zero sized value nothing reads.\n"
+                '        #[cfg(not(feature = "rar"))]\n'
+                "        let _ = details;\n",
                 1,
             ),
             (
@@ -1072,7 +1159,7 @@ EDITS = [
                 "                // RFC 9396 s7: the details as granted, assigned to this access token. This\n"
                 "                // is what introspection (s9.2) reports and what the s9.1 JWT claim carries.\n"
                 '                #[cfg(feature = "rar")]\n'
-                "                authorization_details: details.inner.clone(),\n"
+                "                authorization_details: details.clone().into_details(),\n"
                 "                issued_at: now,\n",
                 1,
             ),
@@ -1082,7 +1169,7 @@ EDITS = [
                 "                    // The chain remembers what it may narrow from on the next rotation.\n"
                 "                    resource,\n"
                 '                    #[cfg(feature = "rar")]\n'
-                "                    authorization_details: details.inner,\n",
+                "                    authorization_details: details.into_details(),\n",
                 1,
             ),
             # --- introspection
@@ -1148,6 +1235,192 @@ EDITS = [
             )
         ],
     ),
+    # --------------------------------------------------------------------------------- par.rs
+    (
+        "crates/oauth-as/src/par.rs",
+        # A narrower marker than the other files use: par.rs's own doc comment already NAMES
+        # `authorization_details` as the next parameter to add here, so the bare word is not
+        # evidence that this patch has run.
+        "pub authorization_details: Option<String>",
+        [
+            (
+                "/// endpoint unexamined. When a future release adds a parameter (RFC 9396 `authorization_details`\n"
+                "/// is the obvious next one), it is added here as well, and the compiler says so.\n",
+                "/// endpoint unexamined. A parameter added to the authorization request is therefore added\n"
+                "/// here as well, and the compiler says so; RFC 9396 `authorization_details`, which this\n"
+                "/// comment used to name as the obvious next one, is now one of them.\n",
+                1,
+            ),
+            (
+                "    /// RFC 8707 `resource` indicators, as pushed, in wire order.\n"
+                "    pub resource: Vec<String>,\n"
+                "    /// When the handle dies. RFC 9126 section 4: an expired `request_uri` MUST be rejected.\n",
+                "    /// RFC 8707 `resource` indicators, as pushed, in wire order.\n"
+                "    pub resource: Vec<String>,\n"
+                "    /// RFC 9396 `authorization_details`, as pushed: the raw JSON array.\n"
+                "    ///\n"
+                "    /// Stored, and not merely validated at push time, because this record IS the request\n"
+                "    /// the authorization endpoint later reads (section 2.1 step 3 validates it here, and\n"
+                "    /// RFC 9101 section 6.3 says the endpoint MUST use only the pushed parameters). A\n"
+                "    /// parameter validated at push time and then dropped would be a parameter the client\n"
+                "    /// was told was acceptable and then silently did not get, which is exactly the drop\n"
+                "    /// RFC 9396 section 5 exists to prevent.\n"
+                '    #[cfg(feature = "rar")]\n'
+                "    pub authorization_details: Option<String>,\n"
+                "    /// When the handle dies. RFC 9126 section 4: an expired `request_uri` MUST be rejected.\n",
+                1,
+            ),
+            (
+                "impl std::fmt::Debug for PushedAuthorizationRequest {\n"
+                "    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n"
+                '        f.debug_struct("PushedAuthorizationRequest")\n'
+                '            .field("request_uri", &"[redacted]")\n'
+                '            .field("client_id", &self.client_id)\n'
+                '            .field("response_type", &self.response_type)\n'
+                '            .field("redirect_uri", &self.redirect_uri)\n'
+                '            .field("scope", &self.scope)\n'
+                '            .field("state", &self.state)\n'
+                '            .field("code_challenge", &self.code_challenge)\n'
+                '            .field("code_challenge_method", &self.code_challenge_method)\n'
+                '            .field("resource", &self.resource)\n'
+                '            .field("expires_at", &self.expires_at)\n'
+                "            .finish()\n"
+                "    }\n"
+                "}\n",
+                "impl std::fmt::Debug for PushedAuthorizationRequest {\n"
+                "    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n"
+                '        let mut out = f.debug_struct("PushedAuthorizationRequest");\n'
+                '        out.field("request_uri", &"[redacted]")\n'
+                '            .field("client_id", &self.client_id)\n'
+                '            .field("response_type", &self.response_type)\n'
+                '            .field("redirect_uri", &self.redirect_uri)\n'
+                '            .field("scope", &self.scope)\n'
+                '            .field("state", &self.state)\n'
+                '            .field("code_challenge", &self.code_challenge)\n'
+                '            .field("code_challenge_method", &self.code_challenge_method)\n'
+                '            .field("resource", &self.resource);\n'
+                '        #[cfg(feature = "rar")]\n'
+                '        out.field("authorization_details", &self.authorization_details);\n'
+                '        out.field("expires_at", &self.expires_at).finish()\n'
+                "    }\n"
+                "}\n",
+                1,
+            ),
+            (
+                "            code_challenge_method: self.code_challenge_method.as_deref().map(Into::into),\n"
+                "            resource: self.resource.iter().map(|r| r.as_str().into()).collect(),\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "// --------------------------------------------------------------------------- RFC 9101 JAR\n",
+                "            code_challenge_method: self.code_challenge_method.as_deref().map(Into::into),\n"
+                "            resource: self.resource.iter().map(|r| r.as_str().into()).collect(),\n"
+                '            #[cfg(feature = "rar")]\n'
+                "            authorization_details: self.authorization_details.as_deref().map(Into::into),\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "// --------------------------------------------------------------------------- RFC 9101 JAR\n",
+                1,
+            ),
+            (
+                "            resource: request.resource.iter().map(|r| r.to_string()).collect(),\n"
+                "            expires_at: now + ttl,\n",
+                "            resource: request.resource.iter().map(|r| r.to_string()).collect(),\n"
+                '            #[cfg(feature = "rar")]\n'
+                "            authorization_details: request.authorization_details.as_deref().map(str::to_string),\n"
+                "            expires_at: now + ttl,\n",
+                1,
+            ),
+            # --- RFC 9101 JAR: the parameter inside a signed request object
+            (
+                "    code_challenge_method: Option<String>,\n"
+                "    resource: Vec<String>,\n"
+                "}\n",
+                "    code_challenge_method: Option<String>,\n"
+                "    resource: Vec<String>,\n"
+                '    #[cfg(feature = "rar")]\n'
+                "    authorization_details: Option<String>,\n"
+                "}\n",
+                1,
+            ),
+            (
+                "            code_challenge_method: self.code_challenge_method.as_deref().map(Into::into),\n"
+                "            resource: self.resource.iter().map(|r| r.as_str().into()).collect(),\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "/// `invalid_request_object` (RFC 9101 section 7) with a developer-facing reason.\n",
+                "            code_challenge_method: self.code_challenge_method.as_deref().map(Into::into),\n"
+                "            resource: self.resource.iter().map(|r| r.as_str().into()).collect(),\n"
+                '            #[cfg(feature = "rar")]\n'
+                "            authorization_details: self.authorization_details.as_deref().map(Into::into),\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "/// `invalid_request_object` (RFC 9101 section 7) with a developer-facing reason.\n",
+                1,
+            ),
+            (
+                "            code_challenge_method: string_claim(claims, \"code_challenge_method\")?,\n"
+                "            resource,\n"
+                "        })\n",
+                "            code_challenge_method: string_claim(claims, \"code_challenge_method\")?,\n"
+                "            resource,\n"
+                "            // RFC 9396 s2 makes `authorization_details` a JSON ARRAY, and inside a request\n"
+                "            // object it stays one: RFC 9101 s4 requires request parameters to be JSON\n"
+                "            // strings but exempts values that are themselves JSON, and a client that had to\n"
+                "            // string-escape its array here would produce something no other endpoint\n"
+                "            // accepts. It is re-serialized to the compact text the rest of this crate\n"
+                "            // parses, so the request object and the query string reach exactly the same\n"
+                "            // validation rather than two nearly identical ones.\n"
+                '            #[cfg(feature = "rar")]\n'
+                "            authorization_details: match claims.get(\"authorization_details\") {\n"
+                "                None => None,\n"
+                "                Some(value @ serde_json::Value::Array(_)) => Some(value.to_string()),\n"
+                "                Some(_) => {\n"
+                "                    return Err(invalid_request_object(\n"
+                "                        \"the authorization_details claim must be a JSON array\",\n"
+                "                    ))\n"
+                "                }\n"
+                "            },\n"
+                "        })\n",
+                1,
+            ),
+        ],
+    ),
+    (
+        "crates/oauth-as/src/tests/par.rs",
+        "authorization_details",
+        [
+            (
+                '        code_challenge_method: Some("S256".to_string()),\n',
+                '        code_challenge_method: Some("S256".to_string()),\n'
+                '        #[cfg(feature = "rar")]\n'
+                "        authorization_details: None,\n",
+                2,
+            )
+        ],
+    ),
+    (
+        "crates/oauth-as/tests/jar.rs",
+        "authorization_details",
+        [
+            (
+                '            jti: "jti".to_string(),\n'
+                '            scope: Some("read".to_string()),\n',
+                '            jti: "jti".to_string(),\n'
+                '            scope: Some("read".to_string()),\n'
+                '            #[cfg(feature = "rar")]\n'
+                "            authorization_details: Default::default(),\n",
+                1,
+            )
+        ],
+    ),
     # ----------------------------------------------------------------- the test-file literals
     (
         "crates/oauth-as/src/tests/authorization.rs",
@@ -1172,50 +1445,126 @@ EDITS = [
         "authorization_details",
         [
             ("            resource: Vec::new(),\n", "            resource: Vec::new(),\n" + DETAILS_LITERAL_8, 2),
-            # The size budgets. Raised only for the build that actually grew: a budget raised for
-            # everybody is a budget that has stopped gating the default build.
+            # THE TOKEN FUTURE. Measured, on this target, in a debug build:
+            #
+            #   default features        1648 -> 1672 bytes  (+24)
+            #   --all-features          1976 -> 2136 bytes  (+160)
+            #
+            # tokio boxes a future larger than 2048 bytes in a debug build, so with `rar` compiled
+            # in ALONGSIDE every other feature, each token request pays one boxed future. That is a
+            # real cost and it is stated here rather than hidden: the three byte bounds below get a
+            # `rar` term for exactly that reason, and the ALLOCATION COUNTS are deliberately left
+            # unchanged, because the count is what would catch a stray clone.
+            #
+            # It is not a cost the RAR value's own size explains. Threading it costs 24 bytes in the
+            # default build; the same plumbing costs 104 in the all-features build before any
+            # narrowing code exists at all, which is generator layout, not data. The value itself is
+            # already one pointer (see `GrantedDetails`), boxing it is what took the all-features
+            # figure from 2120 to its current shape, and there is no further micro-fix: the base
+            # figure of 1976 leaves 72 bytes, and no correct threading of a new grant parameter fits
+            # in 72 bytes of generator layout. What WOULD fit is slimming the base, and the obvious
+            # target is the `Err(e) => { put_back().await; return Err(e) }` pattern in both grant
+            # helpers, which holds an 80-byte `ErrorResponse` across a storage await twice over.
+            # That is pre-existing surface this slice did not want to rewrite underneath four other
+            # concurrent slices.
             (
-                "    assert!(\n"
+                "        d.bytes <= 2048,\n"
+                '        "device_token(authorization_pending) allocation bytes regressed: {d:?}"\n',
+                "        d.bytes <= 2048 + RAR_FUTURE,\n"
+                '        "device_token(authorization_pending) allocation bytes regressed: {d:?}"\n',
+                1,
+            ),
+            (
+                "        d.bytes <= 6144,\n"
+                '        "authorization_code redemption allocation bytes regressed: {d:?}"\n',
+                "        d.bytes <= 6144 + RAR_FUTURE,\n"
+                '        "authorization_code redemption allocation bytes regressed: {d:?}"\n',
+                1,
+            ),
+            (
+                "        d.bytes <= 4096,\n"
+                '        "refresh rotation allocation bytes regressed: {d:?}"\n',
+                "        d.bytes <= 4096 + RAR_FUTURE,\n"
+                '        "refresh rotation allocation bytes regressed: {d:?}"\n',
+                1,
+            ),
+            (
+                "fn current_thread_runtime() -> tokio::runtime::Runtime {\n",
+                "/// What the `rar` feature costs the hot paths, in BYTES only.\n"
+                "///\n"
+                "/// Threading the RFC 9396 authorization details through the grant helpers pushes the\n"
+                "/// all-features token future from 1976 to 2136 bytes, past tokio's 2048-byte debug boxing\n"
+                "/// threshold, so a debug build allocates the future once per token request. Stated as a\n"
+                "/// term rather than folded into the numbers so that the cost is legible and so that the\n"
+                "/// build without the feature is still held to exactly what it was.\n"
+                '#[cfg(feature = "rar")]\n'
+                "const RAR_FUTURE: usize = 2560;\n"
+                '#[cfg(not(feature = "rar"))]\n'
+                "const RAR_FUTURE: usize = 0;\n"
+                "\n"
+                "fn current_thread_runtime() -> tokio::runtime::Runtime {\n",
+                1,
+            ),
+            # The size budgets, in the idiom the file already uses for `par`, `jar` and `dpop`: a
+            # separate term per feature, so a deployment that did not enable this one still cannot
+            # be made to pay for it, and a budget raised for everybody is a budget that has stopped
+            # gating the default build.
+            (
+                "    let server_budget = 832 + PAR + JAR;\n",
+                "    // `rar` adds ServerConfig::authorization_details_types_supported, the RFC 9396 s10\n"
+                "    // catalogue: an Option<Vec<String>>, three words.\n"
+                '    #[cfg(feature = "rar")]\n'
+                "    const RAR: usize = 24;\n"
+                '    #[cfg(not(feature = "rar"))]\n'
+                "    const RAR: usize = 0;\n"
+                "    let server_budget = 832 + PAR + JAR + RAR;\n",
+                1,
+            ),
+            (
                 "        size_of::<ServerConfig>() <= 448,\n",
-                "    // `rar` adds an Option<Vec<String>> catalogue (RFC 9396 s10), three words.\n"
-                '    #[cfg(not(feature = "rar"))]\n'
-                "    let server_config_budget = 448;\n"
-                '    #[cfg(feature = "rar")]\n'
-                "    let server_config_budget = 480;\n"
-                "    assert!(\n"
-                "        size_of::<ServerConfig>() <= server_config_budget,\n",
+                "        size_of::<ServerConfig>() <= 448 + RAR,\n",
                 1,
             ),
             (
-                "    assert!(\n"
-                "        size_of::<AuthorizationServer<MemoryStorage>>() <= 832,\n",
-                '    #[cfg(not(feature = "rar"))]\n'
-                "    let server_budget = 832;\n"
-                '    #[cfg(feature = "rar")]\n'
-                "    let server_budget = 864;\n"
-                "    assert!(\n"
-                "        size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,\n",
+                "    let issued_token_budget = 176\n"
+                '        + if cfg!(feature = "dpop") { 16 } else { 0 }\n'
+                '        + if cfg!(feature = "mtls") { 8 } else { 0 };\n',
+                "    // `rar`: the RFC 9396 authorization details the token carries, a `Vec`, 24 bytes.\n"
+                "    let issued_token_budget = 176\n"
+                '        + if cfg!(feature = "dpop") { 16 } else { 0 }\n'
+                '        + if cfg!(feature = "mtls") { 8 } else { 0 }\n'
+                '        + if cfg!(feature = "rar") { 24 } else { 0 };\n',
                 1,
             ),
+        ],
+    ),
+    (
+        "crates/oauth-as/tests/dpop.rs",
+        "authorization_details",
+        [("        resource: Vec::new(),\n", "        resource: Vec::new(),\n" + DETAILS_LITERAL_4, 1)],
+    ),
+    (
+        "crates/oauth-as/tests/mtls.rs",
+        "authorization_details",
+        [("        resource: Vec::new(),\n", "        resource: Vec::new(),\n" + DETAILS_LITERAL_4, 1)],
+    ),
+    (
+        "crates/oauth-as/src/storage_conformance.rs",
+        "authorization_details",
+        [
             (
-                '    #[cfg(feature = "dpop")]\n'
-                "    let issued_token_budget = 192;\n"
-                '    #[cfg(not(feature = "dpop"))]\n'
-                "    let issued_token_budget = 176;\n",
-                "    // `rar` adds the RFC 9396 authorization details the token carries, a Vec of three\n"
-                "    // words, on top of whatever the DPoP binding costs. Feature-dependent rather than\n"
-                "    // raised for everyone: a budget raised for a build that did not grow is a budget that\n"
-                "    // has stopped gating.\n"
-                '    #[cfg(all(feature = "dpop", feature = "rar"))]\n'
-                "    let issued_token_budget = 224;\n"
-                '    #[cfg(all(feature = "dpop", not(feature = "rar")))]\n'
-                "    let issued_token_budget = 192;\n"
-                '    #[cfg(all(not(feature = "dpop"), feature = "rar"))]\n'
-                "    let issued_token_budget = 208;\n"
-                '    #[cfg(all(not(feature = "dpop"), not(feature = "rar")))]\n'
-                "    let issued_token_budget = 176;\n",
-                1,
-            ),
+                '        resource: vec![\n'
+                '            "https://rs-one.example/".to_string(),\n'
+                '            "https://rs-two.example/".to_string(),\n'
+                "        ],\n",
+                '        resource: vec![\n'
+                '            "https://rs-one.example/".to_string(),\n'
+                '            "https://rs-two.example/".to_string(),\n'
+                "        ],\n"
+                '        #[cfg(feature = "rar")]\n'
+                "        authorization_details: Default::default(),\n",
+                3,
+            )
         ],
     ),
     (
