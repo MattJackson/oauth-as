@@ -1,1 +1,8 @@
 target
+
+# cargo-mutants writes its report tree here. It is build output: large, machine
+# specific, and regenerated on every run.
+mutants.out
+
+# Agent worktrees used for isolated parallel work.
+.claude/worktrees
