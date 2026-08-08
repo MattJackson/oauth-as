@@ -376,7 +376,15 @@ pub enum AccessTokenFormat {
     Opaque,
     /// RFC 9068 `at+jwt` access tokens, signed with ES256. The record is still persisted, so
     /// introspection and revocation continue to work on the exact string the client presents.
-    Jwt(JwtConfig),
+    ///
+    /// BOXED deliberately. [`JwtConfig`] carries a signing key, an audience and a `jwks_uri`, and
+    /// inlining that here put all of it in every [`crate::server::ServerConfig`], which grew
+    /// `AuthorizationServer` from 656 to 856 bytes and tripped the size gate in
+    /// `tests/allocation.rs`. The box costs ONE allocation per server at construction, never per
+    /// request, and keeps the struct the same size for the opaque-token majority who pay for a
+    /// feature they did not enable otherwise. The gate caught this; raising the budget instead
+    /// would have made the gate meaningless.
+    Jwt(Box<JwtConfig>),
 }
 
 /// Seconds since the Unix epoch, the only representation RFC 7519 section 2 `NumericDate` allows

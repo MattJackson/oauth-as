@@ -83,7 +83,7 @@ async fn jwt_server(
     key: EcdsaP256Key,
 ) -> AuthorizationServer<MemoryStorage, ManualClock> {
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
-    cfg.access_token_format = AccessTokenFormat::Jwt(jwt_config(key));
+    cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(jwt_config(key)));
     let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock);
     srv.register_client(device_client()).await.unwrap();
     srv

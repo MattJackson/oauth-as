@@ -318,13 +318,13 @@ fn a_router_refuses_to_publish_a_path_it_would_shadow() {
 #[test]
 fn a_jwks_uri_off_the_issuer_refuses_to_build() {
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
-    config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(
+    config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(Box::new(
         crate::jwt::JwtConfig::new(
             crate::jwt::EcdsaP256Key::generate("k1"),
             "https://rs.example",
         )
         .with_jwks_uri("https://keys.example/jwks"),
-    );
+    ));
     let server = Arc::new(AuthorizationServer::new(
         config,
         crate::store::MemoryStorage::new(),
@@ -343,13 +343,13 @@ fn a_jwks_uri_off_the_issuer_refuses_to_build() {
 #[test]
 fn a_jwks_uri_colliding_with_another_endpoint_refuses_to_build() {
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
-    config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(
+    config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(Box::new(
         crate::jwt::JwtConfig::new(
             crate::jwt::EcdsaP256Key::generate("k1"),
             "https://rs.example",
         )
         .with_jwks_uri("https://as.example/token"),
-    );
+    ));
     let server = Arc::new(AuthorizationServer::new(
         config,
         crate::store::MemoryStorage::new(),

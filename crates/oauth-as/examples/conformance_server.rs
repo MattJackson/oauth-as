@@ -122,8 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // an endpoint nothing answers.
         let key = EcdsaP256Key::from_scalar_bytes(SEEDED_KID, &SEEDED_SIGNING_SCALAR)?;
         let jwks_uri = format!("{}/jwks", issuer.trim_end_matches('/'));
-        config.access_token_format =
-            AccessTokenFormat::Jwt(JwtConfig::new(key, SEEDED_AUDIENCE).with_jwks_uri(jwks_uri));
+        config.access_token_format = AccessTokenFormat::Jwt(Box::new(
+            JwtConfig::new(key, SEEDED_AUDIENCE).with_jwks_uri(jwks_uri),
+        ));
     }
 
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
