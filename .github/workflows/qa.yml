@@ -145,11 +145,16 @@ jobs:
       # compiles the library and its RUNTIME dependencies. They never compile our dev-dependencies,
       # because dev-dependencies are not part of the dependency graph of anyone who depends on us.
       #
-      # Ours (jsonschema, url, oauth2) legitimately require far newer toolchains: jsonschema-regex
-      # and idna_adapter are on edition 2024, which cargo 1.75 cannot even parse. Running the test
-      # suite here would therefore measure OUR tooling choices, not the consumer's constraint, and
-      # would push the declared floor up for a reason no consumer ever experiences. Chasing pins to
-      # drag every dev-dependency back to 1.75 would trade real test quality for a number.
+      # Ours (oauth2, url) legitimately require far newer toolchains. RE-MEASURED after the
+      # `jsonschema` dev-dependency was dropped, because that crate (rust-version 1.85) used to be
+      # the loudest blocker and it is worth knowing whether removing it freed this job to test as
+      # well as build. It did not: `cargo +1.75 test -p oauth-as --locked --no-run` now fails on
+      # `litemap v0.7.5 ... requires rustc 1.81 or newer`, reached through
+      # url -> idna -> idna_adapter -> icu_normalizer -> icu_properties -> icu_locid, and both
+      # `url` and `oauth2` need it. Running the test suite here would therefore still measure OUR
+      # tooling choices, not the consumer's constraint, and would push the declared floor up for a
+      # reason no consumer ever experiences. Chasing pins to drag every dev-dependency back to 1.75
+      # would trade real test quality for a number.
       #
       # So the floor is verified the way a consumer meets it: the library compiles. Behaviour is
       # verified by the full test suite on stable, in the fmt/clippy/test job above.

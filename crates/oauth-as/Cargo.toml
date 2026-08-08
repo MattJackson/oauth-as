@@ -36,6 +36,13 @@ http = ["dep:axum", "dep:tokio"]
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
 # servers are separate processes that should not have to call introspection on every request.
 jwt = ["dep:p256"]
+# RFC 8705 mutual-TLS client authentication and certificate-bound access tokens.
+# OFF by default, and it adds NO dependency: TLS termination is the host's job in this
+# crate (it never sees a socket), so the host hands in a certificate it has already
+# verified and parsed, and the only arithmetic RFC 8705 defines on it is the section 3.1
+# SHA-256 thumbprint. `sha2` and `base64` are already here for RFC 7636 PKCE. An X.509
+# parser would add attack surface to recompute what the host must already know.
+mtls = []
 # RFC 9126 pushed authorization requests: the client POSTs the authorization request to a
 # back-channel endpoint and gets a single-use `request_uri` handle, so the parameters (the PKCE
 # challenge above all) never traverse the browser. Adds no dependency: it is storage plus the
@@ -71,6 +78,21 @@ resource-metadata = []
 # OFF by default because it is a grant that mints a token from a token, and a deployment
 # that has not decided its delegation policy should not have the endpoint compiled in.
 token-exchange = []
+# A RUNNABLE conformance harness for the `Storage` contract, for a HOST to call from its
+# own test suite against its own implementation (crates/oauth-as/src/storage_conformance.rs).
+#
+# It is a cargo feature rather than a separate crate because it tests a trait whose
+# semantics live here, and because a host already depends on this crate. OFF by default and
+# it adds NO dependency: the concurrency primitives it needs are hand-written over std, so a
+# default build pays nothing for it, in code or in tree.
+#
+# WHY IT EXISTS AT ALL: `Storage::take_*` is documented as an ATOMIC remove-and-return, and
+# that clause is the only thing making single-use artifacts single use. A host that
+# implements it as read-then-delete compiles, type-checks, and passes a single-node test
+# suite, while a multi-node deployment silently double-spends refresh tokens and stops
+# detecting authorization code replay. Nothing inside this crate can see that, so the check
+# has to be runnable where the host's store is.
+test-util = []
 
 # DEPENDENCY POLICY: the runtime dependency set is deliberately tiny, and none of these
 # implies an async runtime, an HTTP stack, or a persistence layer; the HOST owns all three.
@@ -114,12 +136,23 @@ tokio = { version = "1", features = ["rt", "macros", "time"] }
 #     against this AS as a black box through its pluggable HTTP-client seam, so the CLIENT library
 #     (not our own assertions) decides whether our device-flow responses and error bodies are
 #     spec-legal. Pinned exactly: a silent client upgrade must never change what "conformant" means.
-#   - `jsonschema` validates every emitted body against schemas transcribed from RFC 6749 section 5
-#     and RFC 8628 sections 3.2 / 3.5 (tests/conformance_schema.rs).
+#   - tests/conformance_schema.rs validates every emitted body against the RFC 6749 section 5 and
+#     RFC 8628 section 3.2 / 3.5 clauses, transcribed as plain Rust.
+#
+# NO JSON SCHEMA VALIDATOR HERE, and that is deliberate. `jsonschema` used to hold that last job.
+# It is taken with default features (resolve-http, resolve-file, tls-aws-lc-rs) merely to check
+# in-memory serde_json::Values, so it pulled a SECOND reqwest alongside the harness's, plus hyper,
+# h2, rustls and the aws-lc-sys C/asm build, for a validator that never resolves a remote $ref and
+# never opens a socket. MEASURED: dropping it removed 88 packages from Cargo.lock and took
+# `cargo tree -e normal,dev -p oauth-as` from 407 lines to 157. It also declares
+# rust-version = 1.85, which was the loudest of the reasons the MSRV job could only BUILD rather
+# than TEST at this crate's 1.75 floor; it was not the only one, and that job's comment records
+# what still blocks it. Every clause it checked is now checked in Rust, with a red-proof per
+# clause; see that test's module docs for the one clause that was dropped (format: "uri", an
+# ANNOTATION in Draft 2020-12, which asserted nothing).
 # The INDEPENDENT harness (written without sight of this crate) lives in
 # crates/oauth-as-conformance in this repository.
 oauth2 = { version = "=5.0.0", default-features = false }
-jsonschema = "0.49"
 http = "1"
 url = "2"
 
