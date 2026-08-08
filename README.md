@@ -81,8 +81,20 @@ clean. Going lower would mean boxing every storage future, which is a heap
 allocation on every storage call, and that is a price every consumer would pay
 forever to support toolchains older than December 2023.
 
-Optional features may carry their own higher floors, since they pull in
-dependencies this crate does not control. Those are documented per feature.
+Optional features carry their own floors, because they pull in dependencies
+this crate does not control. Reported separately rather than averaged into one
+number, since a consumer who does not enable a feature should not be told they
+need a newer toolchain than they do:
+
+| Feature set        | Floor | Set by                        |
+| ------------------ | ----- | ----------------------------- |
+| default (no features) | 1.75 | this crate (RPITIT in `Storage`) |
+| `jwt`              | 1.75  | this crate; `p256` is happy there |
+| `http`             | 1.80  | `axum` 0.8 declares 1.80      |
+
+Each of those is built at exactly that toolchain in CI, with `--locked`. An
+MSRV that only holds when cargo is free to pick different dependency versions
+is not a floor anyone can rely on.
 
 ## Maturity: read this before depending on it
 

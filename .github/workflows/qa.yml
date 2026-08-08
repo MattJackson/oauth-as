@@ -117,11 +117,31 @@ jobs:
         run: cargo build -p oauth-as --locked
       - name: test on 1.75, default features
         run: cargo test -p oauth-as --locked
-      - name: build on 1.75, http feature
-        run: cargo build -p oauth-as --locked --features http
+      # The jwt feature holds the same floor: p256 and its tree build on 1.75.
       - name: build on 1.75, jwt feature
         run: cargo build -p oauth-as --locked --features jwt
-      - name: build on 1.75, all features
+
+  # The `http` feature has its OWN, HIGHER floor, and it is reported separately rather than
+  # averaged into one number. axum 0.8 declares rust-version 1.80, so no amount of care on our
+  # side gets the router onto 1.75. A consumer who wants only the protocol core is not made to
+  # pay for that, which is the whole point of the feature being optional.
+  #
+  # indexmap is pinned in Cargo.lock below the version that raised ITS floor to 1.85, so that this
+  # number is set by axum (a dependency we chose deliberately) rather than drifting upward with an
+  # incidental transitive crate nobody decided on.
+  msrv-http:
+    name: MSRV (1.80) http feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.80 toolchain
+        uses: dtolnay/rust-toolchain@1.80
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.80-http
+      - name: build on 1.80, http feature
+        run: cargo build -p oauth-as --locked --features http
+      - name: build on 1.80, all features
         run: cargo build -p oauth-as --locked --all-features
 
   # Hermetic half of the independent harness: RFC vectors and validator self-checks.
