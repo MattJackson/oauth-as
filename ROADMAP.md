@@ -132,54 +132,118 @@ are "a real deployment needs this and we make it impossible" gaps:
 
 ## Release plan
 
-### 0.2.0: close the operational gaps and the cheap wins
+The shape: **0.2.0 through 0.9.0 close the gap, one coherent slice per
+release, until this crate does everything third party tooling and third party
+clients expect of an OAuth 2.1 authorization server. Then we stop adding
+features, test hard, and cut 1.0.0 when it is genuinely solid.**
+
+Each release is a slice that stands on its own, so a consumer can adopt at any
+point and get something coherent rather than half of two things. Breaking
+changes to `Storage` and the public API are expected through the 0.x series
+and are exactly what the 0.x number is for; they stop at 1.0.
+
+### 0.2.0: operational seams, and the cheap security wins
 
 The theme is "things a real deployment needs that we currently make
-impossible", plus the two low cost specs with outsized security value.
+impossible". None of this is exotic; all of it is blocking.
 
-- Rate limiting seam
-- Audit and event hooks
-- RFC 9207 `iss` authorization response parameter
-- RFC 8707 resource indicators, wired into the RFC 9068 `aud` claim
-- RFC 7591 dynamic client registration
-- Client secret verifier seam, so hosts can store hashes
-- Multi tenant issuer paths (RFC 8414 s3.1 well known placement)
-- Key rotation lifecycle for the JWT feature
+- Rate limiting seam. RFC 8628 s5.1 makes user code entropy adequate only IN
+  COMBINATION WITH rate limiting, and today the host has nowhere to put it.
+- Audit and event hooks: issuance, refusal, suspected replay. A security
+  feature nobody can observe is a security feature nobody can trust.
+- RFC 9207 `iss` authorization response parameter (mix up defence).
+- RFC 8707 resource indicators, wired into the RFC 9068 `aud` claim.
+- Client secret verifier seam, so hosts can store a hash rather than a secret.
+- Multi tenant issuer paths (RFC 8414 s3.1 well known placement).
+- Key rotation lifecycle for the JWT feature: overlapping validity, published
+  next key, retirement.
 
-### 0.3.0: the enterprise authentication tier
+### 0.3.0: client lifecycle
 
-The theme is "deployments whose policy forbids shared secrets". Together these
-unlock FAPI 2.0 as an achievable target, which is the one genuine external
-certification available to a non OIDC AS.
+- RFC 7591 dynamic client registration.
+- RFC 7592 registration management.
+- Registration access tokens, and the policy seam deciding who may register.
 
-- RFC 7523 `private_key_jwt` and `client_secret_jwt`
-- RFC 8705 mTLS client authentication and certificate bound tokens
-- RFC 9449 DPoP
-- RFC 9126 PAR
+Unblocks: MCP, multi tenant deployments, and the OIDF suites, which register
+clients dynamically rather than by hand.
 
-### 0.4.0: delegation, granularity, and a new external judge
+### 0.4.0: client authentication without shared secrets
 
-- RFC 9728 protected resource metadata, which also makes the `authgent`
-  scanner applicable and buys a third party judge we cannot otherwise get
-- RFC 8693 token exchange
-- RFC 9396 RAR
-- RFC 9101 JAR
+The biggest interop gap in the crate today. Until this lands, a deployment
+whose security policy forbids shared secrets cannot use it at all.
 
-### 1.0.0: stability, not features
+- RFC 7523 `private_key_jwt` and `client_secret_jwt`.
+- RFC 8705 mTLS client authentication (`tls_client_auth`,
+  `self_signed_tls_client_auth`), with a seam for the host to pass in the
+  verified client certificate, since TLS termination is the host's job here.
 
-1.0 is earned by the API holding still and the evidence being complete, not by
-the feature list getting longer. Criteria:
+### 0.5.0: sender constrained tokens
 
-- No breaking change to `Storage` or the public API for two minor releases
-- Mutation testing clean, with every survivor killed or recorded as equivalent
-- A `Storage` conformance harness the crate exports, so a host can prove its
-  own implementation satisfies the atomicity contract the server depends on.
-  This matters more than it sounds: a host that implements `take_*` as read
-  then delete gets undetectable refresh token double spend on a multi node
-  deployment, and nothing in the crate can currently catch that.
-- FAPI 2.0 `plain_oauth` certification attempted, if and only if a real
-  consumer wants it. Pursuing a certification nobody asked for is how a
-  roadmap becomes theatre.
+Changes what a token leak costs, which is the highest value security work on
+this list.
+
+- RFC 9449 DPoP.
+- RFC 8705 certificate bound access tokens (the other half of mTLS).
+- Resource server verification helpers, so an RS can actually check the
+  binding rather than being told to.
+
+### 0.6.0: request integrity
+
+- RFC 9126 PAR, so authorization parameters never traverse the browser.
+- RFC 9101 JAR, signed and optionally encrypted request objects.
+
+At this point FAPI 2.0 `plain_oauth` becomes an achievable target, which is
+the one genuine external certification available to a non OIDC AS.
+
+### 0.7.0: delegation, and a new external judge
+
+- RFC 9728 protected resource metadata. Worth its own line: its ABSENCE is
+  precisely why the `authgent` scanner bails on us today, so implementing it
+  buys an additional independent judge, and independent judges are the hardest
+  thing to buy for a plain OAuth AS.
+- RFC 8693 token exchange.
+
+### 0.8.0: granularity and session lifecycle
+
+- RFC 9396 RAR, structured authorization detail beyond scope strings.
+- Session and consent management: remembered consent, consent revocation,
+  and a cascade so revoking a grant kills what it issued.
+- RFC 9470 step up authentication challenges.
+
+### 0.9.0: prove it against the outside world
+
+No new protocol surface. This release exists to run everything external at the
+crate and fix what falls out.
+
+- FAPI 2.0 `plain_oauth` conformance run against the OIDF suite.
+- The `authgent` scanner, now applicable because of 0.7.0.
+- A headless OAuch spike, or a written record of why it remains impossible.
+- The `Storage` conformance harness EXPORTED for hosts, so a host can prove
+  its own implementation satisfies the atomicity contract. This matters more
+  than it sounds: a host implementing `take_*` as read then delete gets
+  undetectable refresh token double spend on a multi node deployment, and
+  nothing in the crate can currently catch that.
+- Interop testing against real third party clients beyond the pinned `oauth2`
+  crate.
+
+### 1.0.0: earned, not scheduled
+
+1.0 is not a feature release and gets no new protocol surface. It is cut when
+we feel solid, and "solid" is defined here so that feeling has to survive
+contact with evidence:
+
+- No breaking change to `Storage` or the public API across 0.9.x.
+- Mutation testing clean: every surviving mutant killed, or recorded in
+  writing as equivalent with the reason.
+- Every finding from an adversarial security review resolved, and a fresh
+  review run against the finished 0.9 surface.
+- The full conformance suite green, including whatever external tooling 0.9.0
+  proved applicable.
+- Documentation complete enough that a stranger can adopt the crate without
+  reading its source.
+
+If those hold and it still does not feel solid, it does not ship. The feeling
+is allowed to veto the checklist. It is not allowed to substitute for it.
 
 ## The rule this list follows
 
