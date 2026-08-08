@@ -1,202 +1,136 @@
 # oauth-as
 
-An embeddable OAuth 2.1 Authorization Server library for Rust.
+[![CI](https://github.com/MattJackson/oauth-as/actions/workflows/dev.yml/badge.svg?branch=dev)](https://github.com/MattJackson/oauth-as/actions/workflows/dev.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![MSRV 1.75](https://img.shields.io/badge/MSRV-1.75-blue.svg)](#minimum-supported-rust-version)
+[![Conformance](https://img.shields.io/badge/independent%20conformance-8%2F8-brightgreen.svg)](#evidence)
 
-This crate is the AUTHORIZATION SERVER half of OAuth: it registers clients, runs
-grant state machines, issues, introspects and revokes tokens, and produces
-exactly the wire shapes the RFCs define. It is a LIBRARY, not a server binary.
-The host owns the HTTP listener, TLS, rate limiting, persistence, and the
-consent experience. The host hands request parameters to `AuthorizationServer`
-and serializes the returned response and error types, which carry their own
-`serde` shapes and HTTP status codes.
+An embeddable **OAuth 2.1 Authorization Server** for Rust.
 
-An optional `http` feature ships an axum router for hosts that would rather not
-write the wire layer themselves. It is off by default and nothing in the
-library depends on it.
+This is the authorization server half of OAuth: it registers clients, runs the grant state
+machines, and issues, introspects and revokes tokens, producing exactly the wire shapes the RFCs
+define. It is a **library**, not a server binary. The host owns the listener, TLS, persistence and
+the consent experience; the library owns the protocol.
 
-## What is implemented
+```toml
+[dependencies]
+oauth-as = "0.2"
+```
 
-Protocol:
+## What it does
 
-- RFC 9068 JWT access tokens (`at+jwt`, ES256) with an RFC 7517 JWKS document,
-  behind an optional `jwt` feature. Opaque tokens remain the default: RFC 9068
-  is an optional profile, not an OAuth 2.1 requirement, and signed tokens earn
-  their keep only when resource servers are separate processes that should not
-  call introspection on every request.
-- RFC 6749 section 4.1 authorization code grant, under the OAuth 2.1
-  constraints: PKCE required, `S256` only, exact redirect URI matching, single
-  use codes, and replay of a code revoking the tokens it already minted.
-- RFC 8628 device authorization grant, as a full state machine:
-  `authorization_pending`, `slow_down` with the mandated interval increase,
-  `expired_token`, `access_denied`, single use redemption, and user code
-  normalization per section 6.1.
-- RFC 6749 section 6 refresh rotation: single use, absolute chain lifetime.
-- RFC 6749 section 4.4 client credentials, confidential clients only, no
-  refresh token (section 4.4.3).
-- RFC 7636 PKCE, verified against the appendix B vector.
-- RFC 8414 authorization server metadata, derived from configuration so that an
-  advertised endpoint or capability is one the server actually has.
-- RFC 7662 introspection and RFC 7009 revocation.
+| Capability | Spec | Notes |
+| ---------- | ---- | ----- |
+| Authorization code grant | RFC 6749 s4.1 | PKCE required, `S256` only, exact redirect URI matching |
+| PKCE | RFC 7636 | Verified against the appendix B vector |
+| Device authorization grant | RFC 8628 | Full state machine: pending, `slow_down`, expiry, denial, single use |
+| Refresh rotation | RFC 6749 s6 | Single use, absolute chain lifetime, **reuse detection revokes the family** |
+| Client credentials | RFC 6749 s4.4 | Confidential clients only, no refresh token |
+| Server metadata | RFC 8414 | Derived from config, so an advertised endpoint is one that exists |
+| Token introspection | RFC 7662 | Unknown, expired and other clients' tokens all read `{"active": false}` |
+| Token revocation | RFC 7009 | Idempotent, ownership verified, no existence oracle |
+| Mix-up defence | RFC 9207 | `iss` on every authorization response, success and error |
+| Resource indicators | RFC 8707 | Narrowable audience, wired into the JWT `aud` claim |
+| JWT access tokens | RFC 9068 | `at+jwt` / ES256 with a JWKS document, optional |
 
-Design:
+Plus the seams a real deployment needs: an audit **event sink**, a **rate limiting** hook
+(RFC 8628 s5.1 makes device user code entropy adequate only in combination with one), a **client
+secret verifier** so hosts store a hash rather than a secret, a **consent** seam, and **CSRF**
+protection on the device verification form.
 
-- A storage seam (`store::Storage`) the HOST implements, plus
-  `store::MemoryStorage` for tests and single process embedding. This crate
-  never assumes what the host's persistence looks like.
-- Nothing is allocated until the host constructs an `AuthorizationServer`, so
-  an embedding host pays nothing until its configuration enables the feature.
-- The default build has five dependencies: `serde`, `serde_json`, `getrandom`,
-  `sha2`, `base64`. None of them implies an async runtime, an HTTP stack, or a
-  persistence layer. The `http` feature adds `axum` and `tokio`; the `jwt`
-  feature adds `p256`. Both are off by default and a consumer who does not ask
-  for them gains not one extra crate.
-- Allocation counts on the hot paths, and the size of the core public types,
-  are pinned by tests rather than asserted in prose. Each of those gates was
-  proven able to FAIL before it was trusted, and one of them has already caught
-  a real regression.
+See [ROADMAP.md](ROADMAP.md) for what is coming and, more usefully, what is missing today.
 
-## Compile settings
+## Features
 
-The release profile in this repository governs OUR builds only. Cargo profiles
-are honored for the workspace being built, so a consumer compiles this crate
-with THEIR profile and nothing in our manifest reaches them.
+The default feature set is **empty**, and stays that way.
 
-What determines a consumer's cost is the shape of the code:
-`AuthorizationServer<S, C>` is generic over the host's `Storage` and `Clock`, so
-it is monomorphized once per pair the host actually instantiates. One pair is
-the normal case. That is a deliberate trade: generics keep the storage seam
-devirtualized, where `dyn Storage` would add an indirect call to every storage
-operation on the token path.
+| Feature | Adds | Cost |
+| ------- | ---- | ---- |
+| *(default)* | The protocol core | `serde`, `serde_json`, `getrandom`, `sha2`, `base64` |
+| `http` | An axum router over the server | `axum`, `tokio` |
+| `jwt` | RFC 9068 signed access tokens and a JWKS | `p256` |
 
-For a consumer who wants the smallest, fastest result, the usual settings apply
-and are worth stating because they are not the defaults: `lto = "fat"`,
-`codegen-units = 1`, `opt-level = 3`, and `strip = "symbols"` in your own
-release profile.
+A consumer who wants only the library gets no HTTP stack, no async runtime, and no signing code.
+That is the premise of the crate, not a configuration option.
+
+## Cost
+
+Measured, not asserted:
+
+- **113 KiB** of linked binary for the whole protocol surface, with LTO and stripping, every entry
+  point reachable so nothing is dead stripped.
+- **Zero allocations** when an uninstalled hook is invoked, pinned by a counting allocator.
+- Allocation counts and type sizes on the hot paths are gated in CI. Those gates have caught three
+  real regressions, including a 2 KB per-request allocation caused by crossing tokio's 2048 byte
+  future boxing threshold.
 
 ## Minimum supported Rust version
 
-1.75, and this is the MEASURED floor rather than a guess: 1.74 fails only on
-return-position `impl Trait` in the `Storage` trait, and 1.75 and 1.80 compile
-clean. Going lower would mean boxing every storage future, which is a heap
-allocation on every storage call, and that is a price every consumer would pay
-forever to support toolchains older than December 2023.
+Measured per feature, because there is not one number, and each is built at exactly that toolchain
+in CI with `--locked`:
 
-Optional features carry their own floors, because they pull in dependencies
-this crate does not control. Reported separately rather than averaged into one
-number, since a consumer who does not enable a feature should not be told they
-need a newer toolchain than they do:
+| Feature set | Floor | Set by |
+| ----------- | ----- | ------ |
+| default | **1.75** | this crate (RPITIT in `Storage`) |
+| `jwt` | **1.75** | `p256` builds there |
+| `http` | **1.80** | `axum` 0.8 declares it |
 
-| Feature set        | Floor | Set by                        |
-| ------------------ | ----- | ----------------------------- |
-| default (no features) | 1.75 | this crate (RPITIT in `Storage`) |
-| `jwt`              | 1.75  | this crate; `p256` is happy there |
-| `http`             | 1.80  | `axum` 0.8 declares 1.80      |
+1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower
+would mean `Box<dyn Future>` there, a heap allocation on every storage call, paid forever by every
+consumer to support toolchains older than December 2023.
 
-Each of those is built at exactly that toolchain in CI, with `--locked`. An
-MSRV that only holds when cargo is free to pick different dependency versions
-is not a floor anyone can rely on.
+## Evidence
 
-## Maturity: read this before depending on it
+An authorization server decides who gets access to everything else. It should not be taken on
+trust, including by its authors. So:
 
-The 0.x version number is deliberate. Honesty about what has and has not been
-demonstrated matters more than polish, and for an authorization server the
-standard is higher than usual.
-
-### What IS proven, by things you can run yourself
-
-- **RFC published test vectors, byte exact.** Inputs and expected outputs are
-  taken verbatim from the RFCs, so the oracle is the spec author rather than
-  this codebase.
-- **Schema validation transcribed from the RFCs.** Every body the AS emits is
-  validated against schemas transcribed clause by clause from RFC 6749
-  section 5 and RFC 8628 sections 3.2 and 3.5.
-- **An independently authored conformance harness, and it is GREEN.**
-  `crates/oauth-as-conformance` was written by an author who could not see this
-  crate's source. That matters because this crate's own tests were written by
-  this crate's author: the judge was arms length, but the CHOICE OF WHAT TO
-  TEST was not. The harness closes that gap. It drives the AS over HTTP as a
-  black box and discovers every endpoint from the RFC 8414 metadata document,
-  so it also proves the advertised endpoints match reality.
-
-  `scripts/oauth-conformance.sh --check` passes: 8 of 8 black box tests, plus
-  the 9 hermetic vector tests and both third party client drives. Not one file
-  in the harness was modified to achieve that. The one mismatch it originally
-  found (it verifies RFC 9068 JWT access tokens against a `jwks_uri`, and this
-  crate's tokens are opaque) was resolved by BUILDING the RFC 9068 support,
-  behind an optional feature, rather than by narrowing the assertion. Editing
-  the harness to make this server pass would have destroyed the only arms
-  length evidence the project has.
-- **A pinned third party client as the judge.** `oauth2 = "=5.0.0"`, a widely
-  used OAuth 2 CLIENT library, completes a full device flow and a full
-  authorization code with PKCE flow against this AS. That library, not this
-  repository's assertions, decides whether the responses are spec legal. It is
-  pinned exactly on purpose: a silent client upgrade must never change what
+- **An independently authored conformance harness passes 8/8.**
+  `crates/oauth-as-conformance` was written by an author who could not see this crate's source.
+  That matters because this crate's own tests were written by its author: the judge was arms
+  length, but the choice of what to test was not. It drives the server over HTTP as a black box and
+  discovers every endpoint from the metadata document, so it also proves the advertised endpoints
+  are real. No file in it was modified to make it pass.
+- **A pinned third party client is the judge.** `oauth2 = "=5.0.0"` completes a full device flow
+  and a full authorization code with PKCE flow against this server and decides for itself whether
+  the responses are spec legal. Pinned exactly: a silent upgrade must never change what
   "conformant" means.
-- **Gates proven able to fail.** `scripts/oauth-conformance.sh --selftest`
-  demonstrates that a corrupted vector expectation fails the vector suite, and
-  that a deliberately nonconformant stub AS fails the black box suite, BEFORE
-  any green from those gates is trusted. A gate nobody has seen go red is a
-  gate nobody should trust.
-- **An adversarial security review**, whose findings are recorded with the RFC
-  section that settles each one, and whose fixes each began as a test that
-  reproduced the attack and failed.
+- **RFC published vectors, byte exact**, so the oracle is the spec author.
+- **Every gate proven able to fail.** `scripts/oauth-conformance.sh --selftest` shows a corrupted
+  vector failing the vector suite and a deliberately nonconformant stub server failing the black
+  box suite, before any green is trusted.
+- **Adversarial security review**, with each fix beginning as a test that reproduced the attack and
+  failed. It found, among others, a cross site device approval chain, missing refresh token reuse
+  detection, and a constant time comparison that returned true for unequal inputs.
+- **Mutation testing**, because a passing suite does not prove the tests constrain the code. See
+  [MUTANTS.md](MUTANTS.md), which records what is still open rather than only what is closed.
 
-### What is NOT proven, and will not be claimed
+### What is not claimed
 
-- **There is no OAuth 2.1 certification programme in existence.** OAuth 2.1 is
-  still an Internet Draft. No implementation of it, this one included, can hold
-  a certification, and any project claiming otherwise is describing something
-  else.
-- **No third party conformance tool has been run against this AS**, because
-  none that applies exists. This was researched rather than assumed:
-  - The OpenID Foundation suite tests OIDC and FAPI profiles. Its FAPI 2.0 plan
-    does have a `plain_oauth` variant, so a non-OIDC AS CAN be certified, but
-    that profile requires PAR, sender constrained tokens, `private_key_jwt` or
-    mTLS, and a browser driven flow, and it tests none of the device grant.
-  - The OIDF suite contains zero references to RFC 8628. Nothing external tests
-    the device grant polling state machine at all.
-  - `authgent` is an MCP OAuth scanner, not the RFC 8414 discovery linter it is
-    sometimes described as. It fetches RFC 9728 protected resource metadata
-    first and skips every remaining check when that is absent, which it always
-    will be for a plain AS.
-  - OAuch has no headless or CI mode; its device flow ends in a browser popup.
-  So the independent judges here are the vendored RFC vectors and the pinned
-  third party client. That is a real bar, and it is not the same thing as
-  certification. We are not going to imply that it is.
-- **Bolting OIDC on to earn a Basic OP badge was considered and rejected.** It
-  would mean id_token issuance, a UserInfo endpoint, a claims model and a user
-  profile store, all of which are host concerns this design deliberately pushes
-  out. The badge would be true and substantively misleading.
+There is **no OAuth 2.1 certification programme in existence** (it is still an Internet Draft), so
+no implementation can hold one. **No third party conformance tool has been run**, because none that
+applies exists: the OpenID Foundation suite covers OIDC and FAPI and contains zero references to
+RFC 8628; `authgent` is an MCP scanner that skips every check without RFC 9728 metadata; OAuch has
+no headless mode. The independent judges here are the vendored vectors and the pinned client. That
+is a real bar and it is not certification, and this README will not imply otherwise.
 
-If you need a battle hardened AS today, use one. If you want an embeddable,
-host agnostic, storage agnostic OAuth 2.1 core with its evidence laid out in
-the open and its gaps stated plainly, this is that, at the maturity the version
-number states.
+The 0.x version is deliberate. If you need a battle hardened server today, use one. If you want an
+embeddable, host agnostic OAuth 2.1 core with its evidence and its gaps both in the open, this is
+that.
 
-## Repository layout
+## Layout
 
-- `crates/oauth-as` is the published library.
-- `crates/oauth-as-conformance` is the independent black box harness: vendored
-  RFC vectors, response shape validators, and flows driven by the pinned third
-  party `oauth2` client. It contains no code from `oauth-as`, never links
-  against it, and is never published.
-- `scripts/oauth-conformance.sh` runs the harness. `--selftest` proves the gate
-  can go red; `--check` serves the AS and runs the black box suite against it.
-- `GOAL.md` states what "done" means for this project as gates that can be
-  checked rather than felt.
+- `crates/oauth-as` is the library.
+- `crates/oauth-as-conformance` is the independent harness. It contains no code from `oauth-as`,
+  never links against it, and is never published.
+- `scripts/oauth-conformance.sh` runs it: `--selftest` proves the gate can go red, `--check` runs
+  it against a live server.
+- [GOAL.md](GOAL.md) defines done as gates that can be checked. [SECURITY.md](SECURITY.md) is the
+  disclosure policy. [CONTRIBUTING.md](CONTRIBUTING.md) has the house rules, which are unusual.
 
 ## License
 
-Licensed under either of
+Dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
-- Apache License, Version 2.0 (LICENSE-APACHE or
-  http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
-
-at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
