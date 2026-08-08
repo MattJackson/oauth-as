@@ -12,7 +12,57 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
-Nothing merged to `dev` since 0.1.0 as of this writing.
+### Added
+
+- **RFC 9068 JWT access tokens** (`at+jwt`, ES256) with an RFC 7517 JWKS document, behind an
+  off-by-default `jwt` feature. Opaque tokens remain the default: RFC 9068 is an optional profile,
+  not an OAuth 2.1 requirement. The AS-side record is still persisted when signing, keyed by
+  whatever the client actually presents, so introspection and revocation keep working and a
+  revoked JWT is genuinely dead here rather than merely deprecated. `jwks_uri` is advertised
+  exactly when the server signs.
+- **The independent conformance harness passes completely**: 8 of 8 black box tests, 9 of 9
+  hermetic RFC vector tests, and both pinned third party `oauth2 = "=5.0.0"` client drives. No
+  file in the harness was modified to achieve it.
+- A CSRF seam, a consent seam, and a rate limiting obligation stated on the device approval API.
+- `Storage::get_refresh_token`, `Storage::revoke_token_family`, and `Storage::sweep_expired`.
+- Allocation and size gates, each proven able to fail before being trusted.
+
+### Fixed (security)
+
+An adversarial security review traced seventeen findings through the code. Each fix began as a
+test that reproduced the attack and failed.
+
+- **Refresh token reuse detection.** Rotation previously deleted the old record, so a replay was
+  `invalid_grant` and nothing more. A thief who redeemed first kept a working chain while the
+  honest client was locked out, which is precisely inverted. Tokens now carry a family, rotated
+  tokens are retained as spent, and presenting one revokes the whole family (OAuth 2.1 section
+  6.1, RFC 9700 section 4.14.2).
+- **Cross site device approval (critical).** The verification form had no CSRF protection, so an
+  auto-submitting cross-origin form plus a victim's session approved an attacker's device grant,
+  yielding a token for the victim's account.
+- **Silent authorization.** The authorization endpoint issued codes with no consent step. With no
+  consent resolver wired it now refuses rather than approving.
+- **Replay revocation ordering.** Revocation on code replay ran before the client ownership check,
+  so any public client could destroy a victim's live tokens using only a leaked code.
+- **Unauthenticated introspection and revocation** when the named client was public (RFC 7662
+  section 2.1, RFC 7009 section 2.1).
+- **Constant time comparison** folded only 16 bits of the length difference, so `"hunter2"` and
+  `"hunter2"` followed by 65536 NUL bytes compared EQUAL; it also leaked the secret's length by
+  loop count.
+- Credential bearing types no longer print secrets under `Debug`.
+- `ValidatedAuthorizationRequest` is now genuinely unconstructible outside validation, which its
+  documentation had already claimed.
+
+### Changed
+
+- **MSRV lowered from a declared 1.86 to a measured 1.75.** 1.74 fails only on return position
+  `impl Trait` in the `Storage` trait; 1.75 compiles clean. `Cargo.lock` moved to format v3, and
+  `base64ct` and `zeroize` are pinned below the versions that moved to edition 2024, because a
+  floor that only holds without `--locked` is not a floor.
+- `Storage` gained required methods (breaking, and deliberately taken before anything is
+  published rather than after).
+- `conformance-serve.sh` excluded from the published tarball: it resolves the workspace root as
+  `../..` and cannot work from an unpacked crate.
 
 ## [0.1.0] - 2026-08-08 (built and tested, not published to crates.io)
 
