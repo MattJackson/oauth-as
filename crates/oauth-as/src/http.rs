@@ -71,6 +71,7 @@ use crate::authorization::{AuthorizationError, AuthorizationRequest};
 use crate::client::ClientId;
 use crate::device::{normalize_user_code, DeviceGrant, DeviceGrantState};
 use crate::error::{ErrorCode, ErrorResponse};
+use crate::events::{Attempt, AttemptOutcome, RateLimitDecision};
 use crate::grant::GrantType;
 use crate::metadata::{well_known_path, AuthorizationServerMetadata};
 use crate::scope::ScopeSet;
@@ -1610,6 +1611,20 @@ async fn pending_grant<S: Storage, C: Clock>(
     state: &Inner<S, C>,
     entered_user_code: &str,
 ) -> Option<(DeviceGrant, Option<String>)> {
+    // THIS LOOKUP IS A GUESSING ORACLE, so it goes through the host's throttle exactly as
+    // AuthorizationServer::pending_grant_by_user_code does. The response distinguishes a live
+    // pending code from an unknown one perfectly (one renders the client and the scope, the other
+    // says the code was not recognised), so without this a host that implemented the RateLimiter
+    // seam correctly would still see nothing while an attacker walked the code space with GETs and
+    // spent a single throttled POST on the one that hit.
+    //
+    // RFC 8628 s5.1 makes the user code's entropy adequate only IN COMBINATION WITH rate limiting
+    // of code entry, and s5.4 names this exact URL, the verification_uri_complete deep link, as
+    // the higher-risk entry point.
+    let hooks = state.server.hooks();
+    if hooks.check(Attempt::DeviceUserCodeEntry) == RateLimitDecision::Deny {
+        return None;
+    }
     let normalized = normalize_user_code(entered_user_code);
     let grant = state
         .server
@@ -1618,7 +1633,17 @@ async fn pending_grant<S: Storage, C: Clock>(
         .await
         .ok()
         .flatten()
-        .filter(|g| g.state == DeviceGrantState::Pending)?;
+        .filter(|g| g.state == DeviceGrantState::Pending);
+    // Report the outcome, because a guessing attack shows up in FAILURES, not in traffic volume.
+    hooks.record(
+        Attempt::DeviceUserCodeEntry,
+        if grant.is_some() {
+            AttemptOutcome::Succeeded
+        } else {
+            AttemptOutcome::Failed
+        },
+    );
+    let grant = grant?;
     let name = state
         .server
         .store()

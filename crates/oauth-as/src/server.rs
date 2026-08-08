@@ -744,7 +744,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             AccessTokenFormat::Jwt(jwt) => jwt,
         };
         let claims = AccessTokenClaims {
-            iss: self.config.issuer.clone(),
+            // The SAME spelling the RFC 8414 document publishes, the RFC 9207 `iss` parameter
+            // carries and introspection reports. `issuer_identifier` trims a trailing slash, and
+            // the raw config value does not, so a host configuring "https://as.example/" used to
+            // publish "https://as.example" everywhere except here. A resource server doing the
+            // byte comparison RFC 9068 s4 and RFC 8414 s3.3 call for would then reject every
+            // token this server signs, or be patched to compare loosely, which disables the
+            // mix-up defence RFC 9207 exists to provide. One server, one identity, everywhere it
+            // states it.
+            iss: self.issuer_identifier().to_string(),
             exp: crate::jwt::unix_seconds(now + self.config.access_token_ttl)
                 .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
             // RFC 8707 s2 with RFC 9068 s2.2: when the client named the resource server(s) it

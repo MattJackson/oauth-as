@@ -514,3 +514,36 @@ fn invalid_key_material_is_rejected_rather_than_guessed_at() {
     assert!(EcdsaP256Key::from_scalar_bytes("k", &[1u8; 31]).is_err());
     assert!(EcdsaP256Key::from_pkcs8_der("k", b"not der").is_err());
 }
+
+/// One server, one identity. RFC 9068 s4 and RFC 8414 s3.3 have a resource server compare the
+/// token's `iss` against the issuer identifier it discovered, as bytes. This server publishes that
+/// identifier with any trailing slash trimmed (the RFC 8414 document, the RFC 9207 `iss`
+/// parameter, and RFC 7662 introspection all use the trimmed form), so a signed token carrying the
+/// raw configured string would disagree with everything else the server says about itself.
+///
+/// The consequence is not cosmetic: an RS doing the comparison correctly rejects every token this
+/// server issues, and an RS that has been "fixed" to compare loosely has had the mix-up defence
+/// RFC 9207 exists to provide disabled for it.
+#[tokio::test]
+async fn the_token_issuer_matches_the_published_issuer_identifier_exactly() {
+    let clock = ManualClock::at_epoch();
+    // Configured WITH a trailing slash, which is the case that used to diverge.
+    let mut cfg = ServerConfig::new("https://as.example/", "https://as.example/device");
+    cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(jwt_config(signing_key())));
+    let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock);
+    srv.register_client(device_client()).await.unwrap();
+
+    let token = issue_via_device_flow(&srv).await;
+    let (_, claims, _) = parts(&token);
+
+    let published = serde_json::to_value(oauth_as::AuthorizationServerMetadata::from_config(
+        srv.config(),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        claims["iss"], published["issuer"],
+        "the signed token's iss must be byte-identical to the published issuer identifier"
+    );
+    assert_eq!(claims["iss"], serde_json::json!("https://as.example"));
+}
