@@ -58,11 +58,18 @@
 #        Note also that the action declares a `fail-on` input it never passes to the CLI, so the
 #        threshold is always the default `error`; do not set `fail-on` here and expect it to do
 #        anything.
-#     6. OAuch (github.com/DistriNet/OAuch, MIT, 17 stars) was re-checked on 2026-08-08: its own
-#        README documents only a Visual-Studio build or a Docker image that serves the same
-#        interactive web UI on a local port. No CLI, no REST automation surface, no CI mode was
-#        found in the repository. It remains a human-driven web app and is not wired in here for
-#        that reason, matching KICKOFF.md's original assessment.
+#     6. OAuch (github.com/DistriNet/OAuch, MIT) is NOT wired in, and 0.9.0 closes the question
+#        rather than deferring it again. ROADMAP.md asked for a headless spike or a written record
+#        of why it is impossible; the record is section 4 of
+#        crates/oauth-as-conformance/EXTERNAL-TOOLING.md. The short version is structural, not a
+#        failure to look: `StartTests` has exactly one call site in the whole repository, inside
+#        a SignalR hub method a live browser invokes, and `IBrowser` has exactly one
+#        implementation, a proxy onto that same SignalR connection. The device flow specifically
+#        inserts a `NotifyUser` step that opens a popup and asks a person to type the user code.
+#        No project sets OutputType to Exe, there are zero [ApiController] and zero [Route]
+#        attributes, no OpenAPI definition, and no git tags. The authors say it in their own RAID
+#        2022 paper: "As a result, OAuch is not fully automated." Last commit 2026-06-13, so
+#        nothing has changed. Do not re-research this without new evidence.
 #     7. No independent, CI-runnable RFC 8414 JSON Schema or metadata-validator tool (distinct
 #        from an OAuth/OIDC mock server, which tests the opposite direction) could be confirmed
 #        to exist as of 2026-08-08. If one surfaces later, wire it in following the same pinning

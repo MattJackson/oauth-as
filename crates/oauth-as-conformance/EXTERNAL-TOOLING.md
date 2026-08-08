@@ -214,10 +214,73 @@ reasoning behind `authgent-baseline.json`. In short:
   its composite action declares a `fail-on` input that it never passes to the CLI, so the
   threshold is always the default `error` regardless of what a workflow sets.
 
-## 4. OAuch
+## 4. OAuch: the headless spike, and why it stays impossible
 
-See the OAuch entry in `.github/workflows/qa.yml` for the current assessment and the date it was
-last checked.
+`ROADMAP.md` asked 0.9.0 for "a headless OAuch spike, or a written record of why it remains
+impossible". This is the record. It is not "we could not find a way"; it is a structural finding,
+and the authors say it themselves.
+
+OAuch (`https://github.com/DistriNet/OAuch`, DistriNet/KU Leuven, MIT) is the only OAuth-first
+tool whose subject matter overlaps this crate: RFC 6819 and RFC 9700 threats, PKCE downgrade
+detection, and six device-endpoint tests. Nothing else tests RFC 8628 at all.
+
+**The blocking fact.** A test run cannot be started except by a live browser holding a SignalR
+connection. `StartTests` has exactly one call site in the entire repository:
+`src/OAuch/OAuch/Hubs/TestRunHub.cs`, inside `OnReady`, which is invoked from
+`Views/Dashboard/Running.cshtml` by the browser's SignalR client. `DashboardController.Running`
+only creates a manager and renders a view. `TestRunHub.FindManager` additionally requires an
+authenticated cookie principal carrying an `https://oauch.io/internalid` claim.
+
+The run BODY needs the browser continuously as well. `IBrowser`
+(`src/OAuch/OAuch.Shared/Interfaces/IBrowser.cs`) has exactly one implementation,
+`src/OAuch/OAuch/TestRuns/Browser.cs`, which is a thin proxy onto SignalR; there is no stub to
+substitute.
+
+**The device flow specifically requires a person.**
+`src/OAuch/OAuch.Protocols/OAuth2/DeviceTokenProvider.cs` inserts a `NotifyUser` step between the
+device code request and polling, and `BuildingBlocks/NotifyUser.cs` opens a popup at the
+verification URI and sends the message "Please enter the following code in the popup window".
+Every device-flow-dependent test is unreachable without a human.
+
+**What is absent, checked rather than assumed.** No project in the solution sets `OutputType` to
+`Exe`, so there is no console entry point; the only `Main` is the ASP.NET host, and its `args` are
+passed to the generic host and never parsed. There are zero `[ApiController]` and zero `[Route]`
+attributes in the tree, no Swagger or OpenAPI definition, no `.github/` directory and therefore no
+CI, and no Selenium, Playwright, Puppeteer or WebDriver reference. There are no git tags and no
+releases. The `docs/` folder is eleven `.docx` copies of specifications, not developer
+documentation.
+
+**The authors say so in print.** The RAID 2022 paper "OAuch: Exploring Security Compliance in the
+OAuth 2.0 Ecosystem" (open access at
+`https://lirias.kuleuven.be/server/api/core/bitstreams/6a50c462-5fbe-4481-bf85-0873cc430c61/content`)
+states: "Related work has shown that executing an OAuth flow can be successfully automated with
+the help of browser automation tools and for a well-defined set of IdPs. OAuch, on the other hand,
+is designed to work on any browser without additional plug-ins and for any IdP. **As a result,
+OAuch is not fully automated.**" It also records that a run averages 39 authorization requests, of
+which about 84 percent complete without a person, and that roughly four per run stall until a
+human clicks the "stalled test" button. The two-year follow-up study by the same authors mentions
+no CLI, headless, scripted or batch mode.
+
+Not automatable is therefore the DESIGN, not an oversight, and it is a defensible design: working
+against any IdP without a per-IdP browser script is what buys their 100-provider study.
+
+**Two further obstacles, worth knowing if anyone revisits this.** The callback URI is hardcoded to
+`https://oauch.io/Callback` (`src/OAuch/OAuch/Helpers/OAuchHelper.cs`) and assigned into every new
+site's settings, so the AS under test would have to register that exact redirect URI and the
+operator's machine would need a `hosts` override. And target endpoints are free-form strings with
+no scheme validation, so a plain-HTTP loopback AS is accepted, but the tool's own
+`IsHttpsRequiredTest` and `IsModernTlsSupportedTest` would then fail correctly.
+
+**Nothing has changed.** The last commit is 2026-06-13 and touches only `LICENSE.txt`; the last
+functional work was DPoP tests in September 2025. The assessment recorded on 2026-08-08 holds in
+every particular.
+
+**If it is ever revisited**, there are exactly two routes, and both are fork-level effort rather
+than a spike: drive the web UI with Playwright against the Docker image, which upstream neither
+ships nor supports and which would break on any UI change; or reference `OAuch.Compliance` and
+`OAuch.Protocols` as libraries and write a non-SignalR `IBrowser` plus a host. The `IBrowser` seam
+is small, six methods, and is the natural place to start. Neither is 0.9.0 work and neither should
+be started without deciding what the result would be allowed to claim.
 
 ## 5. Third-party clients
 
