@@ -106,6 +106,30 @@ pub struct AuthorizationServerMetadata {
     /// empty array would claim the server supports no scopes at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scopes_supported: Option<Vec<String>>,
+    /// RFC 9126 section 5. Present ONLY when the host enabled PAR
+    /// ([`crate::server::ServerConfig::par`]): section 5 says its presence is sufficient for a
+    /// client to decide it may use PAR, so advertising an endpoint that is not served would be a
+    /// promise this server cannot keep.
+    #[cfg(feature = "par")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_authorization_request_endpoint: Option<String>,
+    /// RFC 9126 section 5. `Some(false)` states the default explicitly when PAR is offered;
+    /// omitted entirely when PAR is off, since section 5 gives an absent member the meaning
+    /// `false` and a server with no PAR endpoint has nothing to require.
+    #[cfg(feature = "par")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_pushed_authorization_requests: Option<bool>,
+    /// RFC 9101 section 4: the `alg` values this server will verify a request object with.
+    /// Present only when signed request objects are enabled.
+    #[cfg(feature = "jar")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_object_signing_alg_values_supported: Option<Vec<String>>,
+    /// RFC 9101 section 10.5, registered by its section 9.2. Present only when signed request
+    /// objects are enabled; `true` means a plain RFC 6749 authorization request is refused, which
+    /// is the downgrade that section describes.
+    #[cfg(feature = "jar")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_signed_request_object: Option<bool>,
     /// REQUIRED (section 2). Always exactly `["code"]`: OAuth 2.1 removes the implicit grant.
     pub response_types_supported: Vec<String>,
     /// OPTIONAL (section 2). This server returns the code in the query string.
@@ -242,6 +266,28 @@ impl AuthorizationServerMetadata {
                 .map(|r| endpoint(&r.registration_endpoint, "/register")),
             jwks_uri: advertised_jwks_uri(config),
             scopes_supported: config.scopes_supported.clone(),
+            #[cfg(feature = "par")]
+            pushed_authorization_request_endpoint: config
+                .par
+                .as_ref()
+                .map(|par| par.endpoint(&iss)),
+            #[cfg(feature = "par")]
+            require_pushed_authorization_requests: config
+                .par
+                .as_ref()
+                .map(|par| par.require_pushed_authorization_requests),
+            #[cfg(feature = "jar")]
+            request_object_signing_alg_values_supported: config.jar.as_ref().map(|_| {
+                crate::par::REQUEST_OBJECT_SIGNING_ALGS
+                    .iter()
+                    .map(|alg| alg.to_string())
+                    .collect()
+            }),
+            #[cfg(feature = "jar")]
+            require_signed_request_object: config
+                .jar
+                .as_ref()
+                .map(|jar| jar.require_signed_request_object),
             issuer: iss,
             response_types_supported: vec!["code".to_string()],
             response_modes_supported: vec!["query".to_string()],

@@ -532,6 +532,30 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client_secret: Option<&str>,
         parameters: &[(&str, &str)],
     ) -> Result<PushedAuthorizationResponse, ErrorResponse> {
+        self.pushed_authorization_request_with_credential(
+            client_id,
+            &crate::server::ClientCredential::secret(client_secret),
+            parameters,
+        )
+        .await
+    }
+
+    /// [`AuthorizationServer::pushed_authorization_request`] for a client presenting any credential
+    /// this server accepts at the token endpoint, not just a shared secret.
+    ///
+    /// RFC 9126 section 2.1 step 1 says the client authenticates here "in the same way as at the
+    /// token endpoint", so an RFC 7523 `private_key_jwt` client that the token endpoint accepts
+    /// must be accepted here too; a PAR endpoint that only understood `client_secret_basic` would
+    /// lock exactly the deployments that most want PAR (FAPI 2.0 requires both) out of it. This
+    /// mirrors `device_authorization_with_credential` and
+    /// `introspection_response_with_credential`, for the same reason and with the same shape.
+    #[cfg(feature = "par")]
+    pub async fn pushed_authorization_request_with_credential(
+        &self,
+        client_id: &ClientId,
+        credential: &crate::server::ClientCredential<'_>,
+        parameters: &[(&str, &str)],
+    ) -> Result<PushedAuthorizationResponse, ErrorResponse> {
         // Read before authenticating: a server that is not offering PAR should say so whatever the
         // credential was, and should not become a client-credential oracle for a feature it does
         // not run.
@@ -541,7 +565,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         }
 
         // 1. Client authentication, "in the same way as at the token endpoint" (section 2.1).
-        let client = self.authenticate_client(client_id, client_secret).await?;
+        let client = self.authenticate_client(client_id, credential).await?;
 
         // 2. Section 2.1: `request_uri` MUST NOT be provided here. Chaining one handle to another
         //    would let a client (or an attacker who captured a handle) re-push somebody else's

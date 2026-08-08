@@ -93,6 +93,11 @@ pub mod http;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod metadata;
+/// RFC 9126 pushed authorization requests and RFC 9101 signed request objects, behind the `par`
+/// and `jar` cargo features (both off by default). They are the two ways an authorization request
+/// reaches this server without travelling through the browser as rewritable query text.
+#[cfg(any(feature = "par", feature = "jar"))]
+pub mod par;
 pub mod pkce;
 pub mod registration;
 /// RFC 9728 protected resource metadata, behind the `resource-metadata` cargo feature
@@ -134,6 +139,15 @@ pub use http::{
     SubjectResolver,
 };
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
+#[cfg(feature = "jar")]
+pub use par::{
+    JarConfig, RegisteredRequestObjectKey, RequestObjectAlg, RequestObjectKeyError,
+    RequestObjectKeys, REQUEST_OBJECT_SIGNING_ALGS, REQUEST_OBJECT_TYP,
+};
+#[cfg(feature = "par")]
+pub use par::{
+    ParConfig, PushedAuthorizationRequest, PushedAuthorizationResponse, REQUEST_URI_PREFIX,
+};
 pub use registration::{
     ClientInformation, ClientMetadata, RegistrationAttempt, RegistrationConfig,
     RegistrationDecision, RegistrationErrorCode, RegistrationErrorResponse, RegistrationFailure,

@@ -287,6 +287,8 @@ struct Installed {
     rate_limiter: Option<Box<dyn RateLimiter>>,
     secret_verifier: Option<Box<dyn SecretVerifier>>,
     registration_policy: Option<Box<dyn RegistrationPolicy>>,
+    #[cfg(feature = "jar")]
+    request_object_keys: Option<Box<dyn crate::par::RequestObjectKeys>>,
 }
 
 /// The server's slot for the host seams: exactly one pointer wide, and null until the host
@@ -329,6 +331,26 @@ impl Hooks {
     /// Install the RFC 7591 registration policy, replacing any previous one.
     pub fn install_registration_policy(&mut self, policy: Box<dyn RegistrationPolicy>) {
         self.installed().registration_policy = Some(policy);
+    }
+
+    /// Install the RFC 9101 request object verification keys, replacing any previous source.
+    #[cfg(feature = "jar")]
+    pub fn install_request_object_keys(&mut self, keys: Box<dyn crate::par::RequestObjectKeys>) {
+        self.installed().request_object_keys = Some(keys);
+    }
+
+    /// The installed RFC 9101 request object key source.
+    ///
+    /// `None` is NOT read as "accept anything", for the same reason as
+    /// [`Hooks::registration_policy`] and the opposite of the [`RateLimiter`] default: a server
+    /// that cannot check a signature must refuse the request, because "cannot check" must never
+    /// read as "checked out".
+    #[cfg(feature = "jar")]
+    pub fn request_object_keys(&self) -> Option<&dyn crate::par::RequestObjectKeys> {
+        match &self.0 {
+            Some(installed) => installed.request_object_keys.as_deref(),
+            None => None,
+        }
     }
 
     /// Whether an event sink is installed.

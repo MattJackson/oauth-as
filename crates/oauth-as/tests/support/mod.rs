@@ -353,6 +353,24 @@ impl Storage for FaultStorage {
         self.inner.take_authorization_code(code).await
     }
 
+    #[cfg(feature = "par")]
+    async fn put_pushed_authorization_request(
+        &self,
+        record: oauth_as::PushedAuthorizationRequest,
+    ) -> Result<(), StorageError> {
+        self.inner.put_pushed_authorization_request(record).await
+    }
+
+    #[cfg(feature = "par")]
+    async fn take_pushed_authorization_request(
+        &self,
+        request_uri: &str,
+    ) -> Result<Option<oauth_as::PushedAuthorizationRequest>, StorageError> {
+        self.inner
+            .take_pushed_authorization_request(request_uri)
+            .await
+    }
+
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
         self.inner.put_token(token).await
     }

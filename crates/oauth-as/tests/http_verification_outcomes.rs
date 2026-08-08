@@ -172,6 +172,24 @@ impl Storage for LookupFails {
     ) -> impl Future<Output = Result<Option<DeviceGrant>, StorageError>> + Send {
         self.0.take_device_grant(device_code)
     }
+    // RFC 9126 pushed authorization requests. Delegated like everything else here: the one
+    // behaviour this fixture breaks is the user-code lookup, and a store that also lost its PAR
+    // handles would be testing two failures at once.
+    #[cfg(feature = "par")]
+    fn put_pushed_authorization_request(
+        &self,
+        record: oauth_as::PushedAuthorizationRequest,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.0.put_pushed_authorization_request(record)
+    }
+    #[cfg(feature = "par")]
+    fn take_pushed_authorization_request(
+        &self,
+        request_uri: &str,
+    ) -> impl Future<Output = Result<Option<oauth_as::PushedAuthorizationRequest>, StorageError>> + Send
+    {
+        self.0.take_pushed_authorization_request(request_uri)
+    }
     fn put_authorization_code(
         &self,
         record: AuthorizationCodeRecord,

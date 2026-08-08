@@ -8,7 +8,8 @@
 //! CONTRACT NOTES the server relies on:
 //!
 //! - `take_*` operations are ATOMIC remove-and-return. They are how single-use artifacts (device
-//!   codes at redemption, rotating refresh tokens) stay single use under concurrency. A shared
+//!   codes at redemption, rotating refresh tokens, RFC 9126 pushed authorization request handles)
+//!   stay single use under concurrency. A shared
 //!   multi-node store must implement them with a genuinely atomic primitive (compare-and-set,
 //!   `DELETE ... RETURNING`, or equivalent); a plain read-then-delete reintroduces the double-spend.
 //! - `put_device_grant` upserts by `device_code` and must keep any user-code index consistent.
@@ -147,6 +148,31 @@ pub trait Storage: Send + Sync {
         &self,
         code: &str,
     ) -> impl Future<Output = Result<Option<AuthorizationCodeRecord>, StorageError>> + Send;
+
+    /// Insert or replace a pushed authorization request (RFC 9126 section 2.2), keyed by its
+    /// `request_uri`.
+    #[cfg(feature = "par")]
+    fn put_pushed_authorization_request(
+        &self,
+        record: crate::par::PushedAuthorizationRequest,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Atomically remove and return a pushed authorization request. This is what makes a
+    /// `request_uri` single use: RFC 9126 section 4 says a client MUST use one once and section
+    /// 7.3 asks the server to enforce it rather than trust that, so under concurrent authorization
+    /// requests exactly one caller receives the record and every other caller sees `None`. A plain
+    /// read-then-delete reintroduces the replay this is here to prevent.
+    ///
+    /// Unlike [`Storage::take_authorization_code`], nothing is put back after a SUCCESSFUL
+    /// resolution: a spent handle minted no credential of its own, so there is nothing a later
+    /// presentation of it could need to be recognised for, and retaining it would only keep a live
+    /// capability string in the store. The server DOES put it back when the handle was presented by
+    /// the wrong client, so that a stranger cannot destroy a legitimate client's request.
+    #[cfg(feature = "par")]
+    fn take_pushed_authorization_request(
+        &self,
+        request_uri: &str,
+    ) -> impl Future<Output = Result<Option<crate::par::PushedAuthorizationRequest>, StorageError>> + Send;
 
     /// Persist an issued access token.
     fn put_token(
@@ -287,6 +313,8 @@ struct MemoryInner {
     /// normalized user code -> device_code
     user_code_index: HashMap<String, String>,
     codes: HashMap<String, AuthorizationCodeRecord>,
+    #[cfg(feature = "par")]
+    pushed: HashMap<String, crate::par::PushedAuthorizationRequest>,
     tokens: HashMap<String, IssuedToken>,
     refresh: HashMap<String, RefreshTokenRecord>,
     /// Claimed RFC 7523 / RFC 9449 single-use identifiers, mapped to when they may be reclaimed.
@@ -337,6 +365,10 @@ impl Storage for MemoryStorage {
         g.tokens.retain(|_, t| &t.client_id != client_id);
         g.refresh.retain(|_, r| &r.client_id != client_id);
         g.codes.retain(|_, c| &c.client_id != client_id);
+        // RFC 9126 s2.2 binds a request_uri to the client that pushed it, so a deleted client's
+        // outstanding handles are handles nobody may ever redeem.
+        #[cfg(feature = "par")]
+        g.pushed.retain(|_, p| &p.client_id != client_id);
         g.device_by_code.retain(|_, d| &d.client_id != client_id);
         // The index is a pointer to a grant, not a record of its own; a dangling entry would make
         // a reaped user code resolve to nothing. Same pass `sweep_expired` makes.
@@ -428,6 +460,26 @@ impl Storage for MemoryStorage {
         Ok(self.lock().codes.remove(code))
     }
 
+    #[cfg(feature = "par")]
+    async fn put_pushed_authorization_request(
+        &self,
+        record: crate::par::PushedAuthorizationRequest,
+    ) -> Result<(), StorageError> {
+        self.lock()
+            .pushed
+            .insert(record.request_uri.clone(), record);
+        Ok(())
+    }
+
+    #[cfg(feature = "par")]
+    async fn take_pushed_authorization_request(
+        &self,
+        request_uri: &str,
+    ) -> Result<Option<crate::par::PushedAuthorizationRequest>, StorageError> {
+        // Atomic by construction, like every other `take_*` here: one mutex, one `remove`.
+        Ok(self.lock().pushed.remove(request_uri))
+    }
+
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
         self.lock().tokens.insert(token.access_token.clone(), token);
         Ok(())
@@ -516,6 +568,16 @@ impl Storage for MemoryStorage {
         let before = g.codes.len();
         g.codes.retain(|_, c| now < c.expires_at);
         removed += (before - g.codes.len()) as u64;
+
+        // RFC 9126 s4: an expired request_uri MUST be rejected, and once it is expired there is
+        // nothing left to recognise it for, so it is swept like anything else. A swept handle and
+        // a used one are the same answer at the authorization endpoint, deliberately.
+        #[cfg(feature = "par")]
+        {
+            let before = g.pushed.len();
+            g.pushed.retain(|_, p| now < p.expires_at);
+            removed += (before - g.pushed.len()) as u64;
+        }
 
         let before = g.tokens.len();
         g.tokens.retain(|_, t| now < t.expires_at);

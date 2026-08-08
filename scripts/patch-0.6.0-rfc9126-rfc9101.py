@@ -72,11 +72,16 @@ pub use par::{
 };
 '''
 
-ERROR_VARIANT_ANCHOR = """    InvalidTarget,
+# RE-ANCHORED: the DPoP slice landed `InvalidDpopProof` after `InvalidTarget`, so the end of the
+# enum is no longer `InvalidTarget,\n}`. Re-anchored on the new last variant rather than loosened,
+# exactly as the failure message asks; the three variants below still land at the end of the enum.
+ERROR_VARIANT_ANCHOR = """    #[cfg(feature = "dpop")]
+    InvalidDpopProof,
 }
 """
 
-ERROR_VARIANT_REPLACEMENT = '''    InvalidTarget,
+ERROR_VARIANT_REPLACEMENT = '''    #[cfg(feature = "dpop")]
+    InvalidDpopProof,
     /// RFC 9101 section 7: the `request_uri` in the authorization request returns an error or
     /// contains invalid data. This server mints its own `request_uri` values at its RFC 9126
     /// endpoint and fetches nothing, so "invalid data" here means unknown, already used, expired,
@@ -96,11 +101,14 @@ ERROR_VARIANT_REPLACEMENT = '''    InvalidTarget,
 }
 '''
 
-ERROR_ASSTR_ANCHOR = """            ErrorCode::InvalidTarget => "invalid_target",
+# RE-ANCHORED for the same reason as ERROR_VARIANT_ANCHOR above.
+ERROR_ASSTR_ANCHOR = """            #[cfg(feature = "dpop")]
+            ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
         }
 """
 
-ERROR_ASSTR_REPLACEMENT = '''            ErrorCode::InvalidTarget => "invalid_target",
+ERROR_ASSTR_REPLACEMENT = '''            #[cfg(feature = "dpop")]
+            ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
             #[cfg(feature = "par")]
             ErrorCode::InvalidRequestUri => "invalid_request_uri",
             #[cfg(feature = "jar")]

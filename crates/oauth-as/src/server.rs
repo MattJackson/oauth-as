@@ -104,6 +104,19 @@ pub struct ServerConfig {
     /// BOXED so that the overwhelmingly common `None` costs one null pointer on every
     /// [`ServerConfig`] rather than the whole struct, and allocates nothing.
     pub registration: Option<Box<crate::registration::RegistrationConfig>>,
+    /// RFC 9126 pushed authorization requests. `None` is the DEFAULT and means PAR is OFF: no
+    /// `pushed_authorization_request_endpoint` is advertised and
+    /// [`AuthorizationServer::pushed_authorization_request`] refuses.
+    ///
+    /// BOXED for the same reason as [`ServerConfig::registration`]: the overwhelmingly common
+    /// `None` costs one null pointer on every [`ServerConfig`] rather than the whole struct, and
+    /// allocates nothing.
+    #[cfg(feature = "par")]
+    pub par: Option<Box<crate::par::ParConfig>>,
+    /// RFC 9101 signed request objects. `None` is the DEFAULT and means JAR is OFF: a `request`
+    /// parameter is answered with `request_not_supported` rather than parsed.
+    #[cfg(feature = "jar")]
+    pub jar: Option<Box<crate::par::JarConfig>>,
     /// RFC 8414 `scopes_supported`. `None` omits the member rather than claiming an empty
     /// catalogue.
     pub scopes_supported: Option<Vec<String>>,
@@ -221,6 +234,11 @@ impl ServerConfig {
             jwks_uri: None,
             // OFF. See the field's own docs, and RFC 7591 section 5.
             registration: None,
+            // OFF. PAR is a capability a host opts into, not a default: see the field's docs.
+            #[cfg(feature = "par")]
+            par: None,
+            #[cfg(feature = "jar")]
+            jar: None,
             scopes_supported: None,
             allowed_resources: Vec::new(),
             service_documentation: None,
@@ -714,6 +732,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         self
     }
 
+    /// Install the RFC 9101 request object verification keys: which public key, under which
+    /// algorithm, each client registered for signing request objects.
+    ///
+    /// Required, not optional, for a host that sets [`ServerConfig::jar`]: with no key source
+    /// installed every `request` parameter is refused, because a server that cannot check a
+    /// signature must not act on the claims under it. See [`crate::par::RequestObjectKeys`].
+    #[cfg(feature = "jar")]
+    pub fn with_request_object_keys(
+        mut self,
+        keys: Box<dyn crate::par::RequestObjectKeys>,
+    ) -> Self {
+        self.hooks.install_request_object_keys(keys);
+        self
+    }
+
     /// The installed host seams, for a host that wants to emit its own events onto the same
     /// channel (a consent decision, say) or to consult its own limiter.
     pub fn hooks(&self) -> &Hooks {
@@ -821,7 +854,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// trailing slash off the configured issuer, so this trims it too: a host that wrote
     /// `https://as.example/` must not end up with two spellings of its own identity, because the
     /// mismatch would read to a conforming client as a mix-up attack in progress.
-    fn issuer_identifier(&self) -> &str {
+    // `pub(crate)` so `par.rs` can check an RFC 9101 request object's `aud` claim against the
+    // ONE spelling this server publishes, rather than re-deriving it and risking a second one.
+    pub(crate) fn issuer_identifier(&self) -> &str {
         self.config.issuer.trim_end_matches('/')
     }
 
@@ -1575,6 +1610,46 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// [`AuthorizationServer::issue_authorization_code`], or reports
     /// [`ValidatedAuthorizationRequest::denied`] if the user refuses.
     pub async fn validate_authorization_request(
+        &self,
+        request: &AuthorizationRequest<'_>,
+    ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {
+        // The POLICY gate, ahead of the validation itself: a deployment may declare that
+        // parameters in the query are not an acceptable way to ask for authorization at all.
+        //
+        // RFC 9126 section 4 lets a server require PAR globally, and RFC 9101 section 10.5
+        // requires the equivalent for signed request objects, both for the same reason: an
+        // attacker who can rewrite the browser's URL will simply strip the protection and send a
+        // plain RFC 6749 request unless the server refuses one. This is the only entry point that
+        // takes query parameters, so refusing here is what makes the policy hold; `par.rs` reaches
+        // the validation below directly, having already established that the request was pushed or
+        // signed.
+        #[cfg(feature = "par")]
+        if matches!(&self.config.par, Some(par) if par.require_pushed_authorization_requests) {
+            return Err(AuthorizationError::Direct(
+                ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                    "this server accepts authorization request data only via PAR (RFC 9126 s4)",
+                ),
+            ));
+        }
+        #[cfg(feature = "jar")]
+        if matches!(&self.config.jar, Some(jar) if jar.require_signed_request_object) {
+            return Err(AuthorizationError::Direct(
+                ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                    "this server requires a signed request object (RFC 9101 s10.5)",
+                ),
+            ));
+        }
+        self.validate_direct_authorization_request(request).await
+    }
+
+    /// The validation itself, with no policy gate in front of it.
+    ///
+    /// Split out for RFC 9126 / RFC 9101: a pushed or signed request has ALREADY satisfied the
+    /// policy the wrapper above enforces, and it arrives as parameters rather than as a query, so
+    /// it needs this and not the wrapper. Everything else about it is unchanged, which is the
+    /// point: the PAR endpoint validates a pushed request by calling exactly the function the
+    /// authorization endpoint calls, so the two cannot drift.
+    pub(crate) async fn validate_direct_authorization_request(
         &self,
         request: &AuthorizationRequest<'_>,
     ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {

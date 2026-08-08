@@ -50,6 +50,22 @@ pub enum ErrorCode {
     /// `dpop` has exactly the code set it had before.
     #[cfg(feature = "dpop")]
     InvalidDpopProof,
+    /// RFC 9101 section 7: the `request_uri` in the authorization request returns an error or
+    /// contains invalid data. This server mints its own `request_uri` values at its RFC 9126
+    /// endpoint and fetches nothing, so "invalid data" here means unknown, already used, expired,
+    /// or issued to a different client.
+    #[cfg(feature = "par")]
+    InvalidRequestUri,
+    /// RFC 9101 section 7: the `request` parameter contains an invalid Request Object. Sections
+    /// 6.1 and 6.2 make this the REQUIRED answer for a request object that fails to decrypt, fails
+    /// signature validation, or is signed with a key that is not the client's.
+    #[cfg(feature = "jar")]
+    InvalidRequestObject,
+    /// RFC 9101 section 7: this server does not support the `request` parameter. Emitted when the
+    /// host has not enabled signed request objects at all, which is distinct from a request object
+    /// that was offered and refused.
+    #[cfg(feature = "jar")]
+    RequestNotSupported,
 }
 
 impl ErrorCode {
@@ -72,6 +88,12 @@ impl ErrorCode {
             ErrorCode::InvalidTarget => "invalid_target",
             #[cfg(feature = "dpop")]
             ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
+            #[cfg(feature = "par")]
+            ErrorCode::InvalidRequestUri => "invalid_request_uri",
+            #[cfg(feature = "jar")]
+            ErrorCode::InvalidRequestObject => "invalid_request_object",
+            #[cfg(feature = "jar")]
+            ErrorCode::RequestNotSupported => "request_not_supported",
         }
     }
 

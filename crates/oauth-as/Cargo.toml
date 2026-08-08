@@ -36,6 +36,16 @@ http = ["dep:axum", "dep:tokio"]
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
 # servers are separate processes that should not have to call introspection on every request.
 jwt = ["dep:p256"]
+# RFC 9126 pushed authorization requests: the client POSTs the authorization request to a
+# back-channel endpoint and gets a single-use `request_uri` handle, so the parameters (the PKCE
+# challenge above all) never traverse the browser. Adds no dependency: it is storage plus the
+# validation the authorization endpoint already performs.
+par = []
+# RFC 9101 JWT-secured authorization requests: a signed request object, verified against the key
+# the client registered. Enables `jwt` because verification is ES256 over the same p256 dependency
+# the RFC 9068 signer already uses, and because the JWS primitives being added there for RFC 7523
+# and DPoP are where this verification belongs once they land (see the SEAM note in src/par.rs).
+jar = ["jwt"]
 # RFC 7523 JWT client authentication: `private_key_jwt` (asymmetric, ES256) and `client_secret_jwt`
 # (HMAC, HS256), so that a deployment whose security policy forbids transmitting a shared secret can
 # use this crate at all. It is also required by FAPI 2.0.

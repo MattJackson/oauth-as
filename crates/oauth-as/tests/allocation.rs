@@ -589,8 +589,26 @@ fn core_public_types_stay_within_their_size_budget() {
     // AuthorizationServer<MemoryStorage> is ServerConfig + MemoryStorage + SystemClock; MemoryStorage
     // is a single Mutex<MemoryInner> of 6 empty-capacity HashMaps (3 words each: ptr, len, cap-ish
     // RandomState overhead), so the server's size tracks ServerConfig's almost directly.
+    //
+    // The budget is stated PER FEATURE SET rather than loosened to the widest build, because the
+    // promise this gate makes is "a consumer who does not enable a feature pays nothing for it".
+    // A default build is unchanged by anything below; each optional feature declares exactly what
+    // it costs, so a field added without a matching line here still fails.
+    //
+    // RFC 9126: `Option<Box<ParConfig>>` on ServerConfig (8) plus one HashMap of pushed requests
+    // inside MemoryStorage's MemoryInner (48).
+    #[cfg(feature = "par")]
+    const PAR: usize = 8 + 48;
+    #[cfg(not(feature = "par"))]
+    const PAR: usize = 0;
+    // RFC 9101: `Option<Box<JarConfig>>` on ServerConfig, and no storage of its own.
+    #[cfg(feature = "jar")]
+    const JAR: usize = 8;
+    #[cfg(not(feature = "jar"))]
+    const JAR: usize = 0;
+    let server_budget = 832 + PAR + JAR;
     assert!(
-        size_of::<AuthorizationServer<MemoryStorage>>() <= 832,
+        size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
         size_of::<AuthorizationServer<MemoryStorage>>()
     );
