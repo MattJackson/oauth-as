@@ -25,12 +25,13 @@
 mod support;
 
 use oauth_as::{
-    AuthorizationError, AuthorizationRequest, Client, ClientAuth, ClientId, ErrorCode, GrantType,
-    ScopeSet, TokenRequest,
+    AuthorizationError, AuthorizationRequest, AuthorizationServer, Client, ClientAuth, ClientId,
+    ErrorCode, GrantType, MemoryStorage, ScopeSet, ServerConfig, TokenRequest,
 };
 use support::{
-    confidential_client, mint_code_token, public_client, server_with, ManualClock,
-    CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET, PUBLIC_REDIRECT, RFC7636_VERIFIER,
+    client_credentials_client, confidential_client, mint_code_token, public_client, server_with,
+    ManualClock, CC_SECRET, CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET, PUBLIC_REDIRECT,
+    RFC7636_VERIFIER,
 };
 
 const RS_ONE: &str = "https://rs.example/api";
@@ -294,6 +295,7 @@ fn device_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -597,4 +599,82 @@ async fn the_requested_resource_replaces_the_configured_aud_claim() {
         aud_claim(&two.access_token),
         serde_json::json!([RS_ONE, RS_TWO])
     );
+}
+
+/// RFC 8707 section 2: the server MUST answer `invalid_target` when it "is unwilling or unable to
+/// issue an access token" for a requested resource. Syntax is not authorisation, and until this
+/// check existed the server had no notion of unwilling, so any well-formed absolute URI was
+/// accepted from any client.
+///
+/// The escalation that makes this more than tidiness: with the `jwt` feature on, the requested
+/// resource REPLACES the configured audience in the RFC 9068 `aud` claim. So a client registered
+/// against one resource server could name a second one and be handed a token THIS SERVER SIGNED
+/// carrying that second server's identifier in `aud`. The second server fetches our JWKS, the
+/// signature verifies, `aud` names it, and it authorises on whatever scope string the two happen
+/// to share. Resource servers sharing a scope name like `read` is the ordinary case.
+#[tokio::test]
+async fn a_resource_outside_the_allowlist_is_invalid_target() {
+    let clock = ManualClock::at_epoch();
+    let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    cfg.allowed_resources = vec!["https://a.example/api".to_string()];
+    let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock);
+    srv.register_client(client_credentials_client())
+        .await
+        .unwrap();
+
+    // The resource this deployment actually serves is fine.
+    srv.token_with_resources(
+        TokenRequest::ClientCredentials {
+            client_id: ClientId::new("cc-app"),
+            client_secret: Some(CC_SECRET.to_string()),
+            scope: None,
+        },
+        &["https://a.example/api".to_string()],
+    )
+    .await
+    .expect("a resource this server serves must still be issuable");
+
+    // A resource server it was never authorised for is refused, not signed for.
+    let err = srv
+        .token_with_resources(
+            TokenRequest::ClientCredentials {
+                client_id: ClientId::new("cc-app"),
+                client_secret: Some(CC_SECRET.to_string()),
+                scope: None,
+            },
+            &["https://b.example/api".to_string()],
+        )
+        .await
+        .expect_err("naming a resource this server does not serve must be invalid_target");
+    assert_eq!(err.error, ErrorCode::InvalidTarget);
+}
+
+/// An empty allowlist keeps the previous behaviour rather than refusing everything, because
+/// turning refusal on by default would break every deployment already using resource indicators.
+/// That is a deliberate choice with a real cost, so it is pinned here: if someone later "fixes"
+/// the default, this test tells them they have made a breaking change rather than a safety
+/// improvement, and they can decide knowingly.
+#[tokio::test]
+async fn an_empty_allowlist_means_no_restriction() {
+    let clock = ManualClock::at_epoch();
+    let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    assert!(
+        cfg.allowed_resources.is_empty(),
+        "the default is unrestricted, and that is the documented risk"
+    );
+    let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock);
+    srv.register_client(client_credentials_client())
+        .await
+        .unwrap();
+
+    srv.token_with_resources(
+        TokenRequest::ClientCredentials {
+            client_id: ClientId::new("cc-app"),
+            client_secret: Some(CC_SECRET.to_string()),
+            scope: None,
+        },
+        &["https://anything.example/api".to_string()],
+    )
+    .await
+    .expect("with no allowlist configured, any well-formed resource is still accepted");
 }
