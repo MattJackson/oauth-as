@@ -7,7 +7,12 @@
 //!
 //! # Why this is hand-rolled
 //!
-//! This crate ISSUES exactly one token shape and never parses a JWT it did not make. A general
+//! (As of the `client_assertion` and `dpop` features this module also VERIFIES: see the
+//! VERIFICATION banner in the second half of this file, which is where the rules for handling a
+//! JWS somebody else made are written down. The argument below is about the SIGNING half and is
+//! unchanged by it; the verifier is likewise a few hundred lines rather than a framework.)
+//!
+//! This crate ISSUES exactly one token shape. A general
 //! JOSE library brings a parser, a validation policy engine and a key-format zoo that an issuer
 //! never executes; the compact serialization of RFC 7515 section 3.1 is
 //! `BASE64URL(header) "." BASE64URL(payload) "." BASE64URL(signature)` and fits in this file on
@@ -27,11 +32,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
+use p256::ecdsa::signature::{Signer as _, Verifier as _};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 use p256::SecretKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 /// A key could not be loaded or exported. The message never contains key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,4 +399,393 @@ pub(crate) fn unix_seconds(t: SystemTime) -> Result<u64, JwtError> {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| JwtError("clock is before the Unix epoch".into()))
+}
+
+// =============================================================================================
+// VERIFICATION.
+//
+// Everything above this line SIGNS. Everything below it VERIFIES, which is a different and much
+// more dangerous job, because the input is attacker controlled: the module doc above used to say
+// this crate "never parses a JWT it did not make", and as of the `client_assertion` and `dpop`
+// features that is no longer true. RFC 7523 client assertions and RFC 9449 DPoP proofs are both
+// JWTs a CLIENT made, so what follows is a trust boundary.
+//
+// The rules that boundary is built on, and they are the same three rules every published JWS
+// confusion attack has been aimed at:
+//
+//  1. The KEY is chosen by the verifier, never by the token. A caller passes the key it already
+//     decided to trust (a registered client's JWK, a registered client's secret); nothing here
+//     resolves a key out of the header on its own authority. DPoP is the one apparent exception
+//     and is not really one: its key comes from the proof, but the proof only ever proves
+//     possession of THAT key, and it is the `cnf.jkt` binding, not this file, that decides whether
+//     that key means anything (see src/dpop.rs).
+//  2. The ALGORITHM is chosen by the verifier, never by the token. `verify_es256` and
+//     `verify_hs256` are separate functions taking separate key types, so there is no value of
+//     `alg` that can make an HMAC verification run against a public key. `none` is not implemented
+//     at all: there is no code path here that accepts an unsigned JWS.
+//  3. Nothing is decoded twice. The signature is verified over the EXACT received bytes of
+//     `header.payload` (`CompactJws::signing_input` borrows them), never over a re-serialization
+//     of the parsed claims, so a payload that serializes differently than it arrived cannot verify
+//     under one reading and be interpreted under another.
+// =============================================================================================
+
+/// A JWS could not be parsed, or did not verify.
+///
+/// The message is deliberately coarse and never names which check failed in a way a client could
+/// use to probe a key: callers map this onto one RFC 6749 section 5.2 error code and the detail
+/// stays on the host's own audit channel. It never contains key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyError(String);
+
+impl VerifyError {
+    pub(crate) fn new(msg: impl Into<String>) -> Self {
+        VerifyError(msg.into())
+    }
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "JWS verification error: {}", self.0)
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+/// The JWK members that carry PRIVATE or SYMMETRIC key material, in the RFC 7518 section 6
+/// spellings: `d` (the EC/RSA private value, sections 6.2.2.1 and 6.3.2.1), the RSA CRT
+/// parameters, and `k` (the octets of a symmetric key, section 6.4.1).
+///
+/// RFC 9449 section 4.3 makes rejecting a proof whose `jwk` contains any of these a REQUIREMENT,
+/// and the reason generalises past DPoP: a JWK carrying a private parameter is either a client
+/// that has just leaked its own key to us, or an attacker trying to get a key it controls adopted
+/// where only a public half was expected. Neither is a request worth serving.
+const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+/// The PUBLIC parameters of one EC P-256 key, as received from a client.
+///
+/// This is the VERIFYING counterpart of [`Jwk`], which exists to be SERIALIZED and therefore holds
+/// `&'static str` for every member this crate fixes. This one is parsed from attacker-controlled
+/// JSON, so it is a separate type rather than a relaxation of that one: making [`Jwk`]'s members
+/// owned so it could be deserialized would also make it possible to SERVE a `kty` this crate never
+/// signs with.
+///
+/// Deserialization goes through [`PublicJwk::from_json`], including through `serde`, so there is no
+/// route into this type that skips the private-parameter rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicJwk {
+    /// Key type; only `EC` is accepted.
+    pub kty: String,
+    /// Curve; only `P-256` is accepted.
+    pub crv: String,
+    /// Base64url (unpadded) x coordinate, exactly 32 bytes decoded.
+    pub x: String,
+    /// Base64url (unpadded) y coordinate, exactly 32 bytes decoded.
+    pub y: String,
+    /// The optional key identifier (RFC 7517 section 4.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PublicJwk {
+    /// Routed through [`PublicJwk::from_json`] rather than derived, so that a JWK loaded from the
+    /// host's own client store is held to exactly the same rules as one arriving in a DPoP proof
+    /// header. A derived impl would IGNORE an unknown `d` member rather than reject it, and a
+    /// registration silently carrying a client's private key is precisely the state this type
+    /// exists to make unrepresentable.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        PublicJwk::from_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl PublicJwk {
+    /// Parse and validate one JWK.
+    ///
+    /// Rejects, in this order: a non-object, any member of `PRIVATE_JWK_MEMBERS`, a `kty` other
+    /// than `EC`, a `crv` other than `P-256`, and coordinates that are not exactly 32 bytes of
+    /// base64url. The width check is not pedantry: RFC 7518 section 6.2.1.2 fixes the octet length
+    /// at the curve's field size and requires leading zeros to be KEPT, so a trimmed coordinate is
+    /// a different point, and accepting it is the classic JWK interoperability bug.
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, VerifyError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| VerifyError::new("a JWK must be a JSON object"))?;
+        for member in PRIVATE_JWK_MEMBERS {
+            if object.contains_key(*member) {
+                return Err(VerifyError::new(
+                    "the JWK carries a private or symmetric key parameter",
+                ));
+            }
+        }
+        let string = |name: &str| -> Result<String, VerifyError> {
+            object
+                .get(name)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| VerifyError::new("the JWK is missing a required member"))
+        };
+        let kty = string("kty")?;
+        if kty != "EC" {
+            return Err(VerifyError::new("only EC keys are supported"));
+        }
+        let crv = string("crv")?;
+        if crv != "P-256" {
+            return Err(VerifyError::new("only the P-256 curve is supported"));
+        }
+        let x = string("x")?;
+        let y = string("y")?;
+        let coordinate = |b64: &str| -> Result<(), VerifyError> {
+            match URL_SAFE_NO_PAD.decode(b64) {
+                Ok(bytes) if bytes.len() == 32 => Ok(()),
+                _ => Err(VerifyError::new(
+                    "a P-256 coordinate is exactly 32 base64url-encoded bytes",
+                )),
+            }
+        };
+        coordinate(&x)?;
+        coordinate(&y)?;
+        Ok(PublicJwk {
+            kty,
+            crv,
+            x,
+            y,
+            kid: object
+                .get("kid")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        })
+    }
+
+    /// The RFC 7638 section 3 JWK Thumbprint of this key: SHA-256, base64url without padding.
+    ///
+    /// This is the value RFC 9449 section 6.1 puts in `cnf.jkt` to bind a token to the key a client
+    /// proved possession of. The construction is exact and every part of it is load bearing
+    /// (sections 3.1 through 3.3): ONLY the members required to identify the key type, in
+    /// LEXICOGRAPHIC order, with no whitespace and no other member. `kid`, `use` and `alg` are
+    /// deliberately excluded, which is what makes the thumbprint a property of the KEY rather than
+    /// of one description of it; including any of them would let the same key produce two
+    /// thumbprints and so two tokens a resource server could not tell were bound to one client.
+    pub fn thumbprint(&self) -> String {
+        // Built by hand rather than through `serde_json`, because a serializer's member order is a
+        // property of a struct declaration and this order is a property of the RFC. For `EC` the
+        // required set is `crv`, `kty`, `x`, `y`, which is already lexicographic.
+        let mut json = String::with_capacity(40 + self.crv.len() + self.x.len() + self.y.len());
+        json.push_str("{\"crv\":\"");
+        json.push_str(&self.crv);
+        json.push_str("\",\"kty\":\"");
+        json.push_str(&self.kty);
+        json.push_str("\",\"x\":\"");
+        json.push_str(&self.x);
+        json.push_str("\",\"y\":\"");
+        json.push_str(&self.y);
+        json.push_str("\"}");
+        URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+    }
+}
+
+/// One RFC 7515 section 3.1 compact JWS, split and decoded but NOT yet verified.
+///
+/// Holding the unverified form as its own value is deliberate: it makes "parsed" and "verified"
+/// two different things a caller cannot confuse, and it keeps [`CompactJws::signing_input`]
+/// borrowing the received bytes, so that verification happens over what actually arrived.
+#[derive(Debug)]
+pub struct CompactJws<'a> {
+    /// `BASE64URL(header) "." BASE64URL(payload)`: the JWS Signing Input of RFC 7515 section 5.1
+    /// step 5, borrowed from the input.
+    pub signing_input: &'a str,
+    /// The decoded JOSE protected header.
+    pub header: serde_json::Map<String, serde_json::Value>,
+    /// The decoded payload (the JWT claims set).
+    pub payload: serde_json::Map<String, serde_json::Value>,
+    /// The decoded signature octets.
+    pub signature: Vec<u8>,
+}
+
+impl<'a> CompactJws<'a> {
+    /// Split and decode `token`.
+    ///
+    /// Rejects anything that is not exactly three base64url segments over two dots. A FIVE segment
+    /// token (the RFC 7516 JWE compact serialization) is therefore refused here rather than
+    /// silently read as a JWS with odd contents, and a two segment token (the unsecured form of
+    /// RFC 7515 appendix A.5, whose signature is the empty string) is refused because it has no
+    /// third segment at all.
+    pub fn parse(token: &'a str) -> Result<Self, VerifyError> {
+        let malformed = || VerifyError::new("not a compact JWS of exactly three segments");
+        let mut parts = token.split('.');
+        let header_b64 = parts.next().ok_or_else(malformed)?;
+        let payload_b64 = parts.next().ok_or_else(malformed)?;
+        let signature_b64 = parts.next().ok_or_else(malformed)?;
+        if parts.next().is_some() {
+            return Err(malformed());
+        }
+        // Borrowed rather than rebuilt with `format!`: the signature must cover the bytes that
+        // arrived, and a re-joined string is a second chance to get that wrong.
+        let signing_input = &token[..header_b64.len() + 1 + payload_b64.len()];
+        let object =
+            |b64: &str| -> Result<serde_json::Map<String, serde_json::Value>, VerifyError> {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(b64)
+                    .map_err(|_| VerifyError::new("a JWS segment is not unpadded base64url"))?;
+                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(serde_json::Value::Object(map)) => Ok(map),
+                    _ => Err(VerifyError::new("a JWS segment is not a JSON object")),
+                }
+            };
+        Ok(CompactJws {
+            header: object(header_b64)?,
+            payload: object(payload_b64)?,
+            signature: URL_SAFE_NO_PAD
+                .decode(signature_b64)
+                .map_err(|_| VerifyError::new("the signature is not unpadded base64url"))?,
+            signing_input,
+        })
+    }
+
+    /// A string-valued member of the protected header, or `None` when absent or not a string.
+    pub fn header_str(&self, name: &str) -> Option<&str> {
+        self.header.get(name).and_then(|v| v.as_str())
+    }
+
+    /// A string-valued claim, or `None` when absent or not a string.
+    pub fn claim_str(&self, name: &str) -> Option<&str> {
+        self.payload.get(name).and_then(|v| v.as_str())
+    }
+
+    /// A `NumericDate` claim (RFC 7519 section 2), or `None` when absent or not a non-negative
+    /// integer.
+    ///
+    /// A negative or fractional value is read as ABSENT rather than truncated: `exp: -1` truncated
+    /// towards zero would read as the epoch, and a claim this crate cannot represent exactly must
+    /// not be silently reinterpreted as one it can.
+    pub fn claim_time(&self, name: &str) -> Option<u64> {
+        self.payload.get(name).and_then(|v| v.as_u64())
+    }
+}
+
+/// Verify an `ES256` signature (RFC 7518 section 3.4) over `signing_input` with a public JWK.
+///
+/// `false` for every failure, including a malformed key or a signature of the wrong length: a
+/// caller has exactly one safe reaction to any of them, so distinguishing them would only invite
+/// somebody to treat one as recoverable.
+pub fn verify_es256(jwk: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+    // RFC 7518 section 3.4 fixes the ES256 signature as the fixed-width `r || s` concatenation, 64
+    // bytes. The DER form OpenSSL emits by default is NOT this, and accepting both would give one
+    // signature two encodings.
+    if signature.len() != 64 {
+        return false;
+    }
+    let (Ok(x), Ok(y)) = (
+        URL_SAFE_NO_PAD.decode(&jwk.x),
+        URL_SAFE_NO_PAD.decode(&jwk.y),
+    ) else {
+        return false;
+    };
+    if x.len() != 32 || y.len() != 32 {
+        return false;
+    }
+    // Uncompressed SEC 1 point: 0x04 || X || Y. `from_sec1_bytes` is what rejects a coordinate pair
+    // that is not actually on the curve, which is the check an invalid-curve attack needs to find
+    // missing.
+    let mut sec1 = [0u8; 65];
+    sec1[0] = 0x04;
+    sec1[1..33].copy_from_slice(&x);
+    sec1[33..].copy_from_slice(&y);
+    let Ok(key) = VerifyingKey::from_sec1_bytes(&sec1) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    key.verify(signing_input, &signature).is_ok()
+}
+
+/// HMAC-SHA-256 (RFC 2104), the primitive `HS256` is (RFC 7518 section 3.2).
+///
+/// Hand written rather than pulled in. `hmac` is already in this crate's dependency GRAPH, through
+/// `p256`'s RFC 6979 deterministic nonce, but it is not a direct dependency, and taking one on to
+/// express twenty lines of fully specified construction would widen a surface this crate promises
+/// to keep tiny. The construction has published test vectors, which `src/tests/client_assertion.rs`
+/// checks against, so "we wrote it ourselves" is a checkable claim rather than an assertion.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    // RFC 2104: a key longer than the block size is replaced by its own digest; a shorter one is
+    // zero padded to the block size. SHA-256's block size is 64 bytes.
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= block[i];
+        opad[i] ^= block[i];
+    }
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// Verify an `HS256` signature (RFC 7518 section 3.2) over `signing_input` with a shared secret.
+///
+/// The comparison is CONSTANT TIME with respect to the presented tag. A byte-by-byte compare that
+/// exits at the first difference lets a network attacker build a valid tag one byte at a time
+/// without ever learning the secret, which is the classic MAC verification timing attack; the
+/// length here is fixed at 32 bytes by SHA-256, so unlike `client::constant_time_eq` there is no
+/// length channel to close as well.
+pub fn verify_hs256(secret: &[u8], signing_input: &[u8], signature: &[u8]) -> bool {
+    if signature.len() != 32 {
+        return false;
+    }
+    let expected = hmac_sha256(secret, signing_input);
+    let mut acc = 0u8;
+    for i in 0..32 {
+        acc |= expected[i] ^ signature[i];
+    }
+    acc == 0
+}
+
+/// Assemble one RFC 7515 section 3.1 compact JWS from an already-serialized header and payload.
+///
+/// This crate builds client assertions and DPoP proofs for nobody, so this exists for the OTHER
+/// side of the seam: a host writing the CLIENT half of RFC 7523 or RFC 9449, and this crate's own
+/// tests, which have to be able to produce a WRONG token (a foreign key, a bad `alg`, a stale
+/// `iat`) to demonstrate that the verifier refuses it. A test suite that can only build correct
+/// inputs cannot demonstrate an attack, and this crate's rule is that a security check is not
+/// trusted until the attack it stops has been watched succeeding without it.
+pub fn compact_jws(header: &[u8], payload: &[u8], sign: impl FnOnce(&str) -> Vec<u8>) -> String {
+    let header = URL_SAFE_NO_PAD.encode(header);
+    let payload = URL_SAFE_NO_PAD.encode(payload);
+    let signing_input = format!("{header}.{payload}");
+    let signature = sign(&signing_input);
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+impl EcdsaP256Key {
+    /// Sign an arbitrary JWS Signing Input with `ES256`: the counterpart of [`verify_es256`], and
+    /// the signing half [`compact_jws`] is usually handed.
+    pub fn sign_signing_input(&self, signing_input: &str) -> Result<Vec<u8>, JwtError> {
+        self.sign_es256(signing_input.as_bytes())
+            .map(|s| s.to_vec())
+    }
+
+    /// The public half in the VERIFYING shape, for a host registering this key as a client's
+    /// `private_key_jwt` key. Same parameters as [`EcdsaP256Key::public_jwk`], which produces the
+    /// SERVING shape; there is still no method anywhere in this crate that emits `d`.
+    pub fn to_public_jwk(&self) -> PublicJwk {
+        let jwk = self.public_jwk();
+        PublicJwk {
+            kty: jwk.kty.to_string(),
+            crv: jwk.crv.to_string(),
+            x: jwk.x,
+            y: jwk.y,
+            kid: Some(jwk.kid),
+        }
+    }
 }
