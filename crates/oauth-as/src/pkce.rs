@@ -40,30 +40,5 @@ pub fn verifier_is_valid(verifier: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verifier_grammar_bounds() {
-        let ok = "a".repeat(43);
-        assert!(verifier_is_valid(&ok));
-        assert!(verifier_is_valid(&"a".repeat(128)));
-        assert!(!verifier_is_valid(&"a".repeat(42)), "below 43 chars");
-        assert!(!verifier_is_valid(&"a".repeat(129)), "above 128 chars");
-        assert!(
-            !verifier_is_valid(&format!("{}+", "a".repeat(43))),
-            "'+' outside unreserved set"
-        );
-    }
-
-    #[test]
-    fn challenge_shape() {
-        let c = code_challenge_s256(&"x".repeat(43));
-        assert_eq!(
-            c.len(),
-            43,
-            "SHA-256 is 32 bytes; unpadded base64url of 32 bytes is 43 chars"
-        );
-        assert!(!c.contains('='), "no padding per RFC 7636 appendix A");
-    }
-}
+#[path = "tests/pkce.rs"]
+mod tests;

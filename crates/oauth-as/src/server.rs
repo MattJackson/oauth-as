@@ -9,6 +9,11 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::authorization::{
+    AuthorizationCodeRecord, AuthorizationCodeState, AuthorizationError,
+    AuthorizationErrorRedirect, AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod,
+    ValidatedAuthorizationRequest,
+};
 use crate::client::{Client, ClientId};
 use crate::device::{
     normalize_user_code, DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState,
@@ -17,7 +22,18 @@ use crate::error::{ErrorCode, ErrorResponse};
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
 use crate::store::{Storage, StorageError};
-use crate::token::{IssuedToken, RefreshTokenRecord, TokenResponse, TokenType};
+use crate::token::{
+    IntrospectionResponse, IssuedToken, RefreshTokenRecord, TokenResponse, TokenType, TokenTypeHint,
+};
+
+/// Seconds since the Unix epoch, for the RFC 7519 `exp` / `iat` style claims RFC 7662 reuses.
+/// A pre-epoch instant is not representable in that encoding, so it is reported as absent rather
+/// than wrapped into a misleading number.
+fn unix_seconds(t: SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
 
 /// The time source. Injectable so grant expiry and poll pacing are testable without sleeping;
 /// production hosts use [`SystemClock`].
@@ -41,9 +57,35 @@ impl Clock for SystemClock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     /// The issuer identifier (RFC 8414 `issuer`): the canonical `https` URL of this AS.
+    ///
+    /// RFC 8414 section 2 requires the `https` scheme in production. This crate does NOT enforce
+    /// it, because the same code has to be runnable over plain HTTP on loopback for conformance
+    /// runs and local development; enforcing transport security is the host's job, and the host
+    /// is the only party that knows whether it is behind a TLS terminator.
     pub issuer: String,
     /// Where a user goes to enter a device user code (RFC 8628 `verification_uri`).
     pub verification_uri: String,
+    /// RFC 8414 `authorization_endpoint`. `None` derives `{issuer}/authorize`.
+    pub authorization_endpoint: Option<String>,
+    /// RFC 8414 `token_endpoint`. `None` derives `{issuer}/token`.
+    pub token_endpoint: Option<String>,
+    /// RFC 8628 `device_authorization_endpoint`. `None` derives `{issuer}/device_authorization`.
+    pub device_authorization_endpoint: Option<String>,
+    /// RFC 7662 `introspection_endpoint`. `None` derives `{issuer}/introspect`.
+    pub introspection_endpoint: Option<String>,
+    /// RFC 7009 `revocation_endpoint`. `None` derives `{issuer}/revoke`.
+    pub revocation_endpoint: Option<String>,
+    /// RFC 8414 `jwks_uri`. `None` (the default) means this server publishes no keys, which is
+    /// the truth for opaque access tokens.
+    pub jwks_uri: Option<String>,
+    /// RFC 8414 `scopes_supported`. `None` omits the member rather than claiming an empty
+    /// catalogue.
+    pub scopes_supported: Option<Vec<String>>,
+    /// RFC 8414 `service_documentation`.
+    pub service_documentation: Option<String>,
+    /// Authorization code lifetime. RFC 6749 section 4.1.2 recommends a maximum of 10 minutes;
+    /// the default is 60 seconds, which is ample for a redirect round trip.
+    pub authorization_code_ttl: Duration,
     /// Whether device authorization responses include `verification_uri_complete`
     /// (`{verification_uri}?user_code={code}`).
     pub include_verification_uri_complete: bool,
@@ -73,6 +115,15 @@ impl ServerConfig {
         ServerConfig {
             issuer: issuer.into(),
             verification_uri: verification_uri.into(),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            device_authorization_endpoint: None,
+            introspection_endpoint: None,
+            revocation_endpoint: None,
+            jwks_uri: None,
+            scopes_supported: None,
+            service_documentation: None,
+            authorization_code_ttl: Duration::from_secs(60),
             include_verification_uri_complete: true,
             device_code_ttl: Duration::from_secs(600),
             poll_interval: Duration::from_secs(5),
@@ -89,6 +140,30 @@ impl ServerConfig {
 /// `Authorization` header into this; `client_secret` is `None` for public clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenRequest {
+    /// RFC 6749 section 4.1.3: `grant_type=authorization_code`, with the RFC 7636 `code_verifier`
+    /// that OAuth 2.1 makes mandatory.
+    AuthorizationCode {
+        /// The redeeming client.
+        client_id: ClientId,
+        /// The client secret, when the client is confidential.
+        client_secret: Option<String>,
+        /// The code from the authorization response (single use).
+        code: String,
+        /// The redirect URI the authorization request used; must match exactly.
+        redirect_uri: Option<String>,
+        /// The PKCE verifier for the challenge recorded against the code.
+        code_verifier: Option<String>,
+    },
+    /// RFC 6749 section 4.4: `grant_type=client_credentials`. Confidential clients only, and no
+    /// refresh token is issued (section 4.4.3: the client can simply request another token).
+    ClientCredentials {
+        /// The client acting on its own behalf.
+        client_id: ClientId,
+        /// The client secret. A public client has none, and cannot use this grant.
+        client_secret: Option<String>,
+        /// Optional narrowing scope.
+        scope: Option<ScopeSet>,
+    },
     /// RFC 8628 section 3.4: `grant_type=urn:ietf:params:oauth:grant-type:device_code`.
     DeviceCode {
         /// The polling client.
@@ -184,6 +259,19 @@ fn display_user_code(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+/// Whether a `code_challenge` has the RFC 7636 section 4.2 S256 shape: the base64url (no padding)
+/// encoding of a 32 byte digest, which is exactly 43 characters of the base64url alphabet.
+///
+/// Section 4.1's ABNF admits 43 to 128 characters generally, but that range covers the `plain`
+/// method, where the challenge is the verifier itself. For S256 the length is fixed by the digest
+/// size, so anything else was never produced by SHA-256 and cannot match any verifier.
+fn challenge_is_well_formed(challenge: &str) -> bool {
+    challenge.len() == 43
+        && challenge
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 fn storage_error(e: StorageError) -> ErrorResponse {
@@ -368,6 +456,30 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The token endpoint (RFC 6749 section 3.2; device grant per RFC 8628 section 3.4/3.5).
     pub async fn token(&self, request: TokenRequest) -> Result<TokenResponse, ErrorResponse> {
         match request {
+            TokenRequest::AuthorizationCode {
+                client_id,
+                client_secret,
+                code,
+                redirect_uri,
+                code_verifier,
+            } => {
+                self.authorization_code_token(
+                    &client_id,
+                    client_secret.as_deref(),
+                    &code,
+                    redirect_uri.as_deref(),
+                    code_verifier.as_deref(),
+                )
+                .await
+            }
+            TokenRequest::ClientCredentials {
+                client_id,
+                client_secret,
+                scope,
+            } => {
+                self.client_credentials_token(&client_id, client_secret.as_deref(), scope.as_ref())
+                    .await
+            }
             TokenRequest::DeviceCode {
                 client_id,
                 client_secret,
@@ -391,6 +503,327 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .await
             }
         }
+    }
+
+    /// Validate an authorization request (RFC 6749 section 4.1.1) before any user interaction.
+    ///
+    /// The order of checks is dictated by RFC 6749 section 4.1.2.1 and is a security boundary,
+    /// not a style choice: the client and the redirect URI are validated FIRST, because until
+    /// they are, there is no address the server may safely send an error to. Everything checked
+    /// afterwards is reported by redirecting to the (now validated) URI.
+    ///
+    /// On success the host shows its consent UI and then calls
+    /// [`AuthorizationServer::issue_authorization_code`], or reports
+    /// [`ValidatedAuthorizationRequest::denied`] if the user refuses.
+    pub async fn validate_authorization_request(
+        &self,
+        request: &AuthorizationRequest<'_>,
+    ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {
+        let direct = |code: ErrorCode, why: &str| {
+            AuthorizationError::Direct(ErrorResponse::new(code).with_description(why.to_string()))
+        };
+
+        // 1. The client. An unknown client_id and a malformed one collapse into one answer: the
+        //    user agent is untrusted here, and telling it which client ids exist helps nobody.
+        let client_id = request
+            .client_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| direct(ErrorCode::InvalidRequest, "missing client_id"))?;
+        let client = self
+            .store
+            .get_client(&ClientId::new(client_id))
+            .await
+            .map_err(|_| direct(ErrorCode::ServerError, "storage unavailable"))?
+            .ok_or_else(|| direct(ErrorCode::InvalidRequest, "unknown client_id"))?;
+
+        // 2. The redirect URI. OAuth 2.1 section 4.1.3 requires exact string comparison: no
+        //    prefix matching, no ignoring a trailing slash, no normalising case. Every relaxation
+        //    of this rule has a published attack behind it.
+        let redirect_uri = match request.redirect_uri.as_deref() {
+            Some(requested) => client
+                .redirect_uris
+                .iter()
+                .find(|registered| registered.as_str() == requested)
+                .cloned()
+                .ok_or_else(|| {
+                    direct(
+                        ErrorCode::InvalidRequest,
+                        "redirect_uri does not exactly match a registered URI",
+                    )
+                })?,
+            // RFC 6749 section 3.1.2.3: the request may omit it only when there is exactly one
+            // registration to mean. With several, the server would be guessing where to send a
+            // credential, and a wrong guess is the whole attack.
+            None => match client.redirect_uris.as_slice() {
+                [only] => only.clone(),
+                [] => {
+                    return Err(direct(
+                        ErrorCode::InvalidRequest,
+                        "client has no registered redirect_uri",
+                    ))
+                }
+                _ => {
+                    return Err(direct(
+                        ErrorCode::InvalidRequest,
+                        "redirect_uri is required when several are registered",
+                    ))
+                }
+            },
+        };
+
+        // From here the redirect URI is trusted, so errors go back to the client (section
+        // 4.1.2.1) carrying the state that lets it correlate them.
+        let state = request.state.as_deref().map(str::to_string);
+        let redirect = |code: ErrorCode, why: &str| {
+            AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                redirect_uri: redirect_uri.clone(),
+                error: ErrorResponse::new(code).with_description(why.to_string()),
+                state: state.clone(),
+            })
+        };
+
+        // 3. response_type. OAuth 2.1 removes the implicit grant, so `token` is not merely
+        //    unsupported by this server, it is gone from the protocol.
+        match request.response_type.as_deref() {
+            Some("code") => {}
+            None => return Err(redirect(ErrorCode::InvalidRequest, "missing response_type")),
+            Some(_) => {
+                return Err(redirect(
+                    ErrorCode::UnsupportedResponseType,
+                    "this server issues authorization codes only",
+                ))
+            }
+        }
+
+        if !client.allows_grant(GrantType::AuthorizationCode) {
+            return Err(redirect(
+                ErrorCode::UnauthorizedClient,
+                "client registration does not include the authorization_code grant",
+            ));
+        }
+
+        // 4. PKCE. OAuth 2.1 requires it for every authorization code request. RFC 7636 section
+        //    4.3 defaults an absent code_challenge_method to `plain`, which this server does not
+        //    implement and does not advertise, so an absent method is refused rather than
+        //    silently downgraded.
+        match request.code_challenge_method.as_deref() {
+            Some("S256") => {}
+            None => {
+                return Err(redirect(
+                    ErrorCode::InvalidRequest,
+                    "code_challenge_method=S256 is required",
+                ))
+            }
+            Some(_) => {
+                return Err(redirect(
+                    ErrorCode::InvalidRequest,
+                    "only code_challenge_method=S256 is supported",
+                ))
+            }
+        }
+        let code_challenge = request.code_challenge.as_deref().unwrap_or_default();
+        if !challenge_is_well_formed(code_challenge) {
+            // A malformed challenge can never match any verifier, so accepting it would issue a
+            // code that is guaranteed to fail redemption later, with a misleading error.
+            return Err(redirect(
+                ErrorCode::InvalidRequest,
+                "code_challenge must be the base64url SHA-256 form of RFC 7636 section 4.2",
+            ));
+        }
+
+        // 5. Scope. RFC 6749 section 3.3: absent means the registered default.
+        let scope = match request.scope.as_deref() {
+            None => client.default_scopes.clone(),
+            Some(s) => {
+                let requested = ScopeSet::parse(s)
+                    .map_err(|_| redirect(ErrorCode::InvalidScope, "malformed scope"))?;
+                if !requested.is_subset(&client.allowed_scopes) {
+                    return Err(redirect(
+                        ErrorCode::InvalidScope,
+                        "requested scope exceeds the client registration",
+                    ));
+                }
+                requested
+            }
+        };
+
+        Ok(ValidatedAuthorizationRequest {
+            client_id: client.client_id,
+            redirect_uri,
+            scope,
+            state,
+            code_challenge: code_challenge.to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        })
+    }
+
+    /// Mint an authorization code for a request the user has approved (RFC 6749 section 4.1.2).
+    ///
+    /// `subject` is the authenticated resource owner. Taking a
+    /// [`ValidatedAuthorizationRequest`] rather than a raw request is deliberate: an unvalidated
+    /// request cannot reach code issuance, because it cannot be spelled.
+    pub async fn issue_authorization_code(
+        &self,
+        request: &ValidatedAuthorizationRequest,
+        subject: impl Into<String>,
+    ) -> Result<AuthorizationResponse, AuthorizationError> {
+        let now = self.clock.now();
+        let code = random_hex(32);
+        let record = AuthorizationCodeRecord {
+            code: code.clone(),
+            client_id: request.client_id.clone(),
+            redirect_uri: request.redirect_uri.clone(),
+            scope: request.scope.clone(),
+            subject: subject.into(),
+            code_challenge: request.code_challenge.clone(),
+            code_challenge_method: request.code_challenge_method,
+            expires_at: now + self.config.authorization_code_ttl,
+            state: AuthorizationCodeState::Issued,
+        };
+        self.store
+            .put_authorization_code(record)
+            .await
+            .map_err(|_| {
+                AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                    redirect_uri: request.redirect_uri.clone(),
+                    error: ErrorResponse::new(ErrorCode::ServerError),
+                    state: request.state.clone(),
+                })
+            })?;
+        Ok(AuthorizationResponse {
+            code,
+            state: request.state.clone(),
+        })
+    }
+
+    /// RFC 6749 section 4.1.3 with the OAuth 2.1 PKCE requirement: redeem an authorization code.
+    async fn authorization_code_token(
+        &self,
+        client_id: &ClientId,
+        client_secret: Option<&str>,
+        code: &str,
+        redirect_uri: Option<&str>,
+        code_verifier: Option<&str>,
+    ) -> Result<TokenResponse, ErrorResponse> {
+        let client = self.authenticate_client(client_id, client_secret).await?;
+        if !client.allows_grant(GrantType::AuthorizationCode) {
+            return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
+        }
+
+        // Single use is enforced by the atomic take: concurrent redemptions of the same code
+        // cannot both succeed, because only one of them receives the record.
+        let record = self
+            .store
+            .take_authorization_code(code)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
+
+        // A code presented twice is evidence it leaked, so RFC 6749 section 4.1.2 and RFC 9700
+        // section 4.1.1 want the tokens it already minted revoked, not just the replay refused.
+        // Refusing the replay alone would leave the attacker's stolen access token live.
+        if let AuthorizationCodeState::Consumed {
+            access_token,
+            refresh_token,
+        } = &record.state
+        {
+            let _ = self.store.delete_token(access_token).await;
+            if let Some(rt) = refresh_token {
+                let _ = self.store.take_refresh_token(rt).await;
+            }
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+
+        // A code belongs to the client it was issued to. The record goes BACK rather than being
+        // burned: the legitimate client must still be able to complete its flow, and letting an
+        // unauthenticated third party destroy a live code is a denial of service for free.
+        if record.client_id != client.client_id {
+            let _ = self.store.put_authorization_code(record).await;
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+
+        if self.clock.now() >= record.expires_at {
+            // Expired codes are not put back: they can never become valid again.
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                .with_description("authorization code expired"));
+        }
+
+        // RFC 6749 section 4.1.3: the redirect URI presented here must be the one the code was
+        // issued against, which is what stops a code obtained for one registered URI being
+        // redeemed as if it had been issued for another.
+        match redirect_uri {
+            Some(u) if u == record.redirect_uri => {}
+            _ => {
+                let _ = self.store.put_authorization_code(record).await;
+                return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                    .with_description("redirect_uri does not match the authorization request"));
+            }
+        }
+
+        // RFC 7636 section 4.6. A missing verifier is the exact downgrade PKCE exists to stop, so
+        // it is a failure, never a skipped check.
+        let verified = match (code_verifier, record.code_challenge_method) {
+            (Some(v), CodeChallengeMethod::S256) => {
+                crate::pkce::verify_s256(v, &record.code_challenge)
+            }
+            (None, _) => false,
+        };
+        if !verified {
+            let _ = self.store.put_authorization_code(record).await;
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                .with_description("code_verifier does not match the recorded code_challenge"));
+        }
+
+        let issued = self
+            .issue(
+                &client,
+                Some(record.subject.clone()),
+                record.scope.clone(),
+                None,
+                true,
+            )
+            .await?;
+
+        // Retain the spent code until its own expiry, recording what it minted, so a later replay
+        // is recognisable as a replay rather than as an unknown code.
+        let spent = AuthorizationCodeRecord {
+            state: AuthorizationCodeState::Consumed {
+                access_token: issued.access_token.clone(),
+                refresh_token: issued.refresh_token.clone(),
+            },
+            ..record
+        };
+        self.store
+            .put_authorization_code(spent)
+            .await
+            .map_err(storage_error)?;
+
+        Ok(issued)
+    }
+
+    /// RFC 6749 section 4.4: the client acts on its own behalf, with no resource owner.
+    async fn client_credentials_token(
+        &self,
+        client_id: &ClientId,
+        client_secret: Option<&str>,
+        requested_scope: Option<&ScopeSet>,
+    ) -> Result<TokenResponse, ErrorResponse> {
+        let client = self.authenticate_client(client_id, client_secret).await?;
+        // RFC 6749 section 4.4: this grant is for confidential clients. A public client has no
+        // secret, so "the client itself" is not an identity anyone has proven.
+        if matches!(client.auth, crate::client::ClientAuth::Public) {
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
+                .with_description("client_credentials requires a confidential client"));
+        }
+        if !client.allows_grant(GrantType::ClientCredentials) {
+            return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
+        }
+        let scope = Self::resolve_scope(&client, requested_scope)?;
+        // Section 4.4.3: a refresh token SHOULD NOT be included. The client holds its own
+        // credentials and can mint another token whenever it likes, so a refresh token would be a
+        // second long-lived secret bought for nothing.
+        self.issue(&client, None, scope, None, false).await
     }
 
     /// RFC 8628 sections 3.4/3.5: one device-token poll.
@@ -467,7 +900,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     .await
                     .map_err(storage_error)?
                     .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
-                self.issue(&client, Some(subject), taken.scope, None).await
+                self.issue(&client, Some(subject), taken.scope, None, true)
+                    .await
             }
         }
     }
@@ -526,6 +960,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             record.subject.clone(),
             scope,
             Some(record.expires_at),
+            true,
         )
         .await
     }
@@ -539,6 +974,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         subject: Option<String>,
         scope: ScopeSet,
         refresh_chain_expiry: Option<Option<SystemTime>>,
+        allow_refresh: bool,
     ) -> Result<TokenResponse, ErrorResponse> {
         let now = self.clock.now();
         let access_token = random_hex(32);
@@ -554,27 +990,29 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .await
             .map_err(storage_error)?;
 
-        let refresh_token =
-            if self.config.issue_refresh_tokens && client.allows_grant(GrantType::RefreshToken) {
-                let expires_at = match refresh_chain_expiry {
-                    Some(inherited) => inherited,
-                    None => self.config.refresh_token_ttl.map(|ttl| now + ttl),
-                };
-                let rt = random_hex(32);
-                self.store
-                    .put_refresh_token(RefreshTokenRecord {
-                        refresh_token: rt.clone(),
-                        client_id: client.client_id.clone(),
-                        subject,
-                        scope: scope.clone(),
-                        expires_at,
-                    })
-                    .await
-                    .map_err(storage_error)?;
-                Some(rt)
-            } else {
-                None
+        let refresh_token = if allow_refresh
+            && self.config.issue_refresh_tokens
+            && client.allows_grant(GrantType::RefreshToken)
+        {
+            let expires_at = match refresh_chain_expiry {
+                Some(inherited) => inherited,
+                None => self.config.refresh_token_ttl.map(|ttl| now + ttl),
             };
+            let rt = random_hex(32);
+            self.store
+                .put_refresh_token(RefreshTokenRecord {
+                    refresh_token: rt.clone(),
+                    client_id: client.client_id.clone(),
+                    subject,
+                    scope: scope.clone(),
+                    expires_at,
+                })
+                .await
+                .map_err(storage_error)?;
+            Some(rt)
+        } else {
+            None
+        };
 
         Ok(TokenResponse {
             access_token,
@@ -586,6 +1024,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     }
 
     /// Opaque-token introspection: `Ok(Some(_))` only for a known, unexpired token.
+    ///
+    /// This is the host-facing form, which hands back the whole record. The RFC 7662 WIRE form is
+    /// [`AuthorizationServer::introspection_response`], which answers the reduced, caller-scoped
+    /// document the RFC defines.
     pub async fn introspect(
         &self,
         access_token: &str,
@@ -596,31 +1038,100 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .await?
             .filter(|t| self.clock.now() < t.expires_at))
     }
+
+    /// RFC 7662 token introspection, as the protected endpoint the RFC describes.
+    ///
+    /// The caller must authenticate (section 2.1), and a token belonging to a DIFFERENT client
+    /// reads as inactive rather than as a description of somebody else's grant: section 2.2 says
+    /// the response for an invalid token is simply `active: false`, and section 4 warns that this
+    /// endpoint otherwise becomes an oracle for probing tokens a caller does not hold.
+    pub async fn introspection_response(
+        &self,
+        client_id: &ClientId,
+        client_secret: Option<&str>,
+        token: &str,
+    ) -> Result<IntrospectionResponse, ErrorResponse> {
+        let client = self.authenticate_client(client_id, client_secret).await?;
+        let record = self.introspect(token).await.map_err(storage_error)?;
+        Ok(match record {
+            Some(t) if t.client_id == client.client_id => IntrospectionResponse {
+                active: true,
+                scope: (!t.scope.is_empty()).then(|| t.scope.to_string()),
+                client_id: Some(t.client_id.as_str().to_string()),
+                sub: t.subject.clone(),
+                token_type: Some(TokenType::Bearer),
+                exp: unix_seconds(t.expires_at),
+                iat: unix_seconds(t.issued_at),
+                iss: Some(self.config.issuer.clone()),
+            },
+            // Unknown, expired, or somebody else's. All three are one answer on purpose.
+            _ => IntrospectionResponse::inactive(),
+        })
+    }
+
+    /// RFC 7009 token revocation.
+    ///
+    /// Returns `Ok(())` when the token is gone, INCLUDING when it never existed: section 2.2
+    /// requires a 200 for an unknown token, because distinguishing "revoked" from "never heard of
+    /// it" would let an unauthenticated caller test whether a token string is real.
+    ///
+    /// `token_type_hint` (section 2.1) is an optimisation, not a constraint: the RFC requires the
+    /// server to keep looking if the hint is wrong, so a wrong hint costs a second lookup and
+    /// nothing else.
+    pub async fn revoke(
+        &self,
+        client_id: &ClientId,
+        client_secret: Option<&str>,
+        token: &str,
+        token_type_hint: Option<TokenTypeHint>,
+    ) -> Result<(), ErrorResponse> {
+        let client = self.authenticate_client(client_id, client_secret).await?;
+
+        let try_refresh = || async {
+            match self.store.take_refresh_token(token).await {
+                Ok(Some(record)) if record.client_id == client.client_id => Ok(true),
+                // Another client's token: put it back untouched. Section 2.1 says the server
+                // MUST verify ownership, and silently destroying someone else's refresh chain
+                // would be a denial of service available to any registered client.
+                Ok(Some(record)) => {
+                    let _ = self.store.put_refresh_token(record).await;
+                    Ok(false)
+                }
+                Ok(None) => Ok(false),
+                Err(e) => Err(storage_error(e)),
+            }
+        };
+        let try_access = || async {
+            match self.store.get_token(token).await {
+                Ok(Some(t)) if t.client_id == client.client_id => {
+                    self.store
+                        .delete_token(token)
+                        .await
+                        .map_err(storage_error)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(e) => Err(storage_error(e)),
+            }
+        };
+
+        // The hint only decides which lookup happens first.
+        match token_type_hint {
+            Some(TokenTypeHint::AccessToken) => {
+                if !try_access().await? {
+                    try_refresh().await?;
+                }
+            }
+            _ => {
+                if !try_refresh().await? {
+                    try_access().await?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn user_codes_use_the_alphabet_and_are_unbiased_in_shape() {
-        let code = random_user_code(8);
-        assert_eq!(code.len(), 8);
-        assert!(code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)));
-    }
-
-    #[test]
-    fn display_form_hyphenates_even_lengths() {
-        assert_eq!(display_user_code("WDJBMJHT"), "WDJB-MJHT");
-        assert_eq!(display_user_code("ABCDEF"), "ABC-DEF");
-        assert_eq!(display_user_code("ABCDE"), "ABCDE");
-    }
-
-    #[test]
-    fn random_hex_has_the_stated_entropy_width() {
-        let h = random_hex(32);
-        assert_eq!(h.len(), 64);
-        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_ne!(random_hex(32), random_hex(32));
-    }
-}
+#[path = "tests/server.rs"]
+mod tests;

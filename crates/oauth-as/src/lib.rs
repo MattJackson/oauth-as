@@ -49,6 +49,7 @@ pub mod client;
 pub mod device;
 pub mod error;
 pub mod grant;
+pub mod metadata;
 pub mod pkce;
 pub mod scope;
 pub mod server;
@@ -56,13 +57,18 @@ pub mod store;
 pub mod token;
 
 pub use authorization::{
-    AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod, ResponseType,
+    AuthorizationCodeRecord, AuthorizationCodeState, AuthorizationError,
+    AuthorizationErrorRedirect, AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod,
+    ResponseType, ValidatedAuthorizationRequest,
 };
 pub use client::{Client, ClientAuth, ClientId};
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 pub use error::{ErrorCode, ErrorResponse};
 pub use grant::GrantType;
+pub use metadata::{AuthorizationServerMetadata, WELL_KNOWN_PATH};
 pub use scope::{Scope, ScopeSet};
 pub use server::{AuthorizationServer, Clock, ServerConfig, SystemClock, TokenRequest};
 pub use store::{MemoryStorage, Storage, StorageError};
-pub use token::{IssuedToken, RefreshTokenRecord, TokenResponse, TokenType};
+pub use token::{
+    IntrospectionResponse, IssuedToken, RefreshTokenRecord, TokenResponse, TokenType, TokenTypeHint,
+};

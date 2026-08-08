@@ -20,6 +20,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Mutex;
 
+use crate::authorization::AuthorizationCodeRecord;
 use crate::client::{Client, ClientId};
 use crate::device::DeviceGrant;
 use crate::token::{IssuedToken, RefreshTokenRecord};
@@ -82,6 +83,24 @@ pub trait Storage: Send + Sync {
         device_code: &str,
     ) -> impl Future<Output = Result<Option<DeviceGrant>, StorageError>> + Send;
 
+    /// Insert or replace an authorization code record, keyed by its code string.
+    fn put_authorization_code(
+        &self,
+        record: AuthorizationCodeRecord,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Atomically remove and return an authorization code record. This is the single-use
+    /// redemption primitive for the authorization code grant: under concurrent redemption exactly
+    /// one caller receives the record and every other caller sees `None`.
+    ///
+    /// The server puts a CONSUMED record back after a successful redemption (see
+    /// [`crate::authorization::AuthorizationCodeState`]), so that a replay can be recognised as a
+    /// replay and revoke what the code already minted, rather than looking like a typo.
+    fn take_authorization_code(
+        &self,
+        code: &str,
+    ) -> impl Future<Output = Result<Option<AuthorizationCodeRecord>, StorageError>> + Send;
+
     /// Persist an issued access token.
     fn put_token(
         &self,
@@ -93,6 +112,13 @@ pub trait Storage: Send + Sync {
         &self,
         access_token: &str,
     ) -> impl Future<Output = Result<Option<IssuedToken>, StorageError>> + Send;
+
+    /// Remove an access token. Idempotent: removing a token that is already gone is success, as
+    /// RFC 7009 section 2.2 requires of revocation.
+    fn delete_token(
+        &self,
+        access_token: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Persist a refresh token record.
     fn put_refresh_token(
@@ -115,6 +141,7 @@ struct MemoryInner {
     device_by_code: HashMap<String, DeviceGrant>,
     /// normalized user code -> device_code
     user_code_index: HashMap<String, String>,
+    codes: HashMap<String, AuthorizationCodeRecord>,
     tokens: HashMap<String, IssuedToken>,
     refresh: HashMap<String, RefreshTokenRecord>,
 }
@@ -192,6 +219,21 @@ impl Storage for MemoryStorage {
         Ok(grant)
     }
 
+    async fn put_authorization_code(
+        &self,
+        record: AuthorizationCodeRecord,
+    ) -> Result<(), StorageError> {
+        self.lock().codes.insert(record.code.clone(), record);
+        Ok(())
+    }
+
+    async fn take_authorization_code(
+        &self,
+        code: &str,
+    ) -> Result<Option<AuthorizationCodeRecord>, StorageError> {
+        Ok(self.lock().codes.remove(code))
+    }
+
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
         self.lock().tokens.insert(token.access_token.clone(), token);
         Ok(())
@@ -199,6 +241,11 @@ impl Storage for MemoryStorage {
 
     async fn get_token(&self, access_token: &str) -> Result<Option<IssuedToken>, StorageError> {
         Ok(self.lock().tokens.get(access_token).cloned())
+    }
+
+    async fn delete_token(&self, access_token: &str) -> Result<(), StorageError> {
+        self.lock().tokens.remove(access_token);
+        Ok(())
     }
 
     async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {

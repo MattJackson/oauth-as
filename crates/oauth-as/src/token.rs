@@ -40,6 +40,78 @@ pub struct TokenResponse {
     pub scope: Option<String>,
 }
 
+/// The RFC 7009 section 2.1 `token_type_hint`. A hint the server disagrees with is not an error:
+/// section 2.1 requires it to keep looking, so this only chooses which lookup runs first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenTypeHint {
+    /// The caller believes this is an access token.
+    AccessToken,
+    /// The caller believes this is a refresh token.
+    RefreshToken,
+}
+
+impl std::str::FromStr for TokenTypeHint {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "access_token" => Ok(TokenTypeHint::AccessToken),
+            "refresh_token" => Ok(TokenTypeHint::RefreshToken),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The RFC 7662 section 2.2 introspection response.
+///
+/// `active` is the only REQUIRED member, and for an inactive token it is the ONLY member: section
+/// 2.2 is explicit that the server should not describe a token the caller has not proven it
+/// holds, and section 4 explains why (the endpoint would otherwise answer questions about tokens
+/// an attacker merely guessed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntrospectionResponse {
+    /// Whether the token is currently active.
+    pub active: bool,
+    /// Space-delimited granted scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The client the token was issued to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The resource owner the token acts for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// The token type (RFC 6750 `Bearer`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<TokenType>,
+    /// Expiry, as seconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<u64>,
+    /// Issuance, as seconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iat: Option<u64>,
+    /// The issuer of the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+}
+
+impl IntrospectionResponse {
+    /// The one-member answer for a token that is unknown, expired, or not the caller's.
+    pub fn inactive() -> Self {
+        IntrospectionResponse {
+            active: false,
+            scope: None,
+            client_id: None,
+            sub: None,
+            token_type: None,
+            exp: None,
+            iat: None,
+            iss: None,
+        }
+    }
+}
+
 /// A persisted access token: what introspection needs to answer for an opaque token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedToken {
@@ -75,39 +147,5 @@ pub struct RefreshTokenRecord {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn success_response_shape_is_rfc6749_5_1() {
-        let full = TokenResponse {
-            access_token: "at".into(),
-            token_type: TokenType::Bearer,
-            expires_in: 3600,
-            refresh_token: Some("rt".into()),
-            scope: Some("read write".into()),
-        };
-        assert_eq!(
-            serde_json::to_value(&full).unwrap(),
-            serde_json::json!({
-                "access_token": "at",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-                "refresh_token": "rt",
-                "scope": "read write",
-            })
-        );
-        let minimal = TokenResponse {
-            access_token: "at".into(),
-            token_type: TokenType::Bearer,
-            expires_in: 60,
-            refresh_token: None,
-            scope: None,
-        };
-        assert_eq!(
-            serde_json::to_value(&minimal).unwrap(),
-            serde_json::json!({ "access_token": "at", "token_type": "Bearer", "expires_in": 60 }),
-            "absent optionals must be omitted, not null"
-        );
-    }
-}
+#[path = "tests/token.rs"]
+mod tests;
