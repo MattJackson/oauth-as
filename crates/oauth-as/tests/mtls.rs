@@ -158,7 +158,10 @@ impl EventSink for Failures {
 async fn a_mutual_tls_client_authenticates_with_its_certificate() {
     let srv = server_with(ManualClock::at_epoch(), vec![pki_client()]).await;
     let token = srv
-        .token_with_context(cc_request("payments"), with_certificate(&genuine_certificate()))
+        .token_with_context(
+            cc_request("payments"),
+            with_certificate(&genuine_certificate()),
+        )
         .await
         .expect("the registered certificate must authenticate the client");
     assert_eq!(token.scope.as_deref(), Some("api:read"));
@@ -188,7 +191,10 @@ async fn a_certificate_issued_to_someone_else_gets_no_token() {
         .with_event_sink(Box::new(sink));
 
     let refused = srv
-        .token_with_context(cc_request("payments"), with_certificate(&attacker_certificate()))
+        .token_with_context(
+            cc_request("payments"),
+            with_certificate(&attacker_certificate()),
+        )
         .await
         .expect_err("a certificate issued to another subject must not authenticate this client");
     assert_eq!(refused.error, ErrorCode::InvalidClient);
@@ -269,7 +275,10 @@ async fn a_certificate_does_not_stand_in_for_a_clients_secret() {
     let srv = server_with(ManualClock::at_epoch(), vec![secret_client]).await;
 
     let refused = srv
-        .token_with_context(cc_request("legacy"), with_certificate(&genuine_certificate()))
+        .token_with_context(
+            cc_request("legacy"),
+            with_certificate(&genuine_certificate()),
+        )
         .await
         .expect_err("holding a certificate is not knowing the secret");
     assert_eq!(refused.error, ErrorCode::InvalidClient);
@@ -312,7 +321,10 @@ async fn an_access_token_issued_over_a_certificate_is_bound_to_it() {
         .await
         .unwrap();
     // The resource server's half. This is the check that makes the binding worth anything.
-    let cnf = wire.cnf.clone().expect("RFC 8705 s3.2: a bound token reports cnf");
+    let cnf = wire
+        .cnf
+        .clone()
+        .expect("RFC 8705 s3.2: a bound token reports cnf");
     assert!(cnf.confirms_certificate(CLIENT_DER));
     assert!(
         !cnf.confirms_certificate(ATTACKER_DER),
@@ -578,7 +590,10 @@ async fn a_signed_access_token_carries_the_cnf_claim() {
     srv.register_client(pki_client()).await.unwrap();
 
     let token = srv
-        .token_with_context(cc_request("payments"), with_certificate(&genuine_certificate()))
+        .token_with_context(
+            cc_request("payments"),
+            with_certificate(&genuine_certificate()),
+        )
         .await
         .unwrap();
 

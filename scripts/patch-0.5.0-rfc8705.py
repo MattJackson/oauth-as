@@ -589,10 +589,7 @@ EDITS.append(
                 "                // token carries its binding nowhere else, so s3.2 introspection could not\n"
                 "                // report it if it were not written down here.\n"
                 '                #[cfg(feature = "mtls")]\n'
-                "                x5t_s256: bound\n"
-                "                    .cred\n"
-                "                    .certificate\n"
-                "                    .map(|c| Box::new(*c.thumbprint())),\n"
+                "                x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),\n"
                 "                access_token: access_token.clone(),\n",
             ),
             (
@@ -604,10 +601,7 @@ EDITS.append(
                 "                    // RFC 8705 s3: the chain remembers the certificate it was issued to, and\n"
                 "                    // rotation checks it. See the check in `refresh_token`.\n"
                 '                    #[cfg(feature = "mtls")]\n'
-                "                    x5t_s256: bound\n"
-                "                        .cred\n"
-                "                        .certificate\n"
-                "                        .map(|c| Box::new(*c.thumbprint())),\n"
+                "                    x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),\n"
                 "                    refresh_token: rt.clone(),\n",
             ),
             (
@@ -643,9 +637,11 @@ EDITS.append(
                 "                .put_refresh_token(record)\n"
                 "                .await\n"
                 "                .map_err(storage_error)?;\n"
-                "            return Err(ErrorResponse::new(ErrorCode::InvalidGrant).with_description(\n"
-                '                "this refresh token is bound to a different client certificate",\n'
-                "            ));\n"
+                "            return Err(\n"
+                "                ErrorResponse::new(ErrorCode::InvalidGrant).with_description(\n"
+                '                    "this refresh token is bound to a different client certificate",\n'
+                "                ),\n"
+                "            );\n"
                 "        }\n",
             ),
             (
@@ -703,6 +699,32 @@ EDITS.append(
     )
 )
 
+# OPTIONAL: this file belongs to the 0.6.0 JAR slice, which may or may not have landed in the
+# tree this patch is applied to. Its absence is not an error; its presence with a changed shape
+# still is.
+OPTIONAL_FILES = {"crates/oauth-as/tests/jar.rs"}
+
+EDITS.append(
+    (
+        "crates/oauth-as/tests/jar.rs",
+        "x5t_s256",
+        [
+            (
+                '            jti: "jti".to_string(),\n'
+                '            scope: Some("read".to_string()),\n'
+                "        })\n",
+                '            jti: "jti".to_string(),\n'
+                '            scope: Some("read".to_string()),\n'
+                "            // Not certificate bound: this fixture is testing that an access token is\n"
+                "            // not a request object, and a binding would say nothing about that.\n"
+                '            #[cfg(feature = "mtls")]\n'
+                "            cnf: None,\n"
+                "        })\n",
+            )
+        ],
+    )
+)
+
 EDITS.append(
     (
         "crates/oauth-as/src/jwt.rs",
@@ -744,6 +766,50 @@ def _literal(rel, sites):
         for opener, indent in sites
     ])
 
+EDITS.append(
+    (
+        "crates/oauth-as/tests/jwt.rs",
+        "x5t_s256",
+        [
+            (
+                "        .put_refresh_token(RefreshTokenRecord {\n"
+                '            #[cfg(feature = "dpop")]\n'
+                "            jkt: None,\n",
+                "        .put_refresh_token(RefreshTokenRecord {\n"
+                '            #[cfg(feature = "dpop")]\n'
+                "            jkt: None,\n"
+                '            #[cfg(feature = "mtls")]\n'
+                "            x5t_s256: None,\n",
+            )
+        ],
+    )
+)
+
+# The DPoP suite reads `cnf.jkt` as a bare String. It is an `Option` now, for the reason the
+# `Confirmation` edit above gives: the object holds a member per confirmation method and every one
+# of them has to be absent-able, or a certificate-bound token in a build with both features would
+# have to invent a DPoP key it does not have. The WIRE is unchanged for a dpop-only build.
+EDITS.append(
+    (
+        "crates/oauth-as/tests/dpop.rs",
+        "Some(key.to_public_jwk().thumbprint())",
+        [
+            (
+                '        introspected.cnf.expect("a bound token reports cnf").jkt,\n'
+                "        key.to_public_jwk().thumbprint(),\n",
+                '        introspected.cnf.expect("a bound token reports cnf").jkt,\n'
+                "        Some(key.to_public_jwk().thumbprint()),\n",
+            ),
+            (
+                "        introspected.cnf.unwrap().jkt,\n"
+                "        key.to_public_jwk().thumbprint()\n",
+                "        introspected.cnf.unwrap().jkt,\n"
+                "        Some(key.to_public_jwk().thumbprint())\n",
+            ),
+        ],
+    )
+)
+
 EDITS.append(_literal("crates/oauth-as/tests/grant_state_edges.rs", [
     ("    let token = |name: &str, family: Option<&str>| IssuedToken {\n", "        "),
     ("    let refresh = |name: &str, family: &str| RefreshTokenRecord {\n", "        "),
@@ -773,6 +839,9 @@ def main() -> int:
     for rel, marker, edits in EDITS:
         path = os.path.join(repo, rel)
         if not os.path.isfile(path):
+            if rel in OPTIONAL_FILES:
+                print(f"skipped {rel} (not present in this tree)")
+                continue
             print(f"FAIL: {rel} does not exist under {repo}", file=sys.stderr)
             return 1
         with open(path, "r", encoding="utf-8") as fh:

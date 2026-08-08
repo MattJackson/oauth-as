@@ -289,7 +289,10 @@ fn a_self_signed_certificate_nobody_registered_does_not_authenticate() {
         Err(ClientAuthFailure::CertificateMismatch)
     );
     assert_eq!(
-        verify_certificate(&client, &cred(None, Some(&ClientCertificate::from_der(CERT_A)))),
+        verify_certificate(
+            &client,
+            &cred(None, Some(&ClientCertificate::from_der(CERT_A)))
+        ),
         Ok(())
     );
 }
@@ -303,7 +306,10 @@ fn every_registered_self_signed_certificate_authenticates() {
     ));
     for der in [CERT_A, CERT_B] {
         assert_eq!(
-            verify_certificate(&client, &cred(None, Some(&ClientCertificate::from_der(der)))),
+            verify_certificate(
+                &client,
+                &cred(None, Some(&ClientCertificate::from_der(der)))
+            ),
             Ok(())
         );
     }
