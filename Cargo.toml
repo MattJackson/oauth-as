@@ -1,15 +1,9 @@
-[package]
-name = "oauth-as"
-version = "0.0.1"
-edition = "2021"
-rust-version = "1.86"
-license = "MIT OR Apache-2.0"
-description = "Placeholder. An embeddable OAuth 2.1 Authorization Server library is in development; this release reserves the name and contains no implementation."
-repository = "https://github.com/MattJackson/oauth-as"
-homepage = "https://github.com/MattJackson/oauth-as"
-documentation = "https://docs.rs/oauth-as"
-readme = "README.md"
-keywords = ["oauth", "oauth2", "authorization", "authentication", "placeholder"]
-categories = ["authentication"]
-
-[dependencies]
+# Workspace root. The publishable crate is crates/oauth-as; its manifest is fully
+# self-contained (no workspace inheritance) so it packages for crates.io as-is.
+# crates/oauth-as-conformance is the independent black-box harness and is never published.
+[workspace]
+resolver = "2"
+members = [
+    "crates/oauth-as",
+    "crates/oauth-as-conformance",
+]
