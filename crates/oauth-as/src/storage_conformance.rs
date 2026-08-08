@@ -1979,6 +1979,8 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
             access_token: "at-minted-by-this-code".to_string(),
             refresh_token: Some("rt-minted-by-this-code".to_string()),
         },
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 
@@ -2010,6 +2012,8 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
         x5t_s256: Some(Box::new(crate::mtls::CertificateThumbprint::from_der(
             b"conformance-fixture-certificate",
         ))),
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 
@@ -2040,6 +2044,8 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
         x5t_s256: Some(Box::new(crate::mtls::CertificateThumbprint::from_der(
             b"conformance-fixture-certificate",
         ))),
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 

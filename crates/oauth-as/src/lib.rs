@@ -44,6 +44,12 @@
 //! - CLIENT SECRET STORAGE ([`client::SecretHash`], [`client::SecretVerifier`]). Hosts should
 //!   store a one-way verifier, not the secret. The built-in scheme needs no host code; a host
 //!   whose policy names argon2id or an HSM installs a verifier.
+//! - WHEN AND HOW THE USER LOGGED IN ([`consent::Authentication`], behind the `consent`
+//!   feature). This crate cannot authenticate anybody and will not grow a login page, so a
+//!   host that wants RFC 9470 step-up authentication REPORTS when and how it authenticated
+//!   the user; the library records that report and enforces `max_age` and `acr_values`
+//!   against it. The report is taken at face value, because there is nothing here that
+//!   could check it. See the [`consent`] module docs for the whole boundary.
 //! - WHO MAY REGISTER ([`registration::RegistrationPolicy`]). RFC 7591 dynamic client registration
 //!   is OFF unless [`server::ServerConfig::registration`] is set, and even then every registration
 //!   is REFUSED until a policy is installed. RFC 7591 section 5: an open registration endpoint
@@ -74,6 +80,12 @@ pub mod client;
 /// whose security policy forbids transmitting a shared secret cannot use this crate at all.
 #[cfg(feature = "client_assertion")]
 pub mod client_assertion;
+/// Consent records, consent withdrawal with a revocation cascade, and RFC 9470 step-up
+/// authentication, behind the `consent` cargo feature (off by default). Read the module
+/// docs before using it: it draws a blunt line between what the HOST does (authenticate
+/// the user) and what this library does (record that report, and enforce `max_age`).
+#[cfg(feature = "consent")]
+pub mod consent;
 pub mod device;
 /// RFC 9449 DPoP sender-constrained access tokens, behind the `dpop` cargo feature (off by
 /// default, and implying `jwt`). Without it every token this crate issues is a bearer token, so a
@@ -147,6 +159,10 @@ pub use client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash, 
 pub use client_assertion::{
     AssertionFailure, AssertionKeys, VerifiedAssertion, CLIENT_ASSERTION_TYPE, CLIENT_SECRET_JWT,
     PRIVATE_KEY_JWT,
+};
+#[cfg(feature = "consent")]
+pub use consent::{
+    step_up_challenge, Authentication, AuthenticationRequirement, ConsentRecord, StepUpFailure,
 };
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 #[cfg(feature = "dpop")]

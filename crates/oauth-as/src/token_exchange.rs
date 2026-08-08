@@ -592,8 +592,20 @@ async fn exchange<S: Storage, C: Clock>(
             subject.subject.clone(),
             scope,
             resource,
+            // RFC 9396: the exchanged token inherits the subject token's authorization
+            // details unchanged. That is never a widening, because it is exactly what the
+            // token the client just presented already carried; RFC 8693 defines no
+            // `authorization_details` request parameter of its own, so there is nothing here
+            // to narrow BY, and dropping them silently would hand back a token that says
+            // less than the one it came from without saying so.
+            crate::server::GrantedDetails::of_token(&subject),
             None,
             false,
+            // RFC 8693 s1: a client is presenting a token, not a user presenting themselves.
+            // Nobody authenticated during this request, so there is nothing to report, and
+            // carrying the subject token's report forward would let an exchange launder a stale
+            // authentication into a token that looks freshly stepped up.
+            crate::server::GrantedAuthentication::default(),
         )
         .await?;
 

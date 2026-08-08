@@ -65,6 +65,8 @@ async fn a_client_with_no_registered_redirect_uri_is_refused_without_redirecting
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".into()),
         client_id: Some("no-redirect-app".into()),
         // Omitted, which is the only way to reach the branch: naming one would fail the exact-match
@@ -100,6 +102,8 @@ async fn several_registered_redirect_uris_require_the_request_to_name_one() {
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".into()),
         client_id: Some("multi-redirect".into()),
         redirect_uri: None,
@@ -545,7 +549,11 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
     let token = |name: &str, family: Option<&str>| IssuedToken {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         access_token: name.to_string(),
         client_id: ClientId::new("app"),
         subject: Some("user-1".to_string()),
@@ -553,11 +561,17 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
         issued_at: now,
         expires_at: now + Duration::from_secs(3600),
         family_id: family.map(str::to_string),
+        #[cfg(feature = "consent")]
+        authentication: None,
     };
     let refresh = |name: &str, family: &str| RefreshTokenRecord {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         refresh_token: name.to_string(),
         client_id: ClientId::new("app"),
         subject: Some("user-1".to_string()),
@@ -565,6 +579,8 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
         expires_at: None,
         family_id: family.to_string(),
         state: RefreshTokenState::Active,
+        #[cfg(feature = "consent")]
+        authentication: None,
     };
 
     // Three records in the doomed family (two access tokens minted along the chain, one refresh

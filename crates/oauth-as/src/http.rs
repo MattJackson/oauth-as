@@ -104,6 +104,14 @@ pub enum ConsentDecision {
     /// The resource owner refused. RFC 6749 s4.1.2.1: `access_denied` at the redirect URI, which
     /// is an answer the client is entitled to receive.
     Deny,
+    /// The resource owner agreed AND asked not to be asked again: mint the code, and record (or
+    /// widen) the consent so a later request can be recognised as already granted.
+    ///
+    /// A separate variant rather than something the library infers, because remembering is a
+    /// statement about a user's intent and this crate never sees a user. It will not remember a
+    /// consent nobody asked it to remember, and it will not approve one it does remember.
+    #[cfg(feature = "consent")]
+    ApproveAndRemember,
     /// Serve this response instead, unchanged: a consent screen, a login redirect, a step-up
     /// challenge. Nothing is issued.
     Respond(Box<Response>),
@@ -131,11 +139,31 @@ pub struct ConsentRequest<'a> {
     /// The full request URI, so a host that renders a consent screen can round-trip the user
     /// back to exactly this request after they answer.
     pub uri: &'a Uri,
+    /// What this user has already granted this client, if anything.
+    ///
+    /// This is the library REPORTING and the host DECIDING, and that split is the whole design.
+    /// [`crate::consent::ConsentRecord::covers`] answers whether the remembered grant already
+    /// covers what is being asked for now; whether that is a good enough reason to skip the prompt
+    /// depends on how long ago it was, what the scope means in this deployment, and whether the
+    /// user is on a device the host trusts, none of which this crate knows. So it is handed over,
+    /// and nothing here ever approves on the strength of it.
+    #[cfg(feature = "consent")]
+    pub remembered: Option<&'a crate::consent::ConsentRecord>,
 }
 
 /// How the host makes the RFC 6749 s10.12 consent decision. See
 /// [`RouterBuilder::with_consent_resolver`].
 pub type ConsentResolver = Arc<dyn Fn(&ConsentRequest<'_>) -> ConsentDecision + Send + Sync>;
+
+/// How the host answers "when, and how, did you authenticate this user".
+///
+/// The third identity seam, and the one RFC 9470 needs: a subject resolver answers WHO, a consent
+/// resolver answers WHETHER THEY AGREED, and this answers HOW STRONGLY AND HOW RECENTLY. `None`
+/// means the host is not reporting one, which satisfies no `acr_values` and no `max_age`; see
+/// [`RouterBuilder::with_authentication_reporter`].
+#[cfg(feature = "consent")]
+pub type AuthenticationReporter =
+    Arc<dyn Fn(&HeaderMap) -> Option<crate::consent::Authentication> + Send + Sync>;
 
 /// How the device verification form is protected against RFC 6749 s10.12 cross-site forced
 /// approval.
@@ -229,6 +257,8 @@ struct Inner<S: Storage, C: Clock> {
     origin: String,
     subject: Option<SubjectResolver>,
     consent: Option<ConsentResolver>,
+    #[cfg(feature = "consent")]
+    authentication: Option<AuthenticationReporter>,
     verification: VerificationProtection,
 }
 
@@ -254,6 +284,8 @@ pub struct RouterBuilder<S: Storage, C: Clock> {
     server: Arc<AuthorizationServer<S, C>>,
     subject: Option<SubjectResolver>,
     consent: Option<ConsentResolver>,
+    #[cfg(feature = "consent")]
+    authentication: Option<AuthenticationReporter>,
     verification: VerificationProtection,
 }
 
@@ -265,6 +297,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
             server,
             subject: None,
             consent: None,
+            #[cfg(feature = "consent")]
+            authentication: None,
             verification: VerificationProtection::Unwired,
         }
     }
@@ -308,6 +342,29 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         F: Fn(&ConsentRequest<'_>) -> ConsentDecision + Send + Sync + 'static,
     {
         self.consent = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Supply the host's answer to "when, and how, did you authenticate this user".
+    ///
+    /// REQUIRED for RFC 9470 step-up authentication and useless without it. A client answering a
+    /// resource server's `insufficient_user_authentication` challenge repeats its authorization
+    /// request with `acr_values` and/or `max_age`; this server enforces those against whatever the
+    /// reporter returns, and a host with no reporter wired fails every such request. That is the
+    /// correct answer rather than a bug: an authorization server that cannot say when the user
+    /// logged in cannot honestly claim they logged in recently.
+    ///
+    /// Ordinary requests, which carry neither parameter, are unaffected whether this is wired or
+    /// not.
+    ///
+    /// The report is taken at FACE VALUE. This crate cannot authenticate anyone and has nothing to
+    /// check it against; see the [`crate::consent`] module docs.
+    #[cfg(feature = "consent")]
+    pub fn with_authentication_reporter<F>(mut self, reporter: F) -> Self
+    where
+        F: Fn(&HeaderMap) -> Option<crate::consent::Authentication> + Send + Sync + 'static,
+    {
+        self.authentication = Some(Arc::new(reporter));
         self
     }
 
@@ -480,6 +537,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
             origin: issuer_origin(&issuer).to_string(),
             subject: self.subject,
             consent: self.consent,
+            #[cfg(feature = "consent")]
+            authentication: self.authentication,
             verification: self.verification,
         });
 
@@ -1210,6 +1269,12 @@ async fn token_handler<S: Storage, C: Clock>(
     let context = crate::server::TokenRequestContext {
         credential: creds.credential(),
         resources: &resources,
+        // RFC 9396 s2 makes this ONE JSON array, so `param`'s first-wins rule is the right
+        // one here and a duplicate is a smuggled parameter rather than a second value.
+        // That is the opposite of `resource`, which s2 of RFC 8707 explicitly allows to
+        // repeat, and the difference is why the two are read differently.
+        #[cfg(feature = "rar")]
+        authorization_details: param(&form, "authorization_details"),
         #[cfg(feature = "dpop")]
         dpop_proof,
     };
@@ -1749,6 +1814,37 @@ async fn authorize_handler<S: Storage, C: Clock>(
     // consent seam this endpoint would mint a code on any cross-site top-level navigation a
     // logged-in user's browser is made to follow, so an unwired host refuses. This is a direct
     // 403 for the same reason as the missing subject above: no user refused, none was asked.
+    // RFC 9470 s4: `acr_values` and `max_age`, read off the same query pairs the request came
+    // from. A malformed `max_age` is redirectable rather than direct, because by here the redirect
+    // URI has been validated (RFC 6749 s4.1.2.1) and the client is the party that sent it.
+    #[cfg(feature = "consent")]
+    let requirement = match crate::consent::AuthenticationRequirement::from_pairs(
+        pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return redirect(
+                crate::authorization::AuthorizationErrorRedirect {
+                    redirect_uri: validated.redirect_uri.clone(),
+                    error: e,
+                    state: validated.state.clone(),
+                    iss: validated.issuer.clone(),
+                }
+                .location(),
+            )
+        }
+    };
+
+    // What this user has already granted this client, handed to the resolver below. A storage
+    // failure reads as "nothing remembered", which makes the host ask again: the failure mode of
+    // this lookup has to be an extra prompt, never a skipped one.
+    #[cfg(feature = "consent")]
+    let remembered = state
+        .server
+        .remembered_consent(&validated.client_id, &subject)
+        .await
+        .unwrap_or(None);
+
     let consent = match &state.consent {
         Some(resolver) => resolver(&ConsentRequest {
             headers: &headers,
@@ -1758,6 +1854,8 @@ async fn authorize_handler<S: Storage, C: Clock>(
             redirect_uri: &validated.redirect_uri,
             state: validated.state.as_deref(),
             uri: &uri,
+            #[cfg(feature = "consent")]
+            remembered: remembered.as_ref(),
         }),
         None => {
             return unwired(
@@ -1766,19 +1864,59 @@ async fn authorize_handler<S: Storage, C: Clock>(
             )
         }
     };
+    // Only ever set by the host's own `ApproveAndRemember`; see that variant's docs.
+    #[cfg(feature = "consent")]
+    let mut remember = false;
     match consent {
         ConsentDecision::Approve => {}
+        #[cfg(feature = "consent")]
+        ConsentDecision::ApproveAndRemember => remember = true,
         // A refusal is an answer the client is entitled to receive at its (validated) redirect
         // URI, which is exactly what RFC 6749 s4.1.2.1 `access_denied` is for.
         ConsentDecision::Deny => return redirect(validated.denied().location()),
         ConsentDecision::Respond(response) => return *response,
     }
 
-    match state
+    // The host's report of how and when it authenticated this user, for RFC 9470 s4's parameters to
+    // be enforced against. An unwired host reports `None`, which satisfies no requirement.
+    #[cfg(feature = "consent")]
+    let authentication = state.authentication.as_ref().and_then(|f| f(&headers));
+    #[cfg(feature = "consent")]
+    let issued = state
+        .server
+        .issue_authorization_code_with_authentication(
+            &validated,
+            subject.clone(),
+            &requirement,
+            authentication.as_ref(),
+        )
+        .await;
+    #[cfg(not(feature = "consent"))]
+    let issued = state
         .server
         .issue_authorization_code(&validated, subject)
-        .await
-    {
+        .await;
+
+    // AFTER issuance, and only on success: a consent records that the user granted something, and
+    // nothing was granted if the code was refused.
+    #[cfg(feature = "consent")]
+    if remember && issued.is_ok() {
+        // A failure to remember is not a failure to authorize. The user consented and the code is
+        // already minted; turning that into an error would throw away an approval the user actually
+        // gave, and the only consequence of the lost record is being asked again next time.
+        let _ = state
+            .server
+            .record_consent(
+                &validated.client_id,
+                &subject,
+                &validated.scope,
+                &validated.resource,
+                authentication,
+            )
+            .await;
+    }
+
+    match issued {
         Ok(response) => redirect(response.location(&validated.redirect_uri)),
         Err(AuthorizationError::Direct(e)) => error_response(&e, false, &state.challenge),
         Err(AuthorizationError::Redirect(r)) => redirect(r.location()),

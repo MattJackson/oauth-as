@@ -184,6 +184,8 @@ pub async fn mint_code_token<S: Storage>(
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".to_string().into()),
         client_id: Some(client_id.to_string().into()),
         redirect_uri: Some(redirect_uri.to_string().into()),
@@ -224,6 +226,8 @@ pub async fn mint_code_token_keeping_code<S: Storage>(
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
     let req = AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".to_string().into()),
         client_id: Some(client_id.to_string().into()),
         redirect_uri: Some(redirect_uri.to_string().into()),
@@ -408,6 +412,44 @@ impl Storage for FaultStorage {
 
     async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
         self.inner.revoke_token_family(family_id).await
+    }
+
+    // The consent operations delegate straight through: this store's two fault switches are about
+    // the token plane, and a consent path that could not be driven through it is a path no suite
+    // can test under a failing store.
+    #[cfg(feature = "consent")]
+    async fn put_consent(&self, record: oauth_as::ConsentRecord) -> Result<(), StorageError> {
+        self.inner.put_consent(record).await
+    }
+
+    #[cfg(feature = "consent")]
+    async fn get_consent(
+        &self,
+        consent_id: &str,
+    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+        self.inner.get_consent(consent_id).await
+    }
+
+    #[cfg(feature = "consent")]
+    async fn find_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+        self.inner.find_consent(client_id, subject).await
+    }
+
+    #[cfg(feature = "consent")]
+    async fn consents_for_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<oauth_as::ConsentRecord>, StorageError> {
+        self.inner.consents_for_subject(subject).await
+    }
+
+    #[cfg(feature = "consent")]
+    async fn revoke_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
+        self.inner.revoke_consent(consent_id).await
     }
 
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]

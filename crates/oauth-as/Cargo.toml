@@ -78,6 +78,13 @@ resource-metadata = []
 # OFF by default because it is a grant that mints a token from a token, and a deployment
 # that has not decided its delegation policy should not have the endpoint compiled in.
 token-exchange = []
+# Consent records, consent withdrawal with a revocation cascade, and RFC 9470 step-up
+# authentication. OFF by default because it changes what a host is expected to tell the
+# server: with it on the host REPORTS when and how it authenticated the user, and the
+# library enforces the client's `max_age` and `acr_values` against that report. A
+# deployment that has not decided how to answer that question should not have the seam
+# compiled in. No dependency: serde shapes and comparisons over what is already here.
+consent = []
 # RFC 9396 rich authorization requests: the `authorization_details` parameter, which says
 # what a client is asking for as structure rather than as a scope string. OFF by default
 # because a deployment that has not defined any authorization details TYPE has nothing to

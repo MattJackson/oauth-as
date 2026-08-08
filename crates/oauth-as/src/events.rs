@@ -85,6 +85,18 @@ pub enum ClientAuthFailure {
     SecretMismatch,
     /// The host's own [`RateLimiter`] refused the attempt before it was evaluated.
     RateLimited,
+    /// The registration authenticates with RFC 8705 mutual TLS and NO certificate reached
+    /// this crate. Worth separating from a mismatch: in practice it usually means the TLS
+    /// terminator is not configured to request, verify or forward a client certificate, which
+    /// is an operational fault affecting every mutual-TLS client at once rather than an
+    /// attack on one of them.
+    #[cfg(feature = "mtls")]
+    NoCertificatePresented,
+    /// A certificate was presented and did not match the registration (RFC 8705 section 2.1
+    /// subject values, or section 2.2 thumbprints). This one IS the attack shape: a caller
+    /// holding some valid certificate trying to be a client it is not.
+    #[cfg(feature = "mtls")]
+    CertificateMismatch,
     /// The registration exists and an RFC 7523 client assertion was presented that did not verify:
     /// a bad signature, an `alg` the registration does not use, an audience naming another server,
     /// an expired assertion, or a `jti` that had already been spent.
@@ -182,6 +194,23 @@ pub enum Event<'a> {
         client_id: &'a str,
         /// Which kind was removed.
         token_type: TokenTypeHint,
+    },
+    /// A resource owner WITHDREW a consent, and everything issued under it was revoked.
+    ///
+    /// The one event in this set a USER causes rather than a client, and it is worth recording for
+    /// the same reason the two compromise events are: the cascade logs a client out of an account
+    /// it was in the middle of working with, so a host will be asked what happened.
+    /// `records_revoked` is how many tokens, codes and approved device grants the withdrawal
+    /// actually removed, which is what distinguishes "the user ended a live session" from "the
+    /// user revoked something that had already expired".
+    #[cfg(feature = "consent")]
+    ConsentWithdrawn {
+        /// The client that may no longer act for this user.
+        client_id: &'a str,
+        /// The user who withdrew it.
+        subject: &'a str,
+        /// How many records the cascade removed.
+        records_revoked: u64,
     },
     /// A client registered itself through RFC 7591 dynamic client registration.
     ///

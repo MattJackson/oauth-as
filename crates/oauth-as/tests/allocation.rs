@@ -344,6 +344,18 @@ fn authorization_response_location_allocates_exactly_once_at_the_exact_size() {
 // throughout (never `rt-multi-thread`) specifically so no extra OS thread is alive while a window
 // is being measured.
 
+/// What the `rar` feature costs the hot paths, in BYTES only.
+///
+/// Threading the RFC 9396 authorization details through the grant helpers pushes the
+/// all-features token future from 1976 to 2136 bytes, past tokio's 2048-byte debug boxing
+/// threshold, so a debug build allocates the future once per token request. Stated as a
+/// term rather than folded into the numbers so that the cost is legible and so that the
+/// build without the feature is still held to exactly what it was.
+#[cfg(feature = "rar")]
+const RAR_FUTURE: usize = 2560;
+#[cfg(not(feature = "rar"))]
+const RAR_FUTURE: usize = 0;
+
 fn current_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -430,7 +442,7 @@ fn device_token_pending_poll_hot_path_allocation_bound() {
         "device_token(authorization_pending) allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 2048,
+        d.bytes <= 2048 + RAR_FUTURE,
         "device_token(authorization_pending) allocation bytes regressed: {d:?}"
     );
 }
@@ -463,6 +475,8 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
         let challenge = oauth_as::pkce::code_challenge_s256(verifier);
         let req = AuthorizationRequest {
             resource: Vec::new(),
+            #[cfg(feature = "rar")]
+            authorization_details: Default::default(),
             response_type: Some("code".into()),
             client_id: Some("public-app".into()),
             redirect_uri: Some("https://app.example/cb".into()),
@@ -496,7 +510,7 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
         "authorization_code redemption allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 6144,
+        d.bytes <= 6144 + RAR_FUTURE,
         "authorization_code redemption allocation bytes regressed: {d:?}"
     );
 }
@@ -514,6 +528,8 @@ fn refresh_rotation_hot_path_allocation_bound() {
         let challenge = oauth_as::pkce::code_challenge_s256(verifier);
         let req = AuthorizationRequest {
             resource: Vec::new(),
+            #[cfg(feature = "rar")]
+            authorization_details: Default::default(),
             response_type: Some("code".into()),
             client_id: Some("public-app".into()),
             redirect_uri: Some("https://app.example/cb".into()),
@@ -556,7 +572,7 @@ fn refresh_rotation_hot_path_allocation_bound() {
         "refresh rotation allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 4096,
+        d.bytes <= 4096 + RAR_FUTURE,
         "refresh rotation allocation bytes regressed: {d:?}"
     );
 }
@@ -606,7 +622,13 @@ fn core_public_types_stay_within_their_size_budget() {
     const JAR: usize = 8;
     #[cfg(not(feature = "jar"))]
     const JAR: usize = 0;
-    let server_budget = 832 + PAR + JAR;
+    // `rar` adds ServerConfig::authorization_details_types_supported, the RFC 9396 s10
+    // catalogue: an Option<Vec<String>>, three words.
+    #[cfg(feature = "rar")]
+    const RAR: usize = 24;
+    #[cfg(not(feature = "rar"))]
+    const RAR: usize = 0;
+    let server_budget = 832 + PAR + JAR + RAR;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
@@ -615,7 +637,7 @@ fn core_public_types_stay_within_their_size_budget() {
     // ServerConfig carries ~9 String/Option<String> endpoint fields plus Option<Vec<String>> and
     // several Duration/bool/usize fields (RFC-shaped defaults, all host-overridable).
     assert!(
-        size_of::<ServerConfig>() <= 448,
+        size_of::<ServerConfig>() <= 448 + RAR,
         "ServerConfig grew past its size budget: {}",
         size_of::<ServerConfig>()
     );
@@ -646,9 +668,15 @@ fn core_public_types_stay_within_their_size_budget() {
     // `mtls`: the RFC 8705 s3 certificate binding, an `Option<Box<CertificateThumbprint>>`,
     // 8 bytes, because a thumbprint is a fixed `[u8; 32]` and the pointer to it is thin.
     // The 32 bytes themselves are allocated only for a token that is certificate bound.
+    // `rar`: the RFC 9396 authorization details the token carries, a `Vec`, 24 bytes.
+    // `consent`: the RFC 9470 authentication report, an `Option<Box<Authentication>>`, 8
+    // bytes, because the report itself lives behind the pointer and only a grant the host
+    // actually described allocates it.
     let issued_token_budget = 176
         + if cfg!(feature = "dpop") { 16 } else { 0 }
-        + if cfg!(feature = "mtls") { 8 } else { 0 };
+        + if cfg!(feature = "mtls") { 8 } else { 0 }
+        + if cfg!(feature = "rar") { 24 } else { 0 }
+        + if cfg!(feature = "consent") { 8 } else { 0 };
     assert!(
         size_of::<IssuedToken>() <= issued_token_budget,
         "IssuedToken grew past its size budget: {}",

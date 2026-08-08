@@ -385,7 +385,11 @@ async fn subject_falls_back_to_client_id_when_there_is_no_resource_owner() {
         .put_refresh_token(RefreshTokenRecord {
             #[cfg(feature = "dpop")]
             jkt: None,
+            #[cfg(feature = "mtls")]
+            x5t_s256: None,
             resource: Vec::new(),
+            #[cfg(feature = "rar")]
+            authorization_details: Default::default(),
             refresh_token: "seeded-refresh".into(),
             client_id: ClientId::new("device-client"),
             subject: None,
@@ -395,6 +399,8 @@ async fn subject_falls_back_to_client_id_when_there_is_no_resource_owner() {
             // (OAuth 2.1 s6.1, RFC 9700 s4.14.2). Active, because this one has not been rotated.
             family_id: "seeded-family".into(),
             state: RefreshTokenState::Active,
+            #[cfg(feature = "consent")]
+            authentication: None,
         })
         .await
         .unwrap();

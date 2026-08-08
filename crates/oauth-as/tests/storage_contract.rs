@@ -46,7 +46,11 @@ fn sample_refresh_token(token: &str) -> RefreshTokenRecord {
     RefreshTokenRecord {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         refresh_token: token.to_string(),
         client_id: ClientId::new("some-client"),
         subject: Some("user-1".into()),
@@ -54,12 +58,16 @@ fn sample_refresh_token(token: &str) -> RefreshTokenRecord {
         expires_at: None,
         family_id: "family-1".into(),
         state: RefreshTokenState::Active,
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 
 fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
     AuthorizationCodeRecord {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         code: code.to_string(),
         client_id: ClientId::new("some-client"),
         redirect_uri: "https://app.example/cb".into(),
@@ -69,6 +77,8 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
         code_challenge_method: CodeChallengeMethod::S256,
         expires_at: SystemTime::now() + Duration::from_secs(60),
         state: AuthorizationCodeState::Issued,
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 

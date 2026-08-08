@@ -55,6 +55,53 @@ async fn revoking_an_access_token_makes_it_inactive_to_introspection() {
     assert_eq!(resp, IntrospectionResponse::inactive());
 }
 
+/// RFC 7009 s2.1: "If the particular token is a refresh token and the authorization server
+/// supports the revocation of access tokens, then the authorization server SHOULD also invalidate
+/// all access tokens based on the same authorization grant."
+///
+/// This is the half of revocation a client cannot do for itself. A client that revokes its refresh
+/// token has said "this session is over"; leaving the access token minted from the same grant live
+/// means the session is over for the party that asked and not for whoever holds the token, which is
+/// exactly inverted when the reason for revoking is that something leaked.
+#[tokio::test]
+async fn revoking_a_refresh_token_also_kills_the_access_tokens_of_the_same_grant() {
+    let clock = ManualClock::at_epoch();
+    let srv = server_with(clock, vec![confidential_client()]).await;
+    let issued = mint_code_token(
+        &srv,
+        "confidential-app",
+        Some(CONFIDENTIAL_SECRET),
+        CONFIDENTIAL_REDIRECT,
+        "read",
+        "user-1",
+    )
+    .await;
+    let refresh_token = issued.refresh_token.clone().expect("a refresh token");
+
+    srv.revoke(
+        &ClientId::new("confidential-app"),
+        Some(CONFIDENTIAL_SECRET),
+        &refresh_token,
+        Some(TokenTypeHint::RefreshToken),
+    )
+    .await
+    .expect("revoking a live refresh token must succeed");
+
+    let resp = srv
+        .introspection_response(
+            &ClientId::new("confidential-app"),
+            Some(CONFIDENTIAL_SECRET),
+            &issued.access_token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp,
+        IntrospectionResponse::inactive(),
+        "the access token issued with the revoked refresh token is still live"
+    );
+}
+
 /// RFC 7009 s2.1: revoking a refresh token must break the chain it belonged to, so the next
 /// attempt to use it is `invalid_grant` rather than a fresh token.
 #[tokio::test]

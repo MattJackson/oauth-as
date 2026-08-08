@@ -74,6 +74,8 @@ struct Inner {
     codes: HashMap<String, AuthorizationCodeRecord>,
     tokens: HashMap<String, IssuedToken>,
     refresh: HashMap<String, RefreshTokenRecord>,
+    #[cfg(feature = "consent")]
+    consents: HashMap<String, oauth_as::ConsentRecord>,
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
     replay_ids: HashMap<String, SystemTime>,
     #[cfg(feature = "par")]
@@ -344,6 +346,70 @@ impl Storage for NaiveStore {
             removed += (before - g.tokens.len()) as u64;
         }
         Ok(removed)
+    }
+
+    #[cfg(feature = "consent")]
+    async fn put_consent(&self, record: oauth_as::ConsentRecord) -> Result<(), StorageError> {
+        self.lock()
+            .consents
+            .insert(record.consent_id.to_string(), record);
+        Ok(())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn get_consent(
+        &self,
+        consent_id: &str,
+    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+        Ok(self.lock().consents.get(consent_id).cloned())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn find_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+        Ok(self
+            .lock()
+            .consents
+            .values()
+            .find(|c| &c.client_id == client_id && c.subject.as_ref() == subject)
+            .cloned())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn consents_for_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<oauth_as::ConsentRecord>, StorageError> {
+        Ok(self
+            .lock()
+            .consents
+            .values()
+            .filter(|c| c.subject.as_ref() == subject)
+            .cloned()
+            .collect())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn revoke_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
+        let mut g = self.lock();
+        let consent = match g.consents.remove(consent_id) {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+        let client_id = &consent.client_id;
+        let subject: &str = consent.subject.as_ref();
+        let before = g.tokens.len() + g.refresh.len() + g.codes.len();
+        g.tokens
+            .retain(|_, t| !(&t.client_id == client_id && t.subject.as_deref() == Some(subject)));
+        g.refresh
+            .retain(|_, r| !(&r.client_id == client_id && r.subject.as_deref() == Some(subject)));
+        g.codes
+            .retain(|_, c| !(&c.client_id == client_id && c.subject == subject));
+        let after = g.tokens.len() + g.refresh.len() + g.codes.len();
+        Ok((before - after) as u64)
     }
 
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]

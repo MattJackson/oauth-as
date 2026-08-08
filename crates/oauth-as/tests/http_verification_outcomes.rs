@@ -244,6 +244,44 @@ impl Storage for LookupFails {
     ) -> impl Future<Output = Result<u64, StorageError>> + Send {
         self.0.revoke_token_family(family_id)
     }
+    // Delegated like everything else: the one behaviour this fixture breaks is the user-code
+    // lookup, and a store that also lost its consents would be testing two failures at once.
+    #[cfg(feature = "consent")]
+    fn put_consent(
+        &self,
+        record: oauth_as::ConsentRecord,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.0.put_consent(record)
+    }
+    #[cfg(feature = "consent")]
+    fn get_consent(
+        &self,
+        consent_id: &str,
+    ) -> impl Future<Output = Result<Option<oauth_as::ConsentRecord>, StorageError>> + Send {
+        self.0.get_consent(consent_id)
+    }
+    #[cfg(feature = "consent")]
+    fn find_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> impl Future<Output = Result<Option<oauth_as::ConsentRecord>, StorageError>> + Send {
+        self.0.find_consent(client_id, subject)
+    }
+    #[cfg(feature = "consent")]
+    fn consents_for_subject(
+        &self,
+        subject: &str,
+    ) -> impl Future<Output = Result<Vec<oauth_as::ConsentRecord>, StorageError>> + Send {
+        self.0.consents_for_subject(subject)
+    }
+    #[cfg(feature = "consent")]
+    fn revoke_consent(
+        &self,
+        consent_id: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send {
+        self.0.revoke_consent(consent_id)
+    }
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
     fn claim_replay_id(
         &self,

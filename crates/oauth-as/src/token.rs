@@ -71,24 +71,63 @@ impl fmt::Debug for TokenResponse {
     }
 }
 
-/// The RFC 7800 section 3.1 confirmation claim, in the one shape this server produces: the
-/// RFC 9449 section 6.1 `jkt`, a JWK thumbprint.
+/// The RFC 7800 section 3.1 confirmation claim: HOW a token is sender constrained, meaning
+/// what a presenter has to prove in addition to holding the string.
 ///
-/// This is what a resource server checks the binding against, and it is the whole reason DPoP is
-/// worth anything at introspection time: without it the binding is known only to the authorization
-/// server, and an RS that introspects is back to trusting a bearer string.
-#[cfg(feature = "dpop")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// This is what a resource server checks the binding against, and it is the whole reason
+/// sender constraining is worth anything at introspection time: without it the binding is
+/// known only to the authorization server, and an RS that introspects is back to trusting a
+/// bearer string.
+///
+/// EVERY MEMBER IS OPTIONAL, and that is the design rather than an accident. RFC 7800 section
+/// 3.1 defines `cnf` as a JSON OBJECT whose members are confirmation methods, and different
+/// sender-constraining mechanisms register different members OF THE SAME OBJECT: RFC 9449
+/// section 6.1 registers `jkt` for a DPoP key binding, RFC 8705 section 3.1 registers
+/// `x5t#S256` for a certificate binding. A token can legitimately carry both, so neither may
+/// be modelled as "the" confirmation and neither may overwrite the other. Adding a mechanism
+/// means adding an optional member here; it never means replacing this type.
+#[cfg(any(feature = "dpop", feature = "mtls"))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
-    /// The RFC 7638 SHA-256 thumbprint of the client's proof key, base64url without padding.
-    pub jkt: String,
+    /// RFC 9449 section 6.1 `jkt`: the RFC 7638 SHA-256 thumbprint of the client's proof
+    /// key, base64url without padding.
+    #[cfg(feature = "dpop")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jkt: Option<String>,
+    /// RFC 8705 section 3.1 `x5t#S256`: the SHA-256 thumbprint of the DER encoding of the
+    /// X.509 certificate the client presented when the token was issued. A resource server
+    /// checks it with [`Confirmation::confirms_certificate`].
+    #[cfg(feature = "mtls")]
+    #[serde(rename = "x5t#S256", default, skip_serializing_if = "Option::is_none")]
+    pub x5t_s256: Option<crate::mtls::CertificateThumbprint>,
 }
 
-#[cfg(feature = "dpop")]
+#[cfg(any(feature = "dpop", feature = "mtls"))]
 impl Confirmation {
-    /// Wrap a thumbprint.
+    /// Wrap a DPoP key thumbprint.
+    #[cfg(feature = "dpop")]
     pub fn jkt(jkt: impl Into<String>) -> Self {
-        Confirmation { jkt: jkt.into() }
+        Confirmation {
+            jkt: Some(jkt.into()),
+            #[cfg(feature = "mtls")]
+            x5t_s256: None,
+        }
+    }
+
+    /// Whether this names no confirmation method at all, which is what an ordinary bearer
+    /// token has. The `cnf` member is OMITTED for such a token rather than sent as an empty
+    /// object: an empty `cnf` claims a constraint exists and then names none, which is worse
+    /// than silence.
+    pub fn is_empty(&self) -> bool {
+        #[cfg(feature = "dpop")]
+        if self.jkt.is_some() {
+            return false;
+        }
+        #[cfg(feature = "mtls")]
+        if self.x5t_s256.is_some() {
+            return false;
+        }
+        true
     }
 }
 
@@ -157,14 +196,46 @@ pub struct IntrospectionResponse {
     /// nothing", which is the opposite of the truth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<Vec<String>>,
-    /// RFC 9449 section 6.1: the key this token is bound to, present exactly when it is bound to
-    /// one.
+    /// RFC 9470 section 5: when the resource owner behind this token authenticated, as seconds
+    /// since the Unix epoch (OpenID Connect Core section 2 `auth_time`).
+    ///
+    /// This is what makes a step-up challenge answerable at all: a resource server that asked for a
+    /// `max_age` has to be able to see whether the token it now holds actually satisfies it, and
+    /// RFC 9470 section 5 names introspection as one of the two places it may look. Present exactly
+    /// when the host REPORTED an authentication for the grant (see
+    /// [`crate::consent::Authentication`]), and omitted rather than sent as `null` when it did not,
+    /// because a null there reads to a careless resource server as a freshness it has checked.
+    #[cfg(feature = "consent")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
+    /// RFC 9470 section 5: the authentication context class the host reported for the grant
+    /// (OpenID Connect Core section 2 `acr`). Opaque to this crate; see
+    /// [`crate::consent::Authentication::acr`].
+    #[cfg(feature = "consent")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr: Option<String>,
+    /// RFC 9396 section 9.2: the authorization details this token carries, as a top-level
+    /// member of the introspection response. That section is how a resource server holding
+    /// an OPAQUE token learns what the token actually authorizes, which is the whole reason
+    /// the parameter exists.
+    ///
+    /// Omitted rather than empty when the grant carried none, for the same reason `aud` is:
+    /// an empty array reads as "authorized for nothing in particular", which is a statement,
+    /// and the truth here is silence.
+    #[cfg(feature = "rar")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty"
+    )]
+    pub authorization_details: crate::rar::AuthorizationDetails,
+    /// How this token is sender constrained, present exactly when it is: RFC 9449 section 6.1
+    /// `jkt` for a DPoP key, RFC 8705 section 3.2 `x5t#S256` for a client certificate, or both.
     ///
     /// RFC 7662 section 2.2 lets a server return any claim it likes here, and RFC 9449 section 5
-    /// is explicit that a resource server has to be able to confirm the binding. Omitted rather
-    /// than sent as `null` for an unbound token, because `"cnf": null` reads to a careless RS as a
-    /// confirmation it has already checked.
-    #[cfg(feature = "dpop")]
+    /// and RFC 8705 section 3.2 are each explicit that a resource server has to be able to
+    /// confirm the binding. Omitted rather than sent as `null` for an unbound token, because
+    /// `"cnf": null` reads to a careless RS as a confirmation it has already checked.
+    #[cfg(any(feature = "dpop", feature = "mtls"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cnf: Option<Confirmation>,
 }
@@ -182,7 +253,13 @@ impl IntrospectionResponse {
             iat: None,
             iss: None,
             aud: None,
-            #[cfg(feature = "dpop")]
+            #[cfg(feature = "consent")]
+            auth_time: None,
+            #[cfg(feature = "consent")]
+            acr: None,
+            #[cfg(feature = "rar")]
+            authorization_details: crate::rar::AuthorizationDetails::none(),
+            #[cfg(any(feature = "dpop", feature = "mtls"))]
             cnf: None,
         }
     }
@@ -207,6 +284,12 @@ pub struct IssuedToken {
     /// none. This is what RFC 7662 introspection reports as `aud`, and what the RFC 9068 `aud`
     /// claim carries when the `jwt` feature signs the wire token.
     pub resource: Vec<String>,
+    /// The RFC 9396 authorization details this token carries (section 7: the AS returns the
+    /// details as granted and assigned to the access token). This is what RFC 7662
+    /// introspection reports as `authorization_details` (section 9.2) and what the RFC 9068
+    /// claim carries when the `jwt` feature signs the wire token (section 9.1).
+    #[cfg(feature = "rar")]
+    pub authorization_details: crate::rar::AuthorizationDetails,
     /// Issuance instant.
     pub issued_at: SystemTime,
     /// Expiry instant; the token is dead at and after this instant.
@@ -221,6 +304,20 @@ pub struct IssuedToken {
     /// appended to, so the growable capacity a `String` carries would be dead weight.
     #[cfg(feature = "dpop")]
     pub jkt: Option<Box<str>>,
+    /// RFC 8705 section 3: the SHA-256 thumbprint of the client certificate this token is
+    /// bound to, or `None` for a token that is not certificate bound.
+    ///
+    /// Recorded on the AS side, and not only inside a signed JWT, for the same reason `jkt`
+    /// next door is: this crate's default access token is OPAQUE, and RFC 8705 section 3.2
+    /// has a resource server learn the binding by INTROSPECTING, which it can only be told
+    /// if it was persisted.
+    ///
+    /// `Option<Box<_>>` rather than the 32-byte thumbprint inline, on the same measurement
+    /// as `jkt`: this record is written and read on every token-plane request and
+    /// `tests/allocation.rs` holds it to a size budget, so an unbound token pays one null
+    /// pointer and the allocation happens only for a token that is actually bound.
+    #[cfg(feature = "mtls")]
+    pub x5t_s256: Option<Box<crate::mtls::CertificateThumbprint>>,
     /// The authorization grant this token belongs to (see [`RefreshTokenRecord::family_id`]).
     ///
     /// RFC 9700 section 4.14.2 requires that detecting refresh token reuse revokes "the tokens
@@ -229,6 +326,16 @@ pub struct IssuedToken {
     /// chain (RFC 6749 section 4.4 client credentials), where there is no chain to be reused and
     /// so nothing to revoke by family.
     pub family_id: Option<String>,
+    /// What the host reported about the resource owner's authentication when this token's grant was
+    /// approved, or `None` when it reported nothing.
+    ///
+    /// BOXED, so the common `None` costs one null pointer on a record that is written and read on
+    /// every token-plane request rather than the whole struct; `tests/allocation.rs` holds this
+    /// type to a size budget precisely so that a convenience like an inline `SystemTime` plus an
+    /// `Option<String>` cannot be paid for silently. It is what RFC 9470 section 5 is answered from
+    /// at introspection time.
+    #[cfg(feature = "consent")]
+    pub authentication: Option<Box<crate::consent::Authentication>>,
 }
 
 /// Hand-written so the opaque `access_token` never prints. Everything else is metadata ABOUT the
@@ -237,13 +344,15 @@ pub struct IssuedToken {
 /// and it is an internal grouping identifier, not a bearer credential.
 impl fmt::Debug for IssuedToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IssuedToken")
-            .field("access_token", &"[redacted]")
+        let mut out = f.debug_struct("IssuedToken");
+        out.field("access_token", &"[redacted]")
             .field("client_id", &self.client_id)
             .field("subject", &self.subject)
             .field("scope", &self.scope)
-            .field("resource", &self.resource)
-            .field("issued_at", &self.issued_at)
+            .field("resource", &self.resource);
+        #[cfg(feature = "rar")]
+        out.field("authorization_details", &self.authorization_details);
+        out.field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("family_id", &self.family_id)
             .finish()
@@ -288,6 +397,12 @@ pub struct RefreshTokenRecord {
     /// reason `scope` is: section 2 lets a token request narrow the set and never widen it, so the
     /// chain has to remember what it started with. Empty when the grant named none.
     pub resource: Vec<String>,
+    /// The RFC 9396 authorization details originally granted. Carried across rotation for
+    /// the same reason `scope` and `resource` are: section 6 lets a token request narrow the
+    /// set and never widen it, so the chain has to remember what it started with, and a
+    /// rotation that narrowed must not be climbable back on the next one.
+    #[cfg(feature = "rar")]
+    pub authorization_details: crate::rar::AuthorizationDetails,
     /// Absolute chain expiry; `None` means the chain does not expire by time.
     ///
     /// On a `Spent` record this doubles as the RETENTION deadline: a spent token is kept only so
@@ -305,6 +420,19 @@ pub struct RefreshTokenRecord {
     /// can prove possession for and the victim's key the one that gets refused.
     #[cfg(feature = "dpop")]
     pub jkt: Option<Box<str>>,
+    /// RFC 8705 section 3: the client certificate this refresh chain is bound to, or `None`
+    /// for an unbound chain.
+    ///
+    /// Carried across rotation and CHECKED on redemption, exactly as `jkt` is and for the
+    /// same argument: without it the binding would be decorative past the first access
+    /// token, because a stolen refresh token could simply be re-bound to whatever
+    /// certificate the thief holds on the next rotation. Section 3 makes this a MUST for
+    /// public clients specifically; this crate applies it to every chain that was issued
+    /// over a certificate, because a chain whose holder proved possession of a key once
+    /// should have to keep proving it, and for a confidential mutual-TLS client the rule
+    /// costs nothing (it presents that certificate on every request anyway).
+    #[cfg(feature = "mtls")]
+    pub x5t_s256: Option<Box<crate::mtls::CertificateThumbprint>>,
     /// The FAMILY this token belongs to: one identifier shared by every token, access or refresh,
     /// minted from the same authorization grant, and carried across rotation unchanged.
     ///
@@ -314,6 +442,15 @@ pub struct RefreshTokenRecord {
     pub family_id: String,
     /// Whether this link is still redeemable, or is a retained rotated one.
     pub state: RefreshTokenState,
+    /// The authentication the host reported when the grant this chain came from was approved,
+    /// carried across rotation UNCHANGED.
+    ///
+    /// Carried rather than restamped because a rotation is not a new authentication: the user is
+    /// not present, nothing has been proven again, and giving a refreshed token a fresh `auth_time`
+    /// would let any client defeat an RFC 9470 `max_age` by refreshing. See
+    /// [`IssuedToken::authentication`] for why it is boxed.
+    #[cfg(feature = "consent")]
+    pub authentication: Option<Box<crate::consent::Authentication>>,
 }
 
 /// Hand-written so the opaque `refresh_token` never prints. `state` and `family_id` stay visible
@@ -321,13 +458,15 @@ pub struct RefreshTokenRecord {
 /// revocation needs to see, and neither is a credential.
 impl fmt::Debug for RefreshTokenRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RefreshTokenRecord")
-            .field("refresh_token", &"[redacted]")
+        let mut out = f.debug_struct("RefreshTokenRecord");
+        out.field("refresh_token", &"[redacted]")
             .field("client_id", &self.client_id)
             .field("subject", &self.subject)
             .field("scope", &self.scope)
-            .field("resource", &self.resource)
-            .field("expires_at", &self.expires_at)
+            .field("resource", &self.resource);
+        #[cfg(feature = "rar")]
+        out.field("authorization_details", &self.authorization_details);
+        out.field("expires_at", &self.expires_at)
             .field("family_id", &self.family_id)
             .field("state", &self.state)
             .finish()

@@ -35,6 +35,8 @@ use std::sync::Mutex;
 use crate::authorization::AuthorizationCodeRecord;
 use crate::client::{Client, ClientId};
 use crate::device::DeviceGrant;
+#[cfg(feature = "consent")]
+use crate::device::DeviceGrantState;
 use crate::token::{IssuedToken, RefreshTokenRecord};
 
 /// An opaque host-side storage failure. The server maps these to `server_error` on wire paths;
@@ -243,6 +245,82 @@ pub trait Storage: Send + Sync {
         family_id: &str,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
 
+    /// Insert or replace a consent record, keyed by its `consent_id`.
+    ///
+    /// The server keeps at most ONE live consent per (`client_id`, `subject`) pair and widens it
+    /// in place, so a store that indexes that pair (see [`Storage::find_consent`]) must keep the
+    /// index consistent with this write.
+    #[cfg(feature = "consent")]
+    fn put_consent(
+        &self,
+        record: crate::consent::ConsentRecord,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Look up a consent record by its identifier.
+    #[cfg(feature = "consent")]
+    fn get_consent(
+        &self,
+        consent_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::consent::ConsentRecord>, StorageError>> + Send;
+
+    /// The live consent for one (client, subject) pair, if there is one.
+    ///
+    /// This is what remembered consent is read from, and unlike the rest of the consent operations
+    /// it runs on the AUTHORIZATION ENDPOINT'S path, so a store SHOULD index the pair rather than
+    /// scanning.
+    #[cfg(feature = "consent")]
+    fn find_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> impl Future<Output = Result<Option<crate::consent::ConsentRecord>, StorageError>> + Send;
+
+    /// Every consent one resource owner has granted, so a host can show a user what they have
+    /// approved. Order is not specified; a host that wants one sorts what it gets back.
+    #[cfg(feature = "consent")]
+    fn consents_for_subject(
+        &self,
+        subject: &str,
+    ) -> impl Future<Output = Result<Vec<crate::consent::ConsentRecord>, StorageError>> + Send;
+
+    /// WITHDRAW a consent: remove the record AND everything issued under it, returning how many
+    /// records were removed (the consent record itself is not counted).
+    ///
+    /// This is [`Storage::revoke_token_family`] at a BROADER granularity, and it is deliberately
+    /// the same primitive rather than a parallel mechanism. A family is one refresh chain and the
+    /// tokens minted along it; a consent is every grant one client ever obtained for one user, and
+    /// one consent spans many families over time because every fresh trip through the
+    /// authorization endpoint mints another one. Withdrawing a consent and revoking only the newest
+    /// family would leave every earlier chain live, which is this feature failing silently, and
+    /// silently is the worst way for it to fail: the user has been told they stopped something they
+    /// did not.
+    ///
+    /// "Everything issued under it" means, for the consent's (`client_id`, `subject`) pair:
+    ///
+    /// - access tokens for that subject;
+    /// - refresh records for that subject, whatever family they belong to;
+    /// - authorization codes issued to that subject, which are grants in flight and would otherwise
+    ///   mint a token seconds after the user said stop;
+    /// - device grants that subject has APPROVED but the device has not yet polled, for the same
+    ///   reason. A PENDING device grant is left alone: nobody has consented to it yet, so there is
+    ///   nothing there to withdraw.
+    ///
+    /// It is ONE operation rather than five so a real database can do it in one transaction. A
+    /// withdrawal that half succeeded leaves a user believing they revoked something they did not,
+    /// which is the failure this whole feature exists to prevent.
+    ///
+    /// Withdrawing a consent that is already gone is `Ok(0)`, not an error, for the same reason
+    /// [`Storage::revoke_token_family`] tolerates a concurrent revocation: a user who clicks twice
+    /// has not made a mistake.
+    ///
+    /// This runs when a person clicks something, never on a token-plane request, so it is not a hot
+    /// path. It must simply complete.
+    #[cfg(feature = "consent")]
+    fn revoke_consent(
+        &self,
+        consent_id: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
     /// Atomically CLAIM a single-use identifier, returning `true` when this caller is the first
     /// to claim it and `false` when it has already been claimed.
     ///
@@ -317,6 +395,10 @@ struct MemoryInner {
     pushed: HashMap<String, crate::par::PushedAuthorizationRequest>,
     tokens: HashMap<String, IssuedToken>,
     refresh: HashMap<String, RefreshTokenRecord>,
+    /// Consent records by `consent_id`. Present only under the `consent` feature, so a
+    /// default build's store is byte for byte the store it was before.
+    #[cfg(feature = "consent")]
+    consents: HashMap<String, crate::consent::ConsentRecord>,
     /// Claimed RFC 7523 / RFC 9449 single-use identifiers, mapped to when they may be reclaimed.
     /// Present only under the features that produce them, so a default build's store is byte for
     /// byte the store it was before.
@@ -370,6 +452,11 @@ impl Storage for MemoryStorage {
         #[cfg(feature = "par")]
         g.pushed.retain(|_, p| &p.client_id != client_id);
         g.device_by_code.retain(|_, d| &d.client_id != client_id);
+        // A consent names a client that no longer exists; leaving it would show a user an
+        // application they cannot revoke, on a registration nothing can reach. The same
+        // "everything the registration holds goes with it" rule as the four lines above.
+        #[cfg(feature = "consent")]
+        g.consents.retain(|_, c| &c.client_id != client_id);
         // The index is a pointer to a grant, not a record of its own; a dangling entry would make
         // a reaped user code resolve to nothing. Same pass `sweep_expired` makes.
         let live = &g.device_by_code;
@@ -524,6 +611,98 @@ impl Storage for MemoryStorage {
             .retain(|_, t| t.family_id.as_deref() != Some(family_id));
         g.refresh.retain(|_, r| r.family_id != family_id);
         Ok((before - (g.tokens.len() + g.refresh.len())) as u64)
+    }
+
+    #[cfg(feature = "consent")]
+    async fn put_consent(&self, record: crate::consent::ConsentRecord) -> Result<(), StorageError> {
+        self.lock()
+            .consents
+            .insert(record.consent_id.to_string(), record);
+        Ok(())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn get_consent(
+        &self,
+        consent_id: &str,
+    ) -> Result<Option<crate::consent::ConsentRecord>, StorageError> {
+        Ok(self.lock().consents.get(consent_id).cloned())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn find_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> Result<Option<crate::consent::ConsentRecord>, StorageError> {
+        // A scan, honestly, for a map with no secondary index; a host with a real database indexes
+        // the pair, and the trait doc says so because this one IS on the authorization path.
+        Ok(self
+            .lock()
+            .consents
+            .values()
+            .find(|c| &c.client_id == client_id && c.subject.as_ref() == subject)
+            .cloned())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn consents_for_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<crate::consent::ConsentRecord>, StorageError> {
+        Ok(self
+            .lock()
+            .consents
+            .values()
+            .filter(|c| c.subject.as_ref() == subject)
+            .cloned()
+            .collect())
+    }
+
+    #[cfg(feature = "consent")]
+    async fn revoke_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
+        // The whole cascade under the ONE mutex, which is this store's version of the single
+        // transaction the trait doc asks a real database for: no request can observe a
+        // half-withdrawn consent, and nothing can be issued between the lookup and the sweep.
+        let mut g = self.lock();
+        let consent = match g.consents.remove(consent_id) {
+            Some(c) => c,
+            // Already withdrawn, or never existed. Both are success; see the trait doc.
+            None => return Ok(0),
+        };
+        let client_id = &consent.client_id;
+        let subject: &str = consent.subject.as_ref();
+        let before = g.tokens.len() + g.refresh.len() + g.codes.len() + g.device_by_code.len();
+        g.tokens
+            .retain(|_, t| !(&t.client_id == client_id && t.subject.as_deref() == Some(subject)));
+        g.refresh
+            .retain(|_, r| !(&r.client_id == client_id && r.subject.as_deref() == Some(subject)));
+        // An unredeemed code is a grant in flight. Leaving it would let the client mint a token
+        // seconds after the user withdrew, which is the withdrawal failing in the way nobody
+        // notices until it matters.
+        g.codes
+            .retain(|_, c| !(&c.client_id == client_id && c.subject == subject));
+        // Same for a device grant this user has already approved but the device has not polled for
+        // yet. A PENDING one is left alone: nobody has consented to it, and killing it would end a
+        // login the user may be in the middle of.
+        g.device_by_code.retain(|_, d| {
+            !(&d.client_id == client_id
+                && matches!(&d.state, DeviceGrantState::Approved { subject: s } if s == subject))
+        });
+        // The user-code index points at grants rather than being a record of its own, so a dangling
+        // entry would make a reaped code resolve to nothing. The same pass `sweep_expired` makes.
+        let live = &g.device_by_code;
+        let stale: Vec<String> = g
+            .user_code_index
+            .iter()
+            .filter(|(_, dc)| !live.contains_key(*dc))
+            .map(|(uc, _)| uc.clone())
+            .collect();
+        for uc in stale {
+            g.user_code_index.remove(&uc);
+        }
+        let after = g.tokens.len() + g.refresh.len() + g.codes.len() + g.device_by_code.len();
+        Ok((before - after) as u64)
     }
 
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]

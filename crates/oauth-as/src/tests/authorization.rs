@@ -57,11 +57,15 @@ fn c13_authorization_code_record_debug_format_redacts_code_and_tokens() {
         code_challenge: "some-challenge".to_string(),
         code_challenge_method: CodeChallengeMethod::S256,
         resource: vec!["https://rs.example/api".to_string()],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         expires_at: std::time::SystemTime::UNIX_EPOCH,
         state: AuthorizationCodeState::Consumed {
             access_token: "the-secret-access-token".to_string(),
             refresh_token: Some("the-secret-refresh-token".to_string()),
         },
+        #[cfg(feature = "consent")]
+        authentication: None,
     };
     let printed = format!("{record:?}");
     assert!(!printed.contains("the-secret-code-value"), "{printed}");

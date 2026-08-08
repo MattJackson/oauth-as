@@ -34,6 +34,17 @@ pub enum ErrorCode {
     AuthorizationPending,
     SlowDown,
     ExpiredToken,
+    /// RFC 9396 section 5: the `authorization_details` parameter is unparseable, exceeds
+    /// what this server will accept, names a `type` this server does not support, or asks
+    /// for more than the underlying grant allows (section 6). Section 5 makes refusing a
+    /// MUST rather than a choice: an AS that ignored an authorization detail it did not
+    /// understand would issue a token that says nothing about a permission the client
+    /// believes it obtained, and the client cannot tell the difference.
+    ///
+    /// Distinct from `invalid_request` for the reason `invalid_target` is: the parameter was
+    /// well formed AS A PARAMETER, so a client conflating the two would retry unchanged.
+    #[cfg(feature = "rar")]
+    InvalidAuthorizationDetails,
     /// RFC 8707 section 2: the `resource` parameter names a target this server will not issue a
     /// token for, because the value is malformed, is not an absolute URI, or was never granted.
     /// The code itself is registered by RFC 8693 section 2.2.2 and RFC 8707 section 2 is what
@@ -41,6 +52,17 @@ pub enum ErrorCode {
     /// distinct code from `invalid_request` on purpose: the parameter was well formed AS A
     /// PARAMETER, so a client that conflated the two would retry the same request.
     InvalidTarget,
+    /// RFC 9470 section 3: the authentication the user performed is not enough for what is
+    /// being asked. Registered by RFC 9470 for the RESOURCE server's challenge; this server
+    /// emits it from the AUTHORIZATION endpoint when the host's reported authentication
+    /// cannot satisfy the request's `acr_values` or `max_age`.
+    ///
+    /// Reusing the resource server's code is deliberate. It is the code the client was just
+    /// handed, so re-sending it says the true thing: the authentication is STILL not
+    /// sufficient. `invalid_request` would say the parameters were malformed and invite the
+    /// client to retry the identical request, which is the one thing that cannot help.
+    #[cfg(feature = "consent")]
+    InsufficientUserAuthentication,
     /// RFC 9449 section 5: the DPoP proof on this request is missing, malformed, does not bind to
     /// this request, or has already been used. Registered by RFC 9449 section 12.3.
     ///
@@ -85,7 +107,11 @@ impl ErrorCode {
             ErrorCode::AuthorizationPending => "authorization_pending",
             ErrorCode::SlowDown => "slow_down",
             ErrorCode::ExpiredToken => "expired_token",
+            #[cfg(feature = "rar")]
+            ErrorCode::InvalidAuthorizationDetails => "invalid_authorization_details",
             ErrorCode::InvalidTarget => "invalid_target",
+            #[cfg(feature = "consent")]
+            ErrorCode::InsufficientUserAuthentication => "insufficient_user_authentication",
             #[cfg(feature = "dpop")]
             ErrorCode::InvalidDpopProof => "invalid_dpop_proof",
             #[cfg(feature = "par")]

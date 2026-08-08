@@ -16,14 +16,20 @@ fn c13_issued_token_debug_redacts_the_access_token() {
     let record = IssuedToken {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         access_token: "at-secret-value".into(),
         client_id: ClientId::new("app"),
         subject: Some("alice".into()),
         scope: ScopeSet::parse("read write").unwrap(),
         resource: vec!["https://rs.example/api".to_string()],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         issued_at: UNIX_EPOCH + Duration::from_secs(1_000),
         expires_at: UNIX_EPOCH + Duration::from_secs(4_600),
         family_id: Some("fam-1".into()),
+        #[cfg(feature = "consent")]
+        authentication: None,
     };
     let printed = format!("{record:?}");
     assert!(
@@ -47,14 +53,20 @@ fn c13_refresh_token_record_debug_redacts_the_refresh_token() {
     let record = RefreshTokenRecord {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         refresh_token: "rt-secret-value".into(),
         client_id: ClientId::new("app"),
         subject: Some("alice".into()),
         scope: ScopeSet::parse("read").unwrap(),
         resource: vec!["https://rs.example/api".to_string()],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         expires_at: Some(UNIX_EPOCH + Duration::from_secs(9_000)),
         family_id: "fam-1".into(),
         state: RefreshTokenState::Spent,
+        #[cfg(feature = "consent")]
+        authentication: None,
     };
     let printed = format!("{record:?}");
     assert!(

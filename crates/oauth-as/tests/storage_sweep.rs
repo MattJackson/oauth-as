@@ -58,6 +58,8 @@ fn device_grant(device_code: &str, user_code: &str, expires_at: SystemTime) -> D
 fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRecord {
     AuthorizationCodeRecord {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         code: code.to_string(),
         client_id: ClientId::new("some-client"),
         redirect_uri: "https://app.example/cb".into(),
@@ -70,6 +72,8 @@ fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRe
             access_token: "at".into(),
             refresh_token: None,
         },
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 
@@ -77,7 +81,11 @@ fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
     IssuedToken {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         access_token: token.to_string(),
         client_id: ClientId::new("some-client"),
         subject: Some("user-1".into()),
@@ -85,6 +93,8 @@ fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
         issued_at: now(),
         expires_at,
         family_id: None,
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 
@@ -92,7 +102,11 @@ fn refresh_token(token: &str, expires_at: Option<SystemTime>) -> RefreshTokenRec
     RefreshTokenRecord {
         #[cfg(feature = "dpop")]
         jkt: None,
+        #[cfg(feature = "mtls")]
+        x5t_s256: None,
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         refresh_token: token.to_string(),
         client_id: ClientId::new("some-client"),
         subject: Some("user-1".into()),
@@ -100,6 +114,8 @@ fn refresh_token(token: &str, expires_at: Option<SystemTime>) -> RefreshTokenRec
         expires_at,
         family_id: "family-1".into(),
         state: RefreshTokenState::Active,
+        #[cfg(feature = "consent")]
+        authentication: None,
     }
 }
 

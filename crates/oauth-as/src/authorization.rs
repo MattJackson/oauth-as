@@ -84,6 +84,17 @@ pub struct AuthorizationRequest<'a> {
     /// `Vec` allocates nothing, so a request that carries no `resource` still costs what it did
     /// before this parameter existed.
     pub resource: Vec<Cow<'a, str>>,
+    /// RFC 9396 section 2 `authorization_details`: a JSON array of objects, each naming a
+    /// `type` that defines the rest of it.
+    ///
+    /// RAW TEXT, not a parsed structure, for the reason the rest of this type is raw text:
+    /// a server cannot reject what it cannot represent, and this parameter's failure modes
+    /// (unparseable, oversized, an unknown type) all have to reach the state machine so it
+    /// can answer them the way RFC 9396 section 5 prescribes. Parsing happens in
+    /// [`crate::rar::AuthorizationDetails::parse`], under this crate's bounds, and only the
+    /// validated form carries the result.
+    #[cfg(feature = "rar")]
+    pub authorization_details: Option<Cow<'a, str>>,
 }
 
 impl<'a> AuthorizationRequest<'a> {
@@ -115,6 +126,8 @@ impl<'a> AuthorizationRequest<'a> {
                 "state" => &mut req.state,
                 "code_challenge" => &mut req.code_challenge,
                 "code_challenge_method" => &mut req.code_challenge_method,
+                #[cfg(feature = "rar")]
+                "authorization_details" => &mut req.authorization_details,
                 _ => continue,
             };
             if slot.is_none() {
@@ -205,6 +218,15 @@ pub struct ValidatedAuthorizationRequest {
     /// client named none, which means the issued token carries no audience restriction from this
     /// mechanism.
     pub resource: Vec<String>,
+    /// The RFC 9396 authorization details this request asked for, already parsed and
+    /// already checked against the server's supported types (section 5). Empty when the
+    /// client named none.
+    ///
+    /// A host's consent screen MAY replace this before the code is issued: RFC 9396 section
+    /// 7.1 is explicit that the details attached to the token may differ from the request,
+    /// which is how an AS records the account the user actually picked.
+    #[cfg(feature = "rar")]
+    pub authorization_details: crate::rar::AuthorizationDetails,
     /// Zero-sized witness, private to this module. Its only purpose is that it cannot be named
     /// (let alone constructed) outside `authorization.rs`, so a struct-literal expression cannot
     /// build a whole `ValidatedAuthorizationRequest` from anywhere else, in this crate or out of
@@ -247,8 +269,20 @@ impl ValidatedAuthorizationRequest {
             code_challenge_method,
             issuer,
             resource,
+            #[cfg(feature = "rar")]
+            authorization_details: crate::rar::AuthorizationDetails::none(),
             _sealed: Sealed,
         }
+    }
+
+    /// Record the RFC 9396 authorization details this request was validated as carrying.
+    ///
+    /// `pub(crate)`, like [`ValidatedAuthorizationRequest::new`] itself: the sealed field on
+    /// this type exists so that only validation can produce one, and a public setter for a
+    /// field that decides what a token authorizes would hand that back.
+    #[cfg(feature = "rar")]
+    pub(crate) fn set_authorization_details(&mut self, details: crate::rar::AuthorizationDetails) {
+        self.authorization_details = details;
     }
 
     /// The redirect describing the user refusing consent (RFC 6749 section 4.1.2.1
@@ -461,24 +495,45 @@ pub struct AuthorizationCodeRecord {
     /// NOT widen it (RFC 8707 section 2), and "what was granted" is not knowable at the token
     /// endpoint any other way. Empty means the client asked for no audience restriction.
     pub resource: Vec<String>,
+    /// The RFC 9396 authorization details the user approved.
+    ///
+    /// Recorded on the code for exactly the reason `resource` above is: section 6 lets the
+    /// token request that redeems it NARROW this set and never widen it, and "what was
+    /// granted" is not knowable at the token endpoint any other way. Empty means the client
+    /// asked for no rich authorization detail.
+    #[cfg(feature = "rar")]
+    pub authorization_details: crate::rar::AuthorizationDetails,
     /// Expiry instant; the code is dead at and after this instant.
     pub expires_at: SystemTime,
     /// Whether the code has been redeemed, and what it produced.
     pub state: AuthorizationCodeState,
+    /// What the host reported about the resource owner's authentication when this code was
+    /// approved (the consent-0.8.0 slice; see [`crate::consent::Authentication`]).
+    ///
+    /// Recorded on the CODE because that is the only path by which the authentication the user
+    /// actually performed can reach the token the code mints: the token endpoint has no user in
+    /// front of it and cannot ask. Without it, RFC 9470 section 5's `auth_time` and `acr` could
+    /// only ever be guessed at.
+    #[cfg(feature = "consent")]
+    pub authentication: Option<Box<crate::consent::Authentication>>,
 }
 
 impl fmt::Debug for AuthorizationCodeRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthorizationCodeRecord")
-            .field("code", &"[redacted]")
+        let mut out = f.debug_struct("AuthorizationCodeRecord");
+        out.field("code", &"[redacted]")
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
             .field("scope", &self.scope)
             .field("subject", &self.subject)
             .field("code_challenge", &self.code_challenge)
             .field("code_challenge_method", &self.code_challenge_method)
-            .field("resource", &self.resource)
-            .field("expires_at", &self.expires_at)
+            .field("resource", &self.resource);
+        // Not a credential: it describes what was authorized, which is precisely what an
+        // operator investigating a grant needs to see.
+        #[cfg(feature = "rar")]
+        out.field("authorization_details", &self.authorization_details);
+        out.field("expires_at", &self.expires_at)
             .field("state", &self.state)
             .finish()
     }

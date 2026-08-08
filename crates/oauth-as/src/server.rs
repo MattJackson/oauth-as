@@ -226,6 +226,50 @@ pub struct ServerConfig {
 /// does. See [`AuthorizationServer::approve_device`].
 pub const MIN_USER_CODE_LENGTH: usize = 8;
 
+/// The host-reported authentication an issuance carries, in a wrapper that is ZERO SIZED without
+/// the `consent` feature.
+///
+/// It exists so [`AuthorizationServer::issue`] and its five call sites have ONE signature in every
+/// feature configuration. The alternative, a `cfg` on the argument, cannot be matched by a `cfg` at
+/// the call site, and duplicating five call sites under a `cfg` is five places to get it wrong in
+/// the configuration nobody builds locally. Same reason `Bound` exists for the RFC 9449 binding.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub(crate) struct GrantedAuthentication {
+    #[cfg(feature = "consent")]
+    pub(crate) authentication: Option<Box<crate::consent::Authentication>>,
+}
+
+impl GrantedAuthentication {
+    /// What an authorization code carries into the token it mints.
+    #[cfg(feature = "consent")]
+    pub(crate) fn from_code(record: &AuthorizationCodeRecord) -> Self {
+        GrantedAuthentication {
+            authentication: record.authentication.clone(),
+        }
+    }
+
+    /// Without the feature there is no field to fill, and no field on the record to fill it from.
+    #[cfg(not(feature = "consent"))]
+    pub(crate) fn from_code(_record: &AuthorizationCodeRecord) -> Self {
+        GrantedAuthentication {}
+    }
+
+    /// What a refresh chain carries across a rotation: the ORIGINAL authentication, unchanged. See
+    /// [`crate::token::RefreshTokenRecord::authentication`] on why a rotation is not a new one.
+    #[cfg(feature = "consent")]
+    pub(crate) fn from_refresh(record: &RefreshTokenRecord) -> Self {
+        GrantedAuthentication {
+            authentication: record.authentication.clone(),
+        }
+    }
+
+    /// Without the feature, as above.
+    #[cfg(not(feature = "consent"))]
+    pub(crate) fn from_refresh(_record: &RefreshTokenRecord) -> Self {
+        GrantedAuthentication {}
+    }
+}
+
 /// How many times user-code generation may redraw on a collision before giving up.
 ///
 /// A collision at the floor length is a roughly one-in-a-hundred-billion event per live grant, so
@@ -1731,11 +1775,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The client secret may be presented EITHER on the [`TokenRequest`] variant (where it has
     /// always lived) or on [`TokenRequestContext::credential`]; the context wins when both are set,
     /// and neither is silently dropped.
-    pub async fn token_with_context(
-        &self,
+    pub fn token_with_context<'a>(
+        &'a self,
         request: TokenRequest,
-        context: TokenRequestContext<'_>,
-    ) -> Result<TokenResponse, ErrorResponse> {
+        context: TokenRequestContext<'a>,
+    ) -> impl std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + 'a {
+        async move {
         let requested_resources =
             self.validate_resources(context.resources.iter().map(|r| r.as_str()))?;
         // RFC 9396 s5 and s6, parsed and type-checked ONCE here for the same reason the
@@ -1866,6 +1911,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 self.emit_refusal(&client_id, GrantType::RefreshToken, &outcome);
                 outcome
             }
+        }
         }
     }
 
@@ -2149,6 +2195,59 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         request: &ValidatedAuthorizationRequest,
         subject: impl Into<String>,
     ) -> Result<AuthorizationResponse, AuthorizationError> {
+        self.issue_authorization_code_inner(request, subject, GrantedAuthentication::default())
+            .await
+    }
+
+    /// Mint an authorization code for a request the user has approved, holding the request's RFC
+    /// 9470 step-up requirement to the authentication the HOST reports it performed.
+    ///
+    /// This is the enforcement half of RFC 9470, and it is a library job rather than a host job on
+    /// purpose: a `max_age` the host is trusted to check for itself is a `max_age` that gets checked
+    /// in whichever code path somebody remembered. The host still owns the authentication itself,
+    /// and `authentication` is its REPORT of one; this crate cannot verify that report and does not
+    /// pretend to. See the [`crate::consent`] module docs for the whole boundary.
+    ///
+    /// A requirement the report does not satisfy is refused with RFC 9470 section 3's
+    /// `insufficient_user_authentication`, delivered as a REDIRECT (RFC 6749 section 4.1.2.1):
+    /// by this point the redirect URI has been validated, and the client is both the party that
+    /// asked the question and the party that has to decide whether to send the user back to log in.
+    /// Nothing is minted and no consent is touched.
+    #[cfg(feature = "consent")]
+    pub async fn issue_authorization_code_with_authentication(
+        &self,
+        request: &ValidatedAuthorizationRequest,
+        subject: impl Into<String>,
+        requirement: &crate::consent::AuthenticationRequirement,
+        authentication: Option<&crate::consent::Authentication>,
+    ) -> Result<AuthorizationResponse, AuthorizationError> {
+        if let Err(failure) = requirement.satisfied_by(authentication, self.clock.now()) {
+            return Err(AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                redirect_uri: request.redirect_uri.clone(),
+                error: failure.error_response(),
+                state: request.state.clone(),
+                iss: request.issuer.clone(),
+            }));
+        }
+        self.issue_authorization_code_inner(
+            request,
+            subject,
+            GrantedAuthentication {
+                authentication: authentication.cloned().map(Box::new),
+            },
+        )
+        .await
+    }
+
+    /// The issuance itself, shared by both entry points above so that they cannot drift.
+    async fn issue_authorization_code_inner(
+        &self,
+        request: &ValidatedAuthorizationRequest,
+        subject: impl Into<String>,
+        authentication: GrantedAuthentication,
+    ) -> Result<AuthorizationResponse, AuthorizationError> {
+        #[cfg(not(feature = "consent"))]
+        let _ = authentication;
         let now = self.clock.now();
         let code = random_hex(32);
         let record = AuthorizationCodeRecord {
@@ -2167,6 +2266,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             authorization_details: request.authorization_details.clone(),
             expires_at: now + self.config.authorization_code_ttl,
             state: AuthorizationCodeState::Issued,
+            // RFC 9470 s5: recorded here because the token endpoint has no user in front of it and
+            // could not ask. See `AuthorizationCodeRecord::authentication`.
+            #[cfg(feature = "consent")]
+            authentication: authentication.authentication,
         };
         self.store
             .put_authorization_code(record)
@@ -2356,6 +2459,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 details,
                 None,
                 true,
+                GrantedAuthentication::from_code(&record),
             )
             .await?;
 
@@ -2416,6 +2520,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             details,
             None,
             false,
+            // RFC 6749 s4.4 has no resource owner, so there is no user authentication to report.
+            GrantedAuthentication::default(),
         )
         .await
     }
@@ -2508,6 +2614,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     GrantedDetails::default(),
                     None,
                     true,
+                    // The device grant carries no authentication report: RFC 8628 s3.3 approval
+                    // happens at the host's own verification UI, which is where the report would
+                    // have to be taken, and inventing one here would be this server asserting
+                    // something it never witnessed.
+                    GrantedAuthentication::default(),
                 )
                 .await
             }
@@ -2676,6 +2787,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     expires_at: record.expires_at,
                 }),
                 true,
+                GrantedAuthentication::from_refresh(&record),
             )
             .await?;
 
@@ -2733,6 +2845,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         details: GrantedDetails,
         chain: Option<RefreshChain>,
         allow_refresh: bool,
+        authentication: GrantedAuthentication,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + Send + 'a>,
     > {
@@ -2746,6 +2859,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             details,
             chain,
             allow_refresh,
+            authentication,
         ))
     }
 
@@ -2761,6 +2875,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         details: GrantedDetails,
         chain: Option<RefreshChain>,
         allow_refresh: bool,
+        authentication: GrantedAuthentication,
     ) -> Result<TokenResponse, ErrorResponse> {
         // `bound` carries only the RFC 9449 key binding, so with that feature off it is genuinely
         // unused HERE. It stays in the signature regardless, so the four call sites do not have to
@@ -2768,6 +2883,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // under the configuration nobody builds locally.
         #[cfg(not(feature = "dpop"))]
         let _ = bound;
+        // Same for the RFC 9470 authentication report: without `consent` the wrapper is empty and
+        // genuinely unused here, and an unused parameter is a warning rather than a signature that
+        // differs by feature.
+        #[cfg(not(feature = "consent"))]
+        let _ = authentication;
         // Likewise: without `rar` the details are a zero sized value nothing reads.
         #[cfg(not(feature = "rar"))]
         let _ = details;
@@ -2840,6 +2960,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 issued_at: now,
                 expires_at: now + self.config.access_token_ttl,
                 family_id: family_id.clone(),
+                // RFC 9470 s5: the token reports the authentication behind it, so introspection can
+                // answer the question the resource server's challenge asked.
+                #[cfg(feature = "consent")]
+                authentication: authentication.authentication.clone(),
             })
             .await
             .map_err(storage_error)?;
@@ -2872,6 +2996,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // Present whenever a refresh token is: `issues_refresh` is what decided both.
                     family_id: family_id.unwrap_or_default(),
                     state: RefreshTokenState::Active,
+                    // Carried, never restamped: see `RefreshTokenRecord::authentication`.
+                    #[cfg(feature = "consent")]
+                    authentication: authentication.authentication,
                 })
                 .await
                 .map_err(storage_error)?;
@@ -2989,6 +3116,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // the grant carried RFC 8707 resource indicators. Omitted rather than empty when it
                 // does not: see `IntrospectionResponse::aud`.
                 aud: (!t.resource.is_empty()).then(|| t.resource.clone()),
+                // RFC 9470 s5. A resource server that sent a step-up challenge has to be able to
+                // see whether the token it now holds satisfies it; without these two it would have
+                // to take the client's word for that, which is the whole thing the challenge exists
+                // to avoid.
+                #[cfg(feature = "consent")]
+                auth_time: t
+                    .authentication
+                    .as_ref()
+                    .and_then(|a| unix_seconds(a.auth_time)),
+                #[cfg(feature = "consent")]
+                acr: t
+                    .authentication
+                    .as_ref()
+                    .and_then(|a| a.acr.as_deref().map(str::to_string)),
                 // RFC 9396 s9.2: the details as a top-level member of the introspection
                 // response. For an OPAQUE token this is the ONLY way a resource server can
                 // learn what the token actually authorizes, which is the whole point of the
@@ -3016,6 +3157,109 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // Unknown, expired, or somebody else's. All three are one answer on purpose.
             _ => IntrospectionResponse::inactive(),
         })
+    }
+
+    /// Record that a resource owner has consented to a client acting for them.
+    ///
+    /// One live consent per (client, subject) pair: an existing record is WIDENED in place, keeping
+    /// its identifier and its original `granted_at`, so a user who approves one more scope next
+    /// month still sees one entry rather than two and withdrawing it withdraws the whole
+    /// relationship. See [`crate::consent::ConsentRecord::extend`].
+    ///
+    /// The library NEVER calls this for itself. Recording consent is a statement that a user agreed
+    /// to something, and this crate has no way to know that: it never sees a user. The host calls
+    /// it once its own consent step has actually been answered.
+    #[cfg(feature = "consent")]
+    pub async fn record_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+        scope: &ScopeSet,
+        resource: &[String],
+        authentication: Option<crate::consent::Authentication>,
+    ) -> Result<crate::consent::ConsentRecord, StorageError> {
+        let now = self.clock.now();
+        let mut record = match self.store.find_consent(client_id, subject).await? {
+            Some(existing) => existing,
+            None => crate::consent::ConsentRecord {
+                // 16 bytes of OS randomness, hex encoded, the same shape as every other opaque
+                // identifier this server mints. It is not a credential (see the field's own docs),
+                // but it names a record that can end a user's sessions, so it must not be something
+                // a third party can produce by guessing two strings it already knows.
+                consent_id: random_hex(16).into_boxed_str(),
+                client_id: client_id.clone(),
+                subject: subject.into(),
+                scope: ScopeSet::empty(),
+                resource: Vec::new(),
+                granted_at: now,
+                authentication: None,
+            },
+        };
+        record.extend(scope, resource);
+        // The LATEST authentication replaces the previous one: it is what the user just did, and it
+        // is what an RFC 9470 `max_age` on the next request has to be measured against. A host that
+        // reports nothing this time leaves the previous report standing rather than erasing it,
+        // because "did not say" is not "no longer authenticated".
+        if let Some(a) = authentication {
+            record.authentication = Some(Box::new(a));
+        }
+        self.store.put_consent(record.clone()).await?;
+        Ok(record)
+    }
+
+    /// The consent this user has already given this client, if any.
+    ///
+    /// This ANSWERS a question; it does not make a decision, and nothing in this crate approves an
+    /// authorization request on the strength of it. See
+    /// [`crate::http::RouterBuilder::with_consent_resolver`]: the library reports what it remembers
+    /// and the host decides what that is worth, because "the user agreed to this once" and "the
+    /// user agrees to this now" are different sentences and only the host can tell them apart.
+    #[cfg(feature = "consent")]
+    pub async fn remembered_consent(
+        &self,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> Result<Option<crate::consent::ConsentRecord>, StorageError> {
+        self.store.find_consent(client_id, subject).await
+    }
+
+    /// Everything one resource owner has consented to, so a host can show a user what they have
+    /// granted. Without this a user cannot SEE what they gave away, which is half of why this
+    /// feature exists at all.
+    #[cfg(feature = "consent")]
+    pub async fn consents_for_subject(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<crate::consent::ConsentRecord>, StorageError> {
+        self.store.consents_for_subject(subject).await
+    }
+
+    /// WITHDRAW a consent, revoking everything issued under it. Returns how many records the
+    /// cascade removed.
+    ///
+    /// This is the point of the whole feature. A withdrawal that left tokens alive would be worse
+    /// than no withdrawal at all, because the user would believe they had stopped something they
+    /// had not, so the cascade is one storage operation
+    /// ([`crate::store::Storage::revoke_consent`]) and it reaches every family the consent ever
+    /// produced, plus the authorization codes and approved-but-unpolled device grants that would
+    /// otherwise mint tokens seconds later.
+    ///
+    /// Withdrawing a consent that is already gone is `Ok(0)`, not an error.
+    #[cfg(feature = "consent")]
+    pub async fn withdraw_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
+        // Read first, purely so the audit event can name the client and the user. Two round trips
+        // on a path a person drives by hand is not a cost worth optimising away, and an event that
+        // said only "some consent was withdrawn" is an event nobody can act on.
+        let record = self.store.get_consent(consent_id).await?;
+        let records_revoked = self.store.revoke_consent(consent_id).await?;
+        if let Some(record) = &record {
+            self.hooks.emit(|| Event::ConsentWithdrawn {
+                client_id: record.client_id.as_str(),
+                subject: record.subject.as_ref(),
+                records_revoked,
+            });
+        }
+        Ok(records_revoked)
     }
 
     /// RFC 7009 token revocation.
@@ -3077,6 +3321,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         .take_refresh_token(token)
                         .await
                         .map_err(storage_error)?;
+                    // RFC 7009 section 2.1: "If the particular token is a refresh token and the
+                    // authorization server supports the revocation of access tokens, then the
+                    // authorization server SHOULD also invalidate all access tokens based on the
+                    // same authorization grant." This server does support it, so the SHOULD
+                    // applies, and the grant is exactly what `family_id` names (see
+                    // `RefreshTokenRecord::family_id`): every token, access or refresh, minted from
+                    // the same authorization. Killing only the presented string would leave the
+                    // access token that came out of the same redemption live for its whole TTL,
+                    // which is the opposite of what a client asking for revocation has just said.
+                    //
+                    // Deliberately NOT fatal on a storage failure. Section 2.2 makes the presented
+                    // token's own revocation the answer and that has already succeeded; a cascade
+                    // that could turn a completed revocation into a 503 would leave the client
+                    // believing nothing was revoked when the token it named is already gone.
+                    let _ = self.store.revoke_token_family(&record.family_id).await;
                     self.hooks.emit(|| Event::TokenRevoked {
                         client_id: client.client_id.as_str(),
                         token_type: TokenTypeHint::RefreshToken,
