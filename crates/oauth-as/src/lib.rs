@@ -52,6 +52,12 @@ pub mod grant;
 /// An OPTIONAL axum router over the server, behind the `http` cargo feature (off by default).
 #[cfg(feature = "http")]
 pub mod http;
+/// RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, behind the `jwt` cargo feature
+/// (off by default). Opaque tokens remain the default: RFC 9068 is an optional profile, not an
+/// OAuth 2.1 requirement, and signed tokens earn their keep only when resource servers are
+/// separate processes that should not call introspection on every request.
+#[cfg(feature = "jwt")]
+pub mod jwt;
 pub mod metadata;
 pub mod pkce;
 pub mod scope;
@@ -69,8 +75,11 @@ pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 pub use error::{ErrorCode, ErrorResponse};
 pub use grant::GrantType;
 #[cfg(feature = "http")]
-pub use http::{RouterBuilder, RouterError, SubjectResolver};
-pub use metadata::{AuthorizationServerMetadata, WELL_KNOWN_PATH};
+pub use http::{
+    ConsentDecision, ConsentRequest, ConsentResolver, CsrfTokenHook, RouterBuilder, RouterError,
+    SubjectResolver,
+};
+pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
 pub use scope::{Scope, ScopeSet};
 pub use server::{
     AuthorizationServer, Clock, ServerConfig, SystemClock, TokenRequest, MIN_USER_CODE_LENGTH,

@@ -310,6 +310,54 @@ fn a_router_refuses_to_publish_a_path_it_would_shadow() {
     assert!(matches!(err, RouterError::DuplicatePath { .. }), "{err}");
 }
 
+/// RFC 8414 s2 with RFC 9068 s4: a server that signs must publish keys somewhere a resource
+/// server can reach, and an advertised `jwks_uri` this router cannot serve is the same lie as any
+/// other unroutable endpoint. Off-issuer is refused rather than silently unrouted because these
+/// bytes are produced by this server and nothing else can produce them.
+#[cfg(feature = "jwt")]
+#[test]
+fn a_jwks_uri_off_the_issuer_refuses_to_build() {
+    let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
+    config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(
+        crate::jwt::JwtConfig::new(
+            crate::jwt::EcdsaP256Key::generate("k1"),
+            "https://rs.example",
+        )
+        .with_jwks_uri("https://keys.example/jwks"),
+    );
+    let server = Arc::new(AuthorizationServer::new(
+        config,
+        crate::store::MemoryStorage::new(),
+    ));
+    let err = RouterBuilder::new(server).build().unwrap_err();
+    assert!(
+        matches!(err, RouterError::EndpointOutsideIssuer { endpoint, .. } if endpoint == "jwks_uri"),
+        "{err}"
+    );
+}
+
+/// The key set shares the collision check every other route gets: a `jwks_uri` that lands on the
+/// token endpoint would shadow one of the two, and which one is an implementation detail no host
+/// should have to know.
+#[cfg(feature = "jwt")]
+#[test]
+fn a_jwks_uri_colliding_with_another_endpoint_refuses_to_build() {
+    let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
+    config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(
+        crate::jwt::JwtConfig::new(
+            crate::jwt::EcdsaP256Key::generate("k1"),
+            "https://rs.example",
+        )
+        .with_jwks_uri("https://as.example/token"),
+    );
+    let server = Arc::new(AuthorizationServer::new(
+        config,
+        crate::store::MemoryStorage::new(),
+    ));
+    let err = RouterBuilder::new(server).build().unwrap_err();
+    assert!(matches!(err, RouterError::DuplicatePath { .. }), "{err}");
+}
+
 #[test]
 fn a_verification_uri_off_the_issuer_is_not_an_error() {
     // RFC 8628 announces verification_uri per response, not in the RFC 8414 document, and a host

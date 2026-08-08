@@ -19,10 +19,17 @@
 //! cannot recover from: if a host overrides `token_endpoint`, the route moves with it or
 //! [`RouterBuilder::build`] refuses to produce a router at all.
 //!
+//! Under the `jwt` feature that includes `jwks_uri`: the document advertises it exactly when the
+//! server signs its access tokens, and this router serves the RFC 7517 key set there. A resource
+//! server that cannot fetch the keys cannot verify a single RFC 9068 token, so an advertised
+//! `jwks_uri` this router cannot reach is the same lie as any other unroutable endpoint.
+//!
 //! # Cost
 //!
 //! The metadata document is serialized ONCE, when the router is built, and served from the
-//! resulting [`Bytes`] (a clone is a refcount bump, not a copy). The `WWW-Authenticate` challenge
+//! resulting [`Bytes`] (a clone is a refcount bump, not a copy). The key set is serialized once
+//! for the same reason: its contents change only when the host rebuilds the router. The
+//! `WWW-Authenticate` challenge
 //! is likewise built once. There are no lazy statics, no background tasks, and no per-request
 //! rebuilding of anything derived from configuration. Request parsing borrows out of the request
 //! body and query string and only allocates for values that actually needed percent-decoding.
@@ -170,6 +177,13 @@ pub enum RouterError {
         /// The serializer's message.
         detail: String,
     },
+    /// The RFC 7517 key set could not be serialized. As structurally impossible as the metadata
+    /// case, and reported for the same reason.
+    #[cfg(feature = "jwt")]
+    JwksNotSerializable {
+        /// The serializer's message.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for RouterError {
@@ -186,6 +200,10 @@ impl std::fmt::Display for RouterError {
             RouterError::MetadataNotSerializable { detail } => {
                 write!(f, "RFC 8414 metadata could not be serialized: {detail}")
             }
+            #[cfg(feature = "jwt")]
+            RouterError::JwksNotSerializable { detail } => {
+                write!(f, "RFC 7517 key set could not be serialized: {detail}")
+            }
         }
     }
 }
@@ -197,6 +215,11 @@ struct Inner<S: Storage, C: Clock> {
     server: Arc<AuthorizationServer<S, C>>,
     /// The RFC 8414 document, serialized at build time. Serving it is a refcount bump.
     metadata: Bytes,
+    /// The RFC 7517 key set, serialized at build time, present exactly when the document
+    /// advertises a `jwks_uri` this router serves. PUBLIC parameters only: the bytes come from
+    /// [`AuthorizationServer::jwks`], which has no way to emit a private key parameter.
+    #[cfg(feature = "jwt")]
+    jwks: Option<Bytes>,
     /// The RFC 6749 s5.2 / RFC 7617 challenge, built at build time because the realm never
     /// changes and formatting it per request would be pure waste.
     challenge: HeaderValue,
@@ -370,6 +393,31 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         let verification =
             endpoint_path(&issuer, "verification_uri", &config.verification_uri).ok();
 
+        // RFC 8414 s2 `jwks_uri`. `from_config` advertises it exactly when this server signs its
+        // access tokens, so when it is present the key set is ours to serve and an off-issuer URL
+        // is an error, exactly as it is for introspection and revocation. That is stricter than
+        // `verification_uri` above on purpose: the device page is a host's own branded HTML, while
+        // these bytes are produced by this server and nothing else can produce them.
+        #[cfg(feature = "jwt")]
+        let jwks_path = match &meta.jwks_uri {
+            Some(url) => Some(endpoint_path(&issuer, "jwks_uri", url)?),
+            None => None,
+        };
+        // Serialized ONCE here rather than per request: a key set changes only when the host
+        // rebuilds the router, and a verifier may fetch this on every cold cache.
+        #[cfg(feature = "jwt")]
+        let jwks = match (&jwks_path, self.server.jwks()) {
+            (Some(_), Some(keys)) => Some(Bytes::from(serde_json::to_vec(&keys).map_err(|e| {
+                RouterError::JwksNotSerializable {
+                    detail: e.to_string(),
+                }
+            })?)),
+            // Both sides read the same `access_token_format`, so a path without keys cannot
+            // arise; if it somehow did, not routing is better than routing an empty key set that
+            // a verifier would read as "this issuer has no keys".
+            _ => None,
+        };
+
         // RFC 8414 s3.1: the well-known string is inserted BETWEEN the host and the issuer's
         // path, so this route is NOT `{issuer path}/.well-known/...` and is not the bare
         // well-known path either once the issuer has a path. See `metadata::well_known_path`.
@@ -384,6 +432,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         let inner = Arc::new(Inner {
             server: self.server,
             metadata,
+            #[cfg(feature = "jwt")]
+            jwks,
             // RFC 7617 s2: the realm is a quoted string. The issuer is a URL and so contains no
             // double quote or backslash, which is what would need escaping here.
             challenge: HeaderValue::from_str(&format!("Basic realm=\"{issuer}\""))
@@ -398,6 +448,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         paths.extend(introspect.as_deref());
         paths.extend(revoke.as_deref());
         paths.extend(verification.as_deref());
+        #[cfg(feature = "jwt")]
+        paths.extend(jwks_path.as_deref());
         for i in 0..paths.len() {
             if paths[i + 1..].contains(&paths[i]) {
                 return Err(RouterError::DuplicatePath {
@@ -422,6 +474,10 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
                 path,
                 get(verification_page_handler::<S, C>).post(verification_submit_handler::<S, C>),
             );
+        }
+        #[cfg(feature = "jwt")]
+        if let Some(path) = &jwks_path {
+            router = router.route(path, get(jwks_handler::<S, C>));
         }
         Ok(router.with_state(inner))
     }
@@ -466,6 +522,13 @@ fn issuer_origin(issuer: &str) -> &str {
 fn json_content_type() -> HeaderValue {
     // RFC 6749 s5.1: "application/json;charset=UTF-8".
     HeaderValue::from_static("application/json;charset=UTF-8")
+}
+
+/// RFC 7517 s8.5.1 registers `application/jwk-set+json` for a JWK Set, which is what this is; a
+/// verifier that only checks for a JSON suffix still accepts it.
+#[cfg(feature = "jwt")]
+fn jwks_content_type() -> HeaderValue {
+    HeaderValue::from_static("application/jwk-set+json")
 }
 
 fn html_content_type() -> HeaderValue {
@@ -742,6 +805,26 @@ async fn metadata_handler<S: Storage, C: Clock>(State(state): State<Arc<Inner<S,
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, json_content_type());
     resp
+}
+
+/// RFC 7517 s5: the JWK Set a resource server fetches to verify the RFC 9068 access tokens this
+/// server signs. Served from the bytes produced when the router was built.
+///
+/// PUBLIC key parameters only, and no `Cache-Control: no-store`: unlike the token plane this body
+/// carries no credential, and a key set that may not be cached would be re-fetched by every
+/// verifier on every token, which is how rotation-capable deployments fall over.
+#[cfg(feature = "jwt")]
+async fn jwks_handler<S: Storage, C: Clock>(State(state): State<Arc<Inner<S, C>>>) -> Response {
+    match &state.jwks {
+        Some(bytes) => {
+            let mut resp = (StatusCode::OK, bytes.clone()).into_response();
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, jwks_content_type());
+            resp
+        }
+        // Unreachable: `build` routes this path only when it has the bytes.
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// RFC 6749 s3.2, plus RFC 8628 s3.4 for the device grant.

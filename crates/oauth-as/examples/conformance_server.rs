@@ -10,7 +10,8 @@
 //! can drive without a browser. None of that belongs in a published library. A crate that ships a
 //! client called `conformance-public` with a hard-coded secret has shipped a backdoor and an
 //! excuse; so the fixtures live in this example, which is never published as a binary and is
-//! compiled only when the `http` feature is on.
+//! compiled only when the `http` and `jwt` features are both on (the harness verifies the access
+//! token as an RFC 9068 JWT, so the fixture must sign).
 //!
 //! # Environment
 //!
@@ -19,9 +20,10 @@
 //!   requires it to equal the URL the metadata document is fetched from, so the default is
 //!   derived from the bind address and an override exists only for a host behind a proxy.
 //! * `OAUTH_AS_CONFORMANCE_SEED=1`: register the deterministic fixtures below, treat every
-//!   request as coming from the signed-in user `conformance-user`, auto-approve consent, and
-//!   disable the device verification form's CSRF protection. WITHOUT it this example is an empty
-//!   AS with no clients, no logged-in user, no consent step and no device approvals, which is
+//!   request as coming from the signed-in user `conformance-user`, auto-approve consent, sign
+//!   access tokens as RFC 9068 `at+jwt` with a HARD-CODED key, and disable the device
+//!   verification form's CSRF protection. WITHOUT it this example is an empty AS with no clients,
+//!   no logged-in user, no consent step, no device approvals and opaque access tokens, which is
 //!   what any other reader should see.
 //!
 //! # The seeded mode is NOT a template
@@ -32,12 +34,17 @@
 //! the wiring site below so that copying them is a deliberate act rather than an accident. Do not
 //! copy them. See `RouterBuilder::with_consent_resolver` and `RouterBuilder::with_csrf_tokens`
 //! for what a production host wires instead.
+//!
+//! It also signs with a key whose private half is printed in an RFC and therefore known to
+//! everyone. Anyone who has read RFC 7515 can mint an access token this server would be believed
+//! to have issued. Do not copy that either.
 
 use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
 use oauth_as::http::{ConsentDecision, RouterBuilder};
+use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
 use oauth_as::store::MemoryStorage;
@@ -52,6 +59,39 @@ const CONFIDENTIAL_CLIENT_SECRET: &str = "conformance-secret-0123456789abcdef";
 /// The test user every seeded approval acts as.
 const SEEDED_SUBJECT: &str = "conformance-user";
 
+/// The RFC 9068 s2.2 `aud`: the resource server the seeded tokens are minted for. There is no such
+/// server in a conformance run, so the value is a reserved `.example` name (RFC 2606) rather than
+/// something that could be mistaken for a real deployment's.
+const SEEDED_AUDIENCE: &str = "https://rs.conformance.example";
+
+/// ############################################################################
+/// # CONFORMANCE FIXTURE ONLY. NEVER COPY THIS INTO A PRODUCTION HOST.        #
+/// ############################################################################
+///
+/// The ES256 signing key the seeded AS uses, as a raw P-256 private scalar.
+///
+/// A HARD-CODED SIGNING KEY IN PRODUCTION IS CATASTROPHIC. It is the single secret that decides
+/// which access tokens the whole deployment believes; anyone holding it mints tokens for any user,
+/// any client and any scope, and no revocation of any token fixes it. In a published binary or a
+/// public repository it is not a weak key, it is no key at all.
+///
+/// This one is worse than a leaked key, and deliberately so: it is the P-256 private key printed
+/// in RFC 7515 appendix A.3, so it is already public in an IETF document and cannot be mistaken
+/// for something a copier merely needs to change. It is hard-coded because a conformance fixture
+/// must be REPRODUCIBLE. A key generated per run would make every failure irreproducible: the
+/// tokens, the JWKS and the signatures would differ between the run that failed and the run used
+/// to diagnose it.
+///
+/// A real host loads its key from a KMS, a sealed secret or a file it controls, and rotates it by
+/// publishing the new public key alongside the old (see `EcdsaP256Key`'s `kid` documentation).
+const SEEDED_SIGNING_SCALAR: [u8; 32] = [
+    0x8e, 0x9b, 0x10, 0x9e, 0x71, 0x90, 0x98, 0xbf, 0x98, 0x04, 0x87, 0xdf, 0x1f, 0x5d, 0x77, 0xe9,
+    0xcb, 0x29, 0x60, 0x6e, 0xbe, 0xd2, 0x26, 0x3b, 0x5f, 0x57, 0xc2, 0x13, 0xdf, 0x84, 0xf4, 0xb2,
+];
+
+/// RFC 7517 s4.5 `kid`: names the key in the JWKS and in every token header this AS signs.
+const SEEDED_KID: &str = "conformance-es256-1";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("OAUTH_AS_ADDR").unwrap_or_else(|_| "127.0.0.1:8914".to_string());
@@ -65,6 +105,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RFC 8414 s2 `scopes_supported`: stating the catalogue costs nothing and lets a client see
     // what it may ask for without probing.
     config.scopes_supported = Some(vec!["read".to_string(), "write".to_string()]);
+
+    if seed {
+        // ############################################################################
+        // # CONFORMANCE FIXTURE ONLY. NEVER COPY ANY OF THIS INTO A PRODUCTION HOST.  #
+        // ############################################################################
+        //
+        // RFC 9068 access tokens, signed with the public-by-construction key documented at
+        // SEEDED_SIGNING_SCALAR above. The harness parses the issued access token as a JWT and
+        // verifies its signature against the key set the metadata document advertises, which it
+        // can only do if this server actually signs. Opaque tokens remain the crate's default and
+        // are what this example issues without the seed flag.
+        //
+        // `with_jwks_uri` is what makes the RFC 8414 document advertise `jwks_uri` at all, and it
+        // is under the issuer so that the router serves the key set itself rather than promising
+        // an endpoint nothing answers.
+        let key = EcdsaP256Key::from_scalar_bytes(SEEDED_KID, &SEEDED_SIGNING_SCALAR)?;
+        let jwks_uri = format!("{}/jwks", issuer.trim_end_matches('/'));
+        config.access_token_format =
+            AccessTokenFormat::Jwt(JwtConfig::new(key, SEEDED_AUDIENCE).with_jwks_uri(jwks_uri));
+    }
 
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
 

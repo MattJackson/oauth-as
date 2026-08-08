@@ -1286,3 +1286,138 @@ fn base64_standard(s: &str) -> String {
     use base64::Engine as _;
     STANDARD.encode(s.as_bytes())
 }
+
+/// A server that signs its access tokens: the same fixture as [`start_wired`] plus an ES256 key
+/// and a `jwks_uri` under the issuer. Returns the address and the key identifier the JWKS must
+/// name.
+#[cfg(feature = "jwt")]
+async fn start_signing() -> (SocketAddr, String) {
+    use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let issuer = format!("http://{addr}");
+    let mut config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
+    let kid = "wire-test-key-1".to_string();
+    config.access_token_format = AccessTokenFormat::Jwt(
+        JwtConfig::new(EcdsaP256Key::generate(kid.clone()), "https://rs.example")
+            .with_jwks_uri(format!("{issuer}/jwks")),
+    );
+    let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+    let scopes = ScopeSet::from_tokens(["read", "write"]).expect("scopes");
+    server
+        .register_client(Client {
+            client_id: ClientId::new(CONFIDENTIAL_ID),
+            auth: ClientAuth::ConfidentialSecret {
+                secret: SECRET.to_string(),
+            },
+            grant_types: vec![GrantType::ClientCredentials],
+            redirect_uris: vec![REDIRECT_URI.to_string()],
+            allowed_scopes: scopes.clone(),
+            default_scopes: scopes,
+            name: None,
+        })
+        .await
+        .expect("register confidential");
+    let router = RouterBuilder::new(server).build().expect("router");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (addr, kid)
+}
+
+/// RFC 8414 s2 and RFC 7517 s5: a signing AS advertises `jwks_uri`, that URI answers with a
+/// non-empty `keys` array, and the key it publishes is the one it signs with. A resource server
+/// that cannot fetch these bytes cannot verify a single RFC 9068 token, so the advertised URI
+/// 404ing is the same unrecoverable lie as any other missing endpoint.
+#[cfg(feature = "jwt")]
+#[tokio::test]
+async fn a_signing_server_serves_the_key_set_it_advertises() {
+    let (addr, kid) = start_signing().await;
+    let meta = request(
+        addr,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        &[],
+        None,
+    )
+    .await
+    .json();
+    let uri = meta["jwks_uri"]
+        .as_str()
+        .expect("a signing AS must advertise jwks_uri");
+    assert_eq!(uri, format!("http://{addr}/jwks"));
+
+    let resp = request(addr, "GET", "/jwks", &[], None).await;
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    // RFC 7517 s8.5.1 registers this media type for a JWK Set.
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/jwk-set+json")
+    );
+    let jwks = resp.json();
+    let keys = jwks["keys"].as_array().expect("RFC 7517 s5 keys array");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["kid"], kid);
+    assert_eq!(keys[0]["kty"], "EC");
+    assert_eq!(keys[0]["crv"], "P-256");
+    assert_eq!(keys[0]["alg"], "ES256");
+    // RFC 7517 s6.2.2.1: `d` is the PRIVATE key parameter. Publishing it would hand every reader
+    // the ability to mint tokens this server would be believed to have issued.
+    assert!(
+        keys[0].get("d").is_none() && !resp.body.contains("\"d\""),
+        "the key set must carry public parameters only: {}",
+        resp.body
+    );
+
+    // And the token the wire actually hands out is the JWS compact form of RFC 7515 s3.1 rather
+    // than an opaque string, signed under the advertised kid. The signature itself is verified
+    // against this JWKS in tests/jwt.rs.
+    let token = request(
+        addr,
+        "POST",
+        "/token",
+        &[],
+        Some(&format!(
+            "grant_type=client_credentials&client_id={CONFIDENTIAL_ID}&client_secret={SECRET}"
+        )),
+    )
+    .await
+    .json();
+    let access_token = token["access_token"].as_str().expect("access_token");
+    let parts: Vec<&str> = access_token.split('.').collect();
+    assert_eq!(parts.len(), 3, "RFC 7515 s3.1 compact form: {access_token}");
+    assert!(parts.iter().all(|p| !p.is_empty()));
+    let header = {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let raw = URL_SAFE_NO_PAD.decode(parts[0]).expect("base64url header");
+        serde_json::from_slice::<Value>(&raw).expect("JOSE header JSON")
+    };
+    // RFC 9068 s2.1 fixes typ; the kid is what lets a verifier pick the right key from the set.
+    assert_eq!(header["typ"], "at+jwt");
+    assert_eq!(header["alg"], "ES256");
+    assert_eq!(header["kid"], kid);
+}
+
+/// The other direction, which matters just as much: a server with opaque tokens has no keys, so
+/// it must neither advertise `jwks_uri` nor route one. An advertised key set that verifies
+/// nothing teaches resource servers to trust a document that is not true.
+#[tokio::test]
+async fn an_opaque_server_advertises_no_key_set_and_routes_none() {
+    let addr = start(true).await;
+    let meta = request(
+        addr,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        &[],
+        None,
+    )
+    .await
+    .json();
+    assert!(
+        meta.get("jwks_uri").is_none(),
+        "opaque tokens: nothing to publish"
+    );
+    assert_eq!(request(addr, "GET", "/jwks", &[], None).await.status, 404);
+}

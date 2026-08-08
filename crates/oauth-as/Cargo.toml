@@ -25,6 +25,11 @@ default = []
 # surface rather than writing it themselves, and for the black-box conformance harness (which
 # needs an external process to talk to). Nothing in the library depends on it.
 http = ["dep:axum", "dep:tokio"]
+# RFC 9068 `at+jwt` access tokens signed with ES256, plus the RFC 7517 JWKS document that lets a
+# resource server verify them without calling this server. Opaque tokens remain the DEFAULT: JWT
+# is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
+# servers are separate processes that should not have to call introspection on every request.
+jwt = ["dep:p256"]
 
 # DEPENDENCY POLICY: the runtime dependency set is deliberately tiny, and none of these
 # implies an async runtime, an HTTP stack, or a persistence layer; the HOST owns all three.
@@ -42,6 +47,24 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 # Needed only because `axum::serve` (and therefore any host or example that binds a listener)
 # needs a runtime. The router itself is runtime-agnostic.
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
+
+# OPTIONAL, feature `jwt` only. ES256 signing for RFC 9068 access tokens.
+#
+# WHY p256 AND NOTHING ELSE: it is pure Rust (no cc, no bindgen, no OpenSSL), it is the RustCrypto
+# P-256 implementation the ecosystem already audits, and with default features off it pulls only
+# elliptic-curve/ecdsa/sha2 primitives; sha2 is ALREADY a dependency here for PKCE. No general JOSE
+# framework is used: this crate emits exactly one token shape, so the JWS compact serialization
+# lives in src/jwt.rs on top of serde_json and base64, both already present. A JOSE framework would
+# add a parser, a validator and a key-format zoo that an ISSUER never executes.
+#
+# WHY ES256 AND NOT RS256: RFC 9068 fixes neither, but an ES256 signature is 64 bytes against
+# RSA-2048's 256, and a P-256 public key is 64 bytes against 259. That difference is paid on every
+# token issued and every JWKS fetch.
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdsa",  # ECDSA/P-256/SHA-256 signing, which is ES256 (RFC 7518 s3.4)
+    "pkcs8",  # so a host can load the key format its KMS or openssl already emits
+    "std",    # this crate is std anyway; adds no crate to the tree, only alloc/error impls
+], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
@@ -62,6 +85,11 @@ url = "2"
 # The conformance serve shim (crates/oauth-as/conformance-serve.sh) runs this example. It carries
 # the deterministic fixtures the black-box harness's launch contract asks for; the LIBRARY must
 # never ship conformance fixtures, so they live here and nowhere else.
+#
+# `jwt` is required as well as `http` because the harness verifies the issued access token as an
+# RFC 9068 `at+jwt` against the advertised jwks_uri. Requiring it, rather than degrading to opaque
+# tokens when the feature is off, keeps the failure at build time and legible: a conformance
+# fixture that quietly stops exercising signing is worse than one that refuses to build.
 [[example]]
 name = "conformance_server"
-required-features = ["http"]
+required-features = ["http", "jwt"]

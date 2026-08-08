@@ -18,6 +18,11 @@ library depends on it.
 
 Protocol:
 
+- RFC 9068 JWT access tokens (`at+jwt`, ES256) with an RFC 7517 JWKS document,
+  behind an optional `jwt` feature. Opaque tokens remain the default: RFC 9068
+  is an optional profile, not an OAuth 2.1 requirement, and signed tokens earn
+  their keep only when resource servers are separate processes that should not
+  call introspection on every request.
 - RFC 6749 section 4.1 authorization code grant, under the OAuth 2.1
   constraints: PKCE required, `S256` only, exact redirect URI matching, single
   use codes, and replay of a code revoking the tokens it already minted.
@@ -42,7 +47,31 @@ Design:
   an embedding host pays nothing until its configuration enables the feature.
 - The default build has five dependencies: `serde`, `serde_json`, `getrandom`,
   `sha2`, `base64`. None of them implies an async runtime, an HTTP stack, or a
-  persistence layer.
+  persistence layer. The `http` feature adds `axum` and `tokio`; the `jwt`
+  feature adds `p256`. Both are off by default and a consumer who does not ask
+  for them gains not one extra crate.
+- Allocation counts on the hot paths, and the size of the core public types,
+  are pinned by tests rather than asserted in prose. Each of those gates was
+  proven able to FAIL before it was trusted, and one of them has already caught
+  a real regression.
+
+## Compile settings
+
+The release profile in this repository governs OUR builds only. Cargo profiles
+are honored for the workspace being built, so a consumer compiles this crate
+with THEIR profile and nothing in our manifest reaches them.
+
+What determines a consumer's cost is the shape of the code:
+`AuthorizationServer<S, C>` is generic over the host's `Storage` and `Clock`, so
+it is monomorphized once per pair the host actually instantiates. One pair is
+the normal case. That is a deliberate trade: generics keep the storage seam
+devirtualized, where `dyn Storage` would add an indirect call to every storage
+operation on the token path.
+
+For a consumer who wants the smallest, fastest result, the usual settings apply
+and are worth stating because they are not the defaults: `lto = "fat"`,
+`codegen-units = 1`, `opt-level = 3`, and `strip = "symbols"` in your own
+release profile.
 
 ## Minimum supported Rust version
 
@@ -69,13 +98,22 @@ standard is higher than usual.
 - **Schema validation transcribed from the RFCs.** Every body the AS emits is
   validated against schemas transcribed clause by clause from RFC 6749
   section 5 and RFC 8628 sections 3.2 and 3.5.
-- **An independently authored conformance harness.**
+- **An independently authored conformance harness, and it is GREEN.**
   `crates/oauth-as-conformance` was written by an author who could not see this
   crate's source. That matters because this crate's own tests were written by
   this crate's author: the judge was arms length, but the CHOICE OF WHAT TO
   TEST was not. The harness closes that gap. It drives the AS over HTTP as a
   black box and discovers every endpoint from the RFC 8414 metadata document,
   so it also proves the advertised endpoints match reality.
+
+  `scripts/oauth-conformance.sh --check` passes: 8 of 8 black box tests, plus
+  the 9 hermetic vector tests and both third party client drives. Not one file
+  in the harness was modified to achieve that. The one mismatch it originally
+  found (it verifies RFC 9068 JWT access tokens against a `jwks_uri`, and this
+  crate's tokens are opaque) was resolved by BUILDING the RFC 9068 support,
+  behind an optional feature, rather than by narrowing the assertion. Editing
+  the harness to make this server pass would have destroyed the only arms
+  length evidence the project has.
 - **A pinned third party client as the judge.** `oauth2 = "=5.0.0"`, a widely
   used OAuth 2 CLIENT library, completes a full device flow and a full
   authorization code with PKCE flow against this AS. That library, not this

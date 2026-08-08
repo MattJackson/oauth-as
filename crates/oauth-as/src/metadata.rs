@@ -117,6 +117,35 @@ fn under_issuer(issuer: &str, path: &str) -> String {
     format!("{}{}", issuer.trim_end_matches('/'), path)
 }
 
+/// The `jwks_uri` to advertise, which RFC 8414 section 2 ties to keys this server actually signs
+/// with.
+///
+/// With the `jwt` feature the truth about whether anything is signed lives in
+/// [`ServerConfig::access_token_format`], so it, and not the bare `jwks_uri` field, decides. Both
+/// halves of that matter: advertising a key set for an AS whose tokens are opaque points every
+/// resource server at keys that verify nothing, and signing without advertising leaves them no way
+/// to verify at all (RFC 9068 section 4 expects the key to be discoverable).
+#[cfg(feature = "jwt")]
+fn advertised_jwks_uri(config: &ServerConfig) -> Option<String> {
+    match &config.access_token_format {
+        crate::jwt::AccessTokenFormat::Opaque => None,
+        // `JwtConfig::with_jwks_uri` is the specific statement, so it wins; the `jwks_uri` field
+        // remains the fallback for a host that configured it there before enabling signing.
+        crate::jwt::AccessTokenFormat::Jwt(jwt) => jwt
+            .jwks_uri()
+            .map(str::to_string)
+            .or_else(|| config.jwks_uri.clone()),
+    }
+}
+
+/// Without the `jwt` feature this crate signs nothing, so the only possible source is the host's
+/// own declaration: it is publishing keys some other component holds, and serving that document
+/// is entirely its own affair.
+#[cfg(not(feature = "jwt"))]
+fn advertised_jwks_uri(config: &ServerConfig) -> Option<String> {
+    config.jwks_uri.clone()
+}
+
 impl AuthorizationServerMetadata {
     /// Derive the document from the server's configuration.
     ///
@@ -138,7 +167,7 @@ impl AuthorizationServerMetadata {
             ),
             introspection_endpoint: Some(endpoint(&config.introspection_endpoint, "/introspect")),
             revocation_endpoint: Some(endpoint(&config.revocation_endpoint, "/revoke")),
-            jwks_uri: config.jwks_uri.clone(),
+            jwks_uri: advertised_jwks_uri(config),
             scopes_supported: config.scopes_supported.clone(),
             issuer: iss,
             response_types_supported: vec!["code".to_string()],
