@@ -77,6 +77,31 @@ pub const MAX_PROOF_AGE: Duration = Duration::from_secs(300);
 /// direction only, for the same reason as in [`crate::client_assertion`].
 pub const CLOCK_SKEW_LEEWAY: Duration = Duration::from_secs(60);
 
+/// The largest DPoP proof [`verify_proof`] will look at, in bytes, checked BEFORE it is parsed.
+///
+/// WHY THIS CRATE NEEDS ITS OWN. Every other credential this server checks arrives in a request
+/// BODY, and the body is bounded (`MAX_BODY_BYTES` in `src/http.rs`). A proof arrives in a request
+/// HEADER (RFC 9449 section 4), so that bound never applied to it, and the string went straight
+/// into [`crate::jwt::CompactJws::parse`], which base64-decodes it and runs two JSON parses over
+/// the result. The client is not authenticated at that point: the work is done for anybody who can
+/// open a connection.
+///
+/// WHY 4 KiB, from what a proof actually contains. RFC 9449 section 4.2 fixes the shape: a header
+/// with `typ`, `alg` and an embedded public JWK, which for the ES256 this crate implements is two
+/// 43-character base64url P-256 coordinates plus `kty` and `crv`; a payload with `htm`, `htu`,
+/// `iat` and `jti`, plus at most the section 8 `nonce` and the section 4.3 `ath`; and a 64-byte
+/// signature. Base64url encoded that is a little over 500 bytes in practice, and 4096 leaves room
+/// for a long `htu`, a verbose `kid`, and claims a future revision of the RFC may add, while still
+/// refusing a megabyte of header before any of it is decoded. A proof this cap refuses is not a
+/// proof any conforming client sends.
+///
+/// DEFENCE IN DEPTH, stated honestly: a host's HTTP server almost always caps total header size as
+/// well (8 KiB per header line is a common default), so in most deployments this is the second line
+/// and not the only one. It is here because this library never sees the socket and so cannot rely
+/// on a limit it did not set, and because [`verify_proof`] is public: a host may hand it a string
+/// from anywhere.
+pub const MAX_PROOF_BYTES: usize = 4096;
+
 /// Why a DPoP proof was refused.
 ///
 /// RFC 9449 section 5 makes `invalid_dpop_proof` the token-endpoint answer for all of these; the
@@ -84,7 +109,9 @@ pub const CLOCK_SKEW_LEEWAY: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DpopFailure {
-    /// Not a compact JWS at all.
+    /// Not a compact JWS at all, or longer than [`MAX_PROOF_BYTES`], which is refused on size
+    /// before anything is decoded. Both are the same answer to the client, because both mean this
+    /// server will not read the string it was handed.
     Malformed,
     /// The `typ` header is not `dpop+jwt`, so this JWT is something else.
     NotAProof,
@@ -176,6 +203,13 @@ pub fn verify_proof(
     htu: &str,
     now: SystemTime,
 ) -> Result<VerifiedProof, DpopFailure> {
+    // (0) SIZE, before the parse and therefore before any base64 decoding or JSON parsing happens.
+    // See [`MAX_PROOF_BYTES`]: this is the only bound on a credential that arrives in a header, and
+    // the request carrying it has authenticated nobody yet.
+    if proof.len() > MAX_PROOF_BYTES {
+        return Err(DpopFailure::Malformed);
+    }
+
     let jws = CompactJws::parse(proof).map_err(|_| DpopFailure::Malformed)?;
 
     // (3) `typ` is `dpop+jwt`, and compared exactly. Case folding it would accept `DPOP+JWT`, which
@@ -228,9 +262,24 @@ pub fn verify_proof(
     // one free replay of a captured proof, which is the whole thing the `jti` exists to refuse.
     // The two predicates have to agree at the boundary, and the sweep's is the exclusive one.
     // `client_assertion` has never had this gap because its acceptance was exclusive already.
+    // Every one of these additions is CHECKED, and the reason is that `iat` is a `u64` lifted
+    // straight out of attacker-written JSON on a request that has authenticated nobody. Plain `+`
+    // on a `SystemTime` PANICS on overflow, and this crate is a library: the panic unwinds into the
+    // host's request handler, from a proof header reading `{"iat": 18446744073709551615}`. Mapping
+    // an unrepresentable instant to `StaleProof` is also correct on the merits rather than merely
+    // defensive: section 4.3 (10) wants `iat` inside an acceptable window, and a time that cannot
+    // be represented is outside every window a server could choose.
     let iat = jws.claim_time("iat").ok_or(DpopFailure::StaleProof)?;
-    let issued_at = UNIX_EPOCH + Duration::from_secs(iat);
-    if issued_at > now + CLOCK_SKEW_LEEWAY || issued_at + MAX_PROOF_AGE <= now {
+    let issued_at = UNIX_EPOCH
+        .checked_add(Duration::from_secs(iat))
+        .ok_or(DpopFailure::StaleProof)?;
+    let replay_until = issued_at
+        .checked_add(MAX_PROOF_AGE)
+        .ok_or(DpopFailure::StaleProof)?;
+    let horizon = now
+        .checked_add(CLOCK_SKEW_LEEWAY)
+        .ok_or(DpopFailure::StaleProof)?;
+    if issued_at > horizon || replay_until <= now {
         return Err(DpopFailure::StaleProof);
     }
 
@@ -245,7 +294,7 @@ pub fn verify_proof(
     Ok(VerifiedProof {
         jkt: jwk.thumbprint(),
         jti: jti.to_string(),
-        replay_until: issued_at + MAX_PROOF_AGE,
+        replay_until,
     })
 }
 

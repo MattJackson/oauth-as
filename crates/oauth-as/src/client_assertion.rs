@@ -374,23 +374,42 @@ pub fn verify_assertion(
 
     // RFC 7523 section 3 (4): `exp` is REQUIRED and must not have passed. NO skew leeway here: see
     // `CLOCK_SKEW_LEEWAY`.
+    //
+    // The addition is CHECKED. `exp` is a `u64` out of JSON that nobody has authenticated yet (this
+    // assertion IS the authentication), and `UNIX_EPOCH + Duration::from_secs(u64::MAX)` PANICS
+    // rather than wrapping. In a library that panic unwinds into the host's request handler, and it
+    // happened BEFORE either bound below was compared. `Expired` is the honest answer for a value
+    // that cannot be represented: it is far past the `MAX_ASSERTION_LIFETIME` ceiling the next check
+    // imposes, so the refusal is the same one an `exp` of merely a year hence already gets.
     let exp = jws.claim_time("exp").ok_or(AssertionFailure::Expired)?;
-    let expires_at = UNIX_EPOCH + Duration::from_secs(exp);
+    let expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_secs(exp))
+        .ok_or(AssertionFailure::Expired)?;
     if now >= expires_at {
         return Err(AssertionFailure::Expired);
     }
-    if expires_at > now + MAX_ASSERTION_LIFETIME {
+    let ceiling = now
+        .checked_add(MAX_ASSERTION_LIFETIME)
+        .ok_or(AssertionFailure::Expired)?;
+    if expires_at > ceiling {
         return Err(AssertionFailure::Expired);
     }
 
     // RFC 7523 section 3 (5) and (6): `nbf` and `iat` are OPTIONAL and are checked when present.
     // Both get the skew leeway, because both can only ever refuse an assertion that is otherwise
     // fine.
-    let horizon = now + CLOCK_SKEW_LEEWAY;
+    //
+    // Checked for the same reason `exp` above is, and mapped to `NotYetValid` for the same kind of
+    // reason: a `nbf` or `iat` too large to represent is a time in the future, which is exactly what
+    // this loop refuses. A value that overflows must never be the one value that skips the check.
+    let horizon = now
+        .checked_add(CLOCK_SKEW_LEEWAY)
+        .ok_or(AssertionFailure::NotYetValid)?;
     for claim in ["nbf", "iat"] {
         if let Some(value) = jws.claim_time(claim) {
-            if UNIX_EPOCH + Duration::from_secs(value) > horizon {
-                return Err(AssertionFailure::NotYetValid);
+            match UNIX_EPOCH.checked_add(Duration::from_secs(value)) {
+                Some(instant) if instant <= horizon => {}
+                _ => return Err(AssertionFailure::NotYetValid),
             }
         }
     }
