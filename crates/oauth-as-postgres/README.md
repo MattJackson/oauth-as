@@ -141,6 +141,28 @@ the suite fails and says the detector has gone blind. Measured on the run that p
 read-then-delete double-spent in **100 of 100** rounds and look-then-insert double-claimed in
 **100 of 100**.
 
+The REAL implementation was also broken deliberately, once, to check that the tests are pointed at
+the thing they claim to test rather than only at `naive.rs`. `take_refresh_token` was rewritten as a
+`SELECT` followed by a `DELETE` and both suites went red, on a real server, immediately:
+
+```
+take_refresh_token_has_exactly_one_winner_across_two_connections ... FAILED
+  round 0: DELETE ... RETURNING handed the same refresh token to 2 callers
+           over two separate connections
+
+storage_conformance_against_real_postgres ... FAILED
+  atomic_take/take_refresh_token: 8 of 8 concurrent takes each received the
+  refresh record: the operation is not an atomic remove-and-return
+```
+
+Worth recording, because it is a correction to an assumption: the core's in-process harness DID
+catch this one, at 8 of 8 racers. Its module docs say it cannot prove atomicity across processes,
+and that remains true, but the defect it cannot see is a store whose atomicity comes from an
+in-process LOCK around a read-then-delete pair. A store with no such lock, which is what any real
+database client is, suspends between the two round trips, and the harness's racers interleave there.
+The two-connection test is still the stronger evidence, because it removes the possibility that an
+in-process lock is what produced the green.
+
 These tests are behind `--features pg-integration`, off by default, so `cargo test --workspace` on a
 machine with no database is honest rather than red. The default build carries one test whose *name*
 is the notice that they did not run, and with the feature on a missing
