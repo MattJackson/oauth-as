@@ -91,6 +91,15 @@ pub enum ClientAuthFailure {
     SecretMismatch,
     /// The host's own [`RateLimiter`] refused the attempt before it was evaluated.
     RateLimited,
+    /// The registration is dynamic (RFC 7591) and its `client_secret_expires_at` has passed, so the
+    /// secret is no longer a credential however correct it is.
+    ///
+    /// Separated from [`ClientAuthFailure::SecretMismatch`] because the response differs and the
+    /// urgency differs. This is not an attack: it is a client that missed a rotation window this
+    /// server announced when it registered them, and the fix is to re-register rather than to
+    /// investigate. A run of these after a rotation deadline is expected; a run of them before one
+    /// means the deployment's clock or its issued lifetimes are wrong.
+    SecretExpired,
     /// The registration authenticates with RFC 8705 mutual TLS and NO certificate reached
     /// this crate. Worth separating from a mismatch: in practice it usually means the TLS
     /// terminator is not configured to request, verify or forward a client certificate, which
@@ -122,6 +131,9 @@ impl std::fmt::Display for ClientAuthFailure {
             ClientAuthFailure::UnknownClient => "no registration for that client_id",
             ClientAuthFailure::SecretMismatch => "the presented client credential did not verify",
             ClientAuthFailure::RateLimited => "the host's rate limiter refused the attempt",
+            ClientAuthFailure::SecretExpired => {
+                "the registration's client_secret_expires_at has passed"
+            }
             #[cfg(feature = "mtls")]
             ClientAuthFailure::NoCertificatePresented => {
                 "the registration authenticates with mutual TLS and no certificate was presented"
@@ -207,8 +219,23 @@ pub enum Event<'a> {
         client_id: &'a str,
         /// The refresh family that was revoked, when the code's chain was still reachable.
         family_id: Option<&'a str>,
-        /// Whether anything was actually revoked (a chain already swept leaves nothing to kill).
+        /// Whether the refresh family was actually revoked (a chain already swept leaves nothing to
+        /// kill, and a store that refuses the revocation kills nothing either).
         tokens_revoked: bool,
+        /// Whether ANY step of the compromise response failed to persist: the family revocation,
+        /// the fallback deletion of the access token the code minted, or the write that puts the
+        /// consumed code record back so the NEXT replay is still detectable.
+        ///
+        /// This exists because the wire cannot carry the news. A replayed code is answered
+        /// `invalid_grant` however badly the store is behaving, since the party being answered is
+        /// whoever holds the leaked code, so this event is the ONLY signal a deployment gets that a
+        /// code was replayed and the only place the truth about what was done can be told. An event
+        /// that overstates the containment is worse than no event: it is what an operator reads
+        /// while deciding not to investigate.
+        ///
+        /// `true` means credentials the server intended to destroy may still be live. Treat it as
+        /// an incident that needs a human, not as a storage warning.
+        containment_failed: bool,
     },
     /// EVIDENCE OF COMPROMISE, and the most serious event here. A superseded refresh token was
     /// presented, which means two parties hold it (OAuth 2.1 draft section 6.1, RFC 9700 section
@@ -228,6 +255,15 @@ pub enum Event<'a> {
         client_id: &'a str,
         /// Which kind was removed.
         token_type: TokenTypeHint,
+        /// The presented token IS revoked; this says whether the RFC 7009 section 2.1 SHOULD that
+        /// follows it succeeded. Revoking a refresh token also invalidates the access tokens of the
+        /// same grant, and that cascade is deliberately non-fatal: turning a completed revocation
+        /// into an error would tell an honest client nothing happened when the token it named is
+        /// already gone. Non-fatal is not the same as unreported, and `true` here means the
+        /// client's access tokens from that grant are still live for up to one access token TTL.
+        ///
+        /// Always `false` for an access token: there is no grant-wide cascade to attempt.
+        cascade_failed: bool,
     },
     /// A resource owner WITHDREW a consent, and everything issued under it was revoked.
     ///

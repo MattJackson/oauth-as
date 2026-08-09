@@ -67,6 +67,25 @@ impl ScopeSet {
 
     /// Parse a space-delimited scope string. Repeated whitespace is tolerated; each token is
     /// charset-validated.
+    ///
+    /// # There is NO cap on the token count, and that is a decision with a cost
+    ///
+    /// MEASURED: 31 ns at one token, 80.37 us at a thousand. The growth is n log n, from the
+    /// `BTreeSet`, so this is not the accidental quadratic that
+    /// [`crate::server::MAX_RESOURCE_INDICATORS`] exists to bound; it is a straightforward "how big
+    /// may the parameter be" question, and reaching the top of that range takes roughly ten
+    /// kilobytes of `scope`, which a host's own request-size limit is the right place to refuse.
+    ///
+    /// A cap here was considered and NOT taken, because it cannot be expressed without a breaking
+    /// change that is out of proportion to the problem: [`InvalidScopeToken`] is a tuple struct
+    /// with a public field, so it cannot gain a "too many" variant, and this same function is the
+    /// [`serde::Deserialize`] implementation for every persisted record that carries a scope, as
+    /// well as the constructor a host uses for its own `allowed_scopes`. A limit applied here would
+    /// therefore be a limit on what a deployment may REGISTER and on what it can read back out of
+    /// its own store, which is a different and much larger decision than bounding a request.
+    ///
+    /// If a bound is wanted, the place for it is the wire boundary, alongside the other request
+    /// caps, and it needs an error type this one cannot currently express.
     pub fn parse(s: &str) -> Result<Self, InvalidScopeToken> {
         let mut set = BTreeSet::new();
         for tok in s.split(' ').filter(|t| !t.is_empty()) {

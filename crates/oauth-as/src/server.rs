@@ -201,6 +201,31 @@ pub struct ServerConfig {
     pub access_token_ttl: Duration,
     /// Whether user-approved grants also issue a refresh token. Default true.
     pub issue_refresh_tokens: bool,
+    /// RFC 8693: whether a SENDER-CONSTRAINED subject token may be exchanged.
+    ///
+    /// `false` by default, which means the exchange is REFUSED with `invalid_request` when the
+    /// subject token carries an RFC 9449 DPoP or RFC 8705 mutual-TLS binding. See the "A
+    /// SENDER-CONSTRAINED subject token is REFUSED" section of the [`crate::token_exchange`] module
+    /// docs for the full argument; the short form is that the token this server would hand back
+    /// belongs to the EXCHANGING client, which does not hold the original client's key, so it can
+    /// only be a plain bearer token. Anyone able to authenticate as any client registered for this
+    /// grant could then post a stolen bound token and receive a spendable one, and the property the
+    /// deployment turned DPoP on to buy would be gone.
+    ///
+    /// # What turning it on gives up
+    ///
+    /// Exactly that property, and it is worth being blunt about it: with `true`, a sender-
+    /// constrained token becomes exchangeable for an UNBOUND bearer token, so a leaked bound token
+    /// is once again worth something to whoever finds it, via one request to this endpoint. The
+    /// binding is not propagated (a `cnf` naming a key the new holder cannot prove would be a
+    /// broken grant dressed as a secure one), it is DROPPED, and nothing downstream is told.
+    ///
+    /// It exists because 0.9.0 and earlier did exactly this silently, so a deployment that has
+    /// already built on the downgrade needs a way to keep running while it migrates. It is not a
+    /// tuning knob: a host that sets it has decided that its delegation topology is trusted enough
+    /// to hold the binding for it, and that decision belongs in a sentence somebody wrote and a
+    /// reviewer can find.
+    pub allow_sender_constrained_exchange: bool,
     /// Absolute refresh chain lifetime. Rotation preserves the chain's original expiry rather than
     /// sliding it, so this is a ceiling on the whole chain and not on one token.
     ///
@@ -258,6 +283,40 @@ pub struct ServerConfig {
 /// user-code entry. This library performs none and cannot: it never sees a request, only the host
 /// does. See [`AuthorizationServer::approve_device`].
 pub const MIN_USER_CODE_LENGTH: usize = 8;
+
+/// The largest number of RFC 8707 `resource` indicators one request may carry.
+///
+/// # Why there is a cap at all
+///
+/// Section 2 makes `resource` a REPEATABLE parameter, and it is accepted at the authorization
+/// endpoint, which takes no client credential: an unauthenticated caller chooses `n`. Validation is
+/// O(n) per element against [`ServerConfig::allowed_resources`] plus an O(n) dedup scan, so the
+/// cost is quadratic in a number the caller picks, and it is paid before anything has authenticated
+/// anybody. This is the same argument, and the same remedy, as
+/// [`crate::rar::MAX_AUTHORIZATION_DETAILS_ELEMENTS`]: the other repeatable array a request can
+/// carry. Leaving one capped and the other not was the defect.
+///
+/// # Why 16
+///
+/// It is the number of DISTINCT resource servers one access token may be good at. RFC 8707's own
+/// security considerations push the other way, toward narrow audiences, and a deployment that
+/// genuinely needs one token accepted at more than sixteen separate resource servers has an
+/// audience so wide that the indicator has stopped restricting anything. Sixteen is also what
+/// RFC 9396 already allows for `authorization_details`, so the two arrays a request can repeat are
+/// bounded alike and a reader does not have to hold two numbers.
+///
+/// # Why the scan stayed linear
+///
+/// At sixteen, a `HashSet<String>` is slower, not faster: it pays a SipHash of the whole string per
+/// lookup against at most sixteen comparisons that mostly fail on the length. The defect was never
+/// the scan, it was that nothing bounded `n`. A cap is the entire fix.
+///
+/// # It refuses, it does not truncate
+///
+/// Silently dropping the indicators past the cap would issue a token whose audience is not the one
+/// the client asked for, with nothing told to anybody: the exact failure `crate::rar` refuses for
+/// unknown members. `invalid_target` (section 2) is the honest answer.
+pub const MAX_RESOURCE_INDICATORS: usize = 16;
 
 /// The host-reported authentication an issuance carries, in a wrapper that is ZERO SIZED without
 /// the `consent` feature.
@@ -427,6 +486,9 @@ impl ServerConfig {
             slow_down_increment: Duration::from_secs(5),
             access_token_ttl: Duration::from_secs(3600),
             issue_refresh_tokens: true,
+            // OFF: an exchange that drops a sender constraint is a decision, not a default. See the
+            // field's own docs for what turning it on gives up.
+            allow_sender_constrained_exchange: false,
             refresh_token_ttl: None,
             // 30 days: long enough that a chain abandoned by a client that later comes back with
             // a stale token is still recognised as reuse rather than as noise.
@@ -735,7 +797,16 @@ impl<'a> Bound<'a> {
 /// / [`AuthorizationServer::deny_device`]). These are NOT wire errors: the RFC leaves the
 /// verification interaction to the implementation, and the host renders these however its UI
 /// wants.
+///
+/// `#[non_exhaustive]`, for the reason `lib.rs` gives for re-exporting it at all: a host's
+/// verification UI is expected to MATCH on this, so a later release that has a new way to refuse an
+/// entered code must be able to say so without that being a semver-major change for every host.
+/// Every other host-facing failure enum in this crate carries the same attribute
+/// ([`crate::registration::RegistrationFailure`], [`crate::events::ClientAuthFailure`],
+/// [`crate::consent::StepUpRequirement`]); this one was the exception, and there was no argument
+/// for the exception.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeviceApprovalError {
     /// No live grant matches the entered code.
     UnknownUserCode,
@@ -774,10 +845,29 @@ const USER_CODE_ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 pub(crate) fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
-    let mut out = String::with_capacity(n_bytes * 2);
-    for b in buf {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{b:02x}");
+    hex_encode(&buf)
+}
+
+/// The lower-case hex alphabet, as a table rather than a format string.
+///
+/// `write!(out, "{b:02x}")` per byte goes through `core::fmt`, which for 32 bytes is 32 trips
+/// through a formatter with width and fill handling that a fixed two-nibble encoding never needs.
+/// MEASURED at 1335 ns against 1092 ns for a 32-byte draw-and-encode. The output is identical, so
+/// nothing about the artifact changes; this is the same string arrived at without the machinery.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Hex-encode `bytes`, lower case, two characters per byte.
+///
+/// SPLIT from the draw so that one `getrandom` call can feed several artifacts. `getrandom::fill`
+/// is a SYSCALL, and the measurement that matters is that its cost is almost entirely per CALL
+/// rather than per byte: 875 ns for one byte against 1025 ns for thirty-two on the machine
+/// benches/README.md names. So the number of calls is the thing to reduce, and a caller that needs
+/// two 32-byte artifacts should draw 64 bytes once rather than 32 bytes twice. See `issue`.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
     }
     out
 }
@@ -811,13 +901,39 @@ fn user_code_symbol(byte: u8) -> Option<u8> {
 }
 
 /// A user code of `len` symbols over [`USER_CODE_ALPHABET`], unbiased via rejection sampling.
+///
+/// # The entropy is drawn in ONE call, not one per symbol
+///
+/// `getrandom::fill` is a SYSCALL and its cost is almost entirely per CALL rather than per byte:
+/// MEASURED on the machine `benches/README.md` names, 875 ns for one byte and 1025 ns for
+/// thirty-two. Drawing a byte at a time therefore made the call COUNT the entire cost, and sweeping
+/// `user_code_length` showed a slope of roughly 960 to 1160 ns per SYMBOL. At the default eight
+/// symbols that was about 8.2 us of `device_authorization`'s 9.27 us: 85% of an endpoint that takes
+/// no credential from a public client, spent on syscall entry.
+///
+/// Being honest about the magnitude: on Linux with a vDSO `getrandom` (kernel 6.11 and glibc 2.42
+/// or newer) the per-call cost is far lower, so the figures above are partly a macOS and BSD
+/// `getentropy` number. THE CALL COUNT IS THE PORTABLE DEFECT, which is why this is worth doing
+/// regardless of where it runs.
+///
+/// The uniformity argument is untouched. Every byte still goes through [`user_code_symbol`], values
+/// at or above [`USER_CODE_REJECT_AT`] are still redrawn rather than folded, and the buffer is
+/// simply refilled when it runs out, so a run of rejections costs another draw exactly as it did.
+/// The buffer is a fixed stack array, so this adds no allocation: 64 bytes is enough that the
+/// probability of needing a second draw for the default eight-symbol code is negligible (each byte
+/// is accepted with probability 240/256), while staying small enough to sit in a frame.
 fn random_user_code(len: usize) -> String {
     let mut out = String::with_capacity(len);
-    let mut byte = [0u8; 1];
+    let mut buf = [0u8; 64];
     while out.len() < len {
-        getrandom::fill(&mut byte).expect("OS randomness for OAuth artifacts");
-        if let Some(symbol) = user_code_symbol(byte[0]) {
-            out.push(symbol as char);
+        getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
+        for &byte in buf.iter() {
+            if out.len() == len {
+                break;
+            }
+            if let Some(symbol) = user_code_symbol(byte) {
+                out.push(symbol as char);
+            }
         }
     }
     out
@@ -966,6 +1082,13 @@ impl GrantedDetails {
     }
 
     /// Whether anything was asked for at all.
+    ///
+    /// `dead_code` for the same reason [`GrantedDetails::of_token`] carries it, and NOT because
+    /// nothing calls it: `token_with_resources` uses it on the device-code branch to refuse
+    /// `authorization_details` on a grant that never carried any. That call site is behind
+    /// `#[cfg(feature = "rar")]`, so in a build without that feature this genuinely has no caller,
+    /// and gating the allow on the feature by name would tie this wrapper to a flag whose whole
+    /// purpose is to be invisible from here.
     #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         #[cfg(feature = "rar")]
@@ -1263,8 +1386,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         requested: impl IntoIterator<Item = &'a str>,
     ) -> Result<Vec<String>, ErrorResponse> {
+        // The cap is checked as the list is walked rather than up front, because `requested` is an
+        // iterator (both call sites hand in a borrowed `map`, so there is nothing to count without
+        // collecting first, and collecting is the allocation the cap exists to bound). Refusing at
+        // the moment the cap is exceeded means at most `MAX_RESOURCE_INDICATORS` elements are ever
+        // examined however many were sent.
         let mut out = Vec::new();
+        // Counted on the INPUT, not on `out`. Counting deduplicated survivors would leave a caller
+        // free to send ten thousand copies of one URI: each still costs a full scan of `out`, so
+        // the work is unbounded even though the result is small.
+        let mut seen = 0usize;
         for value in requested {
+            seen += 1;
+            if seen > MAX_RESOURCE_INDICATORS {
+                return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
+                    .with_description("too many resource indicators (RFC 8707 s2)"));
+            }
             if !crate::authorization::is_valid_resource_indicator(value) {
                 // The offending value is NOT echoed: RFC 6749 section 5.2 restricts
                 // error_description to a charset an attacker-supplied URI need not respect, and
@@ -1315,6 +1452,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// A grant that named no resource has nothing to narrow, so a token request that names one is
     /// widening from nothing and is refused. Answering it any other way would let the token
     /// endpoint mint an audience the authorization request never obtained.
+    ///
+    /// # On the O(requested * granted) scan
+    ///
+    /// It needs no cap of its own, and deliberately does not have one. BOTH sides came through
+    /// [`AuthorizationServer::validate_resources`], which refuses past
+    /// [`MAX_RESOURCE_INDICATORS`]: `granted` was validated when the grant was created and
+    /// `requested` was validated by the caller a few lines earlier. So the worst case is 16 * 16
+    /// string comparisons, most of which fail on the length, and a second constant here would be a
+    /// second number to keep in step with the first for no gain.
     pub(crate) fn narrow_resources(
         granted: &[String],
         requested: &[String],
@@ -1396,6 +1542,47 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 return Err(ErrorResponse::new(ErrorCode::InvalidClient));
             }
         };
+        // RFC 7591 section 3.2.1 `client_secret_expires_at`. THIS SERVER MINTS THAT VALUE AND
+        // PUBLISHES IT TO THE REGISTRANT, and until this check existed it never looked at it again:
+        // a secret this deployment had itself declared dead on the wire went on authenticating
+        // forever. A rotation window a server announces and does not enforce is worse than none,
+        // because the operator believes the old secret stopped working on the day the response
+        // said it would.
+        //
+        // Checked HERE, before every credential branch below, rather than beside the secret
+        // comparison: `client_secret_jwt` (RFC 7523) also authenticates with the shared secret, so
+        // a check attached only to the direct comparison would let the same expired secret keep
+        // working through the assertion path. A registration with no secret carries `None` and is
+        // unaffected, and `private_key_jwt` and mutual TLS do not authenticate with a secret at
+        // all, so refusing them here costs nothing they could have used.
+        //
+        // Section 3.2.1: `0` means the secret NEVER expires. It is not "expired at the epoch", and
+        // reading it that way would break every registration that took the default.
+        if let Some(registration) = &client.registration {
+            if let Some(expires_at) = registration.client_secret_expires_at {
+                let expired = expires_at != 0
+                    && self
+                        .clock
+                        .now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|since| since.as_secs() >= expires_at)
+                        // A clock before the epoch cannot say anything has expired yet, and is the
+                        // host's problem rather than a reason to refuse a live credential.
+                        .unwrap_or(false);
+                if expired {
+                    self.hooks.record(attempt, AttemptOutcome::Failed);
+                    self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                        client_id: client_id.as_str(),
+                        failure: ClientAuthFailure::SecretExpired,
+                    });
+                    // The same bare `invalid_client` as every other refusal here. The host's audit
+                    // channel is told which it was; the wire is not, because the difference between
+                    // "expired" and "wrong" tells a caller that the id is real.
+                    return Err(ErrorResponse::new(ErrorCode::InvalidClient));
+                }
+            }
+        }
+
         // RFC 7523 client authentication, when the request presented an assertion. Handled apart
         // from the secret comparison below because it is a different KIND of credential: there is
         // nothing to compare, there is a signature to verify against the REGISTRATION's key and a
@@ -1624,8 +1811,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             Some(s) if s.is_subset(&client.allowed_scopes) => Ok(s.clone()),
             // NB: descriptions must stay inside the RFC 6749 section 5.2 charset (no double
             // quote, no backslash), which scope tokens themselves already satisfy.
-            Some(s) => Err(ErrorResponse::new(ErrorCode::InvalidScope)
-                .with_description(format!("scope [{s}] exceeds the client registration"))),
+            // BORROWED, not built. This refusal is reachable by an UNAUTHENTICATED caller at the
+            // authorization endpoint, at whatever rate they choose, and the `format!` this replaced
+            // allocated a String and echoed the caller's own scope string into it. `tests/
+            // allocation.rs` states the rule on `refused_token_request_allocation_bound`: a refusal
+            // is work the attacker buys, so it does not get to buy a heap allocation. Roughly fifty
+            // other refusal sites in this crate already hand back a `&'static str`; this one was
+            // the exception. The developer who sent it still learns which parameter was wrong,
+            // which is all RFC 6749 section 5.2 asks of `error_description`, and not echoing the
+            // value back keeps it out of the host's logs as well.
+            Some(_) => Err(ErrorResponse::new(ErrorCode::InvalidScope)
+                .with_description("requested scope exceeds the client registration")),
         }
     }
 
@@ -1809,10 +2005,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .is_observed()
             .then(|| (grant.client_id.clone(), subject.clone()));
         grant.state = DeviceGrantState::Approved { subject };
-        self.store
-            .put_device_grant(grant)
+        // COMPARE-AND-SWAP against `Pending`, never a blind put. The read above and this write are
+        // separated by however long the host's store takes, and this is not the only writer: a
+        // DENIAL from a second verification-UI action, or a poll, can land in between. A blind put
+        // resolves that by whoever writes last, which for two decisions on one user code is
+        // arbitrary, and the arbitrary direction that matters is an approval overwriting a refusal
+        // the user already gave. FIRST DECISION WINS instead.
+        //
+        // `NotPending` rather than a new variant: it is the answer this call would have given had
+        // it arrived a moment later and read the decided grant, so the host's verification UI needs
+        // no new case to handle a race it could already reach by being slow.
+        if !self
+            .store
+            .compare_and_swap_device_grant(&DeviceGrantState::Pending, grant)
             .await
-            .map_err(DeviceApprovalError::Storage)?;
+            .map_err(DeviceApprovalError::Storage)?
+        {
+            return Err(DeviceApprovalError::NotPending);
+        }
         // Emitted AFTER the write: an approval that failed to persist did not happen, and an audit
         // log that says otherwise is worse than none.
         if let Some((client_id, subject)) = &audit {
@@ -1833,10 +2043,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let mut grant = self.pending_grant_by_user_code(entered_user_code).await?;
         let audit = self.hooks.is_observed().then(|| grant.client_id.clone());
         grant.state = DeviceGrantState::Denied;
-        self.store
-            .put_device_grant(grant)
+        // Same compare-and-swap, same reason: see `approve_device`. First decision wins in both
+        // directions, so a refusal cannot overwrite an approval either.
+        if !self
+            .store
+            .compare_and_swap_device_grant(&DeviceGrantState::Pending, grant)
             .await
-            .map_err(DeviceApprovalError::Storage)?;
+            .map_err(DeviceApprovalError::Storage)?
+        {
+            return Err(DeviceApprovalError::NotPending);
+        }
         if let Some(client_id) = &audit {
             self.hooks.emit(|| Event::DeviceGrantDenied {
                 client_id: client_id.as_str(),
@@ -1962,6 +2178,28 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // EVERY token request under this feature, including every refusal, which is traffic an
             // attacker sets the rate of. `refused_token_request_allocation_bound` had been
             // carrying that as a named exception; it now asserts zero on every feature set.
+            //
+            // THIS ENDPOINT IS EXPENSIVE UNDER `dpop`, AND A HOST HAS TO SIZE ITS RATE LIMITER FOR
+            // IT. A DPoP proof carrying a WRONG signature costs a full P-256 verification, MEASURED
+            // at 133.18 us on the machine `benches/README.md` names, and it is indistinguishable
+            // from a valid one until that verification finishes; a merely MALFORMED proof costs
+            // 34 ns. So roughly 7,500 requests per second of well-formed garbage saturates a core,
+            // and the caller need hold no credential to send them.
+            //
+            // The ORDERING was examined and deliberately left alone. Moving the proof check after
+            // `authenticate_client` would put a cheap credential test first, but it cannot be done
+            // in this function (each grant helper authenticates its own client, with its own
+            // credential shape), and doing it inside each helper would CHANGE THE WIRE ANSWER: a
+            // request with both a bad secret and a bad proof would answer `invalid_client` where it
+            // now answers `invalid_dpop_proof`. That is error semantics, visible to every
+            // conforming client, traded for a mitigation that is partial anyway, since a caller who
+            // has any valid client credential (a public client id is one) pays nothing to get past
+            // the reorder. RFC 9449 offers nothing cheaper to filter on either: the proof is signed
+            // by a key the AS learns FROM the proof, so there is nothing to check before checking
+            // the signature.
+            //
+            // The honest answer is therefore the rate limiter, not the ordering. See
+            // `crate::rate_limit`.
             #[cfg(feature = "dpop")]
             let jkt = self.verify_dpop(context.dpop_proof).await?;
             // Matched by REFERENCE, and that is the second half of the same measurement the doc
@@ -2553,7 +2791,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // is that the residual stops at the client whose code actually leaked, instead of being
         // handed to every registered client in the deployment.
         if record.client_id != client.client_id {
-            let _ = self.store.put_authorization_code(record).await;
+            // NOT fire-and-forget. If this write fails, a LIVE code belonging to an honest client
+            // has just been destroyed by a stranger's request, and answering `invalid_grant` would
+            // report that as the ordinary refusal it is not: the honest client would come back a
+            // moment later, be told `invalid_grant` as well, and nobody would ever connect the two.
+            // `server_error` is the truthful answer and it is the only place this failure can
+            // surface, because the party in front of us is not the one who was harmed.
+            //
+            // It reveals nothing: reaching this branch at all requires a real code, and the
+            // difference between the two answers is a store failure the caller cannot provoke.
+            self.store
+                .put_authorization_code(record)
+                .await
+                .map_err(storage_error)?;
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
 
@@ -2569,29 +2819,50 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // client has legitimately rotated since redemption dies too: the compromise is of the
             // grant, not of one token from it (RFC 9700 section 4.14.2).
             let mut revoked_family = false;
+            // EVERY STEP BELOW CAN FAIL, AND THE WIRE CANNOT CARRY THE NEWS. The answer to a
+            // replayed code is `invalid_grant` whatever happens here, because the party being
+            // answered is whoever holds a leaked code and there is nothing to tell them. So the
+            // AUDIT EVENT is the only signal a deployment gets, which makes an event that claims
+            // containment it did not achieve strictly worse than no event: it is what an operator
+            // reads while deciding not to investigate. This flag is what stops it lying.
+            let mut containment_failed = false;
             // MOVED out of the record rather than cloned: `rec` is a value this scope already owns
             // and drops, so carrying its family id to the audit event below costs nothing.
             let mut revoked_family_id: Option<String> = None;
             if let Some(rt) = refresh_token {
                 if let Ok(Some(rec)) = self.store.get_refresh_token(rt).await {
-                    let _ = self.store.revoke_token_family(&rec.family_id).await;
-                    revoked_family = true;
                     // Cloned out of the shared snapshot `get_refresh_token` handed back. One
                     // allocation, on the detected-compromise path only, against the seven that
                     // read now costs nothing on the paths that run per request.
                     revoked_family_id = Some(rec.family_id.clone());
+                    // `revoked_family` now means what its name says. It was set unconditionally
+                    // here, with the `Result` discarded, so a store that failed at the one moment
+                    // this server was responding to a detected compromise reported a clean
+                    // containment: the attacker's chain still live, the audit log saying it was
+                    // killed.
+                    match self.store.revoke_token_family(&rec.family_id).await {
+                        Ok(_) => revoked_family = true,
+                        Err(_) => containment_failed = true,
+                    }
                 }
             }
             if !revoked_family {
-                // No refresh chain to reach the family through (or it is already swept): the
-                // access token this code minted is still nameable directly.
-                let _ = self.store.delete_token(access_token).await;
+                // No refresh chain to reach the family through (or it is already swept, or the
+                // revocation above failed): the access token this code minted is still nameable
+                // directly, so this is a genuine fallback and not merely a tidy-up. Dropping its
+                // failure left the compromised access token live for its whole TTL, silently.
+                if self.store.delete_token(access_token).await.is_err() {
+                    containment_failed = true;
+                }
             }
             // The consumed record goes BACK. `src/authorization.rs` and `src/store.rs` both
             // promise it is retained until its own expiry, and that promise is what makes replay
             // detection work more than once: taking it here would make the NEXT replay read as an
-            // unknown code, which is the answer a typo gets.
-            let _ = self.store.put_authorization_code(record).await;
+            // unknown code, which is the answer a typo gets. Losing this write therefore loses the
+            // EVIDENCE, not just a record, which is why it counts as a containment failure too.
+            if self.store.put_authorization_code(record).await.is_err() {
+                containment_failed = true;
+            }
             // EVIDENCE OF COMPROMISE (RFC 6749 section 4.1.2, RFC 9700 section 4.1.1). The
             // revocation above is silent without this: a host cannot investigate a stolen code it
             // was never told about.
@@ -2599,6 +2870,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 client_id: client.client_id.as_str(),
                 family_id: revoked_family_id.as_deref(),
                 tokens_revoked: revoked_family,
+                containment_failed,
             });
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
@@ -2782,23 +3054,46 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // configured increment (the RFC directs the client to add 5 seconds; the server tracks the
         // same number so it can hold the client to it). The window also restarts at this poll:
         // hammering does not drain the wait.
+        //
+        // BOTH WRITES BELOW ARE COMPARE-AND-SWAPS, and this is the argued part. A poll and the
+        // user's decision at the verification UI are two different actors on one record, and the
+        // poll's write is derived from a read that happened one or more storage round trips ago.
+        // Blind-putting that snapshot back reverts an approval the user really gave, or, worse, a
+        // DENIAL: the verification UI has already told the user their refusal was recorded, the
+        // grant is `Pending` again, and nothing anywhere reports an error.
+        //
+        // The trade is deliberate and it is not symmetric. A poll writes exactly two fields,
+        // `interval` and `last_poll_at`, and losing them costs at most one extra `slow_down` on the
+        // next poll. Losing a DECISION is losing something a human did. So a missed swap here is
+        // NOT retried and NOT an error: the poll simply declines to write, the decision stands, and
+        // the device reads it on its next poll a few seconds later. That is the whole design rule,
+        // and it is why this is a compare-and-swap rather than a re-read-and-merge: re-reading
+        // narrows the window, it does not close it, and the decision must not be losable at all.
         if let Some(last) = grant.last_poll_at {
             if now < last + grant.interval {
+                let expected = grant.state.clone();
                 grant.interval += self.config.slow_down_increment;
                 grant.last_poll_at = Some(now);
+                // A genuine storage FAILURE is still fatal, exactly as it was before: only losing
+                // the race is tolerated. The `slow_down` answer stands either way, because the
+                // pacing verdict was computed from a real read of a real record.
                 self.store
-                    .put_device_grant(grant)
+                    .compare_and_swap_device_grant(&expected, grant)
                     .await
                     .map_err(storage_error)?;
                 return Err(ErrorResponse::new(ErrorCode::SlowDown));
             }
         }
+
+        // Cloned before `grant` is moved, and no more often than the `match grant.state.clone()`
+        // this replaced: the branch arms need the state and the swap needs it as the expectation.
+        let state = grant.state.clone();
         grant.last_poll_at = Some(now);
 
-        match grant.state.clone() {
+        match state {
             DeviceGrantState::Pending => {
                 self.store
-                    .put_device_grant(grant)
+                    .compare_and_swap_device_grant(&DeviceGrantState::Pending, grant)
                     .await
                     .map_err(storage_error)?;
                 Err(ErrorResponse::new(ErrorCode::AuthorizationPending))
@@ -3130,15 +3425,39 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             && self.config.issue_refresh_tokens
             && client.allows_grant(GrantType::RefreshToken);
 
-        // The family id is minted (or inherited) BEFORE the access token, because the access token
-        // has to carry it: RFC 9700 section 4.14.2 revokes the tokens of the whole grant on
-        // detected reuse, and an access token with no family is unreachable from that event. A
-        // grant that issues no refresh chain has no family, and allocates nothing for one: there
-        // is no chain to reuse, so there is nothing to revoke by family.
-        let family_id = match (&chain, issues_refresh) {
-            (Some(c), _) => Some(c.family_id.clone()),
-            (None, true) => Some(random_hex(16)),
-            (None, false) => None,
+        // ONE DRAW FOR ALL THREE ARTIFACTS. `getrandom::fill` is a syscall whose cost is almost
+        // entirely per CALL rather than per byte (see `hex_encode`), and an issuance needed up to
+        // three of them: a family id, an access token, and a refresh token. MEASURED at roughly
+        // 1 us saved per issuance, which is about half of `client_credentials_issue` and a fifth of
+        // an authorization code redemption.
+        //
+        // Scoped to a block with NO await inside it, deliberately. The buffer must not survive
+        // across a suspension point or its 80 bytes join the coroutine's state, and this future is
+        // held under tokio's 2048-byte debug boxing threshold by `tests/allocation.rs`. The refresh
+        // token is therefore encoded HERE, before the buffer dies, and carried as an `Option<String>`
+        // to its use below rather than being drawn there.
+        //
+        // Drawing 80 bytes when only 32 will be used is free: the syscall is the cost, and the
+        // alternative (branching on `issues_refresh` before the draw) would buy nothing and add a
+        // path where the unused half is not overwritten.
+        let (family_id, access_token, pending_refresh) = {
+            let mut entropy = [0u8; 80];
+            getrandom::fill(&mut entropy).expect("OS randomness for OAuth artifacts");
+            // The family id is minted (or inherited) BEFORE the access token, because the access
+            // token has to carry it: RFC 9700 section 4.14.2 revokes the tokens of the whole grant
+            // on detected reuse, and an access token with no family is unreachable from that event.
+            // A grant that issues no refresh chain has no family, and allocates nothing for one:
+            // there is no chain to reuse, so there is nothing a reuse detection could revoke.
+            let family_id = match (&chain, issues_refresh) {
+                (Some(c), _) => Some(c.family_id.clone()),
+                (None, true) => Some(hex_encode(&entropy[..16])),
+                (None, false) => None,
+            };
+            (
+                family_id,
+                hex_encode(&entropy[16..48]),
+                issues_refresh.then(|| hex_encode(&entropy[48..])),
+            )
         };
 
         // Cloned ONLY when a sink is installed: both values are consumed by the records written
@@ -3152,7 +3471,6 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .is_observed()
             .then(|| Box::new((subject.clone(), family_id.clone())));
 
-        let access_token = random_hex(32);
         // RFC 9068, when the host configured it: the WIRE token becomes a signed JWT and the
         // random string above becomes its `jti`. The record below is persisted either way, keyed
         // by whatever the client will actually present, so RFC 7662 introspection and RFC 7009
@@ -3206,7 +3524,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 Some(c) => c.expires_at,
                 None => self.config.refresh_token_ttl.map(|ttl| now + ttl),
             };
-            let rt = random_hex(32);
+            // Drawn in the single `getrandom` call at the top of this function; `issues_refresh`
+            // is what decided both that draw and this branch, so the value is always present.
+            let rt = pending_refresh.expect("issues_refresh decided both");
             self.store
                 .put_refresh_token(RefreshTokenRecord {
                     // RFC 9449 s5: the chain remembers the key it was issued to, and rotation
@@ -3406,6 +3726,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The library NEVER calls this for itself. Recording consent is a statement that a user agreed
     /// to something, and this crate has no way to know that: it never sees a user. The host calls
     /// it once its own consent step has actually been answered.
+    ///
+    /// # THE HOST MUST NOT CALL THIS CONCURRENTLY FOR ONE (client, subject) PAIR
+    ///
+    /// This is a read-modify-write: it looks for an existing record, widens it, and writes it back.
+    /// [`Storage`] has no uniqueness constraint on `(client_id, subject)` and no primitive that
+    /// could express one, so two calls that overlap can each find nothing and each create a record,
+    /// leaving the pair with two.
+    ///
+    /// That is NOT fixed here, and the reason is worth stating rather than leaving as an omission.
+    /// The consequences are benign in the direction that matters: the records are ADDITIVE, so
+    /// nothing is lost, [`AuthorizationServer::remembered_consent`] may report the narrower of the
+    /// two and cause a re-prompt (the harmless direction, and the same one
+    /// [`crate::consent::ConsentRecord::extend`] already fails in), and
+    /// [`AuthorizationServer::consents_for_subject`] lists both so a user can still see and
+    /// withdraw the whole relationship. Against that, closing it would mean a second
+    /// compare-and-swap primitive on the [`Storage`] trait for a path that runs ONCE PER HUMAN
+    /// CONSENT DECISION rather than per request, and whose two writers are two tabs of the same
+    /// user's own browser.
+    ///
+    /// What the host owes instead: serialise its own consent writes per (client, subject), which
+    /// any host that already has a session lock around its consent screen gets for nothing.
     #[cfg(feature = "consent")]
     pub async fn record_consent(
         &self,
@@ -3578,10 +3919,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // token's own revocation the answer and that has already succeeded; a cascade
                     // that could turn a completed revocation into a 503 would leave the client
                     // believing nothing was revoked when the token it named is already gone.
-                    let _ = self.store.revoke_token_family(&record.family_id).await;
+                    //
+                    // NOT fatal, but no longer INVISIBLE. The event fired unconditionally, so an
+                    // operator could not tell a complete revocation from one that killed the
+                    // presented string and left every access token of the same grant alive. That
+                    // is the difference between "the client's session is over" and "the client's
+                    // session continues for up to one access token TTL", and only the host can
+                    // decide what to do about it.
+                    let cascade_failed = self
+                        .store
+                        .revoke_token_family(&record.family_id)
+                        .await
+                        .is_err();
                     self.hooks.emit(|| Event::TokenRevoked {
                         client_id: client.client_id.as_str(),
                         token_type: TokenTypeHint::RefreshToken,
+                        cascade_failed,
                     });
                     Ok(true)
                 }
@@ -3600,6 +3953,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     self.hooks.emit(|| Event::TokenRevoked {
                         client_id: client.client_id.as_str(),
                         token_type: TokenTypeHint::AccessToken,
+                        // An access token names no grant to cascade to: it is one record and it is
+                        // gone, or the `?` above already turned the failure into an error.
+                        cascade_failed: false,
                     });
                     Ok(true)
                 }

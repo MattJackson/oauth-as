@@ -212,6 +212,7 @@ fn an_installed_sink_sees_every_event_it_is_handed() {
         client_id: "c",
         family_id: Some("f00d"),
         tokens_revoked: true,
+        containment_failed: false,
     });
     hooks.emit(|| Event::RefreshTokenReuseDetected {
         client_id: "c",
@@ -221,6 +222,7 @@ fn an_installed_sink_sees_every_event_it_is_handed() {
     hooks.emit(|| Event::TokenRevoked {
         client_id: "c",
         token_type: TokenTypeHint::RefreshToken,
+        cascade_failed: false,
     });
 
     let seen = recorder.0.lock().unwrap_or_else(|e| e.into_inner()).clone();

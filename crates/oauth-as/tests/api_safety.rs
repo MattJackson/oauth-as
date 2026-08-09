@@ -57,6 +57,7 @@ fn client_auth_failure_is_a_std_error() {
         oauth_as::ClientAuthFailure::UnknownClient.to_string(),
         oauth_as::ClientAuthFailure::SecretMismatch.to_string(),
         oauth_as::ClientAuthFailure::RateLimited.to_string(),
+        oauth_as::ClientAuthFailure::SecretExpired.to_string(),
     ];
     #[cfg(feature = "mtls")]
     {

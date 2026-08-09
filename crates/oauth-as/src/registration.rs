@@ -409,6 +409,33 @@ impl RegistrationConfig {
 
 /// The registered `token_endpoint_auth_method` values this server implements, which are exactly
 /// the ones its RFC 8414 `token_endpoint_auth_methods_supported` advertises.
+/// The largest number of `redirect_uris` one dynamic registration may declare.
+///
+/// # Why there is a cap at all
+///
+/// RFC 7591 section 2 sets none, and the list is not read here: it is read on EVERY authorization
+/// request for the registered client, as a linear scan with exact string comparison, because
+/// OAuth 2.1 section 4.1.3 forbids anything cheaper than exact matching. So an unbounded list is a
+/// cost bought once, at an endpoint whose [`RegistrationPolicy`] a host may well have opened to
+/// anonymous callers, and then paid per request for as long as the registration exists. That
+/// durability is what makes this worth a constant rather than a shrug.
+///
+/// # Why 16
+///
+/// It is counted from what a real client needs: one redirect URI per deployment environment
+/// (production, staging, a review app or two) times one per platform that needs its own
+/// (web, a native custom scheme, a loopback range for a desktop app). That is a handful, and
+/// sixteen is several times a handful. A registrant that genuinely needs more has one client
+/// standing in for several, which is a modelling problem this cap makes visible rather than a
+/// limit it imposes; separate clients also give the deployment separate secrets and separate
+/// revocation, which is the better shape anyway.
+///
+/// # Why the scan stays linear
+///
+/// At sixteen it is faster than hashing, and it is the same argument as
+/// [`crate::server::MAX_RESOURCE_INDICATORS`]. The defect was the missing bound, not the loop.
+pub const MAX_REGISTERED_REDIRECT_URIS: usize = 16;
+
 const AUTH_METHOD_NONE: &str = "none";
 const AUTH_METHOD_BASIC: &str = "client_secret_basic";
 const AUTH_METHOD_POST: &str = "client_secret_post";
@@ -549,6 +576,19 @@ fn validate(
             RegistrationErrorResponse::new(
                 RegistrationErrorCode::InvalidRedirectUri,
                 "the authorization_code grant requires at least one redirect_uri",
+            ),
+        ));
+    }
+    // A CAP, because a registration is durable and the cost it imposes is not paid here. Every
+    // authorization request for this client scans `redirect_uris` linearly with exact string
+    // comparison (OAuth 2.1 section 4.1.3 allows nothing cheaper), so an unbounded list bought
+    // once at an endpoint a policy may well have opened to anonymous callers is a per-request cost
+    // that lasts as long as the registration does. RFC 7591 section 2 sets no bound of its own.
+    if metadata.redirect_uris.len() > MAX_REGISTERED_REDIRECT_URIS {
+        return Err(RegistrationFailure::Invalid(
+            RegistrationErrorResponse::new(
+                RegistrationErrorCode::InvalidRedirectUri,
+                "too many redirect_uris",
             ),
         ));
     }

@@ -277,6 +277,21 @@ pub struct FaultStorage {
     pub fail_put_refresh: AtomicBool,
     /// When set, every user-code lookup reports a hit, as an unending run of collisions would.
     pub collide_user_codes: AtomicBool,
+    /// When set, `revoke_token_family` fails. This is the store failing at the ONE moment the
+    /// server is responding to a detected compromise, which is when a truthful audit event matters
+    /// most and is the only moment at which a false one can be written.
+    pub fail_revoke_token_family: AtomicBool,
+    /// When set, `delete_token` fails: the fallback containment on a replayed code, and the leg
+    /// that leaves the attacker's access token live if it is dropped.
+    pub fail_delete_token: AtomicBool,
+    /// When set, `put_authorization_code` fails. Two paths write a code back rather than burning
+    /// it: the consumed record after a replay (which is what makes replay detectable a second
+    /// time) and the live record after a client-id mismatch (which is what stops a stranger
+    /// destroying an honest client's code).
+    pub fail_put_authorization_code: AtomicBool,
+    /// When set, `get_refresh_token` reports nothing, so the replay path finds no reachable chain
+    /// and falls through to deleting the access token by name.
+    pub fail_get_refresh: AtomicBool,
     /// The ORDER in which the server consulted the two token lookups.
     ///
     /// RFC 7009 section 2.1 makes `token_type_hint` an optimisation: the server SHOULD look in the
@@ -359,6 +374,9 @@ impl Storage for FaultStorage {
         &self,
         record: AuthorizationCodeRecord,
     ) -> Result<(), StorageError> {
+        if self.fail_put_authorization_code.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected code write failure"));
+        }
         self.inner.put_authorization_code(record).await
     }
 
@@ -400,6 +418,9 @@ impl Storage for FaultStorage {
     }
 
     async fn delete_token(&self, access_token: &str) -> Result<(), StorageError> {
+        if self.fail_delete_token.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected delete failure"));
+        }
         self.inner.delete_token(access_token).await
     }
 
@@ -415,6 +436,9 @@ impl Storage for FaultStorage {
         refresh_token: &str,
     ) -> Result<Option<std::sync::Arc<RefreshTokenRecord>>, StorageError> {
         self.record("get_refresh_token");
+        if self.fail_get_refresh.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         self.inner.get_refresh_token(refresh_token).await
     }
 
@@ -426,6 +450,9 @@ impl Storage for FaultStorage {
     }
 
     async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
+        if self.fail_revoke_token_family.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected family revocation failure"));
+        }
         self.inner.revoke_token_family(family_id).await
     }
 

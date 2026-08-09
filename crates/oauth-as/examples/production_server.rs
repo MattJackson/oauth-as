@@ -167,9 +167,10 @@ impl EventSink for StderrEventSink {
                 client_id,
                 family_id,
                 tokens_revoked,
+                containment_failed,
             } => eprintln!(
                 "ALERT authorization_code_replay client={client_id} family={family_id:?} \
-                 revoked={tokens_revoked}"
+                 revoked={tokens_revoked} containment_failed={containment_failed}"
             ),
             // Everything else is ordinary operational record. `Event` is `#[non_exhaustive]`, so
             // this arm is also what keeps a host compiling when a later release adds one.

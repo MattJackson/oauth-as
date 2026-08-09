@@ -164,8 +164,145 @@ allocation out of the 39 a code redemption already costs. This crate has crossed
 twice, once for 120 bytes and once for 344, and the failure mode on the other side is a 2 KB heap
 allocation on every token request. The trade is refused, with the number, in the function's docs.
 
+### Fixed (security): lost updates on the device grant
+
+- **BEHAVIOUR CHANGE: a device-grant poll can no longer revert the user's decision.**
+  `device_token` read the grant, then blind-wrote it back through `put_device_grant` on both its
+  non-terminal paths (`authorization_pending` and `slow_down`). A concurrent `approve_device` or
+  `deny_device` landing between that read and that write was silently reverted, with the
+  verification UI having already told the user their answer was recorded. The worst case is a
+  DENIAL being thrown away: the grant returns to `Pending` and goes on to be approved by whoever
+  reaches the code next. Both writes are now compare-and-swaps against the state the poll read, and
+  a missed swap is neither retried nor reported as an error: the poll simply declines to write. The
+  asymmetry is deliberate and is argued at the call site. A lost poll timestamp costs at most one
+  extra `slow_down`; a lost decision is a lost human answer, so the timestamp is the losable half.
+- **BEHAVIOUR CHANGE: `approve_device` and `deny_device` are first-decision-wins.** Both were
+  read-modify-writes with no compare-and-swap, so two concurrent verification-UI actions on one user
+  code clobbered each other and the winner was whichever wrote last. Both now swap against
+  `Pending`, and the loser is answered `DeviceApprovalError::NotPending`, which is exactly the
+  answer it would have received had it arrived a moment later. Hosts that call these from a UI where
+  two actions on one code are possible will now see `NotPending` where a write previously succeeded.
+- **`Storage::compare_and_swap_device_grant`**, the primitive the two items above rest on. It is a
+  PROVIDED method with a default implementation, so no existing `Storage` implementor has to change
+  anything to keep compiling. The default does the read, the comparison and the write as three
+  separate calls, which NARROWS the window without closing it; its docs say so plainly, and a host
+  running more than one process against a shared store should override it with
+  `UPDATE ... WHERE state = $expected` or the equivalent. `MemoryStorage` overrides it and performs
+  the whole operation under one lock.
+
+### Performance: the entropy draw, where the allocation gates and the clock disagreed
+
+No behaviour change and no API change: the artifacts are byte for byte what they were, drawn from
+the same OS randomness with the same rejection sampling. What changed is the number of SYSCALLS.
+`getrandom::fill`'s cost is almost entirely per CALL and barely at all per byte (MEASURED: 875 ns
+for one byte, 1025 ns for thirty-two), which the crate's allocation gates cannot see: they reported
+19 allocations before and after, while the clock reported a factor of five. Numbers are medians from
+`crates/oauth-as/benches`, `--all-features`, same machine and profile, before and after.
+
+- **`random_user_code` drew one byte per call**, so the syscall count was the length of the code.
+  `device_authorization` 9.36 us -> 2.66 us. It now fills a 64-byte stack buffer and refills it if a
+  run of rejections exhausts it; no allocation is added and the uniformity argument is untouched.
+- **`issue` drew the family id, the access token and the refresh token separately.** One 80-byte
+  draw now feeds all three, in a scope with no await inside it so the buffer never joins the
+  coroutine state (the token future is held under tokio's 2048-byte boxing threshold).
+  `authorization_code_redemption` 4.84 us -> 2.21 us, `refresh_rotation` 3.50 us -> 2.13 us,
+  `client_credentials_issue` 1.97 us -> 1.84 us.
+- **`random_hex` formatted each byte through `core::fmt`.** A nibble table instead: 1335 ns ->
+  1092 ns for a 32-byte artifact.
+
+Not taken, with the reason recorded in the code rather than only here: **`verify_dpop` still runs
+before `authenticate_client`**. A DPoP proof with a wrong signature costs a full P-256 verification
+(133.18 us, indistinguishable from a valid one until it finishes, against 34 ns for a merely
+malformed proof), so an unauthenticated caller buys that per request. Reordering would change the
+wire answer for a request with both a bad secret and a bad proof, from `invalid_dpop_proof` to
+`invalid_client`, and would not help against a caller holding any valid client credential; RFC 9449
+offers nothing cheaper to pre-filter on, since the verifying key is learned FROM the proof. The
+honest mitigation is the rate limiter, and the cost is now documented at the call site so a host can
+size one. Likewise **`ScopeSet::parse` is still uncapped** (31 ns at one token, 80.37 us at a
+thousand): the growth is n log n rather than quadratic, and a cap cannot be expressed without
+breaking `InvalidScopeToken`, which is also the deserializer for every persisted record carrying a
+scope. Both are written up on the items themselves.
+
+### Fixed (security): failures reported as successes
+
+The wire cannot carry any of these, so the audit sink is the only place the truth can be told. An
+event that overstates a containment is worse than no event, because it is what an operator reads
+while deciding not to investigate.
+
+- **BREAKING: `Event::AuthorizationCodeReplayDetected` gains `containment_failed: bool`, and
+  `tokens_revoked` now means what it says.** On a replayed authorization code the family
+  revocation's `Result` was DISCARDED while `tokens_revoked: true` was set unconditionally, so a
+  store that failed at the one moment this server was responding to a detected compromise reported
+  a clean containment: the attacker's refresh chain still live, the audit log saying it was killed.
+  The fallback deletion of the access token the code minted, and the write that puts the consumed
+  code record back (which is what makes the NEXT replay detectable at all), were fire-and-forget
+  too. All three now feed `containment_failed`. Hosts matching this variant exhaustively must add
+  the field.
+- **BREAKING: `Event::TokenRevoked` gains `cascade_failed: bool`.** RFC 7009 s2.1's SHOULD, that
+  revoking a refresh token also invalidates the access tokens of the same grant, remains
+  deliberately non-fatal (turning a completed revocation into an error would tell an honest client
+  nothing happened when the token it named is already gone), but it fired the event unconditionally,
+  so an operator could not tell a complete revocation from one that left every access token of the
+  grant alive for its full TTL. Always `false` for an access token, which has no grant-wide cascade.
+- **BEHAVIOUR CHANGE: a storage failure while restoring an authorization code after a client-id
+  mismatch is now `server_error`, not `invalid_grant`.** The restore was fire-and-forget, so a
+  failure destroyed a LIVE code belonging to an honest client and answered as though it had merely
+  refused a stranger. The honest client would then be told `invalid_grant` a moment later and
+  nobody would connect the two. Reaching this branch requires a real code, and the difference
+  between the two answers is a store failure the caller cannot provoke, so it is not an oracle.
+
+### Fixed (security): work an unauthenticated caller could buy by sending more
+
+RFC 9396's `authorization_details` array had an explicit element cap and a stated reason for its
+number; the other repeatable arrays reachable from the same endpoints had neither. That asymmetry
+was the finding. In every case the fix is the CAP and not the algorithm: at sixteen a linear scan
+beats a `HashSet` (which pays a hash of the whole string per lookup), and the defect was never the
+loop, it was that nothing bounded `n`.
+
+- **BEHAVIOUR CHANGE: `oauth_as::server::MAX_RESOURCE_INDICATORS` (16).** RFC 8707 s2 makes
+  `resource` repeatable, it is accepted at the authorization endpoint (which takes no client
+  credential), and validation was O(n) against the allowlist plus an O(n) dedup scan per element.
+  MEASURED: 2.16 us at n=1, 16.93 us at 100, 1.08 ms at 1000, with the per-element cost RISING from
+  167 ns to 1030 ns, which is the quadratic signature. A request past the cap is now
+  `invalid_target`. It REFUSES rather than truncating: silently dropping indicators would issue a
+  token whose audience is not the one the client asked for, with nothing told to anybody. The count
+  is taken on the INPUT, not on the deduplicated result, so ten thousand copies of one URI are
+  refused too.
+- **BEHAVIOUR CHANGE: `oauth_as::token_exchange::MAX_AUDIENCE_VALUES` (16).** The same unbounded
+  O(n*m) dedup of RFC 8693 s2.1.1 `audience` against the validated `resource` list. Deliberately the
+  same constant as above, because s2.1.1 says the two parameters name the same thing in two
+  spellings.
+- **BEHAVIOUR CHANGE: `oauth_as::consent::MAX_CONSENT_RESOURCES` (32),** and the worst of the three
+  because the cost was DURABLE rather than per request. `ConsentRecord::extend` deduplicated newly
+  requested resources against the PERSISTED list, which is the union of everything ever approved for
+  a (client, subject) pair, was only ever widened, and is walked linearly by `covers` on every
+  authorization request that consults it. A client naming one fresh indicator per request bought a
+  permanently larger record and a permanently slower check. The cap refuses to GROW and never
+  prunes: a resource that did not fit reads as not covered, so the host re-prompts, which is the
+  harmless direction and the same one the scope union already fails in.
+- **BEHAVIOUR CHANGE: `oauth_as::registration::MAX_REGISTERED_REDIRECT_URIS` (16).** RFC 7591 s2 set
+  no bound, and `redirect_uris` is scanned linearly with exact string comparison (OAuth 2.1 s4.1.3
+  allows nothing cheaper) on every authorization request for the client. A registration is durable,
+  so an unbounded list bought once at an endpoint a policy may have opened to anonymous callers is a
+  per-request cost that lasts as long as the registration. Past the cap is `invalid_redirect_uri`.
+- **BEHAVIOUR CHANGE: the `invalid_scope` refusal no longer echoes the requested scope, and no
+  longer allocates.** `resolve_scope` built its `error_description` with `format!`, interpolating
+  the caller's own scope string, on a refusal an UNAUTHENTICATED caller can drive at will through
+  the RFC 8628 s3.1 device authorization endpoint. That contradicts the crate's own stated rule,
+  documented on `tests/allocation.rs`'s `refused_token_request_allocation_bound`, that a refusal is
+  work the attacker buys. It is now a `&'static str`, like the roughly fifty other refusal sites.
+
 ### Fixed (security)
 
+- **BEHAVIOUR CHANGE: an expired dynamically-registered client secret stops authenticating.**
+  `authenticate_client` never consulted `DynamicRegistration::client_secret_expires_at`, so a secret
+  this server itself MINTED, and published an expiry for in its RFC 7591 s3.2.1 registration
+  response, went on working forever. A rotation window a server announces and does not enforce is
+  worse than none, because the operator believes the old secret stopped working on the stated day.
+  The check sits before every credential branch, so `client_secret_jwt` (which also authenticates
+  with the shared secret) cannot route around it; s3.2.1's `0` still means never. The wire answer is
+  the same bare `invalid_client` as every other client authentication failure; the audit channel is
+  told, through the new `ClientAuthFailure::SecretExpired`.
 - **BEHAVIOUR CHANGE: RFC 8693 token exchange REFUSES a sender-constrained subject token.** A
   DPoP-bound (RFC 9449 `cnf.jkt`) or certificate-bound (RFC 8705 `x5t#S256`) access token presented
   as `subject_token` was exchanged into a new UNBOUND bearer token, with no proof of possession
@@ -179,6 +316,18 @@ allocation on every token request. The trade is refused, with the number, in the
   the original client's key, so the token would be unusable at any resource server that checks the
   binding (RFC 9449 s7.1) while looking as though possession had been proven. An unbound subject
   token exchanges exactly as before. See the module docs in `src/token_exchange.rs`.
+
+  The refusal is now guarded by **`ServerConfig::allow_sender_constrained_exchange`, `false` by
+  default**, which is a MIGRATION path and not a tuning knob: 0.9.0 and earlier performed the
+  downgrade silently, so a deployment already built on it needs a way to keep running while it
+  moves off. Setting it to `true` restores the old behaviour, and what that gives up is exactly the
+  property above: a leaked bound token becomes spendable again via one request to this endpoint.
+  The field's own docs say so in those words.
+- **`DeviceApprovalError` is `#[non_exhaustive]`.** BREAKING for a host that matches it
+  exhaustively, and the reason it should not have been possible to do so: `lib.rs` re-exports this
+  type specifically so a host's verification UI can match on it, and every sibling host-facing
+  failure enum in the crate already carried the attribute. Without it, any new way to refuse an
+  entered user code is a semver-major change for every host.
 - **Three `SystemTime` overflow panics on attacker-supplied time claims**, all reachable from an
   unauthenticated request: `iat` in a DPoP proof (`src/dpop.rs`), and `exp`, `nbf` and `iat` in an
   RFC 7523 client assertion (`src/client_assertion.rs`). Each value is a `u64` out of JSON that

@@ -51,9 +51,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::authorization::AuthorizationCodeRecord;
 use crate::client::{Client, ClientId};
-use crate::device::DeviceGrant;
-#[cfg(feature = "consent")]
-use crate::device::DeviceGrantState;
+use crate::device::{DeviceGrant, DeviceGrantState};
 use crate::token::{IssuedToken, RefreshTokenRecord};
 
 /// An opaque host-side storage failure. The server maps these to `server_error` on wire paths;
@@ -155,6 +153,61 @@ pub trait Storage: Send + Sync {
         &self,
         device_code: &str,
     ) -> impl Future<Output = Result<Option<DeviceGrant>, StorageError>> + Send;
+
+    /// Replace the grant stored under `updated.device_code` with `updated`, but ONLY if the stored
+    /// record's [`DeviceGrantState`] is still `expected`. Answers whether the write happened.
+    ///
+    /// # Why this exists, which is the whole of it
+    ///
+    /// Three unrelated actors write one device grant: the DEVICE polling the token endpoint (which
+    /// restamps the RFC 8628 section 3.5 pacing fields), and the USER approving or denying at the
+    /// host's verification UI. Every one of those is a read-modify-write, and with only
+    /// [`Storage::put_device_grant`] to write through, the last writer wins by accident. The
+    /// interleaving that matters is a poll whose read saw `Pending` landing its write after the
+    /// user has already said no: the blind put reverts the record to `Pending`, the verification UI
+    /// has already told the user their refusal was recorded, and nothing anywhere reports an error.
+    /// A DECISION A USER ACTUALLY MADE IS SILENTLY THROWN AWAY.
+    ///
+    /// A poll TIMESTAMP is losable (the cost is one extra `slow_down`); a decision is not. This is
+    /// the primitive that expresses the difference, and it is a compare-and-swap rather than a
+    /// narrower "write only the pacing fields" call because the verification UI needs the same
+    /// guarantee against ITSELF: two host UI actions on one user code must not clobber each other
+    /// either, and there the field being written IS the state.
+    ///
+    /// # The contract
+    ///
+    /// The comparison and the write MUST happen as ONE atomic step. A store that implements this as
+    /// a read, a comparison, and a separate write has reintroduced precisely the window it is meant
+    /// to close, and it will do so silently, exactly as the `take_*` note at the top of this module
+    /// describes. `SELECT ... FOR UPDATE`, `UPDATE ... WHERE state = $expected`, a Redis
+    /// `WATCH`/`MULTI`, or a compare-and-set on a document revision all express it directly.
+    ///
+    /// `Ok(false)` for a `device_code` that is not present. A grant that has been redeemed or swept
+    /// is gone, and a swap must never bring it back: reinstating a consumed grant would make a
+    /// single-use device code redeemable twice.
+    ///
+    /// # The default implementation is a COMPATIBILITY SHIM, not a correct one
+    ///
+    /// It is provided so that this method could be added without breaking every existing host
+    /// implementation, and it does the read-compare-write in three separate calls. That NARROWS the
+    /// window (the state it compares is re-read immediately before the write, rather than being
+    /// whatever the caller saw several storage round trips ago) but it does not close it. A host
+    /// running more than one process against a shared store SHOULD override it.
+    fn compare_and_swap_device_grant(
+        &self,
+        expected: &DeviceGrantState,
+        updated: DeviceGrant,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        async move {
+            match self.get_device_grant(&updated.device_code).await? {
+                Some(current) if current.state == *expected => {
+                    self.put_device_grant(updated).await?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+    }
 
     /// Insert or replace an authorization code record, keyed by its code string.
     fn put_authorization_code(
@@ -612,6 +665,42 @@ impl Storage for MemoryStorage {
             g.user_code_index.remove(&normalized);
         }
         Ok(grant)
+    }
+
+    /// OVERRIDDEN rather than inherited, and that is the point of the override: the trait's default
+    /// does the compare and the write as separate calls, so it takes and releases this store's lock
+    /// twice and leaves exactly the window the method exists to close. Here the whole operation
+    /// happens under one guard, which is what a single-process host is entitled to expect from the
+    /// reference implementation.
+    ///
+    /// The user-code index maintenance is deliberately NOT duplicated: this delegates to the same
+    /// insert path `put_device_grant` uses, so the two halves of the index contract documented on
+    /// that method cannot drift between the two writers.
+    async fn compare_and_swap_device_grant(
+        &self,
+        expected: &DeviceGrantState,
+        updated: DeviceGrant,
+    ) -> Result<bool, StorageError> {
+        let mut g = self.lock();
+        match g.device_by_code.get(&updated.device_code) {
+            Some(current) if current.state == *expected => {}
+            // Absent, or moved on. Absent is the redeemed-or-swept case and must stay absent: a
+            // swap that reinstated a consumed grant would make a single-use device code
+            // redeemable twice.
+            _ => return Ok(false),
+        }
+        let normalized = crate::device::normalize_user_code(&updated.user_code);
+        if let Some(previous) = g.device_by_code.get(&updated.device_code) {
+            let previous_normalized = crate::device::normalize_user_code(&previous.user_code);
+            if previous_normalized != normalized {
+                g.user_code_index.remove(&previous_normalized);
+            }
+        }
+        g.user_code_index
+            .insert(normalized, updated.device_code.clone());
+        g.device_by_code
+            .insert(updated.device_code.clone(), updated);
+        Ok(true)
     }
 
     async fn put_authorization_code(

@@ -69,6 +69,28 @@ use crate::client::ClientId;
 use crate::error::{ErrorCode, ErrorResponse};
 use crate::scope::ScopeSet;
 
+/// The largest number of RFC 8707 resource indicators one [`ConsentRecord`] will accumulate.
+///
+/// # Why this one matters more than the per-request caps
+///
+/// [`crate::server::MAX_RESOURCE_INDICATORS`] bounds what a single request may ask for, and that
+/// cost dies with the request. This bounds what a (client, subject) relationship accumulates over
+/// its whole life. The list is only ever widened by [`ConsentRecord::extend`], it is never pruned,
+/// and [`ConsentRecord::covers`] walks it linearly on every authorization request that consults the
+/// record. Without a bound, a client naming one fresh indicator per request buys a record that
+/// grows forever and a check that gets slower forever, and the deployment never gets that back.
+///
+/// # Why 32
+///
+/// It is twice the per-request cap, which is the smallest number that is not simply the per-request
+/// cap in disguise: a relationship legitimately widens over time, so a user who approves one set of
+/// resources today and a different set next month should not hit the ceiling on the second visit.
+/// Beyond that, a single (client, subject) pair spanning more than thirty-two distinct resource
+/// servers is a client acting for the user across an estate large enough that per-resource consent
+/// has stopped meaning anything to the person granting it, which is a product problem this number
+/// makes visible rather than a limit it creates.
+pub const MAX_CONSENT_RESOURCES: usize = 32;
+
 /// What the HOST says about how, and when, it authenticated the resource owner.
 ///
 /// This is a REPORT, not a proof. See the module docs: this crate cannot authenticate anyone and
@@ -215,8 +237,28 @@ impl ConsentRecord {
                 self.scope = widened;
             }
         }
-        self.resource.reserve(resource.len());
+        // CAPPED at [`MAX_CONSENT_RESOURCES`], and this is the one bound in the crate whose cost is
+        // DURABLE rather than per request. `self.resource` is the union of every resource ever
+        // approved for one (client, subject) pair; it is only ever widened here and pruned nowhere,
+        // and `covers` scans it linearly on every authorization request that consults the record.
+        // A client that names one fresh resource indicator per authorization request therefore
+        // bought a permanently larger record and a permanently slower check, and nothing anywhere
+        // said no.
+        //
+        // The cap refuses to GROW; it never removes. Dropping something already approved would
+        // narrow a consent silently while tokens carrying it are still live, which is the same lie
+        // this method's docs refuse to tell about narrowing generally.
+        //
+        // Failing here is the HARMLESS direction, and it is the same direction the scope union
+        // above already fails in: a resource that did not fit is not covered, `covers` answers
+        // false, and the host re-prompts the user. The dangerous direction would be reporting
+        // coverage that was never recorded.
+        let room = MAX_CONSENT_RESOURCES.saturating_sub(self.resource.len());
+        self.resource.reserve(resource.len().min(room));
         for r in resource {
+            if self.resource.len() >= MAX_CONSENT_RESOURCES {
+                break;
+            }
             if !self.resource.contains(r) {
                 self.resource.push(r.clone());
             }

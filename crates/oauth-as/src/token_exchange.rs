@@ -116,6 +116,20 @@ use crate::grant::GrantType;
 use crate::scope::ScopeSet;
 use crate::server::{AuthorizationServer, Bound, Clock};
 use crate::store::{Storage, StorageError};
+
+/// The largest number of RFC 8693 section 2.1.1 `audience` values one exchange may carry.
+///
+/// Deliberately the SAME number as [`crate::server::MAX_RESOURCE_INDICATORS`], and not a second
+/// judgement: section 2.1.1 says `audience` and `resource` name the same thing in two spellings,
+/// one a logical name and one a URI, and this crate funnels both into one list against one ceiling.
+/// Two constants would be two numbers a reader has to keep in step, for a distinction the RFC
+/// itself does not draw.
+///
+/// The reason for a bound at all is the reason given on [`crate::server::MAX_RESOURCE_INDICATORS`]:
+/// the parameter is repeatable and the dedup is an O(n) scan per element, so `n` is chosen by the
+/// caller. This endpoint IS authenticated, which is why the finding is a rung lower, but a client
+/// that has merely leaked its secret should not get an amplifier along with it.
+pub const MAX_AUDIENCE_VALUES: usize = crate::server::MAX_RESOURCE_INDICATORS;
 use crate::token::TokenType;
 
 pub use crate::grant::TOKEN_EXCHANGE_GRANT_URN;
@@ -569,12 +583,19 @@ async fn exchange<S: Storage, C: Clock>(
     //     based on policy, which is what this is. The description names the mechanism because a
     //     legitimate client hitting this needs to know WHY, and it is not a secret: the client just
     //     presented the token that carries the binding.
+    //
+    //     GUARDED by `ServerConfig::allow_sender_constrained_exchange`, which is `false` by
+    //     default. The opt-in exists only because 0.9.0 and earlier performed this downgrade
+    //     SILENTLY, so a deployment already built on it needs a migration window; a host that sets
+    //     it has decided its delegation topology is trusted enough to hold the binding for it. What
+    //     it gives up is stated on the field, and it is the whole of what DPoP or mutual TLS was
+    //     bought for.
     #[cfg(feature = "dpop")]
-    if subject.jkt.is_some() {
+    if subject.jkt.is_some() && !server.config().allow_sender_constrained_exchange {
         return Err(sender_constrained_refusal("DPoP (RFC 9449)"));
     }
     #[cfg(feature = "mtls")]
-    if subject.x5t_s256.is_some() {
+    if subject.x5t_s256.is_some() && !server.config().allow_sender_constrained_exchange {
         return Err(sender_constrained_refusal("mutual TLS (RFC 8705)"));
     }
 
@@ -673,6 +694,15 @@ async fn exchange<S: Storage, C: Clock>(
     // instead, where a name the subject token does not carry is `invalid_target` rather than
     // `invalid_request`. A deployment whose audiences are not resource indicators therefore finds
     // that no `audience` value is grantable here, which is the truth rather than a silent success.
+    // CAPPED, for the reason `validate_resources` is capped and with the same number: `audience`
+    // is repeatable, it is deduplicated against `targets` with an O(n) scan per element, and
+    // nothing bounded either side. Checked on the INPUT length rather than on `targets`, because a
+    // caller sending one value ten thousand times still pays a full scan per copy even though the
+    // result stays small.
+    if request.audience.len() > MAX_AUDIENCE_VALUES {
+        return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
+            .with_description("too many audience values (RFC 8693 s2.1.1)"));
+    }
     for audience in request.audience {
         if !targets.iter().any(|t| t == audience) {
             targets.push(audience.clone());
