@@ -737,6 +737,43 @@ async fn a_store_that_cannot_write_a_record_is_not_judged_on_records_it_never_st
     }
 }
 
+/// A SEED THAT DID NOT LAND MUST FAIL THE CHECK LOUDLY, not be waived into a pass.
+///
+/// `revoke_consent/cascades` plants four kinds of record per subject and then asserts each one is
+/// gone after the withdrawal. Three of the four puts had their `Result` discarded, so a store that
+/// silently failed to persist a fixture passed the cascade check FOR THE WRONG REASON: the record
+/// is absent afterwards because it was never there, not because the withdrawal reached it.
+///
+/// This is the EXPORTED harness, so a false pass here does not mislead this repository, it
+/// certifies a stranger's broken store. A host whose `put_refresh_token` is failing needs to be
+/// told that, by name, not handed a green cascade.
+#[tokio::test]
+async fn a_consent_fixture_that_did_not_persist_fails_the_cascade_check_by_name() {
+    for which in [
+        "put_refresh_token",
+        "put_authorization_code",
+        "put_device_grant",
+    ] {
+        let violations = run_against(Faults {
+            put_that_fails: Some(which),
+            ..Faults::default()
+        })
+        .await;
+
+        let named: Vec<&Violation> = violations
+            .iter()
+            .filter(|v| v.check == "revoke_consent/cascades")
+            .filter(|v| v.detail.contains(which))
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "with {which} failing, the cascade check reported nothing about the seed that did not \
+             land, so it passed because the record was never stored rather than because the \
+             withdrawal removed it. All violations: {violations:#?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------- the latch
 
 /// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:2122:58: replace == with != in

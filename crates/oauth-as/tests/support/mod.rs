@@ -292,6 +292,11 @@ pub struct FaultStorage {
     /// When set, `get_refresh_token` reports nothing, so the replay path finds no reachable chain
     /// and falls through to deleting the access token by name.
     pub fail_get_refresh: AtomicBool,
+    /// When set, `put_pushed_authorization_request` fails. The one path that writes a pushed
+    /// request BACK is the cross-client refusal (RFC 9126 s7.5), and losing that write destroys an
+    /// honest client's live handle.
+    #[cfg(feature = "par")]
+    pub fail_put_pushed_request: AtomicBool,
     /// When set, `put_token` fails, which is the FIRST write `AuthorizationServer::issue` makes.
     /// That is the cheapest way to fail an ISSUANCE without failing the writes that surround it,
     /// which is what the ordering suites need: they are about what survives in the store when the
@@ -407,6 +412,9 @@ impl Storage for FaultStorage {
         &self,
         record: oauth_as::PushedAuthorizationRequest,
     ) -> Result<(), StorageError> {
+        if self.fail_put_pushed_request.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected pushed-request write failure"));
+        }
         self.inner.put_pushed_authorization_request(record).await
     }
 

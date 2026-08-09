@@ -227,6 +227,24 @@ in that window was answered `invalid_grant` and never counted as reuse either.
   briefly had was removed. `MemoryStorage` performs the whole operation under one lock, and
   `oauth-as-postgres` performs it as one conditional `UPDATE ... WHERE`.
 
+### Fixed: two silent failures, one on the wire and one in the exported harness
+
+- **A pushed authorization request that cannot be restored is `server_error`, not
+  `invalid_request_uri`.** RFC 9126 s7.5 request URI swapping is refused by putting the record
+  BACK, since the take that resolved it has already removed it, and that write's `Result` was
+  discarded. If it failed, an honest client's live handle had just been destroyed by a stranger's
+  request and the answer was the same routine refusal any made-up handle gets: the owner would
+  arrive a moment later, be told `invalid_request_uri` too, and nobody would connect the two. The
+  authorization code path in `src/server.rs` argues exactly this and propagates; the two are now
+  consistent. It leaks nothing, because reaching that branch requires a real handle and the
+  difference between the answers is a store failure no caller can provoke.
+- **`revoke_consent/cascades` fails loudly when a fixture does not persist.** The check seeds four
+  kinds of record per subject and discarded the `Result` of three of the four puts. Every assertion
+  that follows is "the record is gone", and a record that was never written is gone, so a store
+  that silently failed to persist a fixture PASSED the cascade check for the wrong reason. This is
+  the exported harness, so that false pass would have certified a stranger's broken store. Each
+  seed is now reported by name.
+
 ### Fixed (security): the compare-and-swap shim resurrected redeemed device grants
 
 `Storage::compare_and_swap_device_grant` shipped in this same unreleased cycle with a default body

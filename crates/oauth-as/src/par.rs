@@ -794,7 +794,25 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // authorization code does in `server.rs`: burning a live handle for a request that was
         // never entitled to it is a denial of service handed to whoever asks.
         if record.client_id.as_str() != client_id {
-            let _ = self.store().put_pushed_authorization_request(record).await;
+            // NOT fire-and-forget, and word for word the argument the authorization code path in
+            // `server.rs` gives for the same situation. If this write fails, a LIVE pushed request
+            // belonging to an honest client has just been destroyed by a stranger's request, and
+            // answering `invalid_request_uri` would report that as the ordinary refusal it is not:
+            // the honest client would arrive a moment later, be told `invalid_request_uri` as
+            // well, and nobody would ever connect the two. `server_error` is the truthful answer
+            // and it is the only place this failure can surface, because the party in front of us
+            // is not the one who was harmed.
+            //
+            // It reveals nothing a probe can use: reaching this branch at all requires a real
+            // handle, and the difference between the two answers is a store failure the caller
+            // cannot provoke.
+            self.store()
+                .put_pushed_authorization_request(record)
+                .await
+                .map_err(|e| {
+                    let _ = e;
+                    AuthorizationError::Direct(ErrorResponse::new(ErrorCode::ServerError))
+                })?;
             return Err(direct(
                 ErrorCode::InvalidRequestUri,
                 "request_uri was not issued to this client",

@@ -157,6 +157,7 @@ impl fmt::Display for Violation {
 /// be feature-conditional to be valid.
 pub const CHECKS: &[&str] = &[
     HARNESS_RACE_SETUP,
+    HARNESS_RACER_PANICKED,
     ROUND_TRIP_CLIENT,
     ROUND_TRIP_DEVICE_GRANT,
     ROUND_TRIP_AUTHORIZATION_CODE,
@@ -187,6 +188,7 @@ pub const CHECKS: &[&str] = &[
     CLAIM_REPLAY_ID_REFUSES_SECOND,
     SWEEP_RECLAIMS_REPLAY_IDS,
     ATOMIC_TAKE_PUSHED_REQUEST,
+    ROUND_TRIP_PUSHED_REQUEST,
     ROUND_TRIP_CONSENT,
     REVOKE_CONSENT_CASCADES,
     REVOKE_CONSENT_SPARES_OTHERS,
@@ -194,6 +196,7 @@ pub const CHECKS: &[&str] = &[
 ];
 
 const HARNESS_RACE_SETUP: &str = "harness/race_setup";
+const HARNESS_RACER_PANICKED: &str = "harness/racer_panicked";
 const ROUND_TRIP_CLIENT: &str = "round_trip/client";
 const ROUND_TRIP_DEVICE_GRANT: &str = "round_trip/device_grant";
 const ROUND_TRIP_AUTHORIZATION_CODE: &str = "round_trip/authorization_code";
@@ -224,6 +227,7 @@ const ATOMIC_CLAIM_REPLAY_ID: &str = "atomic_claim/claim_replay_id";
 const CLAIM_REPLAY_ID_REFUSES_SECOND: &str = "claim_replay_id/refuses_a_second_claim";
 const SWEEP_RECLAIMS_REPLAY_IDS: &str = "sweep_expired/reclaims_replay_ids";
 const ATOMIC_TAKE_PUSHED_REQUEST: &str = "atomic_take/take_pushed_authorization_request";
+const ROUND_TRIP_PUSHED_REQUEST: &str = "round_trip/pushed_authorization_request";
 const ROUND_TRIP_CONSENT: &str = "round_trip/consent";
 const REVOKE_CONSENT_CASCADES: &str = "revoke_consent/cascades";
 const REVOKE_CONSENT_SPARES_OTHERS: &str = "revoke_consent/spares_other_subjects";
@@ -319,6 +323,8 @@ where
         self.delete_token(&mut report).await;
         #[cfg(any(feature = "client_assertion", feature = "dpop"))]
         self.claim_replay_id(&mut report).await;
+        #[cfg(feature = "par")]
+        self.round_trip_pushed_request(&mut report).await;
         #[cfg(feature = "par")]
         self.atomic_take_pushed_request(&mut report).await;
         #[cfg(feature = "consent")]
@@ -782,6 +788,27 @@ where
         // `Consumed` carries what the code minted, which is what a replay revokes. A store that
         // flattens the state to a boolean loses the thing the remedy needs.
         report.same(c, "state", &want.state, &got.state);
+        // RFC 9396 section 5: the code IS the record of what the resource owner approved, so a
+        // store that drops the details here mints a token for a narrower authorization than the
+        // user granted, and the client is told nothing about the difference.
+        #[cfg(feature = "rar")]
+        report.same(
+            c,
+            "authorization_details",
+            &want.authorization_details,
+            &got.authorization_details,
+        );
+        // RFC 9470 section 5: the authentication the host reported at the authorization request,
+        // which is what the token minted from this code reports as `auth_time` and `acr`. Dropped,
+        // a client that answered an `insufficient_user_authentication` challenge gets a token that
+        // claims no step-up happened.
+        #[cfg(feature = "consent")]
+        report.same(
+            c,
+            "authentication",
+            &want.authentication,
+            &got.authentication,
+        );
     }
 
     async fn round_trip_token(&self, report: &mut Report) {
@@ -823,6 +850,36 @@ where
         // RFC 9449 section 6: the DPoP binding. Dropped, the token is a bearer token again.
         #[cfg(feature = "dpop")]
         report.same(c, "jkt", &want.jkt, &got.jkt);
+        // RFC 8705 section 3.1: the mTLS binding, which is the OTHER way this crate sender
+        // constrains a token and which is dropped by exactly the same kind of missing column. It
+        // went unchecked here for longer than `jkt` did, which is the argument for checking it: a
+        // store certified clean by this harness while dropping `x5t_s256` silently unbinds every
+        // certificate-bound token it holds, and a resource server that introspects gets a token
+        // with no `cnf` at all, which reads as a plain bearer token rather than as an error.
+        #[cfg(feature = "mtls")]
+        report.same(c, "x5t_s256", &want.x5t_s256, &got.x5t_s256);
+        // RFC 9396 section 5: what the resource owner actually approved, beyond the scope string.
+        // This crate has twice shipped a path that dropped it, so a store that does the same is
+        // precisely the defect this harness exists to catch. A token whose details are gone is a
+        // token the resource server can only fall back to `scope` for, which is the coarse
+        // permission RAR was adopted to stop relying on.
+        #[cfg(feature = "rar")]
+        report.same(
+            c,
+            "authorization_details",
+            &want.authorization_details,
+            &got.authorization_details,
+        );
+        // RFC 9470 section 5: the `auth_time` and `acr` an introspecting resource server reads to
+        // decide whether the authentication behind this token is strong or fresh enough. Dropped,
+        // every token looks like it was minted with no step-up at all.
+        #[cfg(feature = "consent")]
+        report.same(
+            c,
+            "authentication",
+            &want.authentication,
+            &got.authentication,
+        );
     }
 
     async fn round_trip_refresh_token(&self, report: &mut Report) {
@@ -862,6 +919,30 @@ where
         // RFC 9449 section 5: carried across rotation and checked on redemption.
         #[cfg(feature = "dpop")]
         report.same(c, "jkt", &want.jkt, &got.jkt);
+        // RFC 8705 section 3.1, and it matters MORE on the refresh record than on the access
+        // token: this is the binding the next rotation copies onto the token it mints, so a store
+        // that loses it here does not merely unbind one token, it unbinds every token the chain
+        // will ever produce.
+        #[cfg(feature = "mtls")]
+        report.same(c, "x5t_s256", &want.x5t_s256, &got.x5t_s256);
+        // RFC 9396 section 6: the refresh record is what the narrowing on the next rotation is
+        // measured against. Dropped, the grant carries no details for a rotation to narrow, and
+        // the refreshed token silently loses the rich authorization the user approved.
+        #[cfg(feature = "rar")]
+        report.same(
+            c,
+            "authorization_details",
+            &want.authorization_details,
+            &got.authorization_details,
+        );
+        // RFC 9470: carried across rotation so a client cannot defeat a `max_age` by refreshing.
+        #[cfg(feature = "consent")]
+        report.same(
+            c,
+            "authentication",
+            &want.authentication,
+            &got.authentication,
+        );
     }
 
     // ------------------------------------------------------------------ atomicity
@@ -984,6 +1065,90 @@ where
                 );
             }
         }
+    }
+
+    /// The pushed request has to come back out of the store as it went in, field for field.
+    ///
+    /// It was the ONE record kind this harness raced and never round-tripped, which made the PAR
+    /// path the only one where a store could drop a column and be certified clean. That is the
+    /// worst record to have the hole in: RFC 9126 section 2.1 has the AS validate the parameters
+    /// at push time, and RFC 9101 section 6.3 has the authorization endpoint use ONLY the pushed
+    /// parameters, so a parameter that is validated and then lost is a parameter the client was
+    /// told was acceptable and then silently did not get. Losing `code_challenge` in particular is
+    /// a silent PKCE downgrade on a request whose whole purpose was to keep it out of the browser.
+    ///
+    /// There is no non-destructive read for a handle, by design (RFC 9126 section 4 makes it
+    /// single use), so the round trip is put-then-take, exactly as the authorization code's is.
+    #[cfg(feature = "par")]
+    async fn round_trip_pushed_request(&self, report: &mut Report) {
+        let store = self.store().await;
+        let want = sample_pushed_request("urn:ietf:params:oauth:request_uri:round-trip");
+        if report
+            .ok(
+                ROUND_TRIP_PUSHED_REQUEST,
+                "put_pushed_authorization_request",
+                store.put_pushed_authorization_request(want.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let Some(got) = report.ok(
+            ROUND_TRIP_PUSHED_REQUEST,
+            "take_pushed_authorization_request",
+            store
+                .take_pushed_authorization_request(&want.request_uri)
+                .await,
+        ) else {
+            return;
+        };
+        let Some(got) = report.some(
+            ROUND_TRIP_PUSHED_REQUEST,
+            "take_pushed_authorization_request",
+            got,
+        ) else {
+            return;
+        };
+        let c = ROUND_TRIP_PUSHED_REQUEST;
+        report.same(c, "request_uri", &want.request_uri, &got.request_uri);
+        // RFC 9126 section 2.2 binds the handle to the client that pushed it, and section 7.5 is
+        // the attack that binding prevents; a store that loses it lets a stranger's `/authorize`
+        // resolve somebody else's pushed request.
+        report.same(c, "client_id", &want.client_id, &got.client_id);
+        report.same(c, "response_type", &want.response_type, &got.response_type);
+        report.same(c, "redirect_uri", &want.redirect_uri, &got.redirect_uri);
+        report.same(c, "scope", &want.scope, &got.scope);
+        report.same(c, "state", &want.state, &got.state);
+        // RFC 7636 section 4.3: dropped here, the authorization endpoint reads a request with no
+        // challenge and the code it mints is redeemable without a verifier.
+        report.same(
+            c,
+            "code_challenge",
+            &want.code_challenge,
+            &got.code_challenge,
+        );
+        report.same(
+            c,
+            "code_challenge_method",
+            &want.code_challenge_method,
+            &got.code_challenge_method,
+        );
+        report.same(c, "resource", &want.resource, &got.resource);
+        report.same(c, "expires_at", &want.expires_at, &got.expires_at);
+        #[cfg(feature = "rar")]
+        report.same(
+            c,
+            "authorization_details",
+            &want.authorization_details,
+            &got.authorization_details,
+        );
+        // RFC 9470 section 4. This crate has already shipped a bug where these two were dropped on
+        // the PAR path, which disabled step-up for every PAR deployment; a store that drops them
+        // reproduces that bug from the other side, and nothing else would report it.
+        #[cfg(feature = "consent")]
+        report.same(c, "acr_values", &want.acr_values, &got.acr_values);
+        #[cfg(feature = "consent")]
+        report.same(c, "max_age", &want.max_age, &got.max_age);
     }
 
     /// RFC 9126 section 4 makes a `request_uri` single use, and
@@ -1143,19 +1308,36 @@ where
             (&at_mine, &rt_mine, &code_mine, &grant_mine),
             (&at_theirs, &rt_theirs, &code_theirs, &grant_theirs),
         ] {
-            if report
+            // EVERY seed is reported, and each one names the put that did not land. The three
+            // below had their `Result` discarded, which made a store that silently failed to
+            // persist a fixture PASS this check for the wrong reason: the assertions afterwards
+            // are all "the record is gone", and a record that was never written is gone. This is
+            // the exported harness, so that false pass would not have misled this repository, it
+            // would have certified a stranger's broken store.
+            let seeded = report
                 .ok(
                     REVOKE_CONSENT_CASCADES,
-                    "seeding the records a withdrawal must reach",
+                    "seeding the records a withdrawal must reach: put_token",
                     store.put_token(t.clone()).await,
                 )
-                .is_none()
-            {
+                .and(report.ok(
+                    REVOKE_CONSENT_CASCADES,
+                    "seeding the records a withdrawal must reach: put_refresh_token",
+                    store.put_refresh_token(r.clone()).await,
+                ))
+                .and(report.ok(
+                    REVOKE_CONSENT_CASCADES,
+                    "seeding the records a withdrawal must reach: put_authorization_code",
+                    store.put_authorization_code(c.clone()).await,
+                ))
+                .and(report.ok(
+                    REVOKE_CONSENT_CASCADES,
+                    "seeding the records a withdrawal must reach: put_device_grant",
+                    store.put_device_grant(g.clone()).await,
+                ));
+            if seeded.is_none() {
                 return;
             }
-            let _ = store.put_refresh_token(r.clone()).await;
-            let _ = store.put_authorization_code(c.clone()).await;
-            let _ = store.put_device_grant(g.clone()).await;
         }
 
         let removed = match report.ok(
@@ -1332,6 +1514,9 @@ where
         let n = self.racers;
         let gate = Gate::new(n);
         let futures: Vec<BoxTake<T>> = (0..n).map(|_| make(Arc::clone(&gate))).collect();
+        // Racers that never reached their own end. See `RacerGuard`: this is what turns a store
+        // that panics under concurrency into a REPORT rather than a hung test run.
+        let abandoned = Arc::new(AtomicUsize::new(0));
 
         let results = match &self.spawn {
             Some(spawn) => {
@@ -1341,7 +1526,13 @@ where
                 for fut in futures {
                     let collected = Arc::clone(&collected);
                     let latch = Arc::clone(&latch);
+                    let abandoned = Arc::clone(&abandoned);
                     spawn(Box::pin(async move {
+                        let mut guard = RacerGuard {
+                            latch,
+                            abandoned,
+                            finished: false,
+                        };
                         let outcome = fut.await;
                         // A poisoned lock means another racer panicked; the recovered guard is
                         // sound here because the vector is only ever pushed to.
@@ -1349,7 +1540,7 @@ where
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push(outcome);
-                        latch.done();
+                        guard.finished = true;
                     }));
                 }
                 latch.wait().await;
@@ -1358,6 +1549,20 @@ where
             }
             None => JoinAll::new(futures).await,
         };
+
+        let abandoned = abandoned.load(Ordering::SeqCst);
+        if abandoned > 0 {
+            report.fail(
+                HARNESS_RACER_PANICKED,
+                format!(
+                    "{abandoned} of {n} racers never finished: the store's call panicked, or the \
+                     spawner dropped the task before it completed. Whatever the results of this \
+                     check say, a store that panics under concurrent access fails the request that \
+                     hit it, and on a host that aborts on panic it takes the process with it. The \
+                     panic message itself is on the spawner's own reporting path, not here"
+                ),
+            );
+        }
 
         if gate.unsatisfied() {
             report.fail(
@@ -2326,6 +2531,33 @@ impl Latch {
     }
 }
 
+/// Releases one count of the [`Latch`] when a spawned racer's task ends, HOWEVER it ends.
+///
+/// The reason it is a `Drop` guard rather than a call at the bottom of the task: a racer whose
+/// store call panics never reaches the bottom of the task, so a plain `latch.done()` there leaves
+/// the latch one short and [`StorageConformance::run`] parked forever. A host whose store panics
+/// under concurrency would then get a hung test run, which is the worst diagnostic available: it
+/// names nothing, it points at nothing, and it looks like the harness is broken rather than the
+/// store. `Drop` runs during the unwind, so the latch is released and the harness reports.
+///
+/// `finished` distinguishes the two ways a task can end. It is set as the LAST statement of the
+/// task, so an unwind (or a spawner that dropped the future before it completed) leaves it false
+/// and the racer is counted as abandoned.
+struct RacerGuard {
+    latch: Arc<Latch>,
+    abandoned: Arc<AtomicUsize>,
+    finished: bool,
+}
+
+impl Drop for RacerGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+        self.latch.done();
+    }
+}
+
 pub(crate) struct LatchWait {
     latch: Arc<Latch>,
 }
@@ -2415,6 +2647,51 @@ fn scopes(s: &str) -> ScopeSet {
     ScopeSet::parse(s).unwrap_or_else(|_| ScopeSet::empty())
 }
 
+/// The RFC 9396 section 2 `authorization_details` every record fixture carries, as the raw text a
+/// client would push.
+///
+/// Non-empty on purpose, and that is the whole point of it existing. An empty
+/// `AuthorizationDetails` is the DEFAULT, so a fixture carrying one cannot tell a store that
+/// preserves the field from a store that drops it: both read back empty. This crate has already
+/// been bitten twice by RAR details being dropped on a feature-gated path, which is exactly the
+/// defect a host's store can have and exactly what this harness exists to make visible.
+///
+/// One element with several section 2.2 common fields, so a store that truncates the JSON, keeps
+/// only the `type`, or round-trips it through a lossy column is caught as well as one that drops
+/// the column outright.
+#[cfg(feature = "rar")]
+const AUTHORIZATION_DETAILS_JSON: &str = r#"[{"type":"conformance-fixture","locations":["https://rs-one.example/"],"actions":["read","write"],"identifier":"account-4711"}]"#;
+
+/// The parsed form of [`AUTHORIZATION_DETAILS_JSON`]. Parsed rather than constructed because
+/// `AuthorizationDetail`'s members are the RFC's, not this module's, and the parser is the only
+/// thing that has to agree with them.
+///
+/// A parse failure would leave the fixture EMPTY and the round-trip check unable to see a dropped
+/// field, which is silent, so `the_fixtures_carry_the_fields_the_round_trip_checks_exist_for` in
+/// `src/tests/storage_conformance.rs` pins it as non-empty rather than trusting the literal.
+#[cfg(feature = "rar")]
+fn sample_authorization_details() -> crate::rar::AuthorizationDetails {
+    crate::rar::AuthorizationDetails::parse(AUTHORIZATION_DETAILS_JSON)
+        .unwrap_or_else(|_| crate::rar::AuthorizationDetails::none())
+}
+
+/// What the host reported about how it authenticated the user, on every record that carries it.
+///
+/// `Some`, not `None`, for the reason [`sample_authorization_details`] is non-empty: `None` is the
+/// default, so a `None` fixture certifies a store that drops the field. RFC 9470 section 5 is
+/// answered from this, so a store that loses it has disabled step-up authentication for the whole
+/// deployment while every request continues to succeed.
+///
+/// `acr` is set as well as `auth_time`: a store that persists the timestamp and drops the class
+/// (two columns, one migration) satisfies `max_age` and silently fails every `acr_values` request.
+#[cfg(feature = "consent")]
+fn sample_authentication() -> Option<Box<crate::consent::Authentication>> {
+    Some(Box::new(crate::consent::Authentication {
+        auth_time: at_before(120),
+        acr: Some("urn:conformance:acr:multi-factor".into()),
+    }))
+}
+
 fn sample_client(client_id: &str) -> Client {
     Client {
         client_id: ClientId::new(client_id),
@@ -2483,7 +2760,9 @@ fn sample_consent(consent_id: &str, subject: &str) -> crate::consent::ConsentRec
         scope: scopes("read write"),
         resource: vec!["https://rs-one.example/".to_string()],
         granted_at: at_before(60),
-        authentication: None,
+        // See `sample_authentication`. `None` here would have made `round_trip/consent` unable to
+        // see a store that drops the RFC 9470 step-up state the consent was granted under.
+        authentication: sample_authentication(),
     }
 }
 
@@ -2501,8 +2780,12 @@ fn sample_pushed_request(request_uri: &str) -> crate::par::PushedAuthorizationRe
         code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string()),
         code_challenge_method: Some("S256".to_string()),
         resource: vec!["https://rs-one.example/".to_string()],
+        // Populated for the same reason `acr_values` and `max_age` below are: RFC 9101 section 6.3
+        // has the authorization endpoint use ONLY the pushed parameters, so a detail lost between
+        // the push and the read is a detail the client was told was acceptable and then did not
+        // get. `None` is the default and could not have shown that.
         #[cfg(feature = "rar")]
-        authorization_details: None,
+        authorization_details: Some(AUTHORIZATION_DETAILS_JSON.to_string()),
         // RFC 9470 s4. Populated rather than `None` for this fixture's stated reason: a store that
         // drops one of them on the way through has disabled step-up for every PAR request, and the
         // point of this record is that such a drop is visible.
@@ -2528,14 +2811,14 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
             "https://rs-two.example/".to_string(),
         ],
         #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
+        authorization_details: sample_authorization_details(),
         expires_at: at(60),
         state: AuthorizationCodeState::Consumed {
             access_token: Some("at-minted-by-this-code".to_string()),
             refresh_token: Some("rt-minted-by-this-code".to_string()),
         },
         #[cfg(feature = "consent")]
-        authentication: None,
+        authentication: sample_authentication(),
     }
 }
 
@@ -2550,7 +2833,7 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
             "https://rs-two.example/".to_string(),
         ],
         #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
+        authorization_details: sample_authorization_details(),
         issued_at: at_before(10),
         expires_at: at(3600),
         family_id: family_id.map(str::to_string),
@@ -2568,7 +2851,7 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
             b"conformance-fixture-certificate",
         ))),
         #[cfg(feature = "consent")]
-        authentication: None,
+        authentication: sample_authentication(),
     }
 }
 
@@ -2583,7 +2866,7 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
             "https://rs-two.example/".to_string(),
         ],
         #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
+        authorization_details: sample_authorization_details(),
         expires_at: Some(at(86_400)),
         family_id: family_id.to_string(),
         state: RefreshTokenState::Spent,
@@ -2600,7 +2883,7 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
             b"conformance-fixture-certificate",
         ))),
         #[cfg(feature = "consent")]
-        authentication: None,
+        authentication: sample_authentication(),
     }
 }
 
