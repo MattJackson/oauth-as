@@ -8,18 +8,42 @@ and so that nobody has to discover a gap by hitting it in production.
 Each item says what it BUYS. An item that cannot answer that question does not
 belong on a roadmap.
 
-## Where 0.1.0 stands
+## Where this stands NOW (updated at 0.9.0)
 
-Implemented: RFC 6749 authorization code (OAuth 2.1 constrained) and client
-credentials, RFC 8628 device grant, RFC 6749 s6 refresh rotation, RFC 7636
-PKCE, RFC 8414 metadata, RFC 7662 introspection, RFC 7009 revocation, RFC 9068
-JWT access tokens with a JWKS behind an optional feature.
+**Every release in the plan below, 0.2.0 through 0.8.0, has shipped.** The
+sections that follow are kept as written rather than rewritten into the past
+tense, because the argument for WHY each slice was worth building is the useful
+part, and a roadmap edited to look prescient is worth nothing. Read them as the
+reasoning, and this section as the state.
 
-That is a complete, coherent OAuth 2.1 core. What it is NOT is the surface area
-of Keycloak, Ory Hydra, Auth0 or Okta, and the difference is worth naming
-precisely rather than hand waving at "enterprise features".
+Implemented today: RFC 6749 (authorization code under the OAuth 2.1
+constraints, client credentials, refresh rotation with reuse detection),
+RFC 6750, RFC 7009, RFC 7517, RFC 7523, RFC 7591, RFC 7592, RFC 7636, RFC 7662,
+RFC 8414, RFC 8628, RFC 8693, RFC 8705, RFC 8707, RFC 9068, RFC 9101, RFC 9126,
+RFC 9207, RFC 9396, RFC 9449, RFC 9470, RFC 9728. Twelve cargo features, all
+off by default; the default build is still five dependencies.
 
-## The gap, by category
+So the "gap by category" below is now largely CLOSED, with two deliberate
+exceptions that remain non-goals and one item still outstanding:
+
+- **OIDC: still a non-goal**, for the reason KICKOFF gives. The badge it would
+  earn would be true and substantively misleading.
+- **FAPI 2.0 certification: achievable, not attempted.** The remaining work is
+  written down in `crates/oauth-as-conformance/EXTERNAL-TOOLING.md`, including
+  a genuine spec conflict worth knowing about: FAPI 2.0 s5.3.2.1-9 forbids
+  refresh token rotation, which OAuth 2.1 s6.1 and RFC 9700 s4.14.2 are
+  precisely why this crate does it. A FAPI run needs rotation configurable off,
+  which it currently is not.
+- **RFC 9728 is implemented as a TYPE, not a route.** This crate is an
+  authorization server, and s3.1 places that document under the RESOURCE's
+  identifier. A host that also runs a resource server can now publish a
+  conformant document; the crate does not serve one for it.
+
+What this is still NOT is the surface area of Keycloak, Ory Hydra, Auth0 or
+Okta: no user store, no admin UI, no federation, no OIDC. That is the design,
+not a gap.
+
+## The gap, by category (as assessed at 0.1.0)
 
 ### 1. Client authentication we cannot do
 
@@ -136,6 +160,10 @@ The shape: **0.2.0 through 0.9.0 close the gap, one coherent slice per
 release, until this crate does everything third party tooling and third party
 clients expect of an OAuth 2.1 authorization server. Then we stop adding
 features, test hard, and cut 1.0.0 when it is genuinely solid.**
+
+**STATUS: 0.2.0 through 0.8.0 are DONE and 0.9.0 is assembled.** Each heading
+below is kept for its reasoning; see the state section at the top of this file
+for what is actually built.
 
 Each release is a slice that stands on its own, so a consumer can adopt at any
 point and get something coherent rather than half of two things. Breaking
