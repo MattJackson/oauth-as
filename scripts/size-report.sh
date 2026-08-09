@@ -260,13 +260,20 @@ EOF
 fi
 
 # Baselines are shared across rows, so measure each exactly once.
-declare -A BASELINE
+#
+# Memoized in a newline-delimited "key<TAB>value" string rather than an associative array, because
+# `declare -A` is bash 4 and macOS ships bash 3.2 as /bin/bash. This script gates a macOS runner
+# (the recorded budgets are arm64), so bash 4 is exactly the thing it cannot assume.
+BASELINE_CACHE=""
 baseline_for() {
-  local features="$1"
-  if [ -z "${BASELINE[${features:-none}]+set}" ]; then
-    BASELINE[${features:-none}]="$(measure "$features")"
+  local features="${1:-none}"
+  local hit
+  hit="$(printf '%s\n' "$BASELINE_CACHE" | awk -F'\t' -v k="$features" '$1 == k { print $2; exit }')"
+  if [ -z "$hit" ]; then
+    hit="$(measure "$1")"
+    BASELINE_CACHE="$(printf '%s\n%s\t%s' "$BASELINE_CACHE" "$features" "$hit")"
   fi
-  printf '%s' "${BASELINE[${features:-none}]}"
+  printf '%s' "$hit"
 }
 
 if [ "$MODE" = "table" ]; then
