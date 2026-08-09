@@ -226,36 +226,38 @@ impl AuthorizationDetails {
         // SIZE FIRST, before the parser is handed anything. This is the bound that makes every
         // other cost in this function finite.
         if raw.len() > MAX_AUTHORIZATION_DETAILS_BYTES {
-            return Err(invalid(
-                "authorization_details is larger than this server accepts",
-            ));
+            return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                .with_description("authorization_details is larger than this server accepts"));
         }
         let details: Vec<AuthorizationDetail> = serde_json::from_str(raw).map_err(|e| {
             // The parser's message can quote the input, so it is dropped rather than forwarded.
             let _ = e;
-            invalid(
+            ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails).with_description(
                 "authorization_details must be a JSON array of objects, each with a string type \
                  member (RFC 9396 s2)",
             )
         })?;
         if details.len() > MAX_AUTHORIZATION_DETAILS_ELEMENTS {
-            return Err(invalid(
-                "authorization_details has more elements than this server accepts",
-            ));
+            return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                .with_description(
+                    "authorization_details has more elements than this server accepts",
+                ));
         }
         for detail in &details {
             // An empty type is not a type: section 2 makes it an identifier for the API's
             // vocabulary, and the empty string names nothing that could be looked up.
             if detail.detail_type.is_empty() {
-                return Err(invalid(
-                    "each authorization_details element needs a non-empty type (RFC 9396 s2)",
-                ));
+                return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                    .with_description(
+                        "each authorization_details element needs a non-empty type (RFC 9396 s2)",
+                    ));
             }
             for value in detail.other.values() {
                 if depth(value) > MAX_MEMBER_DEPTH {
-                    return Err(invalid(
-                        "authorization_details is nested more deeply than this server accepts",
-                    ));
+                    return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                        .with_description(
+                            "authorization_details is nested more deeply than this server accepts",
+                        ));
                 }
             }
         }
@@ -278,7 +280,8 @@ impl AuthorizationDetails {
         for detail in &self.0 {
             if !supported.iter().any(|s| s.as_str() == &*detail.detail_type) {
                 // The type is NOT echoed, for the reason `parse` gives.
-                return Err(invalid("unknown authorization_details type (RFC 9396 s5)"));
+                return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                    .with_description("unknown authorization_details type (RFC 9396 s5)"));
             }
         }
         Ok(())
@@ -330,10 +333,11 @@ impl AuthorizationDetails {
             match matched {
                 Some(i) => consumed[i] = true,
                 None => {
-                    return Err(invalid(
-                        "authorization_details was not granted by the authorization request \
+                    return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                        .with_description(
+                            "authorization_details was not granted by the authorization request \
                          (RFC 9396 s6)",
-                    ))
+                        ))
                 }
             }
         }
@@ -372,16 +376,6 @@ impl AuthorizationDetails {
     pub fn from_elements(elements: Vec<AuthorizationDetail>) -> Self {
         AuthorizationDetails(elements)
     }
-}
-
-/// `invalid_authorization_details` (RFC 9396 section 5) with a developer-facing reason.
-///
-/// `&'static str`, and every caller passes a literal. That is not only tidiness: the refusal path
-/// here is one an attacker sets the rate of, so a description built by copying a string constant
-/// onto the heap would be one allocation per refused request, bought for nothing. The reason also
-/// never contains any part of the request; see [`AuthorizationDetails::parse`].
-fn invalid(why: &'static str) -> ErrorResponse {
-    ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails).with_description(why)
 }
 
 /// The nesting depth of one JSON value: 1 for a scalar, 1 + the deepest child for a container.

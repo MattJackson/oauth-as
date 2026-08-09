@@ -2026,8 +2026,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         request: &AuthorizationRequest<'_>,
     ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {
-        let direct = |code: ErrorCode, why: &str| {
-            AuthorizationError::Direct(ErrorResponse::new(code).with_description(why.to_string()))
+        // `&'static str`: every description below is a constant naming a condition, never a
+        // value out of the request, so the refusal borrows it rather than copying it. The
+        // authorization endpoint is unauthenticated, so its refusal rate is the attacker's to
+        // choose.
+        let direct = |code: ErrorCode, why: &'static str| {
+            AuthorizationError::Direct(ErrorResponse::new(code).with_description(why))
         };
 
         // 1. The client. An unknown client_id and a malformed one collapse into one answer: the
@@ -2082,10 +2086,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // From here the redirect URI is trusted, so errors go back to the client (section
         // 4.1.2.1) carrying the state that lets it correlate them.
         let state = request.state.as_deref().map(str::to_string);
-        let redirect = |code: ErrorCode, why: &str| {
+        let redirect = |code: ErrorCode, why: &'static str| {
             AuthorizationError::Redirect(AuthorizationErrorRedirect {
                 redirect_uri: redirect_uri.clone(),
-                error: ErrorResponse::new(code).with_description(why.to_string()),
+                error: ErrorResponse::new(code).with_description(why),
                 state: state.clone(),
                 // RFC 9207 section 2: every authorization response, including this one, names the
                 // server that produced it.

@@ -212,13 +212,23 @@ pub struct RegistrationErrorResponse {
     /// The registered code.
     pub error: RegistrationErrorCode,
     /// Human-readable detail for the developer.
+    ///
+    /// `Cow<'static, str>` for the same reason [`crate::error::ErrorResponse`] uses one: every
+    /// refusal `validate` can produce describes a RULE rather than a value, so the description is
+    /// always a string constant, and RFC 7591 section 1.2 makes the initial access token optional,
+    /// which means a host may expose this endpoint to unauthenticated callers who then choose its
+    /// refusal rate. Size neutral: `Option<Cow<'static, str>>` is 24 bytes, exactly what
+    /// `Option<String>` was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_description: Option<String>,
+    pub error_description: Option<std::borrow::Cow<'static, str>>,
 }
 
 impl RegistrationErrorResponse {
     /// An error with a description attached.
-    pub fn new(error: RegistrationErrorCode, description: impl Into<String>) -> Self {
+    pub fn new(
+        error: RegistrationErrorCode,
+        description: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Self {
         RegistrationErrorResponse {
             error,
             error_description: Some(description.into()),
@@ -434,10 +444,6 @@ struct Registered {
     client_name: Option<String>,
 }
 
-fn invalid(code: RegistrationErrorCode, why: &str) -> RegistrationFailure {
-    RegistrationFailure::Invalid(RegistrationErrorResponse::new(code, why))
-}
-
 /// Validate one RFC 7591 section 2 metadata document against what this deployment will register.
 ///
 /// Every refusal here is a registration this server would otherwise have written down and then
@@ -451,40 +457,43 @@ fn validate(
     // terms this server has not read, and nothing after this point would be the registration it
     // asked for. See the module docs for why this is a refusal and not an ignored member.
     if metadata.software_statement.is_some() {
-        return Err(invalid(
-            RegistrationErrorCode::InvalidSoftwareStatement,
-            "this server does not evaluate software statements (RFC 7591 s2.3)",
+        return Err(RegistrationFailure::Invalid(
+            RegistrationErrorResponse::new(
+                RegistrationErrorCode::InvalidSoftwareStatement,
+                "this server does not evaluate software statements (RFC 7591 s2.3)",
+            ),
         ));
     }
 
     // RFC 7591 s2: absent `grant_types` defaults to `["authorization_code"]`.
-    let grant_types: Vec<GrantType> = match metadata.grant_types.as_deref() {
-        None => vec![GrantType::AuthorizationCode],
-        Some(values) => {
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                // An unknown grant type is refused rather than dropped: see the test in
-                // `src/tests/registration.rs`. `implicit` and `password` land here too, which is
-                // right, because OAuth 2.1 removes both.
-                let grant: GrantType = value.parse().map_err(|_| {
-                    invalid(
-                        RegistrationErrorCode::InvalidClientMetadata,
-                        "grant_types names a grant this server does not implement",
-                    )
-                })?;
-                if !config.allowed_grant_types.contains(&grant) {
-                    return Err(invalid(
+    let grant_types: Vec<GrantType> =
+        match metadata.grant_types.as_deref() {
+            None => vec![GrantType::AuthorizationCode],
+            Some(values) => {
+                let mut out = Vec::with_capacity(values.len());
+                for value in values {
+                    // An unknown grant type is refused rather than dropped: see the test in
+                    // `src/tests/registration.rs`. `implicit` and `password` land here too, which is
+                    // right, because OAuth 2.1 removes both.
+                    let grant: GrantType = value.parse().map_err(|_| {
+                        RegistrationFailure::Invalid(RegistrationErrorResponse::new(
+                            RegistrationErrorCode::InvalidClientMetadata,
+                            "grant_types names a grant this server does not implement",
+                        ))
+                    })?;
+                    if !config.allowed_grant_types.contains(&grant) {
+                        return Err(RegistrationFailure::Invalid(RegistrationErrorResponse::new(
                         RegistrationErrorCode::InvalidClientMetadata,
                         "grant_types names a grant this deployment does not offer registrants",
-                    ));
+                    )));
+                    }
+                    if !out.contains(&grant) {
+                        out.push(grant);
+                    }
                 }
-                if !out.contains(&grant) {
-                    out.push(grant);
-                }
+                out
             }
-            out
-        }
-    };
+        };
     let uses_code = grant_types.contains(&GrantType::AuthorizationCode);
 
     // RFC 7591 s2 spells out the correspondence between the two lists (`authorization_code` with
@@ -494,59 +503,64 @@ fn validate(
     //
     // OAuth 2.1 has exactly one response type left, so the whole correspondence reduces to: the
     // list is `["code"]` if and only if the authorization code grant is registered.
-    let response_types: Vec<String> = match metadata.response_types.as_deref() {
-        // s2: absent defaults to `["code"]`, which is only coherent when the code grant is there.
-        None => match uses_code {
-            true => vec![RESPONSE_TYPE_CODE.to_string()],
-            false => Vec::new(),
-        },
-        // An EXPLICIT empty list falls through here and is caught by the correspondence check
-        // below when the code grant is registered: the client said it uses no response type while
-        // asking for the one grant that has one.
-        Some(values) => {
-            for value in values {
-                if value != RESPONSE_TYPE_CODE {
-                    return Err(invalid(
+    let response_types: Vec<String> =
+        match metadata.response_types.as_deref() {
+            // s2: absent defaults to `["code"]`, which is only coherent when the code grant is there.
+            None => match uses_code {
+                true => vec![RESPONSE_TYPE_CODE.to_string()],
+                false => Vec::new(),
+            },
+            // An EXPLICIT empty list falls through here and is caught by the correspondence check
+            // below when the code grant is registered: the client said it uses no response type while
+            // asking for the one grant that has one.
+            Some(values) => {
+                for value in values {
+                    if value != RESPONSE_TYPE_CODE {
+                        return Err(RegistrationFailure::Invalid(RegistrationErrorResponse::new(
                         RegistrationErrorCode::InvalidClientMetadata,
                         "this server issues authorization codes only; OAuth 2.1 removes the \
                          implicit grant",
-                    ));
+                    )));
+                    }
                 }
-            }
-            let asks_for_code = !values.is_empty();
-            // The correspondence, in both directions: `code` without `authorization_code` is a
-            // response type nothing will produce, and `authorization_code` without `code` is a
-            // grant with no way to start.
-            if asks_for_code != uses_code {
-                return Err(invalid(
+                let asks_for_code = !values.is_empty();
+                // The correspondence, in both directions: `code` without `authorization_code` is a
+                // response type nothing will produce, and `authorization_code` without `code` is a
+                // grant with no way to start.
+                if asks_for_code != uses_code {
+                    return Err(RegistrationFailure::Invalid(RegistrationErrorResponse::new(
                     RegistrationErrorCode::InvalidClientMetadata,
                     "grant_types and response_types must correspond: authorization_code with \
                      code (RFC 7591 s2)",
-                ));
+                )));
+                }
+                match asks_for_code {
+                    true => vec![RESPONSE_TYPE_CODE.to_string()],
+                    false => Vec::new(),
+                }
             }
-            match asks_for_code {
-                true => vec![RESPONSE_TYPE_CODE.to_string()],
-                false => Vec::new(),
-            }
-        }
-    };
+        };
 
     // RFC 7591 s2 makes `redirect_uris` required for a redirection-based flow, and s3.2.2 gives
     // the missing case and the malformed case the same code, because both say the same thing: this
     // client has no address a code can be delivered to.
     if uses_code && metadata.redirect_uris.is_empty() {
-        return Err(invalid(
-            RegistrationErrorCode::InvalidRedirectUri,
-            "the authorization_code grant requires at least one redirect_uri",
+        return Err(RegistrationFailure::Invalid(
+            RegistrationErrorResponse::new(
+                RegistrationErrorCode::InvalidRedirectUri,
+                "the authorization_code grant requires at least one redirect_uri",
+            ),
         ));
     }
     for uri in &metadata.redirect_uris {
         if !redirect_uri_is_registerable(uri) {
             // The offending value is NOT echoed: it is attacker-supplied and this description
             // goes into an error body and quite possibly a log line.
-            return Err(invalid(
-                RegistrationErrorCode::InvalidRedirectUri,
-                "each redirect_uri must be an absolute URI with no fragment (RFC 6749 s3.1.2)",
+            return Err(RegistrationFailure::Invalid(
+                RegistrationErrorResponse::new(
+                    RegistrationErrorCode::InvalidRedirectUri,
+                    "each redirect_uri must be an absolute URI with no fragment (RFC 6749 s3.1.2)",
+                ),
             ));
         }
     }
@@ -560,9 +574,11 @@ fn validate(
         token_endpoint_auth_method.as_str(),
         AUTH_METHOD_NONE | AUTH_METHOD_BASIC | AUTH_METHOD_POST
     ) {
-        return Err(invalid(
-            RegistrationErrorCode::InvalidClientMetadata,
-            "token_endpoint_auth_method is not one this server advertises",
+        return Err(RegistrationFailure::Invalid(
+            RegistrationErrorResponse::new(
+                RegistrationErrorCode::InvalidClientMetadata,
+                "token_endpoint_auth_method is not one this server advertises",
+            ),
         ));
     }
     // RFC 6749 s4.4 gives client credentials to confidential clients only, so this pair produces a
@@ -571,32 +587,35 @@ fn validate(
     if token_endpoint_auth_method == AUTH_METHOD_NONE
         && grant_types.contains(&GrantType::ClientCredentials)
     {
-        return Err(invalid(
-            RegistrationErrorCode::InvalidClientMetadata,
-            "client_credentials requires a confidential client (RFC 6749 s4.4)",
+        return Err(RegistrationFailure::Invalid(
+            RegistrationErrorResponse::new(
+                RegistrationErrorCode::InvalidClientMetadata,
+                "client_credentials requires a confidential client (RFC 6749 s4.4)",
+            ),
         ));
     }
 
     // RFC 6749 s3.3 syntax, then the deployment's ceiling. Both are `invalid_client_metadata`:
     // s3.2.2 has one code for a metadata value this server will not accept.
-    let scope = match metadata.scope.as_deref() {
-        None => ScopeSet::empty(),
-        Some(s) => {
-            let requested = ScopeSet::parse(s).map_err(|_| {
-                invalid(
-                    RegistrationErrorCode::InvalidClientMetadata,
-                    "scope is not a space-delimited RFC 6749 s3.3 token list",
-                )
-            })?;
-            if !requested.is_subset(&config.allowed_scopes) {
-                return Err(invalid(
+    let scope =
+        match metadata.scope.as_deref() {
+            None => ScopeSet::empty(),
+            Some(s) => {
+                let requested = ScopeSet::parse(s).map_err(|_| {
+                    RegistrationFailure::Invalid(RegistrationErrorResponse::new(
+                        RegistrationErrorCode::InvalidClientMetadata,
+                        "scope is not a space-delimited RFC 6749 s3.3 token list",
+                    ))
+                })?;
+                if !requested.is_subset(&config.allowed_scopes) {
+                    return Err(RegistrationFailure::Invalid(RegistrationErrorResponse::new(
                     RegistrationErrorCode::InvalidClientMetadata,
                     "scope exceeds what this deployment offers dynamically registered clients",
-                ));
+                )));
+                }
+                requested
             }
-            requested
-        }
-    };
+        };
 
     Ok(Registered {
         redirect_uris: metadata.redirect_uris.clone(),

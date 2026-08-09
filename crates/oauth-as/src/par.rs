@@ -490,22 +490,13 @@ impl RequestObjectClaims {
     }
 }
 
-/// `invalid_request_object` (RFC 9101 section 7) with a developer-facing reason.
-///
-/// The reason never quotes the offending token: RFC 6749 section 5.2 restricts `error_description`
-/// to a charset a base64url blob does not respect, and echoing attacker-supplied bytes into an
-/// error body is how an error message becomes an injection vector.
-#[cfg(feature = "jar")]
-fn invalid_request_object(why: &str) -> ErrorResponse {
-    ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(why.to_string())
-}
-
 /// One base64url (unpadded) segment of a JWS compact serialization.
 #[cfg(feature = "jar")]
 fn decode_segment(segment: &str, what: &str) -> Result<Vec<u8>, ErrorResponse> {
-    URL_SAFE_NO_PAD
-        .decode(segment)
-        .map_err(|_| invalid_request_object(&format!("the {what} is not base64url")))
+    URL_SAFE_NO_PAD.decode(segment).map_err(|_| {
+        ErrorResponse::new(ErrorCode::InvalidRequestObject)
+            .with_description(format!("the {what} is not base64url"))
+    })
 }
 
 /// Verify an ES256 signature over `signing_input`.
@@ -548,9 +539,8 @@ fn string_claim(
         // Section 4: "Parameter names and string values MUST be included as JSON strings". A
         // number or an object here is not a request parameter that could ever have been sent in a
         // query string, so coercing it would be inventing a request the client did not make.
-        Some(_) => Err(invalid_request_object(&format!(
-            "the {name} claim must be a JSON string"
-        ))),
+        Some(_) => Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+            .with_description(format!("the {name} claim must be a JSON string"))),
     }
 }
 
@@ -748,8 +738,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // has not been read yet (or does not exist), and RFC 6749 section 4.1.2.1 forbids
         // redirecting to a URI the server has not validated. That is the whole reason the two
         // error shapes exist.
-        let direct = |code: ErrorCode, why: &str| {
-            AuthorizationError::Direct(ErrorResponse::new(code).with_description(why.to_string()))
+        // `&'static str`: every refusal below names a condition, never a value out of the
+        // request, so the description is always a constant and never needs copying.
+        let direct = |code: ErrorCode, why: &'static str| {
+            AuthorizationError::Direct(ErrorResponse::new(code).with_description(why))
         };
 
         let record = self
@@ -842,11 +834,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let keys = self.hooks().request_object_keys().ok_or_else(|| {
             // A server with no key source cannot check a signature, and "cannot check" must never
             // read as "checked out".
-            invalid_request_object("no request object verification keys are installed")
+            ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("no request object verification keys are installed")
         })?;
-        let registered = keys
-            .registered_key(client_id)
-            .ok_or_else(|| invalid_request_object("the client registered no request object key"))?;
+        let registered = keys.registered_key(client_id).ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("the client registered no request object key")
+        })?;
 
         // RFC 7515 section 3.1 compact serialization: exactly three parts. A five-part token is a
         // JWE, which RFC 9101 section 6.1 defines and this server does not implement; refusing it
@@ -856,28 +850,31 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some(h), Some(p), Some(s), None) => (h, p, s),
                 _ => {
-                    return Err(invalid_request_object(
-                        "not a three part JWS compact serialization",
-                    ))
+                    return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                        .with_description("not a three part JWS compact serialization"))
                 }
             };
 
         let header: serde_json::Value =
-            serde_json::from_slice(&decode_segment(header_b64, "header")?)
-                .map_err(|_| invalid_request_object("the header is not JSON"))?;
+            serde_json::from_slice(&decode_segment(header_b64, "header")?).map_err(|_| {
+                ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the header is not JSON")
+            })?;
         let alg = header
             .get("alg")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| invalid_request_object("the header has no alg"))?;
+            .ok_or_else(|| {
+                ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the header has no alg")
+            })?;
 
         // THE algorithm check. The registration decides; the header only gets to agree with it.
         // This is what makes `alg: none` and every other substitution (RFC 8725 sections 3.1 and
         // 3.2) a refusal rather than a verification path, and it is the reason `alg` is compared
         // BEFORE any signature work is attempted.
         if alg != registered.alg.as_str() {
-            return Err(invalid_request_object(
-                "alg does not match the algorithm registered for this client",
-            ));
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("alg does not match the algorithm registered for this client"));
         }
 
         // RFC 9101 section 6.2: "If a kid Header Parameter is present, the key identified MUST be
@@ -886,9 +883,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             match registered.kid() {
                 Some(kid) if kid == presented => {}
                 _ => {
-                    return Err(invalid_request_object(
-                        "kid does not identify a key registered for this client",
-                    ))
+                    return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                        .with_description(
+                            "kid does not identify a key registered for this client",
+                        ))
                 }
             }
         }
@@ -900,9 +898,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // is a token that was made for something else.
         if let Some(typ) = header.get("typ").and_then(serde_json::Value::as_str) {
             if typ != REQUEST_OBJECT_TYP && typ != "JWT" && typ != "jwt" {
-                return Err(invalid_request_object(
-                    "typ names a JWT that is not a request object",
-                ));
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("typ names a JWT that is not a request object"));
             }
         }
 
@@ -913,36 +910,42 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // decoupled from what it is supposed to be checking.
         let signing_input = &request_object.as_bytes()[..header_b64.len() + 1 + payload_b64.len()];
         if !verify_es256(&registered.sec1, signing_input, &signature) {
-            return Err(invalid_request_object("the signature did not verify"));
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("the signature did not verify"));
         }
 
         // Only now is anything in the payload worth reading.
         let payload: serde_json::Value =
-            serde_json::from_slice(&decode_segment(payload_b64, "payload")?)
-                .map_err(|_| invalid_request_object("the payload is not JSON"))?;
-        let claims = payload
-            .as_object()
-            .ok_or_else(|| invalid_request_object("the payload is not a JSON object"))?;
+            serde_json::from_slice(&decode_segment(payload_b64, "payload")?).map_err(|_| {
+                ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the payload is not JSON")
+            })?;
+        let claims = payload.as_object().ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("the payload is not a JSON object")
+        })?;
 
         // RFC 9101 section 4: "request and request_uri parameters MUST NOT be included in Request
         // Objects". A nested reference would be a request that never terminates, and at the PAR
         // endpoint it would smuggle past the section 2.1 refusal of `request_uri`.
         for forbidden in ["request", "request_uri"] {
             if claims.contains_key(forbidden) {
-                return Err(invalid_request_object(
-                    "a request object must not carry request or request_uri (RFC 9101 s4)",
-                ));
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(
+                        "a request object must not carry request or request_uri (RFC 9101 s4)",
+                    ),
+                );
             }
         }
 
         // Section 6.3: the two client ids MUST be identical.
         match string_claim(claims, "client_id")? {
             Some(claimed) if claimed == client_id.as_str() => {}
-            _ => {
-                return Err(invalid_request_object(
+            _ => return Err(
+                ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(
                     "the client_id claim does not match the request's client_id (RFC 9101 s6.3)",
-                ))
-            }
+                ),
+            ),
         }
 
         // RFC 9101 section 4 says a signed request object SHOULD carry `aud` naming this server's
@@ -960,9 +963,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 _ => false,
             };
             if !addressed_here {
-                return Err(invalid_request_object(
-                    "aud does not name this authorization server",
-                ));
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("aud does not name this authorization server"));
             }
         }
 
@@ -971,14 +973,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let now_secs = crate::server::unix_seconds(self.now());
         if let (Some(now), Some(exp)) = (now_secs, payload.get("exp").and_then(|v| v.as_u64())) {
             if now >= exp {
-                return Err(invalid_request_object("the request object has expired"));
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the request object has expired"));
             }
         }
         if let (Some(now), Some(nbf)) = (now_secs, payload.get("nbf").and_then(|v| v.as_u64())) {
             if now < nbf {
-                return Err(invalid_request_object(
-                    "the request object is not yet valid",
-                ));
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the request object is not yet valid"));
             }
         }
 
@@ -993,18 +995,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     match value.as_str() {
                         Some(s) => out.push(s.to_string()),
                         None => {
-                            return Err(invalid_request_object(
-                                "every resource claim entry must be a JSON string",
-                            ))
+                            return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                                .with_description(
+                                    "every resource claim entry must be a JSON string",
+                                ))
                         }
                     }
                 }
                 out
             }
             Some(_) => {
-                return Err(invalid_request_object(
-                    "the resource claim must be a string or an array of strings",
-                ))
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(
+                        "the resource claim must be a string or an array of strings",
+                    ),
+                )
             }
         };
 
@@ -1029,9 +1034,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 None => None,
                 Some(value @ serde_json::Value::Array(_)) => Some(value.to_string()),
                 Some(_) => {
-                    return Err(invalid_request_object(
-                        "the authorization_details claim must be a JSON array",
-                    ))
+                    return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                        .with_description("the authorization_details claim must be a JSON array"))
                 }
             },
             // RFC 9470 s4, from INSIDE the signature. A client answering a step-up challenge puts
@@ -1055,15 +1059,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 Some(serde_json::Value::Number(n)) => match n.as_u64() {
                     Some(secs) => Some(secs.to_string()),
                     None => {
-                        return Err(invalid_request_object(
-                            "the max_age claim must be a non-negative number of seconds",
-                        ))
+                        return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                            .with_description(
+                                "the max_age claim must be a non-negative number of seconds",
+                            ))
                     }
                 },
                 Some(_) => {
-                    return Err(invalid_request_object(
-                        "the max_age claim must be a JSON string or number",
-                    ))
+                    return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                        .with_description("the max_age claim must be a JSON string or number"))
                 }
             },
         })

@@ -33,8 +33,9 @@
 //! every access control upstream of it has been bypassed by one HTTP request.
 //!
 //! This crate already had the right pattern in two places, and this grant reuses THE SAME CODE
-//! rather than a similar-looking copy of it (see the notes on
-//! [`crate::server::AuthorizationServer::narrow_resources`] usage below):
+//! rather than a similar-looking copy of it (the crate-private `narrow_resources` and
+//! `validate_resources` on `AuthorizationServer`, which the authorization code and refresh paths
+//! call too; see the notes below):
 //!
 //! - SCOPE. RFC 6749 section 6 lets a refresh narrow and never widen; the same rule applies here,
 //!   against the subject token's granted scope. A widening request is `invalid_scope`.
@@ -413,13 +414,6 @@ fn storage_error(e: StorageError) -> ErrorResponse {
     ErrorResponse::new(ErrorCode::ServerError)
 }
 
-/// RFC 8693 section 2.2.2: an invalid or policy-unacceptable subject or actor token, and a request
-/// that is not valid, are all `invalid_request`. Deliberately ONE answer with a description that
-/// names the parameter and not the value: the value is a credential in two of the three cases.
-fn invalid_request(why: &str) -> ErrorResponse {
-    ErrorResponse::new(ErrorCode::InvalidRequest).with_description(why)
-}
-
 /// The exchange itself. Split out of the trait method so the audit emission above wraps every exit
 /// from it, exactly as `AuthorizationServer::emit_refusal` wraps the other four grants.
 async fn exchange<S: Storage, C: Clock>(
@@ -436,9 +430,11 @@ async fn exchange<S: Storage, C: Clock>(
     let issued_token_type = match request.requested_token_type {
         None | Some(TokenTypeIdentifier::AccessToken) => TokenTypeIdentifier::AccessToken,
         Some(_) => {
-            return Err(invalid_request(
-                "this server issues only urn:ietf:params:oauth:token-type:access_token",
-            ))
+            return Err(
+                ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                    "this server issues only urn:ietf:params:oauth:token-type:access_token",
+                ),
+            )
         }
     };
 
@@ -465,9 +461,11 @@ async fn exchange<S: Storage, C: Clock>(
     //    to check the string a different way than it is going to. Refusing on the mismatch rather
     //    than on the lookup is what stops the type parameter becoming decorative.
     if request.subject_token_type != TokenTypeIdentifier::AccessToken {
-        return Err(invalid_request(
-            "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
-        ));
+        return Err(
+            ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
+            ),
+        );
     }
     let subject = server
         .introspect(request.subject_token)
@@ -475,7 +473,10 @@ async fn exchange<S: Storage, C: Clock>(
         .map_err(storage_error)?
         // Unknown, expired and revoked are one answer: the caller holds a string this server will
         // not exchange, and which of the three it is describes a token they may not hold.
-        .ok_or_else(|| invalid_request("subject_token is not a live access token"))?;
+        .ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::InvalidRequest)
+                .with_description("subject_token is not a live access token")
+        })?;
 
     // 4. The actor token (section 2.1), which is what makes this delegation rather than
     //    impersonation (section 1.1).
@@ -485,26 +486,29 @@ async fn exchange<S: Storage, C: Clock>(
         // not a defined request at all, and reading it as impersonation would silently discard a
         // parameter the client thought it was sending.
         (None, Some(_)) => {
-            return Err(invalid_request(
-                "actor_token_type is meaningless without actor_token",
-            ))
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequest)
+                .with_description("actor_token_type is meaningless without actor_token"))
         }
         (Some(_), None) => {
-            return Err(invalid_request(
-                "actor_token_type is required when actor_token is present",
-            ))
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequest)
+                .with_description("actor_token_type is required when actor_token is present"))
         }
         (Some(actor_token), Some(actor_token_type)) => {
             if actor_token_type != TokenTypeIdentifier::AccessToken {
-                return Err(invalid_request(
-                    "actor_token_type must be urn:ietf:params:oauth:token-type:access_token",
-                ));
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                        "actor_token_type must be urn:ietf:params:oauth:token-type:access_token",
+                    ),
+                );
             }
             let actor = server
                 .introspect(actor_token)
                 .await
                 .map_err(storage_error)?
-                .ok_or_else(|| invalid_request("actor_token is not a live access token"))?;
+                .ok_or_else(|| {
+                    ErrorResponse::new(ErrorCode::InvalidRequest)
+                        .with_description("actor_token is not a live access token")
+                })?;
             // The acting party must be the party that just authenticated. Section 4.1 has the
             // `act` claim "identify the acting party to whom authority has been delegated", and a
             // server that will write any name there on production of a bearer string is not
@@ -512,9 +516,8 @@ async fn exchange<S: Storage, C: Clock>(
             // one step ago; the holder of a third party's access token proved possession of a
             // string that leaks.
             if actor.client_id != client.client_id {
-                return Err(invalid_request(
-                    "actor_token was not issued to the authenticated client",
-                ));
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequest)
+                    .with_description("actor_token was not issued to the authenticated client"));
             }
             let act = ActClaim {
                 // RFC 9068 section 2.2's answer for a grant with no resource owner is the client

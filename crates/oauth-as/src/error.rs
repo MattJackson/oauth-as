@@ -5,6 +5,7 @@
 //! 4.1.2.1 (authorization endpoint), and the RFC 8628 section 3.5 device-grant extension codes.
 //! One enum, one struct, owned here: never a third party's generated types.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -145,16 +146,33 @@ impl fmt::Display for ErrorCode {
 
 /// The RFC 6749 section 5.2 error response body: `error` required, `error_description` and
 /// `error_uri` optional and omitted (never `null`) when absent.
+///
+/// # Why the two optional fields are `Cow<'static, str>` and not `String`
+///
+/// This is the type every REFUSAL in this crate is built out of, and a refusal is the one response
+/// an attacker chooses the rate of: an unauthenticated caller can ask for as many `invalid_request`
+/// bodies as it can open sockets for, and asks for none of the successful ones. Roughly 50 of the
+/// crate's 57 description sites pass a string constant, so an owned `String` meant one heap copy
+/// of a `&'static str` per refused request, bought for nothing.
+///
+/// It is free in memory as well as in allocations: `Option<Cow<'static, str>>` is 24 bytes, the
+/// SAME as `Option<String>`, because `Cow`'s discriminant lives in the niche the pointer already
+/// has. MEASURED, not assumed: `ErrorResponse` is 56 bytes before and after, and
+/// `tests/allocation.rs` pins both that size and the zero-allocation claim.
+///
+/// A host that needs a description it computed still passes a `String`: `Cow` owns that case, and
+/// [`ErrorResponse::with_description`] takes `impl Into<Cow<'static, str>>` so both spellings
+/// compile unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
     /// The registered error code.
     pub error: ErrorCode,
     /// Human-readable ASCII detail for the developer (not the end user), per section 5.2.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_description: Option<String>,
+    pub error_description: Option<Cow<'static, str>>,
     /// A URI identifying a human-readable page with more information.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_uri: Option<String>,
+    pub error_uri: Option<Cow<'static, str>>,
 }
 
 impl ErrorResponse {
@@ -168,8 +186,18 @@ impl ErrorResponse {
     }
 
     /// Attach a developer-facing description.
-    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+    ///
+    /// `impl Into<Cow<'static, str>>`, so a `&'static str` borrows and a `String` moves: the
+    /// overwhelmingly common caller passes a literal and pays nothing, and a caller that genuinely
+    /// computed the text keeps working with no change at the call site.
+    pub fn with_description(mut self, description: impl Into<Cow<'static, str>>) -> Self {
         self.error_description = Some(description.into());
+        self
+    }
+
+    /// Attach an `error_uri` (RFC 6749 section 5.2), the same way and for the same reason.
+    pub fn with_uri(mut self, uri: impl Into<Cow<'static, str>>) -> Self {
+        self.error_uri = Some(uri.into());
         self
     }
 

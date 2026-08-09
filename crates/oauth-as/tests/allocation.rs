@@ -112,6 +112,14 @@ fn zero_cost_efficiency_gates() {
             introspection_hot_path_allocation_bound,
         ),
         (
+            "a_refusal_built_from_a_literal_allocates_nothing",
+            a_refusal_built_from_a_literal_allocates_nothing,
+        ),
+        (
+            "refused_token_request_allocation_bound",
+            refused_token_request_allocation_bound,
+        ),
+        (
             "metadata_serialization_allocation_bound",
             metadata_serialization_allocation_bound,
         ),
@@ -669,6 +677,88 @@ fn introspection_hot_path_allocation_bound() {
         d.bytes <= 256,
         "introspection allocation bytes regressed: {d:?}"
     );
+}
+
+/// [`ErrorResponse::with_description`] on a `&'static str` must allocate NOTHING.
+///
+/// This is the zero-margin gate of the two below it, and the claim is exact rather than
+/// approximate: `error_description` is a `Cow<'static, str>`, so a refusal whose description is a
+/// string constant borrows the constant. Roughly 50 of this crate's 57 description sites pass a
+/// literal, and a refusal is a request an ATTACKER sets the rate of, so an allocation here is one
+/// an unauthenticated caller can ask for as fast as it can open sockets.
+fn a_refusal_built_from_a_literal_allocates_nothing() {
+    let (err, d) = measure(|| {
+        ErrorResponse::new(oauth_as::ErrorCode::InvalidRequest)
+            .with_description("this server does not offer pushed authorization requests")
+    });
+    assert!(err.error_description.is_some());
+    assert_eq!(
+        d,
+        Delta::default(),
+        "a refusal described by a string constant must not copy it onto the heap: {d:?}"
+    );
+}
+
+/// One REFUSED token request, end to end: a public client asking for `client_credentials`, which
+/// RFC 6749 section 4.4 has no answer for because there is no way to authenticate the caller.
+///
+/// Refusals are gated separately from the success paths for a reason the success paths do not
+/// have: an attacker chooses how many refusals this server issues, and chooses nothing about how
+/// many tokens it mints. A refusal that allocates is therefore work bought by whoever is attacking,
+/// which is the one place in the crate where "it is only one allocation" is the wrong sentence.
+fn refused_token_request_allocation_bound() {
+    let rt = current_thread_runtime();
+    let srv = rt.block_on(async {
+        let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+        let srv = AuthorizationServer::new(cfg, MemoryStorage::new());
+        // Registered for the grant, so the refusal is the RFC 6749 s4.4 confidentiality rule and
+        // not an earlier and cheaper "this client may not use this grant".
+        srv.register_client(Client {
+            client_id: ClientId::new("public-app"),
+            auth: ClientAuth::Public,
+            grant_types: vec![GrantType::ClientCredentials],
+            redirect_uris: vec![],
+            allowed_scopes: ScopeSet::parse("read write").unwrap(),
+            default_scopes: ScopeSet::parse("read").unwrap(),
+            name: None,
+            registration: None,
+        })
+        .await
+        .unwrap();
+        srv
+    });
+
+    // Built OUTSIDE the window: `ClientId::new` owns its string, and that allocation is the
+    // caller's, not the endpoint's. Measuring it would hide the number this gate is about.
+    let request = TokenRequest::ClientCredentials {
+        client_id: ClientId::new("public-app"),
+        client_secret: None,
+        scope: None,
+    };
+    let (result, d) = measure(|| rt.block_on(srv.token(request)));
+    assert_eq!(
+        result.unwrap_err().error,
+        oauth_as::ErrorCode::InvalidClient
+    );
+    // ZERO on every feature set but one. It was 1 allocation of 49 bytes before
+    // `error_description` became a `Cow<'static, str>`: the whole of it was copying the string
+    // constant "client_credentials requires a confidential client" onto the heap so it could be
+    // owned by a response about to be serialized and dropped.
+    //
+    // `dpop` is the exception, and the allocation is NOT the description. `token_with_context`
+    // reaches the RFC 9449 proof check through a `Box::pin` (168 bytes, measured), which is what
+    // keeps the token future under tokio's debug boxing threshold, and it is paid on every token
+    // request under that feature whether or not a proof was presented. It is called out here
+    // rather than budgeted silently: this is a REFUSAL gate, so a reader has to be able to tell
+    // an allocation the crate chose from one an attacker bought.
+    let dpop_boxed_proof_check = usize::from(cfg!(feature = "dpop"));
+    assert_eq!(
+        d.allocs, dpop_boxed_proof_check,
+        "a refused token request must allocate NOTHING beyond the dpop proof check: {d:?}"
+    );
+
+    // `deallocs` is deliberately not asserted: the `ClientId` the request was built with is moved
+    // in and dropped here, and freeing memory the caller allocated is not the endpoint's cost.
 }
 
 /// The RFC 8414 discovery document is fetched once by any client that has not cached it, so its

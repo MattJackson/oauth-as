@@ -390,8 +390,8 @@ fn authorization_error_redirect_location_carries_every_present_member() {
         redirect_uri: "https://app.example/cb?tenant=acme".to_string(),
         error: ErrorResponse {
             error: ErrorCode::InvalidScope,
-            error_description: Some("scope [a&b] exceeds".to_string()),
-            error_uri: Some("https://as.example/docs#scope".to_string()),
+            error_description: Some("scope [a&b] exceeds".into()),
+            error_uri: Some("https://as.example/docs#scope".into()),
         },
         state: Some("s t".to_string()),
         iss: "https://as.example".to_string(),
