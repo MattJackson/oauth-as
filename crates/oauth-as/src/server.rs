@@ -3726,11 +3726,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // by whatever the client will actually present, so RFC 7662 introspection and RFC 7009
         // revocation keep working and a revoked JWT is genuinely dead at this AS rather than
         // merely deprecated.
-        // Bound before it is matched rather than matched directly, so the reader can see that the
-        // only things live across the `await` below are a `&JwtConfig` and a `String`. MEASURED:
-        // this makes no difference to the frame either way (1704 bytes on `--all-features` both
-        // ways); it is written for the reader, and the measurement is recorded so nobody has to
-        // repeat it.
+        // Bound before it is matched rather than matched directly, because the signing input is
+        // then visibly the LAST thing computed before the suspension. MEASURED: this makes no
+        // difference to the frame either way (1704 bytes on `--all-features` both ways); it is
+        // written for the reader, and the measurement is recorded so nobody has to repeat it.
+        //
+        // WHAT IS LIVE ACROSS THE AWAIT IS THE WHOLE ISSUANCE, and an earlier version of this
+        // comment claimed otherwise. `now`, `issues_refresh`, `family_id`, `pending_refresh`,
+        // `audit`, `subject`, `scope`, `resource`, `details`, `authentication`, `client` and
+        // `bound` are all built above and read below, so they are all in the frame. The SIZE
+        // claim is unaffected and is gated by `tests/allocation.rs`; the description was simply
+        // wrong, and it matters because that await is the host's `Es256Signer` and is unbounded.
         #[cfg(feature = "jwt")]
         let prepared = self.access_token_signing_input(
             client,
