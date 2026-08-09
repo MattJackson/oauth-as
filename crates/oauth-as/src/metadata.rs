@@ -174,6 +174,17 @@ pub struct AuthorizationServerMetadata {
     #[cfg(feature = "resource-metadata")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protected_resources: Option<Vec<String>>,
+    /// RFC 9396 section 10. The authorization details TYPES this server will accept, so a
+    /// client learns what it may ask for rather than discovering it from a refusal.
+    ///
+    /// Omitted rather than empty when the host declared none, exactly as `scopes_supported`
+    /// is: an empty array claims the server supports no types at all, which is a different
+    /// statement from silence and would be read as one. Note that the SERVER's behaviour for
+    /// the two is not different: an undeclared catalogue refuses every type (section 5), so
+    /// this member never overstates what the server will do.
+    #[cfg(feature = "rar")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_details_types_supported: Option<Vec<String>>,
     /// RFC 9207 section 3. Always `true` from this server, and NOT an `Option`.
     ///
     /// The member exists so a client can decide whether it is allowed to REQUIRE the `iss`
@@ -188,6 +199,16 @@ pub struct AuthorizationServerMetadata {
     /// RFC 8707 (resource indicators), which this server also implements, registers NO metadata
     /// member of its own, so there is deliberately nothing here to advertise it.
     pub authorization_response_iss_parameter_supported: bool,
+    /// RFC 8705 section 3.3. Always `true` in a build with the `mtls` feature, and absent
+    /// entirely without it, which is the same honesty rule `jwks_uri` follows.
+    ///
+    /// Constant rather than configurable because the behaviour is: with the feature compiled
+    /// in, an access token issued over a connection whose certificate the host passed in is
+    /// ALWAYS bound to it (RFC 8705 section 3), so there is no configuration under which the
+    /// claim could be false. Section 3.3's default when the member is absent is `false`, so a
+    /// build without the feature says nothing and means nothing, which is correct.
+    #[cfg(feature = "mtls")]
+    pub tls_client_certificate_bound_access_tokens: bool,
 }
 
 /// Join an issuer and an absolute path without producing a double slash.
@@ -311,6 +332,16 @@ impl AuthorizationServerMetadata {
                     methods.push(crate::client_assertion::CLIENT_SECRET_JWT.to_string());
                     methods.push(crate::client_assertion::PRIVATE_KEY_JWT.to_string());
                 }
+                // RFC 8705 s2.1.1 and s2.2.1 register these two, advertised exactly when this
+                // build can actually check a certificate. Both halves matter: advertising a
+                // method the endpoint rejects is a lie a client cannot recover from, and staying
+                // silent about one it accepts is how a client ends up sending a shared secret it
+                // did not need to have.
+                #[cfg(feature = "mtls")]
+                {
+                    methods.push(crate::mtls::TLS_CLIENT_AUTH.to_string());
+                    methods.push(crate::mtls::SELF_SIGNED_TLS_CLIENT_AUTH.to_string());
+                }
                 methods
             },
             #[cfg(feature = "client_assertion")]
@@ -335,7 +366,13 @@ impl AuthorizationServerMetadata {
             service_documentation: config.service_documentation.clone(),
             #[cfg(feature = "resource-metadata")]
             protected_resources: config.protected_resources.clone(),
+            #[cfg(feature = "rar")]
+            authorization_details_types_supported: config
+                .authorization_details_types_supported
+                .clone(),
             authorization_response_iss_parameter_supported: true,
+            #[cfg(feature = "mtls")]
+            tls_client_certificate_bound_access_tokens: true,
         }
     }
 }

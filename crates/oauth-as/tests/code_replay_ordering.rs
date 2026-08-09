@@ -147,6 +147,8 @@ async fn a_wrong_client_presentation_leaves_an_unredeemed_code_usable() {
     let challenge = oauth_as::pkce::code_challenge_s256(support::RFC7636_VERIFIER);
     let req = oauth_as::AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".to_string().into()),
         client_id: Some("confidential-app".to_string().into()),
         redirect_uri: Some(CONFIDENTIAL_REDIRECT.to_string().into()),

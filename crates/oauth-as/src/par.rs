@@ -154,8 +154,9 @@ impl PushedAuthorizationResponse {
 /// opaque bag of whatever was posted. That is deliberate: the endpoint validates the pushed
 /// request at push time (RFC 9126 section 2.1 step 3), so a parameter this server cannot act on
 /// cannot have been validated, and storing it would only let it reappear at the authorization
-/// endpoint unexamined. When a future release adds a parameter (RFC 9396 `authorization_details`
-/// is the obvious next one), it is added here as well, and the compiler says so.
+/// endpoint unexamined. A parameter added to the authorization request is therefore added
+/// here as well, and the compiler says so; RFC 9396 `authorization_details`, which this
+/// comment used to name as the obvious next one, is now one of them.
 ///
 /// `Debug` is hand-written for the same reason as [`crate::authorization::AuthorizationCodeRecord`]'s:
 /// the `request_uri` is a capability handle for as long as it is live (RFC 9126 section 7.1), so it
@@ -182,6 +183,16 @@ pub struct PushedAuthorizationRequest {
     pub code_challenge_method: Option<String>,
     /// RFC 8707 `resource` indicators, as pushed, in wire order.
     pub resource: Vec<String>,
+    /// RFC 9396 `authorization_details`, as pushed: the raw JSON array.
+    ///
+    /// Stored, and not merely validated at push time, because this record IS the request
+    /// the authorization endpoint later reads (section 2.1 step 3 validates it here, and
+    /// RFC 9101 section 6.3 says the endpoint MUST use only the pushed parameters). A
+    /// parameter validated at push time and then dropped would be a parameter the client
+    /// was told was acceptable and then silently did not get, which is exactly the drop
+    /// RFC 9396 section 5 exists to prevent.
+    #[cfg(feature = "rar")]
+    pub authorization_details: Option<String>,
     /// When the handle dies. RFC 9126 section 4: an expired `request_uri` MUST be rejected.
     pub expires_at: std::time::SystemTime,
 }
@@ -189,8 +200,8 @@ pub struct PushedAuthorizationRequest {
 #[cfg(feature = "par")]
 impl std::fmt::Debug for PushedAuthorizationRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PushedAuthorizationRequest")
-            .field("request_uri", &"[redacted]")
+        let mut out = f.debug_struct("PushedAuthorizationRequest");
+        out.field("request_uri", &"[redacted]")
             .field("client_id", &self.client_id)
             .field("response_type", &self.response_type)
             .field("redirect_uri", &self.redirect_uri)
@@ -198,9 +209,10 @@ impl std::fmt::Debug for PushedAuthorizationRequest {
             .field("state", &self.state)
             .field("code_challenge", &self.code_challenge)
             .field("code_challenge_method", &self.code_challenge_method)
-            .field("resource", &self.resource)
-            .field("expires_at", &self.expires_at)
-            .finish()
+            .field("resource", &self.resource);
+        #[cfg(feature = "rar")]
+        out.field("authorization_details", &self.authorization_details);
+        out.field("expires_at", &self.expires_at).finish()
     }
 }
 
@@ -219,6 +231,8 @@ impl PushedAuthorizationRequest {
             code_challenge: self.code_challenge.as_deref().map(Into::into),
             code_challenge_method: self.code_challenge_method.as_deref().map(Into::into),
             resource: self.resource.iter().map(|r| r.as_str().into()).collect(),
+            #[cfg(feature = "rar")]
+            authorization_details: self.authorization_details.as_deref().map(Into::into),
         }
     }
 }
@@ -424,6 +438,8 @@ struct RequestObjectClaims {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     resource: Vec<String>,
+    #[cfg(feature = "rar")]
+    authorization_details: Option<String>,
 }
 
 #[cfg(feature = "jar")]
@@ -438,6 +454,8 @@ impl RequestObjectClaims {
             code_challenge: self.code_challenge.as_deref().map(Into::into),
             code_challenge_method: self.code_challenge_method.as_deref().map(Into::into),
             resource: self.resource.iter().map(|r| r.as_str().into()).collect(),
+            #[cfg(feature = "rar")]
+            authorization_details: self.authorization_details.as_deref().map(Into::into),
         }
     }
 }
@@ -657,6 +675,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             code_challenge: request.code_challenge.as_deref().map(str::to_string),
             code_challenge_method: request.code_challenge_method.as_deref().map(str::to_string),
             resource: request.resource.iter().map(|r| r.to_string()).collect(),
+            #[cfg(feature = "rar")]
+            authorization_details: request.authorization_details.as_deref().map(str::to_string),
             expires_at: now + ttl,
         };
         self.store()
@@ -963,6 +983,23 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             code_challenge: string_claim(claims, "code_challenge")?,
             code_challenge_method: string_claim(claims, "code_challenge_method")?,
             resource,
+            // RFC 9396 s2 makes `authorization_details` a JSON ARRAY, and inside a request
+            // object it stays one: RFC 9101 s4 requires request parameters to be JSON
+            // strings but exempts values that are themselves JSON, and a client that had to
+            // string-escape its array here would produce something no other endpoint
+            // accepts. It is re-serialized to the compact text the rest of this crate
+            // parses, so the request object and the query string reach exactly the same
+            // validation rather than two nearly identical ones.
+            #[cfg(feature = "rar")]
+            authorization_details: match claims.get("authorization_details") {
+                None => None,
+                Some(value @ serde_json::Value::Array(_)) => Some(value.to_string()),
+                Some(_) => {
+                    return Err(invalid_request_object(
+                        "the authorization_details claim must be a JSON array",
+                    ))
+                }
+            },
         })
     }
 }

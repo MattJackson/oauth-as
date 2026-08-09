@@ -273,6 +273,27 @@ pub struct AccessTokenClaims {
     /// conditional, not required).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// RFC 9396 section 9.1: the authorization details this token carries, as a top-level
+    /// claim, so a resource server holding the JWT can read what the token authorizes
+    /// without calling introspection for it.
+    ///
+    /// Omitted rather than sent empty when the grant carried none, exactly as `scope` is: a
+    /// claim present and empty is a statement about the token, and the truth here is that
+    /// there is nothing to state.
+    #[cfg(feature = "rar")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty"
+    )]
+    pub authorization_details: crate::rar::AuthorizationDetails,
+    /// RFC 7800 `cnf`, which RFC 9068 section 2.2.1 lists as a claim an access token MAY
+    /// carry: how this token is sender constrained. RFC 8705 section 3.1 puts the
+    /// certificate thumbprint here, and a resource server that validates the JWT itself can
+    /// then check the binding without calling introspection at all. Absent for an ordinary
+    /// bearer token, and absent from the claim set entirely in a build without the feature.
+    #[cfg(feature = "mtls")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<crate::token::Confirmation>,
 }
 
 /// The JOSE protected header. RFC 9068 section 2.1 fixes `typ` to `at+jwt`, which exists to stop a

@@ -359,6 +359,8 @@ async fn deleting_a_registration_invalidates_everything_it_was_issued() {
     let challenge = oauth_as::pkce::code_challenge_s256(verifier);
     let request = AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".into()),
         client_id: Some(info.client_id.clone().into()),
         redirect_uri: Some("https://app.example/cb".into()),

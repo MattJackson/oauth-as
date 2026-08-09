@@ -44,6 +44,7 @@ fn public_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn confidential_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 
@@ -82,6 +84,7 @@ fn no_grants_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 

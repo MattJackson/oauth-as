@@ -38,6 +38,7 @@ fn hashed_client(auth: ClientAuth) -> Client {
         allowed_scopes: ScopeSet::parse("api:read").unwrap(),
         default_scopes: ScopeSet::parse("api:read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 

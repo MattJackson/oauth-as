@@ -196,6 +196,7 @@ where
             allowed_scopes: scopes.clone(),
             default_scopes: scopes.clone(),
             name: Some("Conformance public client".to_string()),
+            registration: None,
         })
         .await?;
 
@@ -215,6 +216,7 @@ where
             allowed_scopes: scopes.clone(),
             default_scopes: scopes,
             name: Some("Conformance confidential client".to_string()),
+            registration: None,
         })
         .await?;
 

@@ -218,6 +218,7 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
             // attacker-supplied. The metacharacters are here so every test that renders it also
             // proves it is escaped.
             name: Some(PUBLIC_NAME.to_string()),
+            registration: None,
         })
         .await
         .expect("register public");
@@ -232,6 +233,7 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
             allowed_scopes: scopes.clone(),
             default_scopes: scopes,
             name: None,
+            registration: None,
         })
         .await
         .expect("register confidential");
@@ -1316,6 +1318,7 @@ async fn start_signing() -> (SocketAddr, String) {
             allowed_scopes: scopes.clone(),
             default_scopes: scopes,
             name: None,
+            registration: None,
         })
         .await
         .expect("register confidential");

@@ -45,6 +45,8 @@ async fn issue_code<S: oauth_as::Storage>(
     let challenge = oauth_as::pkce::code_challenge_s256(support::RFC7636_VERIFIER);
     let request = oauth_as::AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".to_string().into()),
         client_id: Some(client_id.to_string().into()),
         redirect_uri: Some(redirect_uri.to_string().into()),

@@ -68,6 +68,7 @@ async fn a_public_client_cannot_use_this_grant_even_if_registered_for_it() {
             allowed_scopes: ScopeSet::parse("read").unwrap(),
             default_scopes: ScopeSet::parse("read").unwrap(),
             name: None,
+            registration: None,
         }],
     )
     .await;

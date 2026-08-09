@@ -217,6 +217,22 @@ pub enum ClientAuth {
         /// [`crate::client_assertion::verify_assertion`].
         keys: crate::client_assertion::AssertionKeys,
     },
+    /// RFC 8705: a confidential client that authenticates with a mutual-TLS CERTIFICATE and
+    /// holds no shared secret at all. This is the variant a deployment whose policy forbids
+    /// shared secrets registers, and the only one where the credential never travels: the
+    /// client proves possession of a private key to the host's TLS layer, and this crate is
+    /// handed the resulting certificate as an established fact.
+    ///
+    /// Carried INLINE rather than boxed, on the same measurement as the assertion variant
+    /// above: the widest shape [`crate::mtls::MtlsClientRegistration`] can take is one
+    /// `String` plus a discriminant, against `ConfidentialSecretHash`'s two `String`s, so
+    /// this variant does not make `ClientAuth`, or the [`Client`] cloned out of the store on
+    /// every token-plane request, any bigger than it already was.
+    #[cfg(feature = "mtls")]
+    Mtls {
+        /// Which RFC 8705 method, and what it expects to see.
+        registration: crate::mtls::MtlsClientRegistration,
+    },
 }
 
 /// Hand-written so `ConfidentialSecret { secret }` never prints the secret. An AS library that
@@ -243,6 +259,15 @@ impl fmt::Debug for ClientAuth {
             ClientAuth::ConfidentialAssertion { keys } => f
                 .debug_struct("ConfidentialAssertion")
                 .field("keys", keys)
+                .finish(),
+            // NOT redacted: a registration that names an expected subject DN or a certificate
+            // thumbprint holds no secret. Both are public facts about a public document, and
+            // an operator debugging a refused mutual-TLS client needs to see exactly which
+            // value the server expected.
+            #[cfg(feature = "mtls")]
+            ClientAuth::Mtls { registration } => f
+                .debug_struct("Mtls")
+                .field("registration", registration)
                 .finish(),
         }
     }
@@ -307,6 +332,16 @@ impl ClientAuth {
             // is `AuthorizationServer::authenticate_client` and it does not come through here.
             #[cfg(feature = "client_assertion")]
             ClientAuth::ConfidentialAssertion { .. } => false,
+            // NEVER, and for the same reason as the assertion arm above. A mutual-TLS
+            // registration has no secret to compare against, so there is no presented string
+            // that could be the right one, and `None` is not the right answer either: unlike
+            // `Public`, this client is confidential and something must be proven. The
+            // certificate is checked by `crate::mtls::verify_certificate`, which is reached
+            // only from `AuthorizationServer::authenticate_client`; every OTHER caller of
+            // this function, now or later, therefore fails closed on a mutual-TLS client
+            // rather than accidentally authenticating one with no evidence at all.
+            #[cfg(feature = "mtls")]
+            ClientAuth::Mtls { .. } => false,
         }
     }
 }

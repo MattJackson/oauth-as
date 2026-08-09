@@ -48,6 +48,7 @@ fn device_client() -> Client {
         allowed_scopes: ScopeSet::parse("read write").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: Some("Test device".into()),
+        registration: None,
     }
 }
 
@@ -60,6 +61,7 @@ fn other_device_client() -> Client {
         allowed_scopes: ScopeSet::parse("read").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }
 }
 

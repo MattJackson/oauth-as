@@ -115,7 +115,7 @@ async fn a_token_issued_against_a_proof_is_bound_to_that_key_and_says_so() {
     assert_eq!(introspected.token_type, Some(TokenType::Dpop));
     assert_eq!(
         introspected.cnf.expect("a bound token reports cnf").jkt,
-        key.to_public_jwk().thumbprint(),
+        Some(key.to_public_jwk().thumbprint()),
     );
 }
 
@@ -344,6 +344,8 @@ async fn mint_refresh_token(
     let challenge = oauth_as::pkce::code_challenge_s256(verifier);
     let request = oauth_as::AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".into()),
         client_id: Some("app".into()),
         redirect_uri: Some(REDIRECT.into()),
@@ -489,7 +491,7 @@ async fn the_binding_survives_rotation() {
         .unwrap();
     assert_eq!(
         introspected.cnf.unwrap().jkt,
-        key.to_public_jwk().thumbprint()
+        Some(key.to_public_jwk().thumbprint())
     );
 }
 

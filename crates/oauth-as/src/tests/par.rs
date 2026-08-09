@@ -62,6 +62,8 @@ fn a_stored_handle_is_not_printed_by_debug() {
         state: Some("opaque".to_string()),
         code_challenge: Some("challenge".to_string()),
         code_challenge_method: Some("S256".to_string()),
+        #[cfg(feature = "rar")]
+        authorization_details: None,
         resource: vec!["https://rs.example".to_string()],
         expires_at: std::time::SystemTime::UNIX_EPOCH,
     };
@@ -90,6 +92,8 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
         state: Some("opaque".to_string()),
         code_challenge: Some("challenge".to_string()),
         code_challenge_method: Some("S256".to_string()),
+        #[cfg(feature = "rar")]
+        authorization_details: None,
         resource: vec![
             "https://rs.example/a".to_string(),
             "https://rs.example/b".to_string(),

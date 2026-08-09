@@ -70,6 +70,7 @@ fn register(rt: &tokio::runtime::Runtime, srv: &Srv) {
         allowed_scopes: ScopeSet::parse("read write").unwrap(),
         default_scopes: ScopeSet::parse("read").unwrap(),
         name: None,
+        registration: None,
     }))
     .unwrap();
 }

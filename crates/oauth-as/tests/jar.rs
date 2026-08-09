@@ -134,6 +134,12 @@ async fn an_access_token_is_not_a_request_object() {
             iat: 1_700_000_000,
             jti: "jti".to_string(),
             scope: Some("read".to_string()),
+            #[cfg(feature = "rar")]
+            authorization_details: Default::default(),
+            // Not certificate bound: this fixture is testing that an access token is
+            // not a request object, and a binding would say nothing about that.
+            #[cfg(feature = "mtls")]
+            cnf: None,
         })
         .unwrap();
 

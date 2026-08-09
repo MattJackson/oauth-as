@@ -30,6 +30,8 @@ fn challenge() -> String {
 fn good_request(challenge: &str) -> AuthorizationRequest<'static> {
     AuthorizationRequest {
         resource: Vec::new(),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
         response_type: Some("code".into()),
         client_id: Some("public-app".into()),
         redirect_uri: Some(PUBLIC_REDIRECT.into()),
