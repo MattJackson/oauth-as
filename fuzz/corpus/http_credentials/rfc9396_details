@@ -1,0 +1,1 @@
+[{"type":"payment_initiation","locations":["https://rs.example/"],"actions":["initiate"],"datatypes":["contacts"],"identifier":"acct-1","privileges":["admin"]}]

@@ -11,6 +11,12 @@ members = [
     # manifest even optionally, and implementing the trait from OUTSIDE is what proves the seam is
     # usable through the public API alone. Not published; see its own README.
     "crates/oauth-as-postgres",
+    # The libFuzzer targets. A member rather than the excluded sub-workspace `cargo fuzz init`
+    # writes by default, so that `cargo clippy --workspace --all-targets` is what tells us a
+    # target stopped compiling after a signature moved. A fuzz target that no longer builds is
+    # worse than none, because the directory still looks like coverage. Never published, and
+    # nothing in crates/oauth-as depends on it: it is a CONSUMER of the public API.
+    "fuzz",
 ]
 
 # COMPILE SETTINGS, and an honest note about their reach.

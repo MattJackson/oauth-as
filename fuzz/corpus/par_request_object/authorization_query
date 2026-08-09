@@ -1,0 +1,1 @@
+response_type=code&client_id=fuzz-public&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&scope=read+write&state=xyz&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256

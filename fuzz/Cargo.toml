@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (C) 2026 Matthew Jackson
+
+# The fuzzing workspace member. NEVER PUBLISHED, and nothing in crates/oauth-as depends on it:
+# it is a consumer of the library's PUBLIC API, exactly like a host would be, so adding a target
+# here can never change what a consumer of `oauth-as` compiles or links.
+#
+# WHY A WORKSPACE MEMBER AT ALL, when `cargo fuzz init` writes an EXCLUDED sub-workspace by
+# default. An excluded crate is invisible to `cargo clippy --workspace --all-targets`, which is
+# precisely the gate that would otherwise tell us a fuzz target stopped compiling after a
+# signature moved. A fuzz target that no longer builds is worse than no fuzz target, because the
+# directory still looks like coverage. Membership is what keeps that honest.
+#
+# The COST of membership is that the stable-toolchain gate compiles libfuzzer-sys (a C++ build)
+# on every cold cache. That is paid once per cache generation and is the price of the check above.
+[package]
+name = "oauth-as-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# NOT the library's 1.75 floor, and deliberately not tied to it. cargo-fuzz requires nightly, so
+# there is nothing to be gained by constraining this member, and nothing depends on it. The MSRV
+# job in .github/workflows/qa.yml is scoped to `-p oauth-as` for exactly this reason.
+rust-version = "1.75"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Structure-aware generation. A purely random byte string is a parse error for a JWS or a JSON
+# array on essentially every draw, so those targets would spend their whole budget in the first
+# ten lines of the parser. `arbitrary` lets the generator start from a well formed shape and
+# perturb it, which is what puts the fuzzer past the front door.
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+http = "1"
+# A current-thread runtime, built ONCE and reused, for the targets whose entry point is an
+# `async fn` on AuthorizationServer. Building a runtime per iteration would dominate the
+# iteration cost and hide the parser being measured.
+tokio = { version = "1", features = ["rt"] }
+
+# EVERY optional feature that gates one of the parsers under test. `axum` is deliberately absent:
+# the adapter is thirty lines of `From` impl with no parsing in it, and pulling a pre-1.0 web
+# framework into the fuzz build would only add build time.
+[dependencies.oauth-as]
+path = "../crates/oauth-as"
+default-features = false
+features = ["http", "jwt", "rar", "par", "jar", "dpop", "client_assertion", "mtls"]
+
+# The shared fixtures (the server under test, the JWS builders, the RFC charset predicates). A
+# `lib` rather than an `#[path]` include in each target, so there is ONE definition of "the
+# registered client" and a target cannot silently disagree with its neighbours about it.
+[lib]
+name = "oauth_as_fuzz"
+path = "src/lib.rs"
+
+# Every target below is `test = false, doc = false, bench = false`. They are `#![no_main]` and
+# their `main` comes from libFuzzer, so there is nothing for the test or doc harness to do; the
+# flags keep `cargo test --workspace` from trying to link them against a runtime that only the
+# nightly sanitizer build supplies.
+
+[[bin]]
+name = "scope_parse"
+path = "fuzz_targets/scope_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_user_code"
+path = "fuzz_targets/device_user_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_parse"
+path = "fuzz_targets/rar_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jws_parse"
+path = "fuzz_targets/jws_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwk_from_json"
+path = "fuzz_targets/jwk_from_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authorization_from_pairs"
+path = "fuzz_targets/authorization_from_pairs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_credentials"
+path = "fuzz_targets/http_credentials.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_assertion"
+path = "fuzz_targets/client_assertion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dpop_proof"
+path = "fuzz_targets/dpop_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "par_request_object"
+path = "fuzz_targets/par_request_object.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,7 @@
+# Build output and libFuzzer's own state. The SEED corpora under corpus/ ARE committed: they are
+# the RFC vectors and the crate's own fixtures, and a corpus seeded from known-good input is what
+# gets a fuzzer past the front door in a minute rather than an hour. What is not committed is
+# whatever libFuzzer grows on top of them, which is machine specific and unbounded.
+target/
+artifacts/
+coverage/

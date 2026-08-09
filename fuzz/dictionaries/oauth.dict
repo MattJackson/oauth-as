@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (C) 2026 Matthew Jackson
+#
+# A libFuzzer dictionary (-dict=) of the tokens this server's parsers actually compare against.
+#
+# WHY THIS EXISTS ALONGSIDE THE SEED CORPORA. Most of the targets here decode their input through
+# `arbitrary`, so a corpus file is not a decodable fixture: it is a source of byte substrings for
+# libFuzzer's copy and cross-over mutations. A dictionary is the direct form of the same idea and
+# is the only one that reliably reaches a target whose generator builds strings character by
+# character. Without it a fuzzer will not produce the literal "client_secret_basic", or
+# "urn:ietf:params:oauth:grant-type:device_code", in any budget worth running, and a parser is
+# only interesting near the strings it is deciding between.
+#
+# ASCII only, one token per line, libFuzzer's own escaping rules.
+
+# ---- RFC 6749 s4 and RFC 8628 s3.4: grant types and response types
+"authorization_code"
+"refresh_token"
+"client_credentials"
+"urn:ietf:params:oauth:grant-type:device_code"
+"urn:ietf:params:oauth:grant-type:token-exchange"
+"code"
+"token"
+"grant_type"
+"response_type"
+"client_id"
+"client_secret"
+"redirect_uri"
+"scope"
+"state"
+"device_code"
+"user_code"
+"request_uri"
+"request"
+
+# ---- RFC 7636 PKCE, including appendix B's own vector
+"code_challenge"
+"code_challenge_method"
+"code_verifier"
+"S256"
+"plain"
+"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+# ---- RFC 6749 s5.2 error codes: the answers, which a parser has to be able to reach
+"invalid_request"
+"invalid_client"
+"invalid_grant"
+"unauthorized_client"
+"unsupported_grant_type"
+"invalid_scope"
+"access_denied"
+"server_error"
+"authorization_pending"
+"slow_down"
+"expired_token"
+"invalid_target"
+"invalid_dpop_proof"
+"invalid_request_object"
+"invalid_authorization_details"
+
+# ---- RFC 6749 s2.3.1 and RFC 7523 s2.2: client authentication
+"Basic "
+"Bearer "
+"DPoP "
+"client_secret_basic"
+"client_secret_post"
+"client_secret_jwt"
+"private_key_jwt"
+"tls_client_auth"
+"self_signed_tls_client_auth"
+"client_assertion"
+"client_assertion_type"
+"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+# ---- RFC 7515/7517/7518 JOSE: the header and key members every verifier reads
+"alg"
+"typ"
+"kid"
+"jwk"
+"none"
+"ES256"
+"HS256"
+"RS256"
+"EC"
+"P-256"
+"kty"
+"crv"
+"\"x\""
+"\"y\""
+"\"d\""
+"at+jwt"
+"dpop+jwt"
+"oauth-authz-req+jwt"
+"JWT"
+
+# ---- RFC 7519 / RFC 9449 s4.2 / RFC 7523 s3 claims
+"iss"
+"sub"
+"aud"
+"exp"
+"iat"
+"nbf"
+"jti"
+"htm"
+"htu"
+"cnf"
+"jkt"
+
+# ---- RFC 9396 s2 and s2.2: rich authorization details
+"authorization_details"
+"payment_initiation"
+"account_information"
+"locations"
+"actions"
+"datatypes"
+"identifier"
+"privileges"
+
+# ---- RFC 8707 s2 resource indicators, and the URI shapes they are compared as
+"resource"
+"https://"
+"http://"
+"urn:"
+"://"
+"%2F"
+"%3A"
+"%00"
+"%25"
+"+"
+
+# ---- The fixture identities in fuzz/src/lib.rs. Present so a target can reach the branch where
+# the client id is the RIGHT one and the credential is not, which is the interesting half.
+"fuzz-confidential"
+"fuzz-public"
+"fuzz-assertion"
+"fuzz-jar"
+"https://as.example"
+"https://as.example/token"
+"https://app.example/cb"
