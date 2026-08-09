@@ -160,7 +160,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust 1.75 toolchain
-        uses: dtolnay/rust-toolchain@1.75
+        uses: dtolnay/rust-toolchain@1.100
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-1.75
@@ -213,7 +213,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust 1.80 toolchain
-        uses: dtolnay/rust-toolchain@1.80
+        uses: dtolnay/rust-toolchain@1.100
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-1.80-http
