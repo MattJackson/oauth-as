@@ -17,7 +17,12 @@
 //! line and the headers (201 rather than 200 per RFC 9126 section 2.2, `Cache-Control: no-store`
 //! per RFC 6749 section 5.1) are exactly what a convenience client hides.
 
-#![cfg(all(feature = "http", feature = "par"))]
+// Gated on `axum`, not `http`, because this file binds a real listener and speaks to it: that
+// needs `axum::serve` and tokio's net and io, and both arrive with the `axum` feature rather than
+// with `http`. `http,par` without `axum` is a legal configuration (a host mounting
+// `AuthorizationService` on its own stack), and under it this file must not exist at all. `axum`
+// implies `http`, so naming both would be redundant.
+#![cfg(all(feature = "axum", feature = "par"))]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
