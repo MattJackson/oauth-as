@@ -76,6 +76,10 @@ async fn a_client_with_no_registered_redirect_uri_is_refused_without_redirecting
         state: Some("s".into()),
         code_challenge: Some(challenge.into()),
         code_challenge_method: Some("S256".into()),
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
     };
 
     match srv.validate_authorization_request(&req).await {
@@ -111,6 +115,10 @@ async fn several_registered_redirect_uris_require_the_request_to_name_one() {
         state: None,
         code_challenge: Some(challenge.into()),
         code_challenge_method: Some("S256".into()),
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
     };
 
     match srv.validate_authorization_request(&req).await {

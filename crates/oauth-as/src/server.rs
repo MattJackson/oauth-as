@@ -2198,6 +2198,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
+        // RFC 9470 s4's `acr_values` and `max_age`, parsed from THIS request rather than from the
+        // query the user agent arrived with. That distinction is the whole point: for an RFC 9126
+        // pushed request `request` is the stored record, and for an RFC 9101 signed one it is the
+        // verified claim set, so the two parameters now survive both (they were dropped entirely
+        // before, which disabled step-up for every PAR and JAR deployment) and the query cannot
+        // supply them for either (RFC 9126 s4, RFC 9101 s6.3, which says the server MUST use only
+        // the object's parameters even when the query repeats them).
+        //
+        // Checked last among the redirectable checks, so a request that is ALSO missing PKCE still
+        // hears about PKCE first; that is the order the endpoint reported before this moved here.
+        #[cfg(feature = "consent")]
+        let requirement = crate::consent::AuthenticationRequirement::from_request(request)
+            .map_err(|error| {
+                AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                    redirect_uri: redirect_uri.clone(),
+                    error,
+                    state: state.clone(),
+                    iss: self.issuer_identifier().to_string(),
+                })
+            })?;
+
         // `mut` plus a setter rather than a ninth constructor argument: see
         // `ValidatedAuthorizationRequest::set_authorization_details`.
         #[allow(unused_mut)]
@@ -2213,6 +2234,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         );
         #[cfg(feature = "rar")]
         validated.set_authorization_details(details);
+        #[cfg(feature = "consent")]
+        validated.set_authentication_requirement(requirement);
         Ok(validated)
     }
 

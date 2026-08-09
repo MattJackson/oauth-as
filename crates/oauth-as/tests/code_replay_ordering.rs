@@ -156,6 +156,10 @@ async fn a_wrong_client_presentation_leaves_an_unredeemed_code_usable() {
         state: None,
         code_challenge: Some(challenge.into()),
         code_challenge_method: Some("S256".to_string().into()),
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
     };
     let validated = srv.validate_authorization_request(&req).await.unwrap();
     let response = srv

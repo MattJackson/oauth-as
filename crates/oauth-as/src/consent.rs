@@ -252,11 +252,11 @@ impl AuthenticationRequirement {
     /// Collect the two RFC 9470 section 4 parameters from already-decoded `(name, value)` query
     /// pairs, the same shape [`crate::authorization::AuthorizationRequest::from_pairs`] takes.
     ///
-    /// A SEPARATE parser over the same pairs, rather than two more fields on
-    /// [`crate::authorization::AuthorizationRequest`], because these two parameters exist only under
-    /// this feature while that type is on every authorization request in every build. The cost of
-    /// the choice is that a host driving the library directly calls this as well; [`crate::http`]
-    /// does it for a host that uses the router.
+    /// This is a CONVENIENCE over [`AuthenticationRequirement::from_request`], for a host that
+    /// holds query pairs and nothing else. It is not what this crate's own endpoints use: they
+    /// build the requirement from the RESOLVED request, because for an RFC 9126 pushed request or
+    /// an RFC 9101 signed one the query is not where these parameters live, and reading it anyway
+    /// both drops the ones that were sent and honours ones that were not.
     ///
     /// A repeated parameter keeps the FIRST occurrence, matching `from_pairs` and for the same
     /// reason: RFC 6749 section 3.1 says a parameter MUST NOT appear more than once, and last-wins
@@ -267,40 +267,62 @@ impl AuthenticationRequirement {
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let mut out = AuthenticationRequirement::none();
-        let mut seen_acr = false;
-        let mut seen_max_age = false;
+        let mut acr_values = None;
+        let mut max_age = None;
         for (k, v) in pairs {
             match k.as_ref() {
-                "acr_values" if !seen_acr => {
-                    seen_acr = true;
-                    let raw = v.as_ref();
-                    // One pass to size the list and one to fill it: `acr_values` is a short
-                    // space-delimited list, and counting separators is cheaper than the reallocation
-                    // a growing `Vec` would do on the way to the same answer.
-                    out.acr_values =
-                        Vec::with_capacity(raw.bytes().filter(|b| *b == b' ').count() + 1);
-                    out.acr_values.extend(
-                        raw.split(' ')
-                            .filter(|s| !s.is_empty())
-                            .map(Box::<str>::from),
-                    );
-                }
-                "max_age" if !seen_max_age => {
-                    seen_max_age = true;
-                    // Refused rather than ignored. OpenID Connect Core section 3.1.2.1 makes this
-                    // the "Maximum Authentication Age... Specified as the number of seconds", so a
-                    // value that is not that is not a weaker request, it is an unintelligible one,
-                    // and treating it as absent would answer a step-up challenge with a token that
-                    // never had the freshness the resource server asked for.
-                    let secs: u64 = v.as_ref().parse().map_err(|_| {
-                        ErrorResponse::new(ErrorCode::InvalidRequest)
-                            .with_description("max_age must be a non-negative number of seconds")
-                    })?;
-                    out.max_age = Some(Duration::from_secs(secs));
-                }
+                "acr_values" if acr_values.is_none() => acr_values = Some(v),
+                "max_age" if max_age.is_none() => max_age = Some(v),
                 _ => {}
             }
+        }
+        AuthenticationRequirement::from_raw(
+            acr_values.as_ref().map(AsRef::as_ref),
+            max_age.as_ref().map(AsRef::as_ref),
+        )
+    }
+
+    /// The requirement an already-resolved authorization request carries.
+    ///
+    /// THE one source of these two parameters for every path into the authorization endpoint. A
+    /// plain RFC 6749 request populated the fields from its query, an RFC 9126 pushed request from
+    /// the record it stored at push time, and an RFC 9101 signed request from the claims inside
+    /// the signature; each of the three is the only text that path is allowed to trust, and this
+    /// reads whichever one it was handed.
+    pub fn from_request(
+        request: &crate::authorization::AuthorizationRequest<'_>,
+    ) -> Result<Self, ErrorResponse> {
+        AuthenticationRequirement::from_raw(
+            request.acr_values.as_deref(),
+            request.max_age.as_deref(),
+        )
+    }
+
+    /// The parse itself, over the two raw parameter values.
+    fn from_raw(acr_values: Option<&str>, max_age: Option<&str>) -> Result<Self, ErrorResponse> {
+        let mut out = AuthenticationRequirement::none();
+        if let Some(raw) = acr_values {
+            // One pass to size the list and one to fill it: `acr_values` is a short
+            // space-delimited list, and counting separators is cheaper than the reallocation
+            // a growing `Vec` would do on the way to the same answer.
+            out.acr_values = Vec::with_capacity(raw.bytes().filter(|b| *b == b' ').count() + 1);
+            out.acr_values.extend(
+                raw.split(' ')
+                    .filter(|s| !s.is_empty())
+                    .map(Box::<str>::from),
+            );
+        }
+        if let Some(raw) = max_age {
+            // Refused rather than ignored. OpenID Connect Core section 3.1.2.1 makes this
+            // the "Maximum Authentication Age... Specified as the number of seconds", so a
+            // value that is not that is not a weaker request, it is an unintelligible one,
+            // and treating it as absent would answer a step-up challenge with a token that
+            // never had the freshness the resource server asked for.
+            let secs: u64 = raw.parse().map_err(|_| {
+                ErrorResponse::new(ErrorCode::InvalidRequest)
+                    .with_description("max_age must be a non-negative number of seconds")
+            })?;
+            out.max_age = Some(Duration::from_secs(secs));
         }
         Ok(out)
     }

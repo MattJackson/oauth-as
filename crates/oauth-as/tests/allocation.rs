@@ -476,6 +476,10 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
             state: Some("s".into()),
             code_challenge: Some(challenge.into()),
             code_challenge_method: Some("S256".into()),
+            #[cfg(feature = "consent")]
+            acr_values: None,
+            #[cfg(feature = "consent")]
+            max_age: None,
         };
         let validated = srv.validate_authorization_request(&req).await.unwrap();
         let response = srv
@@ -529,6 +533,10 @@ fn refresh_rotation_hot_path_allocation_bound() {
             state: Some("s".into()),
             code_challenge: Some(challenge.into()),
             code_challenge_method: Some("S256".into()),
+            #[cfg(feature = "consent")]
+            acr_values: None,
+            #[cfg(feature = "consent")]
+            max_age: None,
         };
         let validated = srv.validate_authorization_request(&req).await.unwrap();
         let response = srv

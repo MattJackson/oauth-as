@@ -64,6 +64,10 @@ fn a_stored_handle_is_not_printed_by_debug() {
         code_challenge_method: Some("S256".to_string()),
         #[cfg(feature = "rar")]
         authorization_details: None,
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
         resource: vec!["https://rs.example".to_string()],
         expires_at: std::time::SystemTime::UNIX_EPOCH,
     };
@@ -94,6 +98,10 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
         code_challenge_method: Some("S256".to_string()),
         #[cfg(feature = "rar")]
         authorization_details: None,
+        #[cfg(feature = "consent")]
+        acr_values: Some("urn:acr:phr urn:acr:mfa".to_string()),
+        #[cfg(feature = "consent")]
+        max_age: Some("0".to_string()),
         resource: vec![
             "https://rs.example/a".to_string(),
             "https://rs.example/b".to_string(),
@@ -112,6 +120,17 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
     assert_eq!(request.code_challenge.as_deref(), Some("challenge"));
     assert_eq!(request.code_challenge_method.as_deref(), Some("S256"));
     assert_eq!(request.resource.len(), 2);
+    // RFC 9470 s4. These two are the join's whole reason for existing as a test: they were absent
+    // from this record entirely, so every pushed request resolved to a request asking for no
+    // step-up, whatever the client had pushed.
+    #[cfg(feature = "consent")]
+    {
+        assert_eq!(
+            request.acr_values.as_deref(),
+            Some("urn:acr:phr urn:acr:mfa")
+        );
+        assert_eq!(request.max_age.as_deref(), Some("0"));
+    }
 }
 
 // ------------------------------------------------------------------------------- RFC 9101

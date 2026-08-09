@@ -361,6 +361,10 @@ async fn mint_refresh_token(
         state: Some("s".into()),
         code_challenge: Some(challenge.into()),
         code_challenge_method: Some("S256".into()),
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
     };
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let code = srv

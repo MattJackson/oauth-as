@@ -1814,26 +1814,6 @@ async fn authorize_handler<S: Storage, C: Clock>(
     // consent seam this endpoint would mint a code on any cross-site top-level navigation a
     // logged-in user's browser is made to follow, so an unwired host refuses. This is a direct
     // 403 for the same reason as the missing subject above: no user refused, none was asked.
-    // RFC 9470 s4: `acr_values` and `max_age`, read off the same query pairs the request came
-    // from. A malformed `max_age` is redirectable rather than direct, because by here the redirect
-    // URI has been validated (RFC 6749 s4.1.2.1) and the client is the party that sent it.
-    #[cfg(feature = "consent")]
-    let requirement = match crate::consent::AuthenticationRequirement::from_pairs(
-        pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            return redirect(
-                crate::authorization::AuthorizationErrorRedirect {
-                    redirect_uri: validated.redirect_uri.clone(),
-                    error: e,
-                    state: validated.state.clone(),
-                    iss: validated.issuer.clone(),
-                }
-                .location(),
-            )
-        }
-    };
 
     // What this user has already granted this client, handed to the resolver below. A storage
     // failure reads as "nothing remembered", which makes the host ask again: the failure mode of
@@ -1881,13 +1861,18 @@ async fn authorize_handler<S: Storage, C: Clock>(
     // be enforced against. An unwired host reports `None`, which satisfies no requirement.
     #[cfg(feature = "consent")]
     let authentication = state.authentication.as_ref().and_then(|f| f(&headers));
+    // The requirement comes off the RESOLVED request, not off `pairs`. For a PAR or JAR request the
+    // query holds only `client_id` plus the handle or the object, so reading `pairs` here dropped
+    // `acr_values` and `max_age` entirely and silently disabled step-up for both (RFC 9126 s4, RFC
+    // 9101 s6.3). A malformed `max_age` is now refused during validation, on the same redirect the
+    // rest of the redirectable checks use.
     #[cfg(feature = "consent")]
     let issued = state
         .server
         .issue_authorization_code_with_authentication(
             &validated,
             subject.clone(),
-            &requirement,
+            &validated.authentication_requirement,
             authentication.as_ref(),
         )
         .await;

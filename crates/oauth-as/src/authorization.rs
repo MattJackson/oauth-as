@@ -95,6 +95,27 @@ pub struct AuthorizationRequest<'a> {
     /// validated form carries the result.
     #[cfg(feature = "rar")]
     pub authorization_details: Option<Cow<'a, str>>,
+    /// RFC 9470 section 4 / OpenID Connect Core section 3.1.2.1 `acr_values`: the authentication
+    /// context classes the client will accept, space delimited, in order of preference.
+    ///
+    /// ON THIS TYPE rather than parsed straight off the query, and that is the whole of the fix
+    /// for a real gap. Every way into the authorization endpoint (a plain query, an RFC 9126
+    /// pushed request, an RFC 9101 signed request object) funnels through this struct, so a
+    /// parameter that lives here is a parameter every path must carry; a parameter parsed
+    /// separately from the query is a parameter the other two paths silently drop. That is exactly
+    /// what happened to these two: PAR and JAR requests disabled step-up entirely, and for JAR the
+    /// server was reading intermediary-rewritable query text on a request whose only purpose is
+    /// that it cannot be rewritten (RFC 9101 section 6.3).
+    ///
+    /// RAW TEXT for the same reason as the rest of this type, and parsed into
+    /// [`crate::consent::AuthenticationRequirement`] by validation.
+    #[cfg(feature = "consent")]
+    pub acr_values: Option<Cow<'a, str>>,
+    /// RFC 9470 section 4 / OpenID Connect Core section 3.1.2.1 `max_age`: how old the user's
+    /// authentication may be, in seconds. See [`AuthorizationRequest::acr_values`] for why it is
+    /// a field here rather than something read off the query.
+    #[cfg(feature = "consent")]
+    pub max_age: Option<Cow<'a, str>>,
 }
 
 impl<'a> AuthorizationRequest<'a> {
@@ -128,6 +149,10 @@ impl<'a> AuthorizationRequest<'a> {
                 "code_challenge_method" => &mut req.code_challenge_method,
                 #[cfg(feature = "rar")]
                 "authorization_details" => &mut req.authorization_details,
+                #[cfg(feature = "consent")]
+                "acr_values" => &mut req.acr_values,
+                #[cfg(feature = "consent")]
+                "max_age" => &mut req.max_age,
                 _ => continue,
             };
             if slot.is_none() {
@@ -227,6 +252,17 @@ pub struct ValidatedAuthorizationRequest {
     /// which is how an AS records the account the user actually picked.
     #[cfg(feature = "rar")]
     pub authorization_details: crate::rar::AuthorizationDetails,
+    /// The RFC 9470 step-up requirement this request carried, already parsed.
+    ///
+    /// It rides on the VALIDATED request so that there is exactly ONE source of it per path, and
+    /// that source is the request that was actually resolved: the pushed record for a PAR request,
+    /// the signed claim set for a JAR request, the query for a plain one. Anything that reads the
+    /// query separately is reading the wrong thing for two of the three (RFC 9126 section 4, RFC
+    /// 9101 section 6.3).
+    ///
+    /// Empty means the client asked for no step-up, which is what an ordinary request carries.
+    #[cfg(feature = "consent")]
+    pub authentication_requirement: crate::consent::AuthenticationRequirement,
     /// Zero-sized witness, private to this module. Its only purpose is that it cannot be named
     /// (let alone constructed) outside `authorization.rs`, so a struct-literal expression cannot
     /// build a whole `ValidatedAuthorizationRequest` from anywhere else, in this crate or out of
@@ -271,8 +307,23 @@ impl ValidatedAuthorizationRequest {
             resource,
             #[cfg(feature = "rar")]
             authorization_details: crate::rar::AuthorizationDetails::none(),
+            #[cfg(feature = "consent")]
+            authentication_requirement: crate::consent::AuthenticationRequirement::none(),
             _sealed: Sealed,
         }
+    }
+
+    /// Record the RFC 9470 step-up requirement this request was validated as carrying.
+    ///
+    /// `pub(crate)` for the reason [`ValidatedAuthorizationRequest::set_authorization_details`]
+    /// is: a public setter for the field that decides whether a code may be minted at all would
+    /// hand back exactly what the sealed field exists to keep.
+    #[cfg(feature = "consent")]
+    pub(crate) fn set_authentication_requirement(
+        &mut self,
+        requirement: crate::consent::AuthenticationRequirement,
+    ) {
+        self.authentication_requirement = requirement;
     }
 
     /// Record the RFC 9396 authorization details this request was validated as carrying.

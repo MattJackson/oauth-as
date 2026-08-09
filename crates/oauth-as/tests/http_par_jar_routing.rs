@@ -508,6 +508,13 @@ async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
 /// Sign a request object as the client would (RFC 9101 section 6.1, ES256 compact JWS).
 #[cfg(feature = "jar")]
 fn request_object(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str) -> String {
+    request_object_with(key, issuer, "")
+}
+
+/// The same object with `extra` spliced in before the closing brace, so a test can sign a claim
+/// the base object does not carry. `extra` is raw JSON and must begin with its own comma.
+#[cfg(feature = "jar")]
+fn request_object_with(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str, extra: &str) -> String {
     let header = format!(
         r#"{{"alg":"ES256","typ":"{}","kid":"{}"}}"#,
         oauth_as::par::REQUEST_OBJECT_TYP,
@@ -516,7 +523,7 @@ fn request_object(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str) -> String {
     let payload = format!(
         r#"{{"iss":"{CONFIDENTIAL_ID}","aud":"{issuer}","client_id":"{CONFIDENTIAL_ID}",
             "response_type":"code","redirect_uri":"{REDIRECT_URI}","scope":"read","state":"jarstate",
-            "code_challenge":"{CHALLENGE}","code_challenge_method":"S256"}}"#
+            "code_challenge":"{CHALLENGE}","code_challenge_method":"S256"{extra}}}"#
     );
     oauth_as::jwt::compact_jws(header.as_bytes(), payload.as_bytes(), |signing_input| {
         key.sign_signing_input(signing_input)
@@ -582,4 +589,172 @@ async fn request_and_request_uri_together_are_refused() {
 
     assert_ne!(resp.status, 302, "one of the two was silently preferred");
     assert_eq!(resp.json()["error"], "invalid_request");
+}
+
+// ---------------------------------------------------------------------------------------------
+// RFC 9470 step-up: the two parameters that decide whether a code may be minted at all
+// ---------------------------------------------------------------------------------------------
+
+/// THE ATTACK. A resource server refuses a call with `insufficient_user_authentication` and
+/// `max_age="0"`, so the client does exactly what RFC 9470 section 4 tells it to: it re-asks for
+/// authorization with `max_age=0`, and because this deployment uses PAR it pushes that to the PAR
+/// endpoint. If the two step-up parameters do not survive the push, the requirement at the
+/// authorization endpoint is empty, `satisfied_by` has nothing to check, and a code is minted
+/// against whatever session the browser already had: the user is never asked to re-authenticate,
+/// and the resource server is handed a token that claims a freshness it does not have.
+///
+/// This host wires no authentication reporter, so it reports NOTHING, which satisfies no non-empty
+/// requirement. That is the correct answer here: the refusal is what proves the parameter arrived.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_pushed_max_age_still_has_to_be_satisfied_before_a_code_is_minted() {
+    let addr = start(false).await;
+    let path = par_path(addr).await;
+    let pushed = request(
+        addr,
+        "POST",
+        &path,
+        &[("Authorization", &basic())],
+        Some(&format!(
+            "{}&max_age=0&acr_values=urn%3Aacr%3Aphr",
+            push_body()
+        )),
+    )
+    .await;
+    assert_eq!(pushed.status, 201, "body was {:?}", pushed.body);
+    let request_uri = pushed.json()["request_uri"]
+        .as_str()
+        .expect("request_uri")
+        .to_string();
+    let encoded = request_uri.replace(':', "%3A");
+
+    // RFC 9126 s4: only the pushed parameters count, so the query carries nothing but the handle,
+    // exactly as a conforming client sends it.
+    let authorized = request(
+        addr,
+        "GET",
+        &format!("/authorize?client_id={CONFIDENTIAL_ID}&request_uri={encoded}"),
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(authorized.status, 302, "body was {:?}", authorized.body);
+    let location = authorized.header("location").expect("Location");
+    assert!(
+        !location.contains("code="),
+        "the pushed max_age was dropped, so a code was minted against an unchecked session: \
+         {location}"
+    );
+    assert!(
+        location.contains("error=insufficient_user_authentication"),
+        "RFC 9470 s3 is the answer to an unsatisfied step-up request: {location}"
+    );
+}
+
+/// The other half of RFC 9126 section 4, and of RFC 9101 section 6.3 which it builds on: a
+/// parameter in the QUERY alongside a `request_uri` counts for nothing, INCLUDING these two. A
+/// server that read `max_age` off the query would let anything that can rewrite the browser's URL
+/// (which is the threat PAR exists to remove) force a re-authentication prompt on every request,
+/// and, in the mirror case, would be reading the one part of a PAR request that an intermediary
+/// can still touch.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_max_age_in_the_query_beside_a_request_uri_is_ignored() {
+    let addr = start(false).await;
+    let path = par_path(addr).await;
+    let pushed = request(
+        addr,
+        "POST",
+        &path,
+        &[("Authorization", &basic())],
+        Some(&push_body()),
+    )
+    .await;
+    assert_eq!(pushed.status, 201, "body was {:?}", pushed.body);
+    let request_uri = pushed.json()["request_uri"]
+        .as_str()
+        .expect("request_uri")
+        .to_string();
+    let encoded = request_uri.replace(':', "%3A");
+
+    let authorized = request(
+        addr,
+        "GET",
+        &format!("/authorize?client_id={CONFIDENTIAL_ID}&request_uri={encoded}&max_age=0"),
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(authorized.status, 302, "body was {:?}", authorized.body);
+    let location = authorized.header("location").expect("Location");
+    assert!(
+        location.contains("code="),
+        "nothing was pushed asking for a step-up, so the query's max_age must not have created \
+         one: {location}"
+    );
+}
+
+/// RFC 9101 section 6.3, on the two parameters where reading the query instead of the object is
+/// worst: the whole point of a signed request object is that an intermediary cannot rewrite it,
+/// and `max_age` read off the unsigned query is a `max_age` an intermediary CAN rewrite. A client
+/// answering a step-up challenge puts it inside the object (section 4); a server that looks only
+/// at the query never sees it.
+#[cfg(all(feature = "jar", feature = "consent"))]
+#[tokio::test]
+async fn a_max_age_inside_the_signed_object_is_the_one_that_counts() {
+    let (addr, key) = start_jar().await;
+    let object = request_object_with(
+        &key,
+        &format!("http://{addr}"),
+        r#","max_age":0,"acr_values":"urn:acr:phr""#,
+    );
+
+    let resp = request(
+        addr,
+        "GET",
+        &format!("/authorize?client_id={CONFIDENTIAL_ID}&request={object}"),
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(resp.status, 302, "body was {:?}", resp.body);
+    let location = resp.header("location").expect("Location");
+    assert!(
+        !location.contains("code="),
+        "the signed max_age was ignored and a code was minted anyway: {location}"
+    );
+    assert!(
+        location.contains("error=insufficient_user_authentication"),
+        "RFC 9470 s3 is the answer to an unsatisfied step-up request: {location}"
+    );
+}
+
+/// The mirror: a `max_age` an intermediary APPENDED to the query of a JAR request counts for
+/// nothing, because RFC 9101 section 6.3 says the server MUST use only the object's parameters
+/// "even if the same parameter is provided in the query parameter".
+#[cfg(all(feature = "jar", feature = "consent"))]
+#[tokio::test]
+async fn a_max_age_appended_to_the_query_of_a_signed_request_is_ignored() {
+    let (addr, key) = start_jar().await;
+    let object = request_object(&key, &format!("http://{addr}"));
+
+    let resp = request(
+        addr,
+        "GET",
+        &format!("/authorize?client_id={CONFIDENTIAL_ID}&request={object}&max_age=0"),
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(resp.status, 302, "body was {:?}", resp.body);
+    let location = resp.header("location").expect("Location");
+    assert!(
+        location.contains("code="),
+        "the signed object asked for no step-up, so the query must not have created one: \
+         {location}"
+    );
 }

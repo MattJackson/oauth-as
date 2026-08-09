@@ -368,6 +368,10 @@ async fn deleting_a_registration_invalidates_everything_it_was_issued() {
         state: Some("s".into()),
         code_challenge: Some(challenge.clone().into()),
         code_challenge_method: Some("S256".into()),
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
     };
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let issued = srv

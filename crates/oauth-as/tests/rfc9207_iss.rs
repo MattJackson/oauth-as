@@ -41,6 +41,10 @@ fn good_request(challenge: &str) -> AuthorizationRequest<'static> {
         state: Some("opaque-state".into()),
         code_challenge: Some(challenge.to_string().into()),
         code_challenge_method: Some("S256".into()),
+        #[cfg(feature = "consent")]
+        acr_values: None,
+        #[cfg(feature = "consent")]
+        max_age: None,
         ..Default::default()
     }
 }

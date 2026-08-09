@@ -193,6 +193,21 @@ pub struct PushedAuthorizationRequest {
     /// RFC 9396 section 5 exists to prevent.
     #[cfg(feature = "rar")]
     pub authorization_details: Option<String>,
+    /// RFC 9470 section 4 `acr_values`, as pushed.
+    #[cfg(feature = "consent")]
+    pub acr_values: Option<String>,
+    /// RFC 9470 section 4 `max_age`, as pushed: the raw seconds text, parsed by the same
+    /// validation the query path uses so a malformed value is refused HERE, at push time, which
+    /// is what RFC 9126 section 2.1 means by processing the request as if it had been sent
+    /// directly to the authorization endpoint.
+    ///
+    /// Stored for the reason `authorization_details` above is: this record IS the request the
+    /// authorization endpoint later reads. Dropping these two did not merely lose a preference,
+    /// it disabled RFC 9470 step-up for every PAR deployment, so a client answering an
+    /// `insufficient_user_authentication` challenge with `max_age=0` got a code minted against
+    /// the session it was told to replace.
+    #[cfg(feature = "consent")]
+    pub max_age: Option<String>,
     /// When the handle dies. RFC 9126 section 4: an expired `request_uri` MUST be rejected.
     pub expires_at: std::time::SystemTime,
 }
@@ -212,6 +227,9 @@ impl std::fmt::Debug for PushedAuthorizationRequest {
             .field("resource", &self.resource);
         #[cfg(feature = "rar")]
         out.field("authorization_details", &self.authorization_details);
+        #[cfg(feature = "consent")]
+        out.field("acr_values", &self.acr_values)
+            .field("max_age", &self.max_age);
         out.field("expires_at", &self.expires_at).finish()
     }
 }
@@ -233,6 +251,10 @@ impl PushedAuthorizationRequest {
             resource: self.resource.iter().map(|r| r.as_str().into()).collect(),
             #[cfg(feature = "rar")]
             authorization_details: self.authorization_details.as_deref().map(Into::into),
+            #[cfg(feature = "consent")]
+            acr_values: self.acr_values.as_deref().map(Into::into),
+            #[cfg(feature = "consent")]
+            max_age: self.max_age.as_deref().map(Into::into),
         }
     }
 }
@@ -440,6 +462,10 @@ struct RequestObjectClaims {
     resource: Vec<String>,
     #[cfg(feature = "rar")]
     authorization_details: Option<String>,
+    #[cfg(feature = "consent")]
+    acr_values: Option<String>,
+    #[cfg(feature = "consent")]
+    max_age: Option<String>,
 }
 
 #[cfg(feature = "jar")]
@@ -456,6 +482,10 @@ impl RequestObjectClaims {
             resource: self.resource.iter().map(|r| r.as_str().into()).collect(),
             #[cfg(feature = "rar")]
             authorization_details: self.authorization_details.as_deref().map(Into::into),
+            #[cfg(feature = "consent")]
+            acr_values: self.acr_values.as_deref().map(Into::into),
+            #[cfg(feature = "consent")]
+            max_age: self.max_age.as_deref().map(Into::into),
         }
     }
 }
@@ -677,6 +707,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             resource: request.resource.iter().map(|r| r.to_string()).collect(),
             #[cfg(feature = "rar")]
             authorization_details: request.authorization_details.as_deref().map(str::to_string),
+            #[cfg(feature = "consent")]
+            acr_values: request.acr_values.as_deref().map(str::to_string),
+            #[cfg(feature = "consent")]
+            max_age: request.max_age.as_deref().map(str::to_string),
             expires_at: now + ttl,
         };
         self.store()
@@ -997,6 +1031,38 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 Some(_) => {
                     return Err(invalid_request_object(
                         "the authorization_details claim must be a JSON array",
+                    ))
+                }
+            },
+            // RFC 9470 s4, from INSIDE the signature. A client answering a step-up challenge puts
+            // these in the request object (RFC 9101 s4), and s6.3 requires the server to use only
+            // the object's parameters "even if the same parameter is provided in the query
+            // parameter". Reading the query for these two instead meant trusting the one part of
+            // a JAR request an intermediary can still rewrite, on a request whose entire purpose
+            // is that it cannot be.
+            #[cfg(feature = "consent")]
+            acr_values: string_claim(claims, "acr_values")?,
+            // `max_age` is the one exception to the JSON-string rule above, and OpenID Connect
+            // Core section 6.1's own worked example is why: it shows `"max_age": 86400`, a JSON
+            // NUMBER, in a request object. Refusing that would refuse the conforming client this
+            // parameter exists for, so a non-negative integer is accepted and normalised to the
+            // decimal text the rest of this crate parses. A fractional or negative number is not
+            // "the number of seconds" (OpenID Connect Core s3.1.2.1) and is refused.
+            #[cfg(feature = "consent")]
+            max_age: match claims.get("max_age") {
+                None => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                    Some(secs) => Some(secs.to_string()),
+                    None => {
+                        return Err(invalid_request_object(
+                            "the max_age claim must be a non-negative number of seconds",
+                        ))
+                    }
+                },
+                Some(_) => {
+                    return Err(invalid_request_object(
+                        "the max_age claim must be a JSON string or number",
                     ))
                 }
             },
