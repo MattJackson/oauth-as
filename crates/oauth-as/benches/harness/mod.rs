@@ -254,6 +254,79 @@ impl Bench {
         self.rows.push(summarize(name, means, iters));
     }
 
+    /// Measure several variants of the SAME operation INTERLEAVED, one after another inside every
+    /// round, with the starting variant rotated per round.
+    ///
+    /// This exists because [`Bench::bench_fast`] measures each row to completion before starting
+    /// the next, and that is the wrong shape for the one question where the answer is a DIFFERENCE
+    /// between rows rather than the rows themselves. Over the seconds it takes to measure four
+    /// variants in sequence, a laptop changes CPU frequency, warms up, and picks up and drops
+    /// background work. That drift lands entirely on whichever variant happened to be measured
+    /// during it, and comes out looking exactly like a timing oracle. It DID: the same
+    /// constant-time probe reported "not distinguishable" and "DISTINGUISHABLE" on consecutive
+    /// runs of an otherwise identical binary, which is a probe reporting on the machine rather
+    /// than on the code.
+    ///
+    /// Interleaving fixes the confound rather than papering over it with a wider threshold: every
+    /// variant is sampled inside every round, adjacent in time, so drift is shared by all of them
+    /// and cancels out of the difference. Rotating which variant goes first removes the residual
+    /// bias from whatever the first sample of a round pays (a cold branch predictor, a reloaded
+    /// cache line) always landing on the same one.
+    ///
+    /// `body(i)` must run variant `i`. Variants MUST do the same amount of work by design; that is
+    /// the hypothesis under test.
+    pub fn bench_interleaved<T, F>(&mut self, names: &[&str], mut body: F)
+    where
+        F: FnMut(usize) -> T,
+    {
+        let k = names.len();
+        if k == 0 || !names.iter().any(|n| self.selected(n)) {
+            return;
+        }
+        if self.list_only {
+            for n in names {
+                println!("{n}: bench");
+            }
+            return;
+        }
+
+        let probe_start = Instant::now();
+        black_box(body(0));
+        let probe = probe_start.elapsed().max(Duration::from_nanos(1));
+        let iters = (ROUND_TARGET.as_nanos() / probe.as_nanos().max(1) / k as u128)
+            .max(1)
+            .min(MAX_ITERS as u128) as u64;
+
+        let warm_start = Instant::now();
+        while warm_start.elapsed() < WARMUP {
+            for v in 0..k {
+                for _ in 0..iters {
+                    black_box(body(v));
+                }
+            }
+        }
+
+        let mut means: Vec<Vec<f64>> = vec![Vec::with_capacity(ROUNDS); k];
+        for round in 0..ROUNDS {
+            for step in 0..k {
+                // Rotate the starting variant per round.
+                let v = (round + step) % k;
+                let start = Instant::now();
+                for _ in 0..iters {
+                    black_box(body(v));
+                }
+                means[v].push(start.elapsed().as_secs_f64() / iters as f64);
+            }
+        }
+
+        for (v, name) in names.iter().enumerate() {
+            if self.selected(name) {
+                self.rows
+                    .push(summarize(name, std::mem::take(&mut means[v]), iters));
+            }
+        }
+    }
+
     /// Look a measured row back up by name, for a bench target that wants to COMPARE two rows
     /// (the constant-time gate does this) rather than only print them.
     pub fn row(&self, name: &str) -> Option<&Row> {

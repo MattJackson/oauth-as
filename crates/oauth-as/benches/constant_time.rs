@@ -115,16 +115,22 @@ fn main() {
         let middle = differing_at(16);
         let last = differing_at(SECRET.len() - 1);
 
-        b.bench_fast("client_secret_correct", || auth.verify(Some(SECRET)));
-        b.bench_fast("client_secret_differs_at_byte_0", || {
-            auth.verify(Some(first.as_str()))
-        });
-        b.bench_fast("client_secret_differs_at_byte_16", || {
-            auth.verify(Some(middle.as_str()))
-        });
-        b.bench_fast("client_secret_differs_at_byte_31", || {
-            auth.verify(Some(last.as_str()))
-        });
+        // INTERLEAVED, not four rows measured one after another: see
+        // `harness::Bench::bench_interleaved`. Measuring them in sequence made this probe report
+        // "not distinguishable" and "DISTINGUISHABLE" on consecutive runs of the same binary,
+        // because several seconds of CPU frequency drift landed on whichever variant was being
+        // measured at the time. A probe that answers differently each run has not measured the
+        // code, and a security verdict is the last place to accept that.
+        let presented = [SECRET, first.as_str(), middle.as_str(), last.as_str()];
+        b.bench_interleaved(
+            &[
+                "client_secret_correct",
+                "client_secret_differs_at_byte_0",
+                "client_secret_differs_at_byte_16",
+                "client_secret_differs_at_byte_31",
+            ],
+            |i| auth.verify(Some(presented[i])),
+        );
     }
 
     // --------------------------------------------------------------- RFC 7636 code verifier
@@ -144,15 +150,15 @@ fn main() {
         let near = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXA";
         let far = "ZBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
-        b.bench_fast("pkce_verifier_correct", || {
-            oauth_as::pkce::verify_s256(real, &challenge)
-        });
-        b.bench_fast("pkce_verifier_differs_in_last_char", || {
-            oauth_as::pkce::verify_s256(near, &challenge)
-        });
-        b.bench_fast("pkce_verifier_differs_in_first_char", || {
-            oauth_as::pkce::verify_s256(far, &challenge)
-        });
+        let presented = [real, near, far];
+        b.bench_interleaved(
+            &[
+                "pkce_verifier_correct",
+                "pkce_verifier_differs_in_last_char",
+                "pkce_verifier_differs_in_first_char",
+            ],
+            |i| oauth_as::pkce::verify_s256(presented[i], &challenge),
+        );
     }
 
     // ------------------------------------------------------------------------ a control row
@@ -161,10 +167,17 @@ fn main() {
     // the same run, so that a reader can see this file is capable of reporting a difference at all.
     // Without it, "no difference detected" is indistinguishable from "the probe does not work".
     {
-        let short = "read";
-        let long = "read write admin openid profile email offline_access";
-        b.bench_fast("control_scope_parse_1_token", || ScopeSet::parse(short));
-        b.bench_fast("control_scope_parse_7_tokens", || ScopeSet::parse(long));
+        let inputs = [
+            "read",
+            "read write admin openid profile email offline_access",
+        ];
+        b.bench_interleaved(
+            &[
+                "control_scope_parse_1_token",
+                "control_scope_parse_7_tokens",
+            ],
+            |i| ScopeSet::parse(inputs[i]),
+        );
     }
 
     b.finish();

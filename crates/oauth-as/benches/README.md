@@ -82,6 +82,15 @@ Read this before quoting any figure anywhere.
    verdict means no oracle was visible from user space, on one machine, at roughly nanosecond
    resolution. It is not a side-channel audit. Read that target's module docs before citing it.
 
+   That target measures its variants INTERLEAVED (see `harness::Bench::bench_interleaved`), one
+   sample of each inside every round with the starting variant rotated. It has to. Measured
+   sequentially it reported "not distinguishable" and "DISTINGUISHABLE" on consecutive runs of the
+   same binary, because several seconds of CPU frequency drift landed on whichever variant was
+   under the clock at the time. Interleaved, the four client-secret rows land on the same
+   nanosecond with 0.2% spread, and they do so on every run. If you add a comparison of near-equal
+   rows anywhere else in this suite, interleave it too; sequential measurement is fine for
+   reporting a cost and is not fine for reporting a difference.
+
 ## Why there is no criterion, and no divan
 
 MEASURED, not preferred. Both break `cargo +1.75 test -p oauth-as --locked`, which is `GOAL.md`
