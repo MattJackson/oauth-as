@@ -286,12 +286,21 @@ pub struct AccessTokenClaims {
         skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty"
     )]
     pub authorization_details: crate::rar::AuthorizationDetails,
-    /// RFC 7800 `cnf`, which RFC 9068 section 2.2.1 lists as a claim an access token MAY
-    /// carry: how this token is sender constrained. RFC 8705 section 3.1 puts the
-    /// certificate thumbprint here, and a resource server that validates the JWT itself can
-    /// then check the binding without calling introspection at all. Absent for an ordinary
-    /// bearer token, and absent from the claim set entirely in a build without the feature.
-    #[cfg(feature = "mtls")]
+    /// RFC 7800 `cnf`, which RFC 9068 section 2.2.1 lists as the claim carrying how a token is
+    /// sender constrained. RFC 9449 section 6.1 puts the DPoP key thumbprint here as `jkt` and
+    /// RFC 8705 section 3.1 puts the certificate thumbprint here as `x5t#S256`.
+    ///
+    /// Gated on EITHER mechanism, and this is load bearing rather than tidiness. RFC 9449
+    /// section 6 requires that a resource server be able to "reliably identify whether an access
+    /// token is DPoP-bound"; for a signed token verified locally, this claim is the only thing
+    /// that says so. Gated on `mtls` alone, a `jwt` + `dpop` build (which is the deployment DPoP
+    /// exists for: resource servers verifying signatures rather than calling introspection) issued
+    /// tokens whose binding was invisible, so a leaked token was accepted as a plain bearer token
+    /// by the servers least able to notice.
+    ///
+    /// Absent for an ordinary bearer token, and absent from the claim set entirely in a build with
+    /// neither mechanism.
+    #[cfg(any(feature = "dpop", feature = "mtls"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cnf: Option<crate::token::Confirmation>,
 }

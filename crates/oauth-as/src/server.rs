@@ -1074,14 +1074,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // so, in a form the resource server can check for itself.
             #[cfg(feature = "rar")]
             authorization_details: details.clone().into_details(),
-            // RFC 8705 s3.1: the same binding the AS-side record carries, in the form a
-            // resource server can check for itself without calling introspection at all.
-            #[cfg(feature = "mtls")]
-            cnf: bound.cred.certificate.map(|c| crate::token::Confirmation {
-                #[cfg(feature = "dpop")]
-                jkt: None,
-                x5t_s256: Some(*c.thumbprint()),
-            }),
+            // EVERY binding the AS-side record carries, in the form a resource server can check
+            // for itself without calling introspection at all. RFC 9449 s6.1 for `jkt`, RFC 8705
+            // s3.1 for `x5t#S256`, built the same way introspection builds it so the two can never
+            // disagree about what a token is bound to.
+            #[cfg(any(feature = "dpop", feature = "mtls"))]
+            cnf: {
+                let cnf = crate::token::Confirmation {
+                    #[cfg(feature = "dpop")]
+                    jkt: bound.jkt.map(str::to_string),
+                    #[cfg(feature = "mtls")]
+                    x5t_s256: bound.cred.certificate.map(|c| *c.thumbprint()),
+                };
+                (!cnf.is_empty()).then_some(cnf)
+            },
         };
         jwt.sign_access_token(&claims).map_err(|e| {
             // The host sees the real error through its own logging of the config it supplied; the

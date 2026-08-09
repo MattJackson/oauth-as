@@ -7,12 +7,20 @@
 //! actually buys with it: that a token issued against a proof is BOUND to that key and says so, on
 //! the wire and at introspection; that a captured proof cannot be spent twice; and that the binding
 //! survives refresh, which is the difference between DPoP being real and being decorative.
+//!
+//! It also asserts the binding in the SIGNED TOKEN's own claim set, not only through introspection.
+//! Those are two different oracles for the same fact and only one of them is available to a
+//! resource server that verifies an RFC 9068 JWT locally, which is the deployment DPoP is for; a
+//! suite that checks only introspection cannot see a `cnf` that never reached the JWT at all.
 #![cfg(feature = "dpop")]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+
 use oauth_as::dpop::htu_of;
-use oauth_as::jwt::{compact_jws, EcdsaP256Key};
+use oauth_as::jwt::{compact_jws, AccessTokenFormat, EcdsaP256Key, JwtConfig};
 use oauth_as::{
     AuthorizationServer, AuthorizationServerMetadata, Client, ClientAuth, ClientId, ErrorCode,
     GrantType, MemoryStorage, ScopeSet, ServerConfig, Storage, TokenRequest, TokenRequestContext,
@@ -518,4 +526,132 @@ fn the_metadata_advertises_the_proof_algorithms_and_nothing_it_would_refuse() {
 #[test]
 fn htu_of_is_the_comparison_the_rfc_describes() {
     assert_eq!(htu_of("https://as.example/token?x=1#f"), TOKEN_ENDPOINT);
+}
+
+// ------------------------------------------------- the binding in the SIGNED token's claim set
+
+/// The same server, but issuing RFC 9068 signed JWTs instead of opaque tokens. This is the
+/// deployment DPoP exists for: resource servers that verify the token themselves and never call
+/// introspection, so the JWT's own claim set is the ONLY place they can learn that the token is
+/// sender constrained (RFC 9449 s6 requires them to be able to).
+fn jwt_server() -> AuthorizationServer<MemoryStorage> {
+    let mut cfg = ServerConfig::new(ISSUER, "https://as.example/device");
+    cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
+        EcdsaP256Key::generate("as-kid-1"),
+        "https://rs.example",
+    )));
+    AuthorizationServer::new(cfg, MemoryStorage::new())
+}
+
+/// The claims of a compact JWS, decoded here rather than through any of this crate's own types:
+/// the question is what a THIRD party reading the token off the wire sees.
+fn jwt_claims(token: &str) -> serde_json::Value {
+    let payload = token.split('.').nth(1).expect("compact JWS is three parts");
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+}
+
+/// RFC 9449 s6.1: a DPoP-bound access token carries `cnf.jkt`. Asserted on the JWT itself, because
+/// introspection builds its `cnf` from the stored record while the JWT builds one of its own, and
+/// a suite that only ever asked introspection could not tell the two apart. It could not, in fact:
+/// the JWT claim was gated on `mtls` alone, so a `jwt` + `dpop` build signed tokens whose binding
+/// was invisible to exactly the resource servers that verify signatures, and every test passed.
+#[tokio::test]
+async fn a_signed_access_token_carries_the_dpop_thumbprint_in_its_own_claims() {
+    let key = EcdsaP256Key::generate("device");
+    let srv = jwt_server();
+    srv.register_client(confidential_client()).await.unwrap();
+
+    let response = srv
+        .token_with_context(request(), with_proof(&proof(&key, "jwt-1")))
+        .await
+        .expect("a conforming proof yields a token");
+    assert_eq!(response.token_type, TokenType::Dpop);
+
+    let claims = jwt_claims(&response.access_token);
+    assert_eq!(
+        claims["cnf"]["jkt"],
+        serde_json::Value::String(key.to_public_jwk().thumbprint()),
+        "RFC 9449 s6.1: the signed token must name the key it is bound to, in claims {claims}"
+    );
+}
+
+/// An unbound request must NOT grow a `cnf`. RFC 7800 s3.1 makes the claim mean "this token is
+/// constrained", so an empty or spurious one asserts a constraint that nothing enforces.
+#[tokio::test]
+async fn a_signed_access_token_with_no_binding_carries_no_cnf_at_all() {
+    let srv = jwt_server();
+    srv.register_client(confidential_client()).await.unwrap();
+    let response = srv.token(request()).await.unwrap();
+    assert_eq!(response.token_type, TokenType::Bearer);
+    let claims = jwt_claims(&response.access_token);
+    assert!(
+        claims.get("cnf").is_none(),
+        "a bearer token must not claim a confirmation method, got {claims}"
+    );
+}
+
+/// RFC 9449 s6.1 and RFC 8705 s3.1 name DIFFERENT members of the SAME `cnf` claim, and a client
+/// may hold both constraints at once: mutual TLS authenticates it to this server, DPoP binds the
+/// token to a key it proves possession of at the resource server. Neither may erase the other, and
+/// the obvious `map` over one binding does exactly that to the second.
+#[cfg(feature = "mtls")]
+#[tokio::test]
+async fn a_signed_access_token_carries_both_bindings_when_the_client_holds_both() {
+    use oauth_as::{
+        CertificateThumbprint, ClientCertificate, ClientCredential, MtlsClientRegistration,
+        RegisteredCertificates,
+    };
+
+    // Stand-in DER: nothing in this crate parses a certificate (see the `mtls` module docs), so
+    // the only property it needs is to be a byte string with a known thumbprint.
+    const DER: &[u8] = b"\x30\x82\x02\x0a--the-dpop-and-mtls-client-certificate";
+
+    let srv = jwt_server();
+    srv.register_client(Client {
+        client_id: ClientId::new("app"),
+        auth: ClientAuth::Mtls {
+            registration: MtlsClientRegistration::SelfSignedTlsClientAuth(
+                RegisteredCertificates::from_der_certificates([DER]),
+            ),
+        },
+        grant_types: vec![GrantType::ClientCredentials],
+        redirect_uris: vec![],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    })
+    .await
+    .unwrap();
+
+    let key = EcdsaP256Key::generate("device");
+    let certificate = ClientCertificate::from_der(DER);
+    let dpop = proof(&key, "both-1");
+    let response = srv
+        .token_with_context(
+            TokenRequest::ClientCredentials {
+                client_id: ClientId::new("app"),
+                client_secret: None,
+                scope: None,
+            },
+            TokenRequestContext {
+                credential: ClientCredential::certificate(&certificate),
+                dpop_proof: Some(&dpop),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a certificate plus a proof is one client holding two constraints");
+
+    let claims = jwt_claims(&response.access_token);
+    assert_eq!(
+        claims["cnf"]["jkt"],
+        serde_json::Value::String(key.to_public_jwk().thumbprint()),
+        "the DPoP binding must survive the certificate binding, in claims {claims}"
+    );
+    assert_eq!(
+        claims["cnf"]["x5t#S256"],
+        serde_json::to_value(CertificateThumbprint::from_der(DER)).unwrap(),
+        "the certificate binding must survive the DPoP binding, in claims {claims}"
+    );
 }
