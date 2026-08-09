@@ -326,7 +326,7 @@ jobs:
         run: scripts/oauth-mcp-lint.sh --selftest
       - name: Build the AS and the RFC 9728 fixture resource
         run: |
-          cargo build --locked -p oauth-as --features http,jwt,resource-metadata \
+          cargo build --locked -p oauth-as --features axum,jwt-p256,resource-metadata \
             --example conformance_server --example protected_resource_fixture
       # Backgrounded servers always redirect their output to a file, never to a command
       # substitution, which would hang until the child closed its inherited stdout.
