@@ -489,8 +489,15 @@ pub enum AuthorizationCodeState {
     Issued,
     /// Already redeemed, recording what it minted so a replay can revoke it.
     Consumed {
-        /// The access token issued.
-        access_token: String,
+        /// The access token issued, if the issuance got as far as producing one.
+        ///
+        /// `None` means the code was marked consumed and the issuance that followed did not
+        /// complete. That is deliberate and it is not a lost write: the record is written BEFORE
+        /// issuance precisely so that a store failure halfway through a redemption cannot take the
+        /// replay alarm offline with it (see `AuthorizationServer::authorization_code_token`).
+        /// There is genuinely nothing to revoke in that case, because nothing was issued, and a
+        /// replay of the code is still recognised as a replay.
+        access_token: Option<String>,
         /// The refresh token issued, if any.
         refresh_token: Option<String>,
     },
@@ -501,11 +508,14 @@ impl fmt::Debug for AuthorizationCodeState {
         match self {
             AuthorizationCodeState::Issued => f.write_str("Issued"),
             AuthorizationCodeState::Consumed {
-                access_token: _,
+                access_token,
                 refresh_token,
             } => f
                 .debug_struct("Consumed")
-                .field("access_token", &"[redacted]")
+                // Presence/absence stays visible for the same reason it does for the refresh token
+                // below, and here it carries more: `None` is how a redemption whose issuance failed
+                // is told apart from one that completed.
+                .field("access_token", &access_token.as_ref().map(|_| "[redacted]"))
                 .field(
                     "refresh_token",
                     // Presence/absence is worth keeping visible (it distinguishes an

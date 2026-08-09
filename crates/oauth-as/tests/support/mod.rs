@@ -292,6 +292,11 @@ pub struct FaultStorage {
     /// When set, `get_refresh_token` reports nothing, so the replay path finds no reachable chain
     /// and falls through to deleting the access token by name.
     pub fail_get_refresh: AtomicBool,
+    /// When set, `put_token` fails, which is the FIRST write `AuthorizationServer::issue` makes.
+    /// That is the cheapest way to fail an ISSUANCE without failing the writes that surround it,
+    /// which is what the ordering suites need: they are about what survives in the store when the
+    /// minting half of a redemption dies half way through.
+    pub fail_put_token: AtomicBool,
     /// The ORDER in which the server consulted the two token lookups.
     ///
     /// RFC 7009 section 2.1 makes `token_type_hint` an optimisation: the server SHOULD look in the
@@ -406,6 +411,9 @@ impl Storage for FaultStorage {
     }
 
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
+        if self.fail_put_token.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected token write failure"));
+        }
         self.inner.put_token(token).await
     }
 

@@ -2830,20 +2830,29 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // and drops, so carrying its family id to the audit event below costs nothing.
             let mut revoked_family_id: Option<String> = None;
             if let Some(rt) = refresh_token {
-                if let Ok(Some(rec)) = self.store.get_refresh_token(rt).await {
-                    // Cloned out of the shared snapshot `get_refresh_token` handed back. One
-                    // allocation, on the detected-compromise path only, against the seven that
-                    // read now costs nothing on the paths that run per request.
-                    revoked_family_id = Some(rec.family_id.clone());
-                    // `revoked_family` now means what its name says. It was set unconditionally
-                    // here, with the `Result` discarded, so a store that failed at the one moment
-                    // this server was responding to a detected compromise reported a clean
-                    // containment: the attacker's chain still live, the audit log saying it was
-                    // killed.
-                    match self.store.revoke_token_family(&rec.family_id).await {
-                        Ok(_) => revoked_family = true,
-                        Err(_) => containment_failed = true,
+                // The `Err` arm is NOT the same thing as `Ok(None)` and must not be folded into it.
+                // `Ok(None)` means there is no chain to revoke, which is a clean outcome. `Err`
+                // means the store could not say, so the family revocation was never even ATTEMPTED
+                // and the attacker's chain may be live. Reading both as "no chain" is exactly the
+                // overstated containment `containment_failed` exists to prevent.
+                match self.store.get_refresh_token(rt).await {
+                    Ok(Some(rec)) => {
+                        // Cloned out of the shared snapshot `get_refresh_token` handed back. One
+                        // allocation, on the detected-compromise path only, against the seven that
+                        // read now costs nothing on the paths that run per request.
+                        revoked_family_id = Some(rec.family_id.clone());
+                        // `revoked_family` now means what its name says. It was set unconditionally
+                        // here, with the `Result` discarded, so a store that failed at the one
+                        // moment this server was responding to a detected compromise reported a
+                        // clean containment: the attacker's chain still live, the audit log saying
+                        // it was killed.
+                        match self.store.revoke_token_family(&rec.family_id).await {
+                            Ok(_) => revoked_family = true,
+                            Err(_) => containment_failed = true,
+                        }
                     }
+                    Ok(None) => {}
+                    Err(_) => containment_failed = true,
                 }
             }
             if !revoked_family {
@@ -2851,8 +2860,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // revocation above failed): the access token this code minted is still nameable
                 // directly, so this is a genuine fallback and not merely a tidy-up. Dropping its
                 // failure left the compromised access token live for its whole TTL, silently.
-                if self.store.delete_token(access_token).await.is_err() {
-                    containment_failed = true;
+                //
+                // `None` means the redemption that consumed this code never got as far as issuing
+                // anything (see `AuthorizationCodeState::Consumed::access_token`), so there is
+                // genuinely nothing to revoke and nothing failed. The replay is still real and is
+                // still reported.
+                if let Some(at) = access_token {
+                    if self.store.delete_token(at).await.is_err() {
+                        containment_failed = true;
+                    }
                 }
             }
             // The consumed record goes BACK. `src/authorization.rs` and `src/store.rs` both
@@ -2937,34 +2953,76 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
+        // Retain the spent code until its own expiry, recording what it minted, so a later replay
+        // is recognisable as a replay rather than as an unknown code.
+        //
+        // THE CONSUMED RECORD IS WRITTEN BEFORE ISSUANCE, and word for word the same argument as
+        // the refresh rotation in `refresh_token` below: `take_authorization_code` above has
+        // already removed this code, `Storage` has no transaction so the take and this write cannot
+        // be one operation, and all that can be chosen is which way the pair fails.
+        //
+        // Issuing first fails OPEN: a store that dies mid-issuance leaves the code gone with no
+        // consumed record, so a replay of a code that leaked into a log, a `Referer` header or
+        // browser history reads as a typo, and RFC 6749 section 4.1.2 / RFC 9700 section 4.1.1
+        // replay detection is off for that grant permanently and silently. Writing it first fails
+        // CLOSED: the client is refused and starts a new authorization request, which it can do
+        // without help, and the alarm stays armed.
+        //
+        // The price is the SECOND write below, because what the code minted is not knowable until
+        // it has been minted. That is a much smaller loss if it fails than this one is: the alarm
+        // is already armed by then.
+        let subject = record.subject.clone();
+        let scope = record.scope.clone();
+        let authentication = GrantedAuthentication::from_code(&record);
+        let mut consumed = AuthorizationCodeRecord {
+            state: AuthorizationCodeState::Consumed {
+                access_token: None,
+                refresh_token: None,
+            },
+            ..record
+        };
+        self.store
+            .put_authorization_code(consumed.clone())
+            .await
+            .map_err(storage_error)?;
+
         let issued = self
             .issue_boxed(
                 &client,
                 bound,
                 GrantType::AuthorizationCode,
-                Some(record.subject.clone()),
-                record.scope.clone(),
+                Some(subject),
+                scope,
                 resource,
                 details,
                 None,
                 true,
-                GrantedAuthentication::from_code(&record),
+                authentication,
             )
             .await?;
 
-        // Retain the spent code until its own expiry, recording what it minted, so a later replay
-        // is recognisable as a replay rather than as an unknown code.
-        let spent = AuthorizationCodeRecord {
-            state: AuthorizationCodeState::Consumed {
-                access_token: issued.access_token.clone(),
-                refresh_token: issued.refresh_token.clone(),
-            },
-            ..record
+        // Now the record can name what it minted, which is what lets a replay REVOKE rather than
+        // merely be refused.
+        consumed.state = AuthorizationCodeState::Consumed {
+            access_token: Some(issued.access_token.clone()),
+            refresh_token: issued.refresh_token.clone(),
         };
-        self.store
-            .put_authorization_code(spent)
-            .await
-            .map_err(storage_error)?;
+        if self.store.put_authorization_code(consumed).await.is_err() {
+            // The client is answered with an error, so it never receives the tokens that were just
+            // minted and they become orphans: live records nobody was ever handed. Best effort
+            // cleanup, and the `Result` is deliberately discarded rather than reported, because
+            // there is nothing useful left to say. These are 32 bytes of OS randomness that were
+            // never transmitted to anyone, so a failed cleanup costs storage the host's
+            // `Storage::sweep_expired` reclaims at the token's own expiry, and nothing else. The
+            // Both artifacts are nameable directly here, which is cheaper and more precise than
+            // asking the store for the family they belong to.
+            let _ = self.store.delete_token(&issued.access_token).await;
+            if let Some(rt) = &issued.refresh_token {
+                let _ = self.store.take_refresh_token(rt).await;
+            }
+            return Err(ErrorResponse::new(ErrorCode::ServerError)
+                .with_description("could not record the redemption"));
+        }
 
         Ok(issued)
     }
@@ -3285,33 +3343,41 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
-        let issued = self
-            .issue_boxed(
-                &client,
-                bound,
-                GrantType::RefreshToken,
-                record.subject.clone(),
-                scope,
-                resource,
-                details,
-                Some(RefreshChain {
-                    family_id: record.family_id.clone(),
-                    expires_at: record.expires_at,
-                }),
-                true,
-                GrantedAuthentication::from_refresh(&record),
-            )
-            .await?;
-
         // Retain the rotated token, marked spent, exactly as the authorization code path retains a
         // consumed code and for the same reason: a deleted token makes a later presentation
         // indistinguishable from an unknown string, and reuse detection is then impossible. A
         // chain with no absolute expiry gets a retention deadline here, so the record is
         // reclaimable by `Storage::sweep_expired` rather than immortal.
+        //
+        // THIS WRITE HAPPENS BEFORE ISSUANCE, AND THE ORDER IS A SECURITY PROPERTY RATHER THAN A
+        // STYLE CHOICE. `Storage` deliberately has no transaction (see the trait's own docs: a host
+        // may be backing this with anything from a HashMap to a sharded KV store, and requiring
+        // cross-key atomicity would exclude most of them), so the atomic take above and this write
+        // CANNOT be made one operation. All that can be chosen is which way the pair fails.
+        //
+        // Issuing first and marking spent afterwards fails OPEN. The take has already removed this
+        // token; if anything in issuance or in this write then fails, the token is gone with NO
+        // spent record, so a later presentation of it reads as an unknown string rather than as
+        // reuse. RFC 9700 section 4.14.2 detection is then off for this family, permanently and
+        // silently, at exactly the moment the deployment's storage is misbehaving, which is when a
+        // compromise is most likely to go unnoticed. The freshly minted tokens meanwhile stay live
+        // and orphaned, because the caller is answered with an error and never sees them.
+        //
+        // Marking spent first fails CLOSED, and that is the right trade. If this write fails,
+        // nothing has been minted and the client re-authenticates. If it succeeds and issuance then
+        // fails, the client is locked out of this chain and re-authenticates, and the alarm is
+        // ARMED: the next presentation of this token is recognised as reuse and revokes the family.
+        // Locking a client out is an inconvenience it can recover from without help; a
+        // compromise-detection capability going offline is not.
+        let chain_expires_at = record.expires_at;
+        // Read off the record BEFORE it is moved into the spent value below. These are the same
+        // three clones the issuance took when it ran first, so the ordering change costs nothing.
+        let subject = record.subject.clone();
+        let family_id = record.family_id.clone();
+        let authentication = GrantedAuthentication::from_refresh(&record);
         let spent = RefreshTokenRecord {
             state: RefreshTokenState::Spent,
-            expires_at: record
-                .expires_at
+            expires_at: chain_expires_at
                 .or_else(|| Some(self.clock.now() + self.config.refresh_reuse_window)),
             ..record
         };
@@ -3320,7 +3386,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .await
             .map_err(storage_error)?;
 
-        Ok(issued)
+        self.issue_boxed(
+            &client,
+            bound,
+            GrantType::RefreshToken,
+            subject,
+            scope,
+            resource,
+            details,
+            Some(RefreshChain {
+                family_id,
+                expires_at: chain_expires_at,
+            }),
+            true,
+            authentication,
+        )
+        .await
     }
 
     /// Mint and persist an access token (and, when configured, a rotated refresh token).

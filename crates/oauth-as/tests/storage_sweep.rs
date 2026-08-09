@@ -69,7 +69,7 @@ fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRe
         code_challenge_method: CodeChallengeMethod::S256,
         expires_at,
         state: AuthorizationCodeState::Consumed {
-            access_token: "at".into(),
+            access_token: Some("at".into()),
             refresh_token: None,
         },
         #[cfg(feature = "consent")]

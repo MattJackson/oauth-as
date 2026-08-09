@@ -2338,7 +2338,7 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
         authorization_details: Default::default(),
         expires_at: at(60),
         state: AuthorizationCodeState::Consumed {
-            access_token: "at-minted-by-this-code".to_string(),
+            access_token: Some("at-minted-by-this-code".to_string()),
             refresh_token: Some("rt-minted-by-this-code".to_string()),
         },
         #[cfg(feature = "consent")]

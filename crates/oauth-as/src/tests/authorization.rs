@@ -61,7 +61,7 @@ fn c13_authorization_code_record_debug_format_redacts_code_and_tokens() {
         authorization_details: Default::default(),
         expires_at: std::time::SystemTime::UNIX_EPOCH,
         state: AuthorizationCodeState::Consumed {
-            access_token: "the-secret-access-token".to_string(),
+            access_token: Some("the-secret-access-token".to_string()),
             refresh_token: Some("the-secret-refresh-token".to_string()),
         },
         #[cfg(feature = "consent")]
@@ -85,7 +85,7 @@ fn c13_issued_state_debug_format_has_nothing_to_redact() {
 #[test]
 fn c13_consumed_state_without_refresh_token_shows_none_not_a_value() {
     let state = AuthorizationCodeState::Consumed {
-        access_token: "at".to_string(),
+        access_token: Some("at".to_string()),
         refresh_token: None,
     };
     let printed = format!("{state:?}");

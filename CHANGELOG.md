@@ -164,6 +164,46 @@ allocation out of the 39 a code redemption already costs. This crate has crossed
 twice, once for 120 bytes and once for 344, and the failure mode on the other side is a 2 KB heap
 allocation on every token request. The trade is refused, with the number, in the function's docs.
 
+### Fixed (security): the reuse alarm that went dark exactly when the store was flaky
+
+Two redemptions destroy a credential and mint replacements: the authorization code grant (RFC 6749
+s4.1.3) and refresh rotation (OAuth 2.1 draft s6.1). Both begin with an ATOMIC TAKE, which is what
+makes them single use under concurrency, and both then have to write a record saying the taken
+credential was spent, because that record IS the replay and reuse alarm (RFC 6749 s4.1.2, RFC 9700
+s4.1.1 and s4.14.2). `Storage` deliberately has no transaction, so the take and that write cannot be
+made one operation; the only thing that can be chosen is the ORDER, and the order decides which way
+the pair fails.
+
+Both wrote the spent record AFTER minting and persisting the new tokens, which fails OPEN. If
+anything in issuance failed, the old credential was gone from the store with no spent record, so a
+later presentation of it read as an UNKNOWN STRING rather than as reuse: detection for that family
+was off, permanently and silently, at exactly the moment a deployment's storage was misbehaving. The
+freshly minted tokens meanwhile stayed live and orphaned, because the caller was answered with an
+error and never saw them. The same ordering also left the credential entirely absent from the store
+for the whole duration of minting on the HAPPY path, so a presentation racing the legitimate client
+in that window was answered `invalid_grant` and never counted as reuse either.
+
+- **The spent refresh record is now written BEFORE issuance.** This fails CLOSED: a failed write
+  means nothing was minted and the client re-authenticates; a write that succeeds and an issuance
+  that then fails means the client is locked out of that chain and re-authenticates, with the alarm
+  ARMED. Locking a client out is an inconvenience it recovers from without help; a
+  compromise-detection capability going offline is not. The argument is in the code, at the call
+  site, because a host reading `Storage`'s lack of a transaction needs to know this is a design seam
+  and not a slip.
+- **The consumed authorization code record is now written BEFORE issuance**, for the same reason and
+  with the same argument. What the code minted is not knowable until it has been minted, so a SECOND
+  write records that afterwards; if that one fails the alarm is already armed, the redemption is
+  refused, and the two orphaned artifacts are cleaned up best effort.
+- **BREAKING: `AuthorizationCodeState::Consumed::access_token` is `Option<String>`.** `None` is a
+  code that was marked consumed by a redemption whose issuance did not complete: a replay of it is
+  still recognised and reported, and there is genuinely nothing to revoke. Persisted records written
+  by earlier versions deserialize unchanged, since a JSON string reads back as `Some`.
+- **The authorization-code replay branch no longer reads a storage FAILURE as "no chain to
+  revoke".** `if let Ok(Some(rec)) = get_refresh_token(..)` folded the `Err` arm into the `Ok(None)`
+  arm, so a store that could not answer left `containment_failed` FALSE while the family revocation
+  was never even attempted. That flag exists precisely to stop the audit event overstating what the
+  server achieved, and this path defeated it.
+
 ### Fixed (security): lost updates on the device grant
 
 - **BEHAVIOUR CHANGE: a device-grant poll can no longer revert the user's decision.**
