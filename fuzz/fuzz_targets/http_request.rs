@@ -138,13 +138,20 @@ fuzz_target!(|request: Request| {
     };
 
     let is_head = request.method == "HEAD";
-    let routed = fixture.paths.contains(&request.path)
+    // THE PATH THE SERVER SEES, taken from the parsed URI rather than from the string the
+    // generator built. Those are not the same thing and the difference was a false positive the
+    // fuzzer found in under thirty thousand executions: the generator appends arbitrary text to a
+    // real path, that text can start with `?`, and `/register?x=1` is the routed path `/register`
+    // with a query. An oracle that reads the raw string calls that unrouted and then reports the
+    // perfectly correct 405 as a defect. `http::Uri` splits it the way the server does.
+    let path = built.uri().path().to_string();
+    let routed = fixture.paths.contains(&path)
         // The RFC 7592 s3 client-management route is `{register}/{client_id}`, a prefix match, so
         // "is this path routed" cannot be a set membership test alone.
         || fixture
             .paths
             .iter()
-            .any(|p| request.path.starts_with(&format!("{p}/")));
+            .any(|p| path.starts_with(&format!("{p}/")));
 
     let response = runtime().block_on(fixture.service.handle(built));
 

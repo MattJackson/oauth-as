@@ -25,9 +25,17 @@
 //! 2. A 401 CARRIES `WWW-Authenticate`. RFC 9110 s11.6.1 makes the header mandatory on a 401, and
 //!    RFC 6749 s5.2 requires it specifically when the request used an authentication scheme. A
 //!    401 without it is a response no conforming client can act on.
-//! 3. NO CREDENTIAL IS REFLECTED. Nothing the request presented as a secret appears anywhere in
-//!    the response body. An error path that echoes what it was sent turns a mistyped credential
-//!    in a proxy log into a disclosed one.
+//! 3. NO CREDENTIAL IS REFLECTED, checked DIFFERENTIALLY. The same request is sent twice, with
+//!    every presented secret replaced by a different string of the same length the second time,
+//!    and the two error bodies must be byte identical. An error path that echoes what it was sent
+//!    turns a mistyped credential in a proxy log into a disclosed one.
+//!
+//!    The obvious formulation, "the secret does not appear in the body as a substring", was tried
+//!    FIRST and is unsound: the fuzzer found it within twenty thousand executions by generating a
+//!    secret that is a substring of a FIXED error message this server writes ("more than one
+//!    client authentication method (RFC 6749 s2.3)"). No secret was reflected; the oracle was
+//!    wrong. The differential form has no such failure mode, because a body that does not depend
+//!    on the secret cannot change when only the secret changes.
 
 #![no_main]
 
@@ -42,7 +50,7 @@ use oauth_as_fuzz::{
 };
 
 /// How the `Authorization` header is spelled.
-#[derive(Arbitrary, Debug)]
+#[derive(Arbitrary, Clone, Debug)]
 enum Header {
     /// No header at all: the credential, if any, is in the form body.
     Absent,
@@ -64,7 +72,7 @@ enum Header {
     Raw(Vec<u8>),
 }
 
-#[derive(Arbitrary, Debug)]
+#[derive(Arbitrary, Clone, Debug)]
 struct Input {
     header: Header,
     /// The form body: `client_id` and `client_secret` may be presented here instead
@@ -122,28 +130,61 @@ fn header_value(header: &Header) -> Option<Vec<u8>> {
     })
 }
 
-/// Every string the input presented as a secret, so invariant 3 can look for each of them.
-fn presented_secrets(input: &Input) -> Vec<String> {
-    let mut secrets = Vec::new();
-    match &input.header {
+/// The same input with every presented secret replaced, character for character, by a different
+/// one of the SAME LENGTH.
+///
+/// Same length matters: a body that legitimately mentions how long something was, or that is
+/// truncated at a limit, would otherwise differ for a reason that is not reflection.
+fn with_substituted_secrets(input: &Input) -> Input {
+    fn substitute(s: &str) -> String {
+        // A fixed permutation rather than a constant, so the replacement is as long as the
+        // original and shares none of its characters.
+        s.chars()
+            .map(|c| match c {
+                'a'..='y' | 'A'..='Y' | '0'..='8' => char::from_u32(c as u32 + 1).unwrap_or('z'),
+                'z' => 'a',
+                'Z' => 'A',
+                '9' => '0',
+                other => other,
+            })
+            .collect()
+    }
+    let mut other = input.clone();
+    match &mut other.header {
         Header::Basic { password, .. } | Header::BasicUnencoded { password, .. } => {
-            secrets.push(password.clone())
+            *password = substitute(password)
         }
-        Header::BasicAlternateAlphabet { .. } => secrets.push(CONFIDENTIAL_SECRET.to_string()),
         _ => {}
     }
-    if let Some(secret) = &input.body_client_secret {
-        secrets.push(secret.clone());
+    if let Some(secret) = &mut other.body_client_secret {
+        *secret = substitute(secret);
     }
-    // Only secrets long enough to be distinctive. A one-character "secret" would collide with
-    // ordinary response text and the invariant would be about nothing.
-    secrets.retain(|s| s.len() >= 8);
-    secrets
+    other
 }
 
-fuzz_target!(|input: Input| {
-    let fixture = fixture();
+/// Whether this input presents the REGISTERED secret. The differential in invariant 3 is skipped
+/// for those, because substituting a working credential changes the ANSWER and not just the echo.
+fn presents_the_real_secret(input: &Input, body: &str) -> bool {
+    matches!(input.header, Header::BasicAlternateAlphabet { .. })
+        || body.contains(CONFIDENTIAL_SECRET)
+        || header_value(&input.header)
+            .is_some_and(|v| String::from_utf8_lossy(&v).contains(CONFIDENTIAL_SECRET))
+}
 
+/// The form body this input sent, and the response it got back.
+struct Exchange {
+    /// The form body as it went on the wire, which invariant 1 inspects for the real secret.
+    body: String,
+    status: u16,
+    content_type: Option<String>,
+    /// Whether the response carried `WWW-Authenticate` (RFC 9110 s11.6.1).
+    challenge: bool,
+    bytes: Vec<u8>,
+}
+
+/// Send one request. `None` when the request is one no HTTP server would have delivered in the
+/// first place.
+fn exchange(input: &Input) -> Option<Exchange> {
     let mut body = String::new();
     if let Some(grant_type) = &input.grant_type {
         body.push_str(&format!("grant_type={}", form_encode(grant_type)));
@@ -169,19 +210,15 @@ fuzz_target!(|input: Input| {
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
     if let Some(value) = header_value(&input.header) {
-        match HeaderValue::from_bytes(&value) {
-            Ok(value) => builder = builder.header(AUTHORIZATION, value),
-            // Not a field value any HTTP server would deliver. See `http_request` for why
-            // skipping these is matching the attack surface rather than narrowing it.
-            Err(_) => return,
-        }
+        // Not a field value any HTTP server would deliver. `HeaderValue` rejects the control
+        // bytes RFC 9110 s5.5 excludes from a field value, so skipping these is matching the
+        // attack surface rather than narrowing it.
+        let value = HeaderValue::from_bytes(&value).ok()?;
+        builder = builder.header(AUTHORIZATION, value);
     }
-    let Ok(request) = builder.body(Body::from(body.clone())) else {
-        return;
-    };
+    let request = builder.body(Body::from(body.clone())).ok()?;
 
-    let response = runtime().block_on(fixture.service.handle(request));
-
+    let response = runtime().block_on(fixture().service.handle(request));
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -189,7 +226,27 @@ fuzz_target!(|input: Input| {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let challenge = response.headers().get(WWW_AUTHENTICATE).is_some();
-    let bytes = response.into_body().into_bytes();
+    let bytes = response.into_body().into_bytes().to_vec();
+    Some(Exchange {
+        body,
+        status,
+        content_type,
+        challenge,
+        bytes,
+    })
+}
+
+fuzz_target!(|input: Input| {
+    let Some(sent) = exchange(&input) else {
+        return;
+    };
+    let Exchange {
+        body,
+        status,
+        content_type,
+        challenge,
+        bytes,
+    } = sent;
 
     assert_response_invariants(status, content_type.as_deref(), &bytes);
 
@@ -208,26 +265,30 @@ fuzz_target!(|input: Input| {
     // secret may authenticate. That is the bypass check, and it is a wrong ANSWER rather than a
     // crash, which is what a panic-only target would have missed.
     if status < 400 {
-        let header_text = header_value(&input.header)
-            .map(|v| String::from_utf8_lossy(&v).into_owned())
-            .unwrap_or_default();
-        let secret_present = body.contains(CONFIDENTIAL_SECRET)
-            || header_text.contains(CONFIDENTIAL_SECRET)
-            || matches!(input.header, Header::BasicAlternateAlphabet { .. });
         assert!(
-            secret_present,
+            presents_the_real_secret(&input, &body),
             "the token endpoint answered {status} for client {CONFIDENTIAL_ID} without the \
              registered secret being presented at all: header={:?} body={body:?}",
             input.header
         );
     }
 
-    // 3.
-    let text = String::from_utf8_lossy(&bytes);
-    for secret in presented_secrets(&input) {
-        assert!(
-            !text.contains(&secret),
-            "a presented credential was reflected in the response body: {text:?}"
-        );
+    // 3. The differential. Only on a REFUSAL: a success carries a freshly minted access token,
+    // which differs between two runs for reasons that have nothing to do with the credential.
+    if status >= 400 && !presents_the_real_secret(&input, &body) {
+        let other = with_substituted_secrets(&input);
+        if let Some(other) = exchange(&other) {
+            assert_eq!(
+                other.status, status,
+                "changing only the presented secret changed the status: {:?}",
+                input.header
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&bytes),
+                String::from_utf8_lossy(&other.bytes),
+                "the response body depends on the presented credential, which means it echoes \
+                 some part of it"
+            );
+        }
     }
 });

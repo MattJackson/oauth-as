@@ -226,6 +226,23 @@ pub fn fixture() -> &'static Fixture {
         let service = ServiceBuilder::new(std::sync::Arc::clone(server()))
             .with_subject_resolver(|_headers| Some("fuzz-subject".to_string()))
             .with_consent_resolver(|_req| oauth_as::http::ConsentDecision::Approve)
+            // CSRF TOKENS, and this one was FOUND rather than foreseen. Without them
+            // `ServiceBuilder` leaves the RFC 8628 s3.3 verification page in its `Unwired` state,
+            // which answers every GET with a deliberate 500 saying the host never supplied a CSRF
+            // seam (RFC 6749 s10.12). The first run of `http_request` minimised straight to
+            // `GET /device` and reported that 500 as a violated invariant: correctly, in that the
+            // invariant did its job, and uselessly, in that it was measuring an unconfigured
+            // fixture rather than the library. A fuzz target whose fixture short-circuits before
+            // the parser is a target that proves nothing, so the seam is wired here.
+            //
+            // Constant tokens, because the target is the PARSER and not the session store: the
+            // interesting inputs are the ones where the form body, the `Origin` header and the
+            // token disagree, and a token that varies would make those unreachable by chance
+            // rather than by construction.
+            .with_csrf_tokens(
+                |_headers| Some("fuzz-csrf-token".to_string()),
+                |_headers| Some("fuzz-csrf-token".to_string()),
+            )
             .build()
             .expect("the fixture configuration routes without collision");
 
