@@ -128,6 +128,30 @@ The general rule this makes explicit, and it cuts both ways: a mutation run judg
 configuration it was built with. Any `#[cfg]`-selected alternative needs its own run, and a "miss"
 in a block the run did not compile is a statement about the run, not about the suite.
 
+## IN PROGRESS: an all-features run at 0.9.0
+
+A run is under way at the release commit over the WHOLE feature set:
+
+```
+cargo mutants -p oauth-as --all-features --timeout 300 -j 3
+```
+
+**1353 mutants found.** That is more than double the 617 the run below measured, which is the
+size of the gap this run exists to close: eight modules (`registration`, `resource_metadata`,
+`token_exchange`, `par`, `rar`, `dpop`, `mtls`, `client_assertion`) landed after commit `5f663c0`
+and have never been mutation tested.
+
+This section is updated with the real numbers when the run finishes. Until then the position is
+the one stated at the bottom of this file: Gate 4 is NOT met.
+
+### The process note, because the last run's first pass was worthless
+
+`-j 3 --timeout 300` is deliberate and is not a preference. The previous sweep's first pass ran at
+`-j 10` on a busy machine and produced 185 timeouts, which prove nothing about the suite: an
+overloaded machine timing out is a statement about the machine. The baseline suite here builds in
+13s and tests in 13s, so a 300 second timeout is a 23x margin, and a timeout under it is a genuine
+non-terminating mutant rather than load.
+
 ## Where this actually stands, so nobody reads the file above as "done"
 
 Last authoritative run: `cargo mutants -p oauth-as --features http,jwt --timeout 180`, at commit
