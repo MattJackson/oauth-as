@@ -97,12 +97,26 @@
 //!   is arguably right and is deliberately not done here silently; a host that wants it should say
 //!   so, and there is no seam for it yet.
 //! - The `act` claim is returned to the HOST ([`ExchangedToken::act`]) but is not carried inside
-//!   this server's own tokens: an opaque access token has no claims, and the record this AS
-//!   persists ([`crate::token::IssuedToken`]) is cloned on every token-plane request, so adding a
-//!   field to it is a cost every deployment pays including those that never enable this feature.
-//!   The consequence is concrete and worth being blunt about: with this crate's own tokens, a
-//!   downstream resource learns the delegation from the host, not from the token or from RFC 7662
-//!   introspection. A host that signs its own tokens has the claim it needs to put in them.
+//!   this server's own tokens. The consequence is concrete and worth being blunt about: with this
+//!   crate's own tokens, a downstream resource learns the delegation from the host, not from the
+//!   token and not from RFC 7662 introspection. A host that signs its own tokens has the claim it
+//!   needs to put in them.
+//!
+//!   THIS IS A GAP RATHER THAN A DESIGN, and the reason given for it through 0.9.0 is no longer
+//!   true. That reason was that [`crate::token::IssuedToken`] "is cloned on every token-plane
+//!   request, so adding a field to it is a cost every deployment pays":
+//!   [`crate::store::Storage::get_token`] returns an `Arc<IssuedToken>` now, so the record's shape
+//!   costs a read nothing, and a `#[cfg(feature = "token-exchange")] Option<Box<ActClaim>>` would
+//!   cost a deployment without this feature exactly zero bytes and one with it 8 bytes per token
+//!   plus one allocation per DELEGATED token. On the merits, RFC 8693 section 1.1 delegation that
+//!   RFC 7662 introspection cannot see is a deficiency: introspection is the only channel an
+//!   opaque token has, which makes it the one place the claim would do any good.
+//!
+//!   What now stands in the way is not allocation but the PERSISTENCE CONTRACT. `IssuedToken` is
+//!   the record every host's [`crate::store::Storage`] implementation writes and reads, so a new
+//!   field is a schema migration in every store this crate does not own, not a struct edit here.
+//!   That is a coordinated change with a release behind it rather than something to slip in, and
+//!   until it is made this paragraph is a statement of what a deployment does not get.
 
 use std::fmt;
 use std::str::FromStr;

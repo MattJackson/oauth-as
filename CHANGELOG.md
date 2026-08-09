@@ -68,6 +68,138 @@ consistently: an absent consent resolver refuses, an absent registration policy 
   exposure rules: one published a `pub String` a caller could also forge, the other kept it
   entirely. Both are readable and neither is forgeable now.
 
+### Changed (BREAKING): `ErrorCode` is `#[non_exhaustive]`
+
+`ErrorCode` is the most widely matched type this crate publishes, and its VARIANT SET depends on
+cargo features: `rar`, `consent`, `dpop`, `par` and `jar` each add one. Without the attribute a
+host's exhaustive `match` compiled or failed depending on which features something ELSE in its
+dependency graph had turned on, which is a build break with no release behind it. Every sibling
+failure enum was already marked (`ConsentDecision`, `ConsentRequest`, `ServiceError` and
+`DeviceApprovalError` were fixed earlier in this cycle); this one was missed.
+
+Migration: add a `_` arm. `ErrorCode::as_str` still gives the wire spelling of whatever arrives
+there, so an unknown code is reportable rather than opaque.
+
+`ErrorCode::http_status` also lost its `_ => 400` catch-all and now names every variant, so adding
+a code forces its author to choose a status instead of inheriting one. No status changed.
+
+### Added: the request caps a host needs to size its own limits
+
+`MAX_RESOURCE_INDICATORS`, `MAX_REGISTERED_REDIRECT_URIS`, `MAX_AUDIENCE_VALUES`,
+`MAX_CONSENT_RESOURCES`, `MAX_PROOF_BYTES`, `MAX_FORM_PARAMETERS` and `MAX_BODY_BYTES` are now
+re-exported at the crate root, where `MIN_USER_CODE_LENGTH` and the three
+`MAX_AUTHORIZATION_DETAILS_*` constants already were. They are the numbers a host sizes its own
+gateway, proxy and client limits against, and they are of no use one at a time: a proxy that
+truncates a body below `MAX_BODY_BYTES` moves the refusal somewhere this crate cannot describe.
+Nothing moved; the module paths still resolve.
+
+`RegistrationErrorResponse` now implements `std::error::Error`, as its direct sibling
+`ErrorResponse` already did. A host propagating a refusal with `?` into a `Box<dyn Error>` should
+not have to care which of the two it is holding.
+
+### Performance: three refusals and two signing paths that formatted what was already fixed
+
+Measured with the counting allocator; the gates are in `tests/refusal_cost.rs` and
+`tests/allocation_paths.rs`. The rule being applied is the one on
+`tests/allocation.rs`'s `refused_token_request_allocation_bound`: a refusal is work the attacker
+buys.
+
+- **The RFC 9068 compact serialization is built in ONE buffer.** `JwtConfig::sign_access_token`
+  assembled `header.payload` with `format!` and then formatted THAT into a second `format!`, so a
+  token close to a kilobyte was allocated and fully copied twice. The signing input is a PREFIX of
+  the compact form (RFC 7515 s5.1 steps 5 and 7), so the signature is appended to the buffer that
+  was signed. MEASURED: signing alone goes from 9 allocations / 1960 bytes to 3 / 746, and one
+  whole `at+jwt` issuance from 25 / 4709 to 19 / 3255. `jwt::compact_jws`, the helper a host uses
+  to build the CLIENT half of RFC 7523 and RFC 9449, got the same treatment. No wall-clock change
+  is measurable: `cargo bench --bench extensions` puts `issue_token_rfc9068_jwt` at 84.13 us before
+  and 83.53 us after, because a P-256 signature is 80 us of it and 6 allocations are not.
+- **The server's own token endpoint URL is derived once, at construction.**
+  `AuthorizationServer::token_endpoint` `format!`ed a value fixed for the life of the server, once
+  per RFC 9449 proof verification AND once per RFC 7523 assertion verification, so a
+  `private_key_jwt` client sending DPoP paid it twice per token request. MEASURED: DPoP proof
+  verification 56 allocations to 54, client assertion verification 37 to 35. The precomputed
+  `Box<str>` costs 16 bytes on `AuthorizationServer` and only under the two features that read it,
+  declared in `tests/allocation.rs`'s size gate rather than absorbed into its margin.
+- **Three refusal descriptions that were `format!`ed from a fixed set of `&'static str` are now
+  borrowed.** RFC 9101's "the header/payload/signature is not base64url" is reached at the
+  UNAUTHENTICATED authorization endpoint, and RFC 8693's "... is not a token type RFC 8693 s3
+  registers" is reached before the presented client credential has been checked. Roughly 50 of the
+  crate's description sites already passed a constant, which is what `Cow<'static, str>` is there
+  for; these were the ones that did not.
+
+REJECTED from the same finding, with the measurement that settles it:
+`AuthorizationErrorRedirect`'s owned `redirect_uri`, `state` and `iss`. A redirectable refusal
+costs 6 allocations and 71 bytes against the 8 allocations of the VALID request it replaces, and
+reaching it already requires a registered `client_id` and an exactly matching registered
+`redirect_uri` (OAuth 2.1 s4.1.3), so it is not the cheaper request to send in volume. Borrowing
+the three fields would put a lifetime on a public error enum for a saving the attacker cannot
+exploit, and the redirect URI is materialised from an `Arc<Client>` inside the call, so there is
+nothing for it to borrow FROM. `tests/refusal_cost.rs` pins the relation rather than the wish.
+
+### Removed: the crate's only `#[must_use]`
+
+`JwtConfig::forget_retired_key_breaking_its_live_tokens` carried one; the other twenty-eight
+consuming builders did not, which taught a reader a rule nobody was following. Every builder here
+takes `self` BY VALUE, so dropping the result moves the receiver away and the borrow checker
+already refuses the next use of it; what the attribute added was the case where the whole
+expression is discarded and the value never used again, which is dead code rather than a setting
+silently lost. (For a `&self -> Self` builder the analysis is the opposite. This crate has none.)
+`tests/host_api_shape.rs` now gates it as ALL or NOTHING, so a later decision to mark them all
+stays available and a second lone attribute does not.
+
+### Changed: one hex encoder instead of two
+
+`server::hex_encode` (device codes, authorization codes, opaque tokens) and `client::hex_lower`
+(the stored secret verifier) were byte-for-byte identical, down to a private
+`b"0123456789abcdef"` table each. They are now one function in a private `crate::hex`, following
+the precedent `src/skew.rs` set for `CLOCK_SKEW_LEEWAY`, and `tests/hex_single_definition.rs`
+keeps it at one. Only one of the two copies carried the measurement that chose a nibble table over
+`write!(out, "{b:02x}")` (1092 ns against 1335 ns for 32 bytes), so a reader improving the other
+had nothing telling them the question was settled.
+
+### Documented: three rationales that one optimisation had made false
+
+When `Storage`'s pure reads moved to `Arc`, three separate design arguments lost their premise and
+none was updated. Each is re-examined here rather than reworded, and the DECISION is stated
+either way:
+
+- **`Client::registration` stays boxed.** The argument was that a `Client` is deep cloned out of
+  the store on every token-plane request; `get_client` returns `Arc<Client>` now, so the struct's
+  size is not on that path at all. The box is more clearly right than when it was chosen, because
+  the optimisation removed its only cost: it used to add an allocation to every clone of a
+  registered client, and there are no such clones now. What it buys is memory in the store, and it
+  is measured rather than asserted: 8 bytes against 104 inline, a `Client` of 200 bytes rather than
+  296, paid per registration whether or not RFC 7591 is enabled.
+- **`CertificateThumbprint` stays 32 raw bytes.** Of the three reasons given, the load-bearing one
+  never depended on the premise: a fixed 32-byte compare cannot be confused by an encoding
+  difference (padded against unpadded, standard alphabet against URL-safe), which is the classic
+  way two implementations agree about a certificate and disagree about a string. The clause about
+  `IssuedToken` being "cloned out of the host's store on every introspection" is gone, because
+  `get_token` returns an `Arc` and introspection clones nothing.
+- **The RFC 8693 `act` claim is still not on `IssuedToken`, and that is now a GAP rather than a
+  design.** The reason given was that the record is cloned on every token-plane request; it is not.
+  On the merits, a delegation that RFC 7662 introspection cannot see is a deficiency, because
+  introspection is the only channel an opaque token has. What stands in the way now is the
+  PERSISTENCE CONTRACT: `IssuedToken` is the record every host's `Storage` implementation writes,
+  so a new field is a schema migration in stores this crate does not own. The module docs say that
+  instead of the allocation argument they used to make.
+
+`AuthorizationServer::register_client` also stopped saying that RFC 7591 dynamic registration
+"will layer on this" in the future tense: it shipped, and `register_dynamic_client` is it.
+`src/registration.rs`'s refusal of an unregisterable `token_endpoint_auth_method` stopped saying
+"not one this server advertises", which was false and sent the developer back to a document that
+says the opposite: the RFC 8414 list describes the TOKEN ENDPOINT, which accepts four methods that
+cannot be REGISTERED because `ClientMetadata` models neither `jwks`/`jwks_uri` nor the RFC 8705
+s2.1.1 subject parameters. The constants now carry that containment, and the module docs no longer
+claim the crate "does not yet do RFC 7523 client assertions".
+
+`README.md`'s feature count is re-derived rather than picked: the MSRV section said "the other
+nine features add no dependency" and the feature table said "ten of the fourteen", and neither was
+right once `serde_json` became optional. FIVE features add nothing to a dependency tree at all
+(`par`, `consent`, `token-exchange`, `resource-metadata`, `test-util`); three more add no crate of
+their own; the rest each bring at least one, and every one of those crates declares a floor below
+this crate's 1.75.
+
 ### Changed (BREAKING): the storage seam stopped copying what the caller only reads
 
 Measured with the counting allocator against `MemoryStorage`, not asserted. The whole point of a

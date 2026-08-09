@@ -84,13 +84,21 @@ pub const TLS_CLIENT_AUTH_SAN_EMAIL: &str = "tls_client_auth_san_email";
 /// The RFC 8705 section 3.1 `x5t#S256` value: the SHA-256 hash of the DER encoding of an X.509
 /// certificate.
 ///
-/// Held as the 32 RAW bytes rather than as the base64url text, for three reasons. Comparison is
-/// then a fixed 32-byte compare that cannot be confused by an encoding difference (padded against
-/// unpadded, standard alphabet against URL-safe), which is the classic way two implementations
-/// agree about a certificate and disagree about a string. It is 32 bytes rather than a `String`'s
-/// 24 bytes plus a heap allocation, and it appears inside [`crate::token::IssuedToken`], which is
-/// cloned out of the host's store on every introspection. And the base64url form is produced only
-/// where it is actually needed: on the wire.
+/// Held as the 32 RAW bytes rather than as the base64url text, and the first reason is the one
+/// that decides it: comparison is then a fixed 32-byte compare that cannot be confused by an
+/// encoding difference (padded against unpadded, standard alphabet against URL-safe), which is the
+/// classic way two implementations agree about a certificate and disagree about a string. A
+/// `String` would make an equality test a question about text that has two legal spellings.
+///
+/// It is also `Copy` and allocates nothing, where the 43-character base64url text would be a heap
+/// allocation per value. That was originally argued from this type appearing inside
+/// [`crate::token::IssuedToken`], "which is cloned out of the host's store on every
+/// introspection"; that premise is GONE, because [`crate::store::Storage::get_token`] hands back
+/// an `Arc<IssuedToken>` and introspection clones nothing. What survives is the write side and the
+/// size gate: the token record is built on every issuance and `tests/allocation.rs` holds its
+/// `size_of` to a budget, and the binding is stored as `Option<Box<CertificateThumbprint>>` there,
+/// so an unbound token pays 8 bytes and no allocation while a bound one pays 32 bytes rather than
+/// a 43-byte string. The base64url form is produced only where it is actually needed: on the wire.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CertificateThumbprint([u8; 32]);
 

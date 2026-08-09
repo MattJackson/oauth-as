@@ -15,8 +15,17 @@ use serde::{Deserialize, Serialize};
 /// The wire spelling is the exact registered token (`snake_case`), which the `serde` rename below
 /// pins; `tests/conformance_schema.rs` locks the full emitted set against a schema transcribed
 /// from the RFCs.
+///
+/// `#[non_exhaustive]`, and for this enum that is not the usual forward-compatibility hedge. The
+/// VARIANT SET here depends on cargo features: `rar`, `consent`, `dpop`, `par` and `jar` each add
+/// one. Without the attribute, a host's exhaustive `match` compiles or fails depending on which
+/// features something ELSE in its dependency graph turned on, which is a build break with no
+/// release behind it. This is also the most widely matched type this crate publishes, so a host
+/// that wants a total match should write one with a `_` arm and decide what an unknown code means
+/// to it (`ErrorCode::as_str` still gives it the wire spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorCode {
     // RFC 6749 section 5.2 (token endpoint).
     /// RFC 6749 section 5.2 `invalid_request`: the request is missing a required parameter,
@@ -168,12 +177,50 @@ impl ErrorCode {
     /// section 5.2: 400 unless the code is `invalid_client` (401, and the host should attach a
     /// `WWW-Authenticate` header when the client attempted header-based authentication), plus the
     /// conventional 500/503 for the two server-side codes.
+    ///
+    /// EVERY variant is listed, exactly as in [`ErrorCode::as_str`] above, and there is no
+    /// catch-all. A `_ => 400` arm compiles for a variant nobody thought about, and 400 is a
+    /// plausible enough answer that nothing would ever notice: the status is part of the wire
+    /// contract, so adding a code should require choosing one rather than inheriting one.
     pub fn http_status(self) -> u16 {
         match self {
+            // 401, because RFC 6749 section 5.2 says so: client authentication failed, and the
+            // response participates in the `WWW-Authenticate` challenge exchange.
             ErrorCode::InvalidClient => 401,
+            // The two server-side codes take the conventional statuses for what they describe.
             ErrorCode::ServerError => 500,
             ErrorCode::TemporarilyUnavailable => 503,
-            _ => 400,
+            // Everything below is 400: RFC 6749 section 5.2's default for a request this server
+            // will not act on, and RFC 8628 section 3.5 keeps the device grant's three polling
+            // codes there too (they are answers about the REQUEST, not about the server).
+            ErrorCode::InvalidRequest => 400,
+            ErrorCode::InvalidGrant => 400,
+            ErrorCode::UnauthorizedClient => 400,
+            ErrorCode::UnsupportedGrantType => 400,
+            ErrorCode::InvalidScope => 400,
+            ErrorCode::AccessDenied => 400,
+            ErrorCode::UnsupportedResponseType => 400,
+            ErrorCode::AuthorizationPending => 400,
+            ErrorCode::SlowDown => 400,
+            ErrorCode::ExpiredToken => 400,
+            ErrorCode::InvalidTarget => 400,
+            #[cfg(feature = "rar")]
+            ErrorCode::InvalidAuthorizationDetails => 400,
+            // RFC 9470 section 3 gives 401 to the RESOURCE server's challenge; this is the
+            // AUTHORIZATION server's token-endpoint refusal of a grant whose authentication was
+            // too old or too weak, which is an RFC 6749 section 5.2 error response like the rest.
+            #[cfg(feature = "consent")]
+            ErrorCode::InsufficientUserAuthentication => 400,
+            // RFC 9449 section 5: the token endpoint answers a bad proof with 400 and this code,
+            // not with 401, because the client's CREDENTIAL was fine and its proof was not.
+            #[cfg(feature = "dpop")]
+            ErrorCode::InvalidDpopProof => 400,
+            #[cfg(feature = "par")]
+            ErrorCode::InvalidRequestUri => 400,
+            #[cfg(feature = "jar")]
+            ErrorCode::InvalidRequestObject => 400,
+            #[cfg(feature = "jar")]
+            ErrorCode::RequestNotSupported => 400,
         }
     }
 }

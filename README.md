@@ -60,28 +60,34 @@ See [ROADMAP.md](ROADMAP.md) for what is coming and, more usefully, what is miss
 
 ## Features
 
-Fourteen features. The default set is **empty**, and stays that way.
+Fifteen features. The default set is **empty**, and stays that way.
 
 | Feature | Adds | Implies | Cost in dependencies |
 | ------- | ---- | ------- | -------------------- |
-| *(default)* | The protocol core | | `serde`, `serde_json`, `getrandom`, `sha2`, `base64` |
+| *(default)* | The protocol core | | `serde`, `getrandom`, `sha2`, `base64` |
 | `http` | An HTTP service over the server: `http::Request` in, `http::Response` out, **no web framework and no async runtime** | | `http`, `http-body`, `bytes` |
 | `axum` | `impl From<AuthorizationService> for axum::Router`, plus the runtime to bind a listener with. About thirty lines, and the whole of this crate's exposure to a pre-1.0 framework | `http` | `axum` 0.8, `tokio` |
-| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document | | `p256` |
-| `jwt-pkcs8` | `EcdsaP256Key::from_pkcs8_der` / `to_pkcs8_der`, for a host whose key arrives as DER rather than as a raw scalar | `jwt` | one crate, `pkcs8`; `der`, `spki` and `const_oid` are already in a `jwt` tree via `sec1` |
+| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, over the `Es256Signer` / `Es256Verifier` seam | | `serde_json` |
+| `jwt-p256` | The built-in ES256 backend for that seam, for a host with no opinion about where its signing key lives | `jwt` | `p256` |
+| `jwt-pkcs8` | `EcdsaP256Key::from_pkcs8_der` / `to_pkcs8_der`, for a host whose key arrives as DER rather than as a raw scalar | `jwt-p256` | one crate, `pkcs8`; `der`, `spki` and `const_oid` are already in a `jwt-p256` tree via `sec1` |
 | `client_assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
 | `dpop` | RFC 9449 sender-constrained tokens | `jwt` | none of its own |
 | `jar` | RFC 9101 signed request objects | `jwt` | none of its own |
-| `mtls` | RFC 8705 mTLS client auth and certificate-bound tokens | | none |
+| `mtls` | RFC 8705 mTLS client auth and certificate-bound tokens | | `serde_json` |
 | `par` | RFC 9126 pushed authorization requests | | none |
-| `rar` | RFC 9396 rich authorization requests | | none |
+| `rar` | RFC 9396 rich authorization requests | | `serde_json` |
 | `token-exchange` | RFC 8693 token exchange | | none |
 | `consent` | Consent records, withdrawal with a revocation cascade, RFC 9470 step-up | | none |
 | `resource-metadata` | The RFC 9728 document type, for a host that also runs a resource server | | none |
 | `test-util` | A runnable `Storage` conformance harness for hosts to run against their own store | | none |
 
-Ten of the fourteen add no dependency at all: they are serde shapes and comparisons over what is
-already there. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
+Five of the fifteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
+`token-exchange`, `resource-metadata` and `test-util` are serde shapes and comparisons over what is
+already there. Three more (`client_assertion`, `dpop`, `jar`) add no crate of their own; they turn
+on `jwt`, which brings `serde_json`. The other seven each bring at least one crate: `serde_json`
+for `jwt`, `mtls` and `rar` (it is optional as of 0.9.1, so a default build no longer carries it),
+`http`/`http-body`/`bytes` for `http`, `axum` and `tokio` for `axum`, `p256` for `jwt-p256`, and
+`pkcs8` for `jwt-pkcs8`. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
 whose major has never moved, so they can appear in this crate's public signatures without making a
 framework upgrade in your tree a breaking change here. If you want a `Router`, turn on `axum` as
 well; if you are on a different axum major, leave it off and mount the service directly.
@@ -108,7 +114,7 @@ difference between two linked binaries, one with the crate and one without, buil
 | `http` | 388 KiB | not measured |
 | `http` + `jwt` | 451 KiB | 378 KiB |
 | `axum` (with a tokio runtime and a bound listener) | 600 KiB | not measured |
-| everything, all fourteen features | 1103 KiB | 1022 KiB |
+| everything, all fifteen features | 1103 KiB | 1022 KiB |
 
 What each optional feature adds on top of the core:
 
@@ -201,8 +207,12 @@ in CI with `--locked`:
 | `axum` | **1.80** | `axum` 0.8 declares it |
 
 `axum` is the only feature that raises the floor, and it raises it because a dependency it pulls
-in says so, not because of anything in this crate. The other nine features add no dependency, so
-they add no floor; `client_assertion`, `dpop` and `jar` inherit `jwt`'s.
+in says so, not because of anything in this crate. Of the other fourteen, five add no crate at all
+(`par`, `consent`, `token-exchange`, `resource-metadata`, `test-util`) and so add no floor, and the
+rest add only crates whose own declared floor is below this one: `serde_json` 1.71 for `jwt` (and
+so for `client_assertion`, `dpop` and `jar`, which turn it on), for `mtls` and for `rar`,
+`http` 1.57 / `http-body` 1.61 / `bytes` 1.57 for `http`, `p256` 1.65 for `jwt-p256`, and
+`pkcs8` 1.65 for `jwt-pkcs8`.
 
 1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower
 would mean `Box<dyn Future>` there, a heap allocation on every storage call, paid forever by every

@@ -811,7 +811,17 @@ fn core_public_types_stay_within_their_size_budget() {
     const RAR: usize = 24;
     #[cfg(not(feature = "rar"))]
     const RAR: usize = 0;
-    let server_budget = 832 + PAR + JAR + RAR;
+    // RFC 7523 and RFC 9449: `AuthorizationServer::token_endpoint`, the derived endpoint URL both
+    // verifiers compare against, as a `Box<str>` precomputed at construction. Two words, and it
+    // exists only under the two features that read it. It is DECLARED here rather than absorbed
+    // because the point of this gate is that a field costs somebody a line: what it buys is a
+    // `format!` of a fixed value removed from every DPoP proof and every client assertion, which
+    // for a `private_key_jwt` client sending DPoP was twice per token request.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    const TOKEN_ENDPOINT: usize = 16;
+    #[cfg(not(any(feature = "client_assertion", feature = "dpop")))]
+    const TOKEN_ENDPOINT: usize = 0;
+    let server_budget = 832 + PAR + JAR + RAR + TOKEN_ENDPOINT;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",

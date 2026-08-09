@@ -56,10 +56,16 @@
 //!   assertion the client believes is being HONOURED, and silently dropping it would register a
 //!   client on terms nobody agreed to.
 //! - The optional human-readable metadata of RFC 7591 section 2 (`client_uri`, `logo_uri`,
-//!   `contacts`, `tos_uri`, `policy_uri`, `jwks`, `jwks_uri`). They are ignored, as section 2
-//!   permits, because this server has nothing to do with them: it renders no branded consent
-//!   screen and does not yet do RFC 7523 client assertions, so storing them would be storing
+//!   `contacts`, `tos_uri`, `policy_uri`). They are ignored, as section 2 permits, because this
+//!   server renders no branded consent screen, so storing them would be storing
 //!   attacker-supplied strings for no purpose.
+//! - `jwks` and `jwks_uri` (RFC 7591 section 2), and this one is a GAP rather than a decision.
+//!   The crate does RFC 7523 client assertions under the `client_assertion` feature, so a key
+//!   registered here would be a key the token endpoint could use; modelling these two members is
+//!   most of what it would take to make `private_key_jwt` registrable, and it is not done. Until
+//!   it is, a `private_key_jwt` client is one the HOST provisions out of band, and asking to
+//!   register one is refused rather than accepted-and-ignored (see the note on the
+//!   `AUTH_METHOD_*` constants below).
 
 use serde::{Deserialize, Serialize};
 
@@ -245,6 +251,12 @@ impl std::fmt::Display for RegistrationErrorResponse {
     }
 }
 
+/// For the reason [`crate::error::ErrorResponse`] is one: this is the value a host is handed when
+/// a registration is refused, and a host that propagates it with `?` into a `Box<dyn Error>`
+/// should not have to care which of the two sibling refusal bodies it is holding. There is no
+/// `source`: the refusal describes a rule this server applied, not a failure underneath it.
+impl std::error::Error for RegistrationErrorResponse {}
+
 /// Why a registration or management request was refused.
 ///
 /// One enum for RFC 7591 and RFC 7592 because the two endpoints share every failure mode they have
@@ -407,8 +419,6 @@ impl RegistrationConfig {
     }
 }
 
-/// The registered `token_endpoint_auth_method` values this server implements, which are exactly
-/// the ones its RFC 8414 `token_endpoint_auth_methods_supported` advertises.
 /// The largest number of `redirect_uris` one dynamic registration may declare.
 ///
 /// # Why there is a cap at all
@@ -436,6 +446,27 @@ impl RegistrationConfig {
 /// [`crate::server::MAX_RESOURCE_INDICATORS`]. The defect was the missing bound, not the loop.
 pub const MAX_REGISTERED_REDIRECT_URIS: usize = 16;
 
+// The `token_endpoint_auth_method` values one may REGISTER here, which are a strict SUBSET of the
+// ones RFC 8414 `token_endpoint_auth_methods_supported` advertises, and deliberately so. That
+// document describes the TOKEN ENDPOINT (RFC 8414 s2), which really does accept
+// `client_secret_jwt`, `private_key_jwt`, `tls_client_auth` and `self_signed_tls_client_auth` for
+// a client the host provisioned out of band; narrowing it to this list would lie to every
+// statically configured client that uses one.
+//
+// The other four are out of reach of REGISTRATION, not of the server:
+//
+// - `private_key_jwt` and `client_secret_jwt` need a key. [`ClientMetadata`] models neither `jwks`
+//   nor `jwks_uri` (RFC 7591 s2), so there is nowhere for a registrant to put one, and
+//   `client_secret_jwt` additionally needs the shared secret IN THE CLEAR at verification time
+//   while a registration keeps only a one-way [`SecretHash`].
+// - `tls_client_auth` and `self_signed_tls_client_auth` need the RFC 8705 s2.1.1 subject
+//   parameters (`tls_client_auth_subject_dn` and the four SAN forms), which are likewise not
+//   modelled.
+//
+// Accepting any of the four would mint a registration the token endpoint could never honour,
+// which is worse than refusing it: RFC 7591 s3.2.2 gives `invalid_client_metadata` for exactly
+// this, a value the server will not register. Closing the gap means modelling `jwks`/`jwks_uri`
+// and the RFC 8705 subject parameters, and that is the change to make, not a wider list here.
 const AUTH_METHOD_NONE: &str = "none";
 const AUTH_METHOD_BASIC: &str = "client_secret_basic";
 const AUTH_METHOD_POST: &str = "client_secret_post";
@@ -617,7 +648,9 @@ fn validate(
         return Err(RegistrationFailure::Invalid(
             RegistrationErrorResponse::new(
                 RegistrationErrorCode::InvalidClientMetadata,
-                "token_endpoint_auth_method is not one this server advertises",
+                "token_endpoint_auth_method is not one this server can REGISTER; RFC 8414 \
+                 token_endpoint_auth_methods_supported describes the token endpoint, which \
+                 accepts more",
             ),
         ));
     }

@@ -1927,17 +1927,28 @@ async fn token_exchange_response<S: Storage, C: Clock>(
     client_secret: Option<String>,
     via_header: bool,
 ) -> Response {
+    // The three refusals below, written out rather than built from the parameter's name. There
+    // are exactly three call sites and the name is a constant at each of them, so `format!` was
+    // copying one of three fixed sentences onto the heap per refused request; this refusal happens
+    // BEFORE the exchange is attempted, so before the presented client credential has been
+    // checked, which makes its rate the caller's to choose.
+    const SUBJECT_NOT_A_TOKEN_TYPE: &str =
+        "subject_token_type is not a token type RFC 8693 s3 registers";
+    const ACTOR_NOT_A_TOKEN_TYPE: &str =
+        "actor_token_type is not a token type RFC 8693 s3 registers";
+    const REQUESTED_NOT_A_TOKEN_TYPE: &str =
+        "requested_token_type is not a token type RFC 8693 s3 registers";
+
     fn token_type(
-        name: &'static str,
+        refusal: &'static str,
         value: &str,
     ) -> Result<crate::token_exchange::TokenTypeIdentifier, ErrorResponse> {
         // The VALUE is not echoed, for the reason `grant_type` is not echoed above: RFC
         // 6749 s5.2 restricts error_description to a charset an attacker-supplied URN need
         // not respect, and naming the parameter is enough for the developer who sent it.
-        value.parse().map_err(|_| {
-            ErrorResponse::new(ErrorCode::InvalidRequest)
-                .with_description(format!("{name} is not a token type RFC 8693 s3 registers"))
-        })
+        value
+            .parse()
+            .map_err(|_| ErrorResponse::new(ErrorCode::InvalidRequest).with_description(refusal))
     }
 
     let subject_token = match required(form, "subject_token") {
@@ -1945,21 +1956,21 @@ async fn token_exchange_response<S: Storage, C: Clock>(
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
     let subject_token_type = match required(form, "subject_token_type")
-        .and_then(|v| token_type("subject_token_type", v))
+        .and_then(|v| token_type(SUBJECT_NOT_A_TOKEN_TYPE, v))
     {
         Ok(v) => v,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
     let actor_token = param(form, "actor_token");
     let actor_token_type = match param(form, "actor_token_type")
-        .map(|v| token_type("actor_token_type", v))
+        .map(|v| token_type(ACTOR_NOT_A_TOKEN_TYPE, v))
         .transpose()
     {
         Ok(v) => v,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
     let requested_token_type = match param(form, "requested_token_type")
-        .map(|v| token_type("requested_token_type", v))
+        .map(|v| token_type(REQUESTED_NOT_A_TOKEN_TYPE, v))
         .transpose()
     {
         Ok(v) => v,
