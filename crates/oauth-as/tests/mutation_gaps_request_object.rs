@@ -221,8 +221,8 @@ fn the_reason_a_registered_key_was_refused_is_the_actual_reason() {
     let short = base64_url(&[1u8; 31]);
     let narrow = RegisteredRequestObjectKey::es256_from_jwk_coordinates(None, &short, Y)
         .expect_err("a 31 byte coordinate is not a key");
-    let wrong_form = RegisteredRequestObjectKey::es256_from_sec1(None, &[0x00; 65])
-        .expect_err("65 bytes that do not begin 0x04 are not an uncompressed point");
+    let not_on_curve = RegisteredRequestObjectKey::es256_from_sec1(None, &[0x04; 65])
+        .expect_err("a point that is not on P-256 is not a key");
 
     assert!(
         bad_x.detail().contains('x'),
@@ -240,9 +240,9 @@ fn the_reason_a_registered_key_was_refused_is_the_actual_reason() {
         narrow.detail()
     );
     assert!(
-        wrong_form.detail().contains("0x04"),
-        "the detail must say which SEC 1 encoding was expected, got {:?}",
-        wrong_form.detail()
+        not_on_curve.detail().contains("P-256"),
+        "the detail must say the point is not on the curve, got {:?}",
+        not_on_curve.detail()
     );
     // And, the property that makes the four assertions above worth making: they are four
     // DIFFERENT sentences. A single constant would satisfy any one of them written loosely.
@@ -250,7 +250,7 @@ fn the_reason_a_registered_key_was_refused_is_the_actual_reason() {
         bad_x.detail(),
         bad_y.detail(),
         narrow.detail(),
-        wrong_form.detail(),
+        not_on_curve.detail(),
     ];
     for (i, a) in details.iter().enumerate() {
         for b in details.iter().skip(i + 1) {

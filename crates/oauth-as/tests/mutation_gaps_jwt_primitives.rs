@@ -49,14 +49,7 @@ fn protected_header(kid: &str) -> Vec<u8> {
         EcdsaP256Key::from_scalar_bytes(kid, &SCALAR).expect("a valid P-256 scalar"),
         AUDIENCE,
     );
-    // Signing is async because an `Es256Signer` may be a KMS. The built-in `jwt-p256` backend does
-    // no I/O, so this drives the future to completion on a current-thread runtime rather than
-    // making every caller of this helper async for a future that is ready on its first poll.
-    let token = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("a current-thread runtime")
-        .block_on(config.sign_access_token(&claims()))
-        .expect("signing");
+    let token = config.sign_access_token(&claims()).expect("signing");
     let first = token
         .split('.')
         .next()
