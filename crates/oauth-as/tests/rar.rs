@@ -748,3 +748,60 @@ fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+/// ATTACK. Every element is, individually, a perfect narrowing of the one granted element: they
+/// are all EXACT COPIES of it. Nothing is added, nothing is changed, nothing is broadened. What
+/// changes is how MANY there are.
+///
+/// A check that asks "is each requested element a narrowing of something granted?" answers yes
+/// sixteen times, and the resource server is handed sixteen payment authorizations for a consent
+/// screen that showed one. Whether that means sixteen payments is type-defined, which is exactly
+/// the point: RFC 9396 s6.1 says the authorization server cannot know what a type's members mean,
+/// and every OTHER ambiguity in this comparison is resolved by refusing (a changed identifier, a
+/// dropped identifier, a changed type-defined member). Duplication was the one move that got the
+/// permissive answer.
+///
+/// So a requested element must consume a DISTINCT granted element. Genuine narrowing still works,
+/// because narrowing a granted element still matches it once.
+#[tokio::test]
+async fn the_token_endpoint_cannot_duplicate_a_granted_element() {
+    let srv = rar_server(ManualClock::at_epoch()).await;
+    let c = challenge();
+    let code = code_for(&srv, &c, Some(GRANTED)).await;
+
+    // The granted element, repeated to the element ceiling. Byte-identical each time.
+    let one = r#"{"type":"payment_initiation","actions":["initiate","status"],"locations":["https://rs.example/payments"],"identifier":"acct-1","instructedAmount":{"currency":"EUR","amount":"50.00"}}"#;
+    let sixteen = format!(
+        "[{}]",
+        std::iter::repeat(one)
+            .take(MAX_AUTHORIZATION_DETAILS_ELEMENTS)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let error = redeem_asking_for(&srv, &code, &sixteen)
+        .await
+        .expect_err("one granted authorization must not become sixteen");
+    assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
+
+    srv.token(redeem(&code))
+        .await
+        .expect("the refused request must not have burned the code");
+}
+
+/// The other half, so the fix cannot be "refuse anything repeated". Two DIFFERENT granted
+/// elements must still both be obtainable, and a genuine narrowing of each must still match: the
+/// rule is one granted element consumed per requested element, not a ban on similar-looking ones.
+#[tokio::test]
+async fn two_distinct_granted_elements_can_both_be_narrowed() {
+    let srv = rar_server(ManualClock::at_epoch()).await;
+    let c = challenge();
+    let two = r#"[{"type":"payment_initiation","actions":["initiate","status"],"locations":["https://rs.example/payments"],"identifier":"acct-1","instructedAmount":{"currency":"EUR","amount":"50.00"}},{"type":"account_information","actions":["read","list"],"identifier":"acct-1"}]"#;
+    let code = code_for(&srv, &c, Some(two)).await;
+
+    // Each narrowed: one action dropped from each element.
+    let narrowed = r#"[{"type":"payment_initiation","actions":["initiate"],"locations":["https://rs.example/payments"],"identifier":"acct-1","instructedAmount":{"currency":"EUR","amount":"50.00"}},{"type":"account_information","actions":["read"],"identifier":"acct-1"}]"#;
+    redeem_asking_for(&srv, &code, narrowed)
+        .await
+        .expect("narrowing each of two distinct granted elements must still be allowed");
+}

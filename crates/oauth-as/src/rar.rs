@@ -304,12 +304,37 @@ impl AuthorizationDetails {
         if requested.is_empty() {
             return Ok(self.clone());
         }
+        // Each requested element must consume a DISTINCT granted element.
+        //
+        // Matching every requested element independently is the obvious implementation and it is
+        // wrong in one specific way: an exact copy of a granted element is, individually, a
+        // perfect narrowing of it, so N copies all match the same grant and one authorization
+        // becomes N. Nothing is added or broadened, only repeated, which is why a per-element
+        // check cannot see it.
+        //
+        // Whether N copies MEAN N of anything is type defined, and RFC 9396 s6.1 is explicit that
+        // the authorization server cannot know: only the API that defined the `type` does. Every
+        // other ambiguity in `is_narrowing_of` is resolved by refusing (a changed `identifier`, a
+        // dropped one, a changed type defined member), and duplication was the one that got the
+        // permissive answer. It gets the same answer as the rest now.
+        //
+        // Genuine narrowing is untouched: a narrowed element still matches its granted element
+        // once, and two distinct grants still satisfy two distinct requests.
+        let mut consumed = vec![false; self.0.len()];
         for want in &requested.0 {
-            if !self.0.iter().any(|granted| want.is_narrowing_of(granted)) {
-                return Err(invalid(
-                    "authorization_details was not granted by the authorization request \
-                     (RFC 9396 s6)",
-                ));
+            let matched = self
+                .0
+                .iter()
+                .enumerate()
+                .position(|(i, granted)| !consumed[i] && want.is_narrowing_of(granted));
+            match matched {
+                Some(i) => consumed[i] = true,
+                None => {
+                    return Err(invalid(
+                        "authorization_details was not granted by the authorization request \
+                         (RFC 9396 s6)",
+                    ))
+                }
             }
         }
         Ok(requested.clone())
