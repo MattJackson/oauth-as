@@ -74,7 +74,7 @@ TARGET_ROOT="${SIZE_REPORT_TARGET_ROOT:-$REPO_ROOT/target/size-report}"
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
 # Every oauth-as feature, mirrored in the probe as `f-<name>`. --all-features is this list.
-ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client_assertion,f-consent,f-token-exchange,f-resource-metadata,f-test-util"
+ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client_assertion,f-consent,f-token-exchange,f-resource-metadata,f-test-util"
 
 # ---------------------------------------------------------------------------------------------
 # THE ROWS.
@@ -95,9 +95,10 @@ ROWS=(
   "default|lib||the protocol core: four grants, the authorization endpoint, RFC 8414 metadata, RFC 7662, RFC 7009, RFC 7591"
   "http|f-http||the core plus the HTTP service, with a request dispatched to every route"
   "axum|f-axum||the above plus the axum Router adapter and the tokio a host binds a listener with"
-  "jwt|f-jwt||the core with RFC 9068 at+jwt access tokens, ES256 signing, and the RFC 7517 JWKS"
-  "jwt-pkcs8 (called)|f-jwt-pkcs8||jwt, plus a PKCS#8 key actually exported and re-imported"
-  "jwt-pkcs8 (never called)|f-jwt-pkcs8-unused||jwt, with the jwt-pkcs8 feature ON and its two constructors never reached"
+  "jwt (seam only)|f-jwt||the core with RFC 9068 at+jwt access tokens over a HOST-supplied ES256 signer: no curve implementation at all"
+  "jwt-p256|f-jwt-p256||the above plus the built-in p256 backend, which is what every consumer of jwt had before the seam"
+  "jwt-pkcs8 (called)|f-jwt-pkcs8||jwt-p256, plus a PKCS#8 key actually exported and re-imported"
+  "jwt-pkcs8 (never called)|f-jwt-pkcs8-unused||jwt-p256, with the jwt-pkcs8 feature ON and its two constructors never reached"
   "mtls|f-mtls||RFC 8705 thumbprints, subject matching and certificate-bound tokens"
   "par|f-par||RFC 9126 pushed authorization requests, pushed and redeemed"
   "jar|f-jar||RFC 9101 signed request objects (implies jwt)"
@@ -148,16 +149,29 @@ budget_for() {
     # what a host turns this feature on to do. Measured 614,661; the 212 KiB over the `http` row is
     # almost entirely the runtime, which is the host's cost and not this crate's.
     aarch64-apple-darwin:axum) echo 646144 ;;
-    # + RFC 9068 ES256 signing, the RFC 7517 JWKS, and JWS verification. Measured 265,017; about a
-    # third of the 64 KiB over the core is p256/primeorder and the rest is this crate's. It does
-    # NOT include PKCS#8 key loading, which is a separate `jwt-pkcs8` feature and, measured, a
-    # separate 30,824 bytes paid only by a host that calls the two constructors behind it.
-    aarch64-apple-darwin:jwt) echo 278528 ;;
-    # the conformance server's own feature set. Measured 461,974.
-    aarch64-apple-darwin:"http,jwt") echo 485376 ;;
-    # every feature, every one exercised. Measured 1,129,020. This is the ceiling on what this
+    # + RFC 9068 signing over a HOST-SUPPLIED `Es256Signer`, the RFC 7517 JWKS, and the JWK
+    # parsing the verification seam rests on. NO curve implementation: this is what a host with
+    # its key in a KMS pays. Measured 244,013, RE-MEASURED 2026-08-09 when the seam split `jwt`
+    # from `jwt-p256`; the row was 274,254 when `jwt` implied p256, so the split took 29.5 KiB off
+    # a host that brings its own backend. The budget comes DOWN with the measurement, because a
+    # budget left at the old number would stop being a gate on this row at all.
+    aarch64-apple-darwin:"jwt (seam only)") echo 256000 ;;
+    # + the built-in p256 backend, which is what every consumer of `jwt` had before the seam.
+    # Measured 274,725 against the pre-seam `jwt` row's 274,254: the seam costs a host that keeps
+    # the built-in backend 471 bytes, which is the `Arc<dyn Es256Signer>` vtable and the boxed
+    # future's shim. It does NOT include PKCS#8 key loading, which is a separate `jwt-pkcs8`
+    # feature and, measured, a separate 30,536 bytes paid only by a host that calls the two
+    # constructors behind it.
+    aarch64-apple-darwin:jwt-p256) echo 288768 ;;
+    # the conformance server's own feature set. Measured 440,476, down from 461,974 before the
+    # signing seam: `http,jwt` is now the HTTP surface plus the seam, with no curve.
+    aarch64-apple-darwin:"http,jwt") echo 462848 ;;
+    # every feature, every one exercised. Measured 1,170,306, RE-MEASURED 2026-08-09 for the
+    # signing seam. It was 1,165,636: the +4,670 is the seam itself (two traits, the object-safe
+    # bridge, the verifier indirection at three call sites) plus the `signer_conformance` harness,
+    # which `test-util` now carries alongside the `Storage` one. This is the ceiling on what this
     # crate can cost anyone, and it is the row a new subsystem shows up in first.
-    aarch64-apple-darwin:all-features) echo 1185792 ;;
+    aarch64-apple-darwin:all-features) echo 1229824 ;;
     *) echo "" ;;
   esac
 }
@@ -165,7 +179,9 @@ budget_for() {
 # The rows `--check` gates. Not every row: a gate over twenty numbers is a gate that goes red for
 # noise and gets ignored. These six are the feature sets a real consumer actually picks, and any
 # regression big enough to matter shows up in at least one of them.
-GATED_ROWS=("default" "http" "axum" "jwt" "http,jwt" "all-features")
+# `jwt (seam only)` AND `jwt-p256` are both gated, because after the seam they are two different
+# consumers with two different costs, and a gate on only one of them would let the other drift.
+GATED_ROWS=("default" "http" "axum" "jwt (seam only)" "jwt-p256" "http,jwt" "all-features")
 
 # ---------------------------------------------------------------------------------------------
 # The instrument: the sum of the byte-exact SECTION sizes in the loadable code and data segments.

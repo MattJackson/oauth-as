@@ -77,7 +77,35 @@ axum = ["http", "dep:axum", "dep:tokio"]
 # resource server verify them without calling this server. Opaque tokens remain the DEFAULT: JWT
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
 # servers are separate processes that should not have to call introspection on every request.
-jwt = ["dep:p256", "dep:serde_json"]
+#
+# NO CRYPTO DEPENDENCY. This feature is the JWT SURFACE plus the two traits the host implements
+# (`Es256Signer`, `Es256Verifier`); the ES256 arithmetic itself is a BACKEND, and `jwt-p256` below
+# is the one this crate ships. Through 0.9.0 the two were the same feature, which structurally
+# required the private signing key to live in this process: an authorization server could not be
+# deployed with its key in a cloud KMS or an HSM, which is the one property a regulated deployment
+# is required to have. Splitting them is also what stops `jwt` adding a COMPLETE SECOND elliptic
+# curve implementation (measured: +20 packages) to the many hosts that already have one through
+# `rustls`.
+#
+# With no backend installed, the crate REFUSES: no signer means no token is minted, and no
+# verifier means no DPoP proof, request object or client assertion is accepted. That is this
+# crate's established posture (an absent consent resolver refuses, an absent registration policy
+# refuses) and the reason generalises: a server that cannot check a signature must never behave as
+# though it had checked one.
+jwt = ["dep:serde_json"]
+# THE BUILT-IN ES256 BACKEND: `EcdsaP256Key` (an `Es256Signer` over `p256`) and `P256Verifier`.
+# What every consumer of `jwt` had before the seam existed, and what a host that has no opinion
+# about where its key lives should still enable.
+#
+# ADDITIVE, like every cargo feature and unlike the mutually exclusive backend flags this design
+# rejected: a tree that enables `jwt-p256` AND installs a host's own signer compiles, and the
+# host's signer wins because it was INSTALLED rather than because a feature was picked. Feature
+# unification across a dependency graph therefore cannot break anybody's build.
+#
+# Enabling it INSTALLS the verifier as the default: `AuthorizationServer` falls back to
+# `P256Verifier` when the host installs none, so a consumer who enables `jwt-p256` sees exactly
+# the behaviour, the tokens, the JWKS and the `kid` they had before.
+jwt-p256 = ["jwt", "dep:p256"]
 # RFC 8705 mutual-TLS client authentication and certificate-bound access tokens.
 # OFF by default, and it adds NO dependency: TLS termination is the host's job in this
 # crate (it never sees a socket), so the host hands in a certificate it has already
@@ -91,9 +119,9 @@ mtls = ["dep:serde_json"]
 # validation the authorization endpoint already performs.
 par = []
 # RFC 9101 JWT-secured authorization requests: a signed request object, verified against the key
-# the client registered. Enables `jwt` because verification is ES256 over the same p256 dependency
-# the RFC 9068 signer already uses, and because the JWS primitives being added there for RFC 7523
-# and DPoP are where this verification belongs once they land (see the SEAM note in src/par.rs).
+# the client registered. Enables `jwt` for the JWS primitives and the `Es256Verifier` seam, which
+# is where this crate's ONE copy of signature verification lives; it does NOT enable a backend, so
+# a host that installs its own verifier takes no p256 for this.
 jar = ["jwt"]
 # RFC 7523 JWT client authentication: `private_key_jwt` (asymmetric, ES256) and `client_secret_jwt`
 # (HMAC, HS256), so that a deployment whose security policy forbids transmitting a shared secret can
@@ -103,8 +131,8 @@ jar = ["jwt"]
 # VERIFICATION, and this crate holds exactly ONE copy of that code (see the VERIFICATION banner in
 # src/jwt.rs). Two half-built verifiers behind two independent feature flags is how a codebase ends
 # up with an algorithm-confusion bug in whichever half nobody reviewed. Neither feature adds a
-# dependency: ES256 verification is the `p256` that `jwt` already pulls in, and HMAC-SHA-256 is
-# twenty lines over the `sha2` that PKCE already required.
+# dependency: ES256 verification goes through the `Es256Verifier` seam (enable `jwt-p256`, or
+# install your own), and HMAC-SHA-256 is twenty lines over the `sha2` that PKCE already required.
 client_assertion = ["jwt"]
 # RFC 9449 DPoP: sender-constrained access tokens, bound to a key the client proves possession of on
 # every request. Without it every token this crate issues is a bearer token, so a stolen one is
@@ -124,7 +152,10 @@ dpop = ["jwt"]
 # What the split actually buys is one CRATE off a `--features jwt` dependency tree, `pkcs8` itself:
 # `der`, `spki`, `const_oid`, `base64ct` and `zeroize` are already there via `sec1`/`elliptic-curve`.
 # That is compile time and audit surface, not binary size.
-jwt-pkcs8 = ["jwt", "p256/pkcs8"]
+#
+# It hangs off `jwt-p256` rather than `jwt`, and has to: `EcdsaP256Key` is the p256 backend's type,
+# so its constructors cannot exist in a build that has no p256.
+jwt-pkcs8 = ["jwt-p256", "p256/pkcs8"]
 # RFC 9728 protected resource metadata. This crate is an AUTHORIZATION SERVER, not a
 # resource server, so what this feature adds is the TYPE a host publishes for its OWN
 # resource, plus the section 4 `protected_resources` member on the AS metadata document.
@@ -204,7 +235,9 @@ bytes = { version = "1", optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 
-# OPTIONAL, feature `jwt` only. ES256 signing for RFC 9068 access tokens.
+# OPTIONAL, feature `jwt-p256` only (NOT `jwt`, which carries the traits and no arithmetic). The
+# built-in ES256 backend: signing for RFC 9068 access tokens and verification for RFC 9449 DPoP,
+# RFC 9101 request objects and RFC 7523 client assertions.
 #
 # WHY p256 AND NOTHING ELSE: it is pure Rust (no cc, no bindgen, no OpenSSL), it is the RustCrypto
 # P-256 implementation the ecosystem already audits, and with default features off it pulls only
@@ -260,13 +293,14 @@ url = "2"
 # the deterministic fixtures the black-box harness's launch contract asks for; the LIBRARY must
 # never ship conformance fixtures, so they live here and nowhere else.
 #
-# `jwt` is required as well as `axum` because the harness verifies the issued access token as an
-# RFC 9068 `at+jwt` against the advertised jwks_uri. Requiring it, rather than degrading to opaque
+# `jwt-p256` is required as well as `axum` because the harness verifies the issued access token as
+# an RFC 9068 `at+jwt` against the advertised jwks_uri, and the fixture therefore has to SIGN: the
+# `jwt` feature is the seam and carries no key implementation. Requiring it, rather than degrading to opaque
 # tokens when the feature is off, keeps the failure at build time and legible: a conformance
 # fixture that quietly stops exercising signing is worse than one that refuses to build.
 [[example]]
 name = "conformance_server"
-required-features = ["axum", "jwt"]
+required-features = ["axum", "jwt-p256"]
 
 # The WORKED PRODUCTION WIRING: what a real host must do at every seam this crate deliberately
 # leaves open (storage atomicity, rate limiting, consent, CSRF, session-backed subject
@@ -276,7 +310,8 @@ required-features = ["axum", "jwt"]
 # `axum` (which implies `http`) but NOT `jwt`: the example binds a listener, and `axum::serve` is
 # how it does that. Opaque access tokens are this crate's default and the right choice for most
 # deployments, so requiring `jwt` to read the production example would imply the opposite. The
-# signing section inside it is behind `#[cfg(feature = "jwt")]`, so an all-features build
+# signing section inside it is behind `#[cfg(feature = "jwt-p256")]`, since it loads a key from a
+# PKCS#8 file and so needs the built-in backend rather than the seam; an all-features build
 # exercises it and a plain `--features axum` build still gets the example.
 [[example]]
 name = "production_server"

@@ -58,6 +58,65 @@ the TLS layer and therefore always passes `certificate: None`. A host terminatin
 `token_with_context` (or the `*_with_credential` entry points) with a certificate it verified
 itself; a host mounting only the HTTP service should not register mTLS clients.
 
+### Changed (BREAKING): the ES256 signing and verification seam
+
+`jwt` no longer contains an elliptic curve. It carries the JWT surface plus two traits, and the
+arithmetic is a BACKEND: `jwt-p256` is the one this crate ships, and a host may install its own.
+
+The reason is a capability the crate could not offer at all: `JwtConfig` held a concrete
+`EcdsaP256Key`, so the private signing key was STRUCTURALLY required to live in this process, and
+`oauth-as` could not be deployed with its key in a cloud KMS or an HSM. The signing key is the one
+secret whose compromise forges every token a deployment will ever issue, and "the key is in the
+process" is precisely what a regulated deployment must avoid. The dependency reduction is real but
+secondary: `jwt` used to add 20 packages, a complete second elliptic curve implementation, to a host
+that already had one through `rustls`.
+
+**Migration in one line, for a host that has no opinion about where its key lives:**
+`features = ["jwt"]` becomes `features = ["jwt-p256"]`. Nothing else changes: the same tokens, the
+same JWKS, the same `kid`, the same `EcdsaP256Key` constructors, the same `verify_es256`.
+
+- **`jwt` no longer implies `p256`.** `jwt-p256 = ["jwt", "dep:p256"]` is the built-in backend.
+  Nothing is mutually exclusive: a dependency graph that unifies `jwt-p256` on cannot take a host's
+  own backend away, because the host's wins by being INSTALLED rather than by a feature being
+  picked. `dpop`, `jar` and `client_assertion` continue to imply `jwt` (the verification surface)
+  and now imply no backend.
+- **`jwt-pkcs8` hangs off `jwt-p256`** rather than off `jwt`. `EcdsaP256Key::from_pkcs8_der` and
+  `to_pkcs8_der` are the p256 backend's constructors and cannot exist without it.
+- **`JwtConfig::new` and `JwtConfig::rotate_to` take an `impl Es256Signer`** rather than an
+  `EcdsaP256Key`. `EcdsaP256Key` implements the trait, so every existing call site compiles
+  unchanged under `jwt-p256`.
+- **`JwtConfig::sign_access_token` is `async`.** `Es256Signer::sign` is async because a KMS call is
+  a network round trip and a PKCS#11 call blocks. The in-process backend does no I/O, so its future
+  is ready on its first poll. Add `.await`.
+  Measured cost: ONE allocation per signed token, the `Box::pin` that makes `Arc<dyn Es256Signer>`
+  possible, and ZERO bytes on the token endpoint's future (1704 bytes on `--all-features` before and
+  after), because the claim set is built and consumed on the sync side of the await.
+- **`dpop::verify_proof` and `client_assertion::verify_assertion` take a `&dyn Es256Verifier`** as
+  their first argument. It is a parameter rather than an `Option`, because there is no "none" that
+  could be safe: a caller with no verifier must refuse.
+- **`AuthorizationServer::with_es256_verifier`** installs the verifier for RFC 9449 DPoP proofs, RFC
+  9101 request objects and RFC 7523 client assertions. With `jwt-p256` compiled in and nothing
+  installed, `P256Verifier` is the default, which is why a `jwt-p256` consumer sees no change. With
+  NEITHER, every signed credential is refused: `invalid_dpop_proof`, `invalid_request_object`,
+  `invalid_client`. Same posture as an absent consent resolver or an absent registration policy.
+- **`RegisteredRequestObjectKey` no longer validates that the registered point is ON P-256 at
+  registration time**, because `jar` no longer contains a curve. Every ENCODING mistake is still
+  refused there (non-base64url, a coordinate that is not 32 bytes, a SEC 1 blob that is not 65 bytes
+  or does not begin `0x04`, which is a new refusal). The curve equation is checked by the installed
+  verifier, per request, and still fails closed. This also collapsed the crate's SECOND copy of
+  ES256 verification, which `par.rs` had carried privately since the `jar` feature landed.
+
+### Added
+
+- **`oauth_as::signer_conformance`**, behind `test-util`, a runnable conformance harness for a
+  host's `Es256Signer` and `Es256Verifier`, in the same shape as the `Storage` one. A broken signer
+  fails SILENTLY: at a resource server a wrong signature is indistinguishable from a tampered token,
+  so the deployment learns about it from its users. Fourteen checks, including the RFC 7515 appendix
+  A.3 known-answer vector, the fixed-width `R || S` of RFC 7518 s3.4 against the ASN.1 DER nearly
+  every KMS returns by default, and that `public_jwk()` is the public half OF the key that signed.
+  Every one of them has a planted fault in `tests/signer_conformance_selftest.rs` that has been
+  watched go red.
+
 ### Changed (BREAKING): types that made the wrong thing easy
 
 Every item here is an API-safety change, pre-1.0, and the crate's existing posture applied

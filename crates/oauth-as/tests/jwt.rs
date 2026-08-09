@@ -18,7 +18,10 @@
 //!    toolchain and is never published), and a transcription that drifts is caught the moment the
 //!    black-box run happens.
 
-#![cfg(feature = "jwt")]
+#![cfg(feature = "jwt-p256")]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -521,6 +524,9 @@ fn invalid_key_material_is_rejected_rather_than_guessed_at() {
     // All zeroes is not a valid P-256 scalar (SEC 1: 1 <= d <= n-1).
     assert!(EcdsaP256Key::from_scalar_bytes("k", &[0u8; 32]).is_err());
     assert!(EcdsaP256Key::from_scalar_bytes("k", &[1u8; 31]).is_err());
+    // Behind `jwt-pkcs8`, a feature of the p256 BACKEND: without the DER decoder there is no
+    // constructor here to refuse anything.
+    #[cfg(feature = "jwt-pkcs8")]
     assert!(EcdsaP256Key::from_pkcs8_der("k", b"not der").is_err());
 }
 

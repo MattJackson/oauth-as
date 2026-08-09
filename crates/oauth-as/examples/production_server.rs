@@ -621,7 +621,7 @@ where
 /// previous key is still in the configuration, the new one is promoted over it, and both are
 /// published. A deployment that rotates without a restart rebuilds the service with the new
 /// configuration and swaps it in, which is the host's business and not something this crate hides.
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 fn configure_signing(
     config: &mut ServerConfig,
     issuer: &str,
@@ -763,7 +763,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7591 s5 is why refusing is the default: an open registration endpoint lets anyone on the
     // internet mint a client, which weakens every threat model that assumed controlling a
     // registered client was hard.
-    #[cfg(feature = "jwt")]
+    #[cfg(feature = "jwt-p256")]
     configure_signing(&mut config, &issuer)?;
 
     let server = AuthorizationServer::new(config, HostStorage::new())

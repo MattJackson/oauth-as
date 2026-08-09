@@ -71,19 +71,26 @@ hostdeps = ["dep:serde", "dep:serde_json", "dep:http", "dep:bytes", "dep:sha2"]
 # probe itself.
 f-http = ["lib", "dep:http", "oauth-as/http"]
 f-axum = ["lib", "f-http", "dep:axum", "dep:tokio", "oauth-as/axum"]
+# The SEAM, which after 0.9.0 carries no crypto dependency at all: the probe supplies its own
+# `Es256Signer`, exactly as a host with a KMS-held key does. This row is what such a host pays.
 f-jwt = ["lib", "oauth-as/jwt"]
-f-jwt-pkcs8 = ["lib", "f-jwt", "oauth-as/jwt-pkcs8"]
+# The BUILT-IN BACKEND, which is where p256 and its tree actually enter.
+f-jwt-p256 = ["lib", "f-jwt", "oauth-as/jwt-p256"]
+f-jwt-pkcs8 = ["lib", "f-jwt-p256", "oauth-as/jwt-pkcs8"]
 # The SAME crate feature, with the probe's exercise of it left OFF. It exists to answer one
 # question the crate's own manifest asserts an answer to: what does compiling `jwt-pkcs8` in and
 # never calling it cost? Under `lto = "fat"` the answer turns out to be nothing, which is not what
 # a reader of the manifest would guess.
-f-jwt-pkcs8-unused = ["lib", "f-jwt", "oauth-as/jwt-pkcs8"]
+f-jwt-pkcs8-unused = ["lib", "f-jwt-p256", "oauth-as/jwt-pkcs8"]
 f-mtls = ["lib", "oauth-as/mtls"]
 f-par = ["lib", "oauth-as/par"]
-f-jar = ["lib", "f-jwt", "oauth-as/jar"]
+# `f-jwt-p256`, not `f-jwt`: the probe has to PRODUCE the credential it verifies.
+f-jar = ["lib", "f-jwt-p256", "oauth-as/jar"]
 f-rar = ["lib", "oauth-as/rar"]
-f-dpop = ["lib", "f-jwt", "oauth-as/dpop"]
-f-client_assertion = ["lib", "f-jwt", "oauth-as/client_assertion"]
+# `f-jwt-p256`, not `f-jwt`: the probe has to PRODUCE the credential it verifies.
+f-dpop = ["lib", "f-jwt-p256", "oauth-as/dpop"]
+# `f-jwt-p256`, not `f-jwt`: the probe has to PRODUCE the credential it verifies.
+f-client_assertion = ["lib", "f-jwt-p256", "oauth-as/client_assertion"]
 f-consent = ["lib", "oauth-as/consent"]
 f-token-exchange = ["lib", "oauth-as/token-exchange"]
 f-resource-metadata = ["lib", "oauth-as/resource-metadata"]

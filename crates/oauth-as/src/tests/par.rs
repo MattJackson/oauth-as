@@ -156,6 +156,9 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
 // ------------------------------------------------------------------------------- RFC 9101
 
 #[cfg(feature = "jar")]
+// `jwt-p256`, the built-in ES256 backend: every test in here has to SIGN a request object, and
+// after the `Es256Signer` seam landed `jar` implies the verification surface, not a curve.
+#[cfg(feature = "jwt-p256")]
 mod jar {
     use super::*;
 
@@ -538,18 +541,72 @@ mod jar {
         assert_eq!(error.error, ErrorCode::InvalidRequestObject);
     }
 
-    /// A registered key is checked when it is REGISTERED, so a host that pastes in a truncated or
-    /// off-curve coordinate finds out at configuration time rather than at request time.
+    /// The other half of what moved out of registration: a well formed pair of coordinates that
+    /// is NOT a point on P-256 registers, and then verifies NOTHING. Fail closed is the property
+    /// that matters; being told early is the convenience.
+    #[tokio::test]
+    async fn an_off_curve_key_registers_but_verifies_nothing() {
+        let off_curve = RegisteredRequestObjectKey::es256_from_sec1(None, &[0x04; 65])
+            .expect("well formed coordinates, which is all registration can now check");
+
+        let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+        cfg.jar = Some(Box::new(JarConfig::new()));
+        let server = AuthorizationServer::new(cfg, MemoryStorage::new()).with_request_object_keys(
+            Box::new(OneClientsKey {
+                client_id: ClientId::new("app"),
+                key: off_curve,
+            }),
+        );
+        server
+            .register_client(Client {
+                client_id: ClientId::new("app"),
+                auth: ClientAuth::Public,
+                grant_types: vec![GrantType::AuthorizationCode],
+                redirect_uris: vec!["https://app.example/cb".to_string()],
+                allowed_scopes: ScopeSet::parse("read write").unwrap(),
+                default_scopes: ScopeSet::parse("read").unwrap(),
+                name: None,
+                registration: None,
+            })
+            .await
+            .unwrap();
+
+        // A genuinely signed request object, under a genuinely valid key. It is refused because
+        // the REGISTERED key is unusable, which is the only safe reading of an unusable key.
+        let object = sign(header(), claims(), &signing_key(7));
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a key that is not on the curve verifies nothing");
+        assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+    }
+
+    /// A registered key's ENCODING is checked when it is REGISTERED, so a host that pastes in a
+    /// truncated coordinate finds out at configuration time rather than at request time.
+    ///
+    /// WHAT MOVED, and it moved for a reason worth stating: whether the point is actually ON P-256
+    /// is no longer checked here. It cannot be, because `--features jar` no longer contains an
+    /// elliptic curve at all (the ES256 arithmetic is behind the `Es256Verifier` seam, and the
+    /// `jwt-p256` backend is one implementation of it). The check still happens, in the installed
+    /// verifier, once per request, and it still FAILS CLOSED, which
+    /// [`an_off_curve_key_registers_but_verifies_nothing`] is what proves. What is lost is only
+    /// how early the host is told, and what is bought is that a host with its own backend does not
+    /// carry a second curve implementation to be told slightly sooner.
     #[test]
     fn a_malformed_public_key_cannot_be_registered() {
-        assert!(RegisteredRequestObjectKey::es256_from_sec1(None, &[0x04; 65]).is_err());
         assert!(RegisteredRequestObjectKey::es256_from_sec1(None, &[0x04; 33]).is_err());
+        // 65 bytes, but not the uncompressed SEC 1 form: the leading byte is what says which
+        // encoding this is, so a buffer that does not begin 0x04 is not the point it looks like.
+        assert!(RegisteredRequestObjectKey::es256_from_sec1(None, &[0x00; 65]).is_err());
         assert!(RegisteredRequestObjectKey::es256_from_jwk_coordinates(
             None,
             "not base64!",
             "AAAA"
         )
         .is_err());
+        // A three byte coordinate: RFC 7518 s6.2.1.2 fixes P-256's at 32, leading zeros KEPT.
+        assert!(
+            RegisteredRequestObjectKey::es256_from_jwk_coordinates(None, "AAAA", "AAAA").is_err()
+        );
 
         let key = signing_key(7);
         let point = key.verifying_key().to_encoded_point(false);

@@ -11,12 +11,21 @@
 //!
 //! Each test asserts the REFUSAL rather than `should_panic`: the property is that no panic happens,
 //! and that the refusal is the one the module already had for a time claim it will not accept.
-#![cfg(feature = "client_assertion")]
+#![cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::client_assertion::{verify_assertion, AssertionFailure, AssertionKeys};
 use oauth_as::jwt::{compact_jws, EcdsaP256Key};
+
+/// The crate's built-in ES256 backend. Verification now goes through the [`oauth_as::jwt::Es256Verifier`] seam,
+/// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
+/// default, which is what keeps these tests measuring the behaviour they always measured.
+#[cfg(feature = "jwt-p256")]
+const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
 
 const TOKEN_ENDPOINT: &str = "https://as.example/token";
 const CLIENT_ID: &str = "pkjwt";
@@ -59,7 +68,14 @@ fn an_exp_of_u64_max_is_refused_rather_than_panicking() {
     );
 
     assert_eq!(
-        verify_assertion(&keys(&key), &assertion, CLIENT_ID, &[TOKEN_ENDPOINT], now()),
+        verify_assertion(
+            VERIFIER,
+            &keys(&key),
+            &assertion,
+            CLIENT_ID,
+            &[TOKEN_ENDPOINT],
+            now()
+        ),
         Err(AssertionFailure::Expired),
         "an exp past MAX_ASSERTION_LIFETIME is refused, and one that cannot be represented is too"
     );
@@ -83,7 +99,14 @@ fn an_nbf_or_iat_of_u64_max_is_refused_rather_than_panicking() {
         let assertion = sign(&key, &claims);
 
         assert_eq!(
-            verify_assertion(&keys(&key), &assertion, CLIENT_ID, &[TOKEN_ENDPOINT], now()),
+            verify_assertion(
+                VERIFIER,
+                &keys(&key),
+                &assertion,
+                CLIENT_ID,
+                &[TOKEN_ENDPOINT],
+                now()
+            ),
             Err(AssertionFailure::NotYetValid),
             "{claim} of u64::MAX is in the future by more than any leeway"
         );

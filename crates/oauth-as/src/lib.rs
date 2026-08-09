@@ -213,6 +213,10 @@ pub mod dpop;
 pub mod error;
 pub mod events;
 pub mod grant;
+// PRIVATE, and one function long: the lower-case hex encoder that `server` (device codes,
+// authorization codes, opaque tokens) and `client` (the stored secret verifier) both need. It sits
+// here for the reason `skew` does, and it was two copies of one loop until 0.9.1.
+mod hex;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod http;
@@ -237,6 +241,12 @@ pub mod registration;
 pub mod resource_metadata;
 pub mod scope;
 pub mod server;
+// A RUNNABLE conformance harness for the `Es256Signer` and `Es256Verifier` contracts, for a HOST
+// to run against the ES256 backend it is about to deploy. Behind `test-util`, which adds nothing
+// to a default build. The module's own `//!` docs are the documentation.
+#[cfg(all(feature = "test-util", feature = "jwt"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "test-util", feature = "jwt"))))]
+pub mod signer_conformance;
 // PRIVATE, and one item long: the clock-skew allowance that `client_assertion` and `dpop` both
 // PUBLISH. It lives here because those two are independent features and neither can own a
 // constant the other must still see; both re-export it, so the public paths are unchanged.
@@ -267,11 +277,12 @@ pub use client_assertion::{
 #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
 pub use consent::{
     step_up_challenge, Authentication, AuthenticationRequirement, ConsentRecord, StepUpFailure,
+    MAX_CONSENT_RESOURCES,
 };
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 #[cfg(feature = "dpop")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dpop")))]
-pub use dpop::{DpopFailure, VerifiedProof, DPOP_HEADER, DPOP_TOKEN_TYPE};
+pub use dpop::{DpopFailure, VerifiedProof, DPOP_HEADER, DPOP_TOKEN_TYPE, MAX_PROOF_BYTES};
 pub use error::{ErrorCode, ErrorResponse};
 pub use events::{
     Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
@@ -282,7 +293,7 @@ pub use grant::GrantType;
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub use http::{
     AuthorizationService, Body, ConsentDecision, ConsentRequest, ConsentResolver, CsrfTokenHook,
-    ServiceBuilder, ServiceError, SubjectResolver,
+    ServiceBuilder, ServiceError, SubjectResolver, MAX_BODY_BYTES, MAX_FORM_PARAMETERS,
 };
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
 #[cfg(feature = "mtls")]
@@ -314,7 +325,7 @@ pub use rate_limit::{FixedWindowRateLimiter, RateLimitConfig};
 pub use registration::{
     ClientInformation, ClientMetadata, RegistrationAttempt, RegistrationConfig,
     RegistrationDecision, RegistrationErrorCode, RegistrationErrorResponse, RegistrationFailure,
-    RegistrationPolicy,
+    RegistrationPolicy, MAX_REGISTERED_REDIRECT_URIS,
 };
 #[cfg(feature = "resource-metadata")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resource-metadata")))]
@@ -328,11 +339,16 @@ pub use scope::{Scope, ScopeSet};
 // error type of a re-exported method was an oversight rather than a decision.
 pub use server::{
     AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ServerConfig, SystemClock,
-    TokenRequest, TokenRequestContext, UserApproval, MIN_USER_CODE_LENGTH,
+    TokenRequest, TokenRequestContext, UserApproval, MAX_RESOURCE_INDICATORS, MIN_USER_CODE_LENGTH,
 };
 pub use store::{MemoryStorage, Storage, StorageError};
-#[cfg(feature = "dpop")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dpop")))]
+// The GATE MATCHES THE TYPE's, which is `any(dpop, mtls)`: `IntrospectionResponse::cnf` is a
+// public field under that same pair, so an `mtls`-only host (RFC 8705 certificate-bound tokens,
+// which is the whole reason such a host exists) was handed a value it could not name here. It
+// could still reach `oauth_as::token::Confirmation`, which is why nothing failed to compile; a
+// re-export that is NARROWER than the item it re-exports is an absence, not an error.
+#[cfg(any(feature = "dpop", feature = "mtls"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "dpop", feature = "mtls"))))]
 pub use token::Confirmation;
 pub use token::{
     IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,
@@ -342,5 +358,5 @@ pub use token::{
 #[cfg_attr(docsrs, doc(cfg(feature = "token-exchange")))]
 pub use token_exchange::{
     ActClaim, ExchangeSemantics, ExchangedToken, TokenExchange, TokenExchangeRequest,
-    TokenExchangeResponse, TokenTypeIdentifier, TOKEN_EXCHANGE_GRANT_URN,
+    TokenExchangeResponse, TokenTypeIdentifier, MAX_AUDIENCE_VALUES, TOKEN_EXCHANGE_GRANT_URN,
 };

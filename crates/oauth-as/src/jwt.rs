@@ -45,9 +45,27 @@
 //! JOSE library brings a parser, a validation policy engine and a key-format zoo that an issuer
 //! never executes; the compact serialization of RFC 7515 section 3.1 is
 //! `BASE64URL(header) "." BASE64URL(payload) "." BASE64URL(signature)` and fits in this file on
-//! top of `serde_json` and `base64`, which the crate already depends on. The only thing that
-//! genuinely needs a library is the P-256 arithmetic, and that is `p256` (see Cargo.toml for why
-//! that crate and why ES256 rather than RS256).
+//! top of `serde_json` and `base64`, which the crate already depends on.
+//!
+//! # THE ES256 SEAM: the arithmetic is not in this feature
+//!
+//! The P-256 arithmetic is the one thing that genuinely needs an implementation, and after 0.9.0
+//! it is not one this feature brings. [`Es256Signer`] and [`Es256Verifier`] are the seam; the
+//! `jwt-p256` feature is the BACKEND this crate ships over `p256`, and a host may install its own
+//! instead. Two reasons, in the order they matter:
+//!
+//! 1. THE PRIVATE KEY NEED NOT BE IN THIS PROCESS. [`Es256Signer::sign`] is async precisely so it
+//!    can be a cloud KMS or a PKCS#11 token, where the key never leaves its boundary and this
+//!    process holds only a handle. The signing key is the one secret whose compromise forges every
+//!    token the deployment will ever issue, and "the key is in the process" is exactly the property
+//!    a regulated deployment must avoid. Through 0.9.0 this module made it structural.
+//! 2. It stops `jwt` adding a complete SECOND elliptic curve implementation (measured: 20 packages)
+//!    to a host that already has one through `rustls`, which is most Rust HTTP servers.
+//!
+//! [`Es256Verifier`] is SYNC, and the asymmetry is the design rather than an oversight: verifying
+//! holds only PUBLIC keys, so there is nothing to externalise, and it sits on the RFC 9449 DPoP hot
+//! path where an ES256 verification is already about 133 microseconds. Making it async would buy
+//! nothing and cost bytes on the token future.
 //!
 //! # What the host owns
 //!
@@ -57,28 +75,38 @@
 //! host's own key-provisioning tool, and the host is expected to store what it generates.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+#[cfg(feature = "jwt-p256")]
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
+#[cfg(feature = "jwt-p256")]
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 #[cfg(feature = "jwt-pkcs8")]
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+#[cfg(feature = "jwt-p256")]
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// A key could not be loaded or exported. The message never contains key material.
+#[cfg(feature = "jwt-p256")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyError(String);
 
+#[cfg(feature = "jwt-p256")]
 impl fmt::Display for KeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "signing key error: {}", self.0)
     }
 }
 
+#[cfg(feature = "jwt-p256")]
 impl std::error::Error for KeyError {}
 
 /// A token could not be signed or serialized. The message never contains key material.
@@ -93,18 +121,224 @@ impl fmt::Display for JwtError {
 
 impl std::error::Error for JwtError {}
 
+/// A host's ES256 backend could not produce a signature.
+///
+/// One opaque type rather than an enum, and no source error: the caller in
+/// [`JwtConfig::sign_access_token`] has exactly one reaction to any of them (mint no token, answer
+/// `server_error`), so distinguishing "the KMS was unreachable" from "the key was disabled" here
+/// would only invite somebody to treat one as recoverable on a path where neither is. The host
+/// already has the real detail, because the host wrote the signer.
+///
+/// The message MUST NOT contain key material; nothing in this crate ever prints it on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignerError(String);
+
+impl SignerError {
+    /// Describe a signing failure. Do not put key material in it.
+    pub fn new(message: impl Into<String>) -> Self {
+        SignerError(message.into())
+    }
+}
+
+impl fmt::Display for SignerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ES256 signer error: {}", self.0)
+    }
+}
+
+impl std::error::Error for SignerError {}
+
+/// WHERE THIS SERVER'S SIGNING KEY LIVES. The host implements it; this crate holds only a handle.
+///
+/// Enable `jwt-p256` and use [`EcdsaP256Key`] if the key is a scalar in this process. Implement
+/// this if it is not: a cloud KMS, a PKCS#11 token, an HSM, a remote signing service.
+///
+/// # The two halves are deliberately different shapes
+///
+/// [`Es256Signer::sign`] is ASYNC because it holds a SECRET, so it is the half that wants to leave
+/// the process, and leaving the process is a network round trip (or, for PKCS#11, a blocking call
+/// that belongs on a blocking pool). [`Es256Verifier`] is SYNC because it holds only public keys,
+/// so there is nothing to externalise.
+///
+/// # `public_jwk` is SYNC, and that is a REQUIREMENT ON YOU
+///
+/// A KMS-backed signer may need a network round trip to learn its own public half, and this method
+/// gives it nowhere to await. That is deliberate, so it has to be said plainly:
+///
+/// **Fetch the public half ONCE, AT CONSTRUCTION, and return a cached value here.** Do not block a
+/// runtime thread inside this method, and do not panic if a fetch fails; neither is necessary,
+/// because construction is where the fetch belongs.
+///
+/// Sync is the right shape independently of KMS: this crate serialises the RFC 7517 JWKS document
+/// ONCE, at construction, exactly as it does the RFC 8414 metadata document. An async
+/// `public_jwk()` would invite a network call on a PUBLIC, UNAUTHENTICATED, CACHEABLE endpoint that
+/// any client may poll at any rate. Forcing the fetch to construction is the behaviour this crate
+/// wants, and making the method sync is how the type system asks for it.
+///
+/// Two consequences follow, and neither is papered over:
+///
+/// - **Construction becomes fallible, and may be slow.** Your signer reaches the KMS before you
+///   build [`JwtConfig`]. A KMS that is unreachable at boot is then a STARTUP failure, which is the
+///   correct time to find out, rather than a 500 on the first token request.
+/// - **A KEY ROTATED IN THE KMS BEHIND THIS PROCESS'S BACK GOES STALE SILENTLY.** The cached public
+///   half would advertise a key that no longer signs, so every token the deployment issues fails
+///   verification against its own published JWKS, and nothing in this process notices. **Rotating
+///   in the KMS alone is NOT enough.** Rotation must go through [`JwtConfig::rotate_to`], which
+///   keeps the retired PUBLIC half published so tokens minted before the swap keep verifying. This
+///   is the mistake an operator makes exactly once, in production, and its symptom (every token
+///   suddenly invalid) points nowhere near its cause.
+///
+/// # What this trait deliberately cannot do
+///
+/// There is NO method that returns a private key, and there must never be one.
+/// [`JwtConfig`]'s retired set holds public halves only, so a retired key cannot sign again BY
+/// CONSTRUCTION rather than by a promise the code keeps: retirement drops the signer, and a `Jwk`
+/// is all that is left.
+///
+/// # Before you deploy one
+///
+/// Run [`crate::signer_conformance`] against it, behind the `test-util` feature. A broken signer
+/// fails SILENTLY: a wrong signature is indistinguishable, at a resource server, from a tampered
+/// token. Emitting ASN.1 DER instead of the fixed-width form below is the obvious way to be wrong,
+/// and it is wrong in a way only a real client notices.
+#[cfg(feature = "jwt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub trait Es256Signer: Send + Sync {
+    /// The `ES256` signature over `signing_input`, which is the JWS Signing Input of RFC 7515
+    /// section 5.1 step 5: the ASCII of `BASE64URL(header) "." BASE64URL(payload)`.
+    ///
+    /// The return is the FIXED-WIDTH `r || s` concatenation RFC 7518 section 3.4 mandates: 64
+    /// bytes, 32 per coordinate, leading zeros KEPT. It is **NOT** the ASN.1 DER
+    /// `SEQUENCE { r INTEGER, s INTEGER }` that OpenSSL and nearly every KMS return by default,
+    /// and converting is your job. The array type refuses the wrong LENGTH; it cannot refuse the
+    /// wrong ENCODING, which is what [`crate::signer_conformance`] is for.
+    ///
+    /// Sign the bytes as given. Do not hash them first: `ES256` is ECDSA/P-256/SHA-256, so the
+    /// SHA-256 is part of the signature scheme, and a KMS whose API wants a digest is a KMS you
+    /// hash for exactly once.
+    fn sign(
+        &self,
+        signing_input: &[u8],
+    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send;
+
+    /// The PUBLIC half, for the RFC 7517 JWKS document and the `kid` on every token header.
+    ///
+    /// Cached at construction. Read the trait docs above before implementing this one.
+    fn public_jwk(&self) -> Jwk;
+}
+
+/// Delegating impl so a host can share ONE signer between several [`JwtConfig`]s (two audiences,
+/// two servers in one process) without a newtype. `JwtConfig` erases to a `dyn` handle internally,
+/// so this costs nothing extra.
+#[cfg(feature = "jwt")]
+impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
+    fn sign(
+        &self,
+        signing_input: &[u8],
+    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+        (**self).sign(signing_input)
+    }
+
+    fn public_jwk(&self) -> Jwk {
+        (**self).public_jwk()
+    }
+}
+
+/// HOW THIS SERVER CHECKS A SIGNATURE SOMEBODY ELSE MADE: RFC 9449 DPoP proofs, RFC 9101 request
+/// objects, RFC 7523 client assertions.
+///
+/// Enable `jwt-p256` for the built-in [`P256Verifier`], or install your own with
+/// [`crate::AuthorizationServer::with_es256_verifier`]. With neither, every signed credential is
+/// REFUSED: a server that cannot check a signature must never behave as though it had checked one.
+///
+/// SYNC on purpose. This holds only PUBLIC keys, so there is no secret to externalise and nothing
+/// to be gained from a round trip; it also sits on the DPoP hot path, which runs once per token
+/// request. See the module docs on the asymmetry with [`Es256Signer`].
+///
+/// # The contract, and every clause of it is load bearing
+///
+/// `true` means, and may only mean: `signature` is a valid `ES256` (ECDSA/P-256/SHA-256) signature
+/// over exactly `signing_input`, under exactly `key`. In particular:
+///
+/// - `signature` MUST be the 64-byte fixed-width `r || s` of RFC 7518 section 3.4. Reject any
+///   other length, and do NOT also accept the ASN.1 DER form: two encodings of one signature is
+///   signature malleability, and a value a deployment recorded as unique stops being unique.
+/// - `key` must be checked to be ON THE CURVE. That check is what an invalid-curve attack needs to
+///   find missing, and it is the reason this crate hands you a [`PublicJwk`] rather than a parsed
+///   point: the coordinates arrived from a client.
+/// - There is no `false` you may return for an error and no error you may return at all. A
+///   malformed key, a wrong-length signature and a signature that simply does not verify all have
+///   the same and only safe answer, and distinguishing them would only invite a caller to treat
+///   one as recoverable.
+///
+/// # Before you deploy one
+///
+/// Run [`crate::signer_conformance`] against it. It carries the RFC 7515 appendix A.3 vector,
+/// which neither side of your deployment produced, and it is the only thing that can tell a
+/// verifier that is right from one that agrees with your signer.
+#[cfg(feature = "jwt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub trait Es256Verifier: Send + Sync {
+    /// Does `signature` verify over `signing_input` under `key`? See the trait docs for what
+    /// `true` is allowed to mean.
+    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool;
+}
+
+/// The OBJECT-SAFE shadow of [`Es256Signer::sign`], so that [`JwtConfig`] can hold `Arc<dyn ...>`.
+///
+/// Only `sign` needs shadowing: `public_jwk` is called ONCE, on the concrete type, before the
+/// signer is erased, and the `Jwk` it returned is what [`JwtConfig`] keeps.
+///
+/// It exists because those two requirements are in tension in the language rather than in the
+/// design. `async fn` in a trait (return-position `impl Trait`, which is also what [`crate::Storage`]
+/// uses and what sets this crate's 1.75 MSRV floor) is what lets a host write a natural
+/// `async fn sign`, and it is exactly what makes a trait not object safe. Boxing the future in the
+/// PUBLIC trait would push that syntax onto every implementor forever; boxing it here, once, keeps
+/// the public shape and confines the cost to one line.
+///
+/// The cost is ONE allocation per signed access token, paid only by a host that configured RFC 9068
+/// tokens at all. The alternative is making [`JwtConfig`] generic over the signer, which is a third
+/// monomorphization axis on `AuthorizationServer`: MEASURED at 53,548 bytes per additional
+/// `(Storage, Clock)` pair, which is 27% of this crate's entire default binary surface. One
+/// allocation and one indirect call against a signing operation that may be a network round trip is
+/// not measurable; that is.
+#[cfg(feature = "jwt")]
+trait DynEs256Signer: Send + Sync {
+    fn dyn_sign<'a>(
+        &'a self,
+        signing_input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<[u8; 64], SignerError>> + Send + 'a>>;
+}
+
+#[cfg(feature = "jwt")]
+impl<T: Es256Signer> DynEs256Signer for T {
+    fn dyn_sign<'a>(
+        &'a self,
+        signing_input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<[u8; 64], SignerError>> + Send + 'a>> {
+        Box::pin(self.sign(signing_input))
+    }
+}
+
 /// A P-256 signing key plus the `kid` that names it.
 ///
 /// The `kid` is what makes rotation possible: an AS publishes the old and new public keys in the
 /// same JWKS, signs new tokens under the new `kid`, and retires the old entry once every token
 /// signed under it has expired (RFC 7517 section 4.5; RFC 7515 section 4.1.4). Without a `kid` a
 /// verifier must trial every advertised key and rotation becomes a guessing game.
+///
+/// THE BUILT-IN BACKEND, behind `jwt-p256`. It is an [`Es256Signer`] like any other; what makes it
+/// the default choice is only that the key is a scalar in this process, which is the right answer
+/// for most deployments and the wrong one for a deployment whose policy says the key may not be.
+#[cfg(feature = "jwt-p256")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
 #[derive(Clone)]
 pub struct EcdsaP256Key {
     kid: String,
     signing: SigningKey,
 }
 
+#[cfg(feature = "jwt-p256")]
 impl EcdsaP256Key {
     /// Load from a raw 32 byte big-endian private scalar (SEC 1: `1 <= d <= n-1`; out-of-range and
     /// wrong-length input is rejected rather than reduced, because a silently reduced key is a key
@@ -219,6 +453,7 @@ impl EcdsaP256Key {
     }
 }
 
+#[cfg(feature = "jwt-p256")]
 impl fmt::Debug for EcdsaP256Key {
     /// Redacted on purpose: `ServerConfig` derives `Debug`, and a host that logs its config must
     /// not thereby log its signing key.
@@ -230,6 +465,7 @@ impl fmt::Debug for EcdsaP256Key {
     }
 }
 
+#[cfg(feature = "jwt-p256")]
 impl PartialEq for EcdsaP256Key {
     /// Equality over the PUBLIC identity only (kid plus public point). Two handles to the same key
     /// compare equal without any comparison touching the secret scalar.
@@ -248,7 +484,46 @@ impl PartialEq for EcdsaP256Key {
     }
 }
 
+#[cfg(feature = "jwt-p256")]
 impl Eq for EcdsaP256Key {}
+
+/// The built-in backend's signing half. `sign` is async by the trait and does no I/O here: the key
+/// is in this process, so the future is ready on its first poll and there is no suspension point
+/// for the token path to pay for.
+#[cfg(feature = "jwt-p256")]
+impl Es256Signer for EcdsaP256Key {
+    fn sign(
+        &self,
+        signing_input: &[u8],
+    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+        // Computed BEFORE the async block, so nothing borrows `signing_input` across a suspension
+        // point that does not exist. The future this returns owns a `Result` and nothing else.
+        let signed = self.sign_es256(signing_input).map_err(|e| SignerError(e.0));
+        async move { signed }
+    }
+
+    fn public_jwk(&self) -> Jwk {
+        EcdsaP256Key::public_jwk(self)
+    }
+}
+
+/// The built-in backend's verifying half: ES256 (ECDSA/P-256/SHA-256) over `p256`.
+///
+/// A unit struct rather than a function so it can be INSTALLED, which is what makes a host's own
+/// verifier able to replace it. `AuthorizationServer` falls back to this one when the host installs
+/// none and `jwt-p256` is compiled in, which is why enabling that feature reproduces exactly the
+/// behaviour every consumer had before the seam existed.
+#[cfg(feature = "jwt-p256")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct P256Verifier;
+
+#[cfg(feature = "jwt-p256")]
+impl Es256Verifier for P256Verifier {
+    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+        verify_es256(key, signing_input, signature)
+    }
+}
 
 /// One RFC 7517 JWK: the PUBLIC parameters of an EC P-256 signing key and nothing else.
 ///
@@ -271,6 +546,29 @@ pub struct Jwk {
     pub use_: &'static str,
     /// The algorithm this key is for; always `ES256` (RFC 7517 section 4.4).
     pub alg: &'static str,
+}
+
+impl Jwk {
+    /// The same key in the VERIFYING shape.
+    ///
+    /// [`Jwk`] exists to be SERIALIZED, so every member this crate fixes is a `&'static str`;
+    /// [`PublicJwk`] is parsed from attacker-controlled JSON and is therefore a different type on
+    /// purpose (see its own docs). This is the one direction that is always safe, because these
+    /// parameters were produced here rather than received: a `Jwk` a signer published is by
+    /// construction `EC` / `P-256` with 32-byte coordinates.
+    ///
+    /// Used by [`crate::signer_conformance`] to check a signer's output against the key that
+    /// signer publishes, which is the one check that catches a `public_jwk()` belonging to some
+    /// other key.
+    pub fn to_public_jwk(&self) -> PublicJwk {
+        PublicJwk {
+            kty: self.kty.to_string(),
+            crv: self.crv.to_string(),
+            x: self.x.clone(),
+            y: self.y.clone(),
+            kid: Some(self.kid.clone()),
+        }
+    }
 }
 
 /// An RFC 7517 section 5 JWK Set: what the host serves at its `jwks_uri`.
@@ -366,16 +664,44 @@ pub struct AccessTokenClaims {
 /// this crate has no background tasks by design (see the crate doc's "Zero cost until enabled"),
 /// and the host is the only party that knows its own [`crate::ServerConfig::access_token_ttl`],
 /// which is the number that decides when dropping is safe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Rotating a key that lives in a KMS
+///
+/// [`JwtConfig::rotate_to`] is the ONLY thing that rotates. Rotating in the KMS alone leaves this
+/// process advertising a cached public half that no longer signs, and every token the deployment
+/// issues then fails verification against its own published JWKS, silently. See
+/// [`Es256Signer::public_jwk`].
+///
+/// `Clone` shares the signer rather than duplicating it (`Arc`), and `PartialEq` compares the
+/// PUBLISHED IDENTITY: the active and retired JWKs, the audience and the `jwks_uri`. There is no
+/// private scalar left to compare once the key may be outside this process, and comparing handles
+/// would make two configurations over one KMS key unequal for no reason a host could act on.
+#[derive(Clone)]
 pub struct JwtConfig {
-    key: EcdsaP256Key,
+    /// The host's ES256 backend, which may be a key in this process or a handle to one in a KMS.
+    ///
+    /// `Arc<dyn _>` and not a generic parameter. Making [`JwtConfig`] generic would put a THIRD
+    /// monomorphization axis on `AuthorizationServer`, and the second one is MEASURED at 53,548
+    /// bytes per additional `(Storage, Clock)` pair, 27% of this crate's whole default binary
+    /// surface. One indirect call against a signing operation that may be a network round trip is
+    /// not measurable; that is.
+    signer: Arc<dyn DynEs256Signer>,
+    /// The ACTIVE key's public half, read from the signer ONCE, here.
+    ///
+    /// Cached rather than re-asked per call, and that is the other half of the contract
+    /// [`Es256Signer::public_jwk`] states: the JWKS document is a public, unauthenticated,
+    /// cacheable thing any client may poll, and a signer that reaches a KMS to answer would put a
+    /// network call behind it. It also keeps [`JwtConfig::kid`] able to return a `&str`.
+    active: Jwk,
     /// The PUBLIC halves of previously active keys, most recently retired first.
     ///
-    /// Public halves, not [`EcdsaP256Key`]s, and that is the point: a retired key must never sign
-    /// again, and dropping the private scalar at retirement makes that structural rather than a
-    /// promise the code merely keeps today. It is also the cheaper representation, which matters
-    /// because [`JwtConfig`] sits behind the box in [`AccessTokenFormat::Jwt`] precisely to keep
-    /// key material out of every [`crate::ServerConfig`].
+    /// Public halves, not signers, and that is the point: a retired key must never sign again, and
+    /// dropping the SIGNER at retirement makes that structural rather than a promise the code
+    /// merely keeps today. With the private half possibly in a KMS this matters more, not less:
+    /// the handle is what could still be called, and there is no handle left. It is also the
+    /// cheaper representation, which matters because [`JwtConfig`] sits behind the box in
+    /// [`AccessTokenFormat::Jwt`] precisely to keep key material out of every
+    /// [`crate::ServerConfig`].
     retired: Vec<Jwk>,
     audience: Audience,
     jwks_uri: Option<String>,
@@ -425,10 +751,17 @@ impl JwtConfig {
     /// Configure signing for one audience. The audience is REQUIRED (RFC 9068 section 2.2) and has
     /// no default: only the deployment knows which resource server a token is meant for, and a
     /// guessed `aud` is a token that is valid somewhere nobody intended.
-    pub fn new(key: EcdsaP256Key, audience: impl Into<String>) -> Self {
+    /// `signer` is anything implementing [`Es256Signer`]: [`EcdsaP256Key`] under `jwt-p256`, an
+    /// `Arc` of one shared with another configuration, or the host's own KMS-backed type. Its
+    /// public half is read HERE, once, and never again; see [`Es256Signer::public_jwk`] for what
+    /// that requires of an implementor and for why rotation must come back through
+    /// [`JwtConfig::rotate_to`].
+    pub fn new(signer: impl Es256Signer + 'static, audience: impl Into<String>) -> Self {
+        let active = signer.public_jwk();
         JwtConfig {
-            encoded_header: encoded_jose_header(key.kid()),
-            key,
+            encoded_header: encoded_jose_header(&active.kid),
+            active,
+            signer: Arc::new(signer),
             // A brand new configuration has retired nothing. The single-key deployment, which is
             // most of them, never touches anything below and keeps exactly the API it had.
             retired: Vec::new(),
@@ -449,12 +782,19 @@ impl JwtConfig {
     /// the name twice, because two JWKs sharing a `kid` make selection ambiguous, which is the one
     /// thing `kid` exists to prevent. A host that reuses a `kid` for a genuinely different key is
     /// making a mistake this crate cannot detect, and the RFC's advice is simply to not do that.
-    pub fn rotate_to(mut self, new_active: EcdsaP256Key) -> Self {
-        let retiring = self.key.public_jwk();
-        self.key = new_active;
+    ///
+    /// THE SIGNER IS DROPPED, not stored: what is retained of the outgoing key is its public half
+    /// and nothing else, so a retired key cannot sign again by construction. For a KMS-backed
+    /// signer this is also the ONLY correct way to rotate; rotating in the KMS while this process
+    /// holds the old cached public half is silent breakage (see [`Es256Signer::public_jwk`]).
+    pub fn rotate_to(mut self, new_active: impl Es256Signer + 'static) -> Self {
+        let retiring = std::mem::replace(&mut self.active, new_active.public_jwk());
+        // The previous signer is dropped by this assignment. There is deliberately nowhere else it
+        // is written down.
+        self.signer = Arc::new(new_active);
         // The header names the ACTIVE key, so it is rebuilt exactly here and nowhere else.
-        self.encoded_header = encoded_jose_header(self.key.kid());
-        let active_kid = self.key.kid();
+        self.encoded_header = encoded_jose_header(&self.active.kid);
+        let active_kid = self.active.kid.as_str();
         // A kid appears at most once in the published set: any older entry sharing a name with the
         // key just retired, or with the new active key, goes.
         self.retired
@@ -491,7 +831,12 @@ impl JwtConfig {
     /// drop its own signing key by naming it would leave an AS signing with a key it does not
     /// publish: no token it issues would verify anywhere, which is strictly worse than the state
     /// the host was trying to leave.
-    #[must_use = "this returns the updated configuration; the receiver is consumed"]
+    // NO `#[must_use]`, and that is a decision about the whole crate rather than about this one
+    // method: see `tests/host_api_shape.rs`. Every builder here CONSUMES its receiver, so dropping
+    // the result moves the configuration away and the borrow checker refuses the next use of it.
+    // The attribute would add only the case where the entire expression is discarded, which is
+    // dead code rather than a misconfiguration. It sat here alone, on one of twenty-nine such
+    // builders, which taught a reader a rule the other twenty-eight did not follow.
     pub fn forget_retired_key_breaking_its_live_tokens(mut self, kid: &str) -> Self {
         self.retired.retain(|jwk| jwk.kid != kid);
         self
@@ -518,7 +863,7 @@ impl JwtConfig {
 
     /// The signing key's identifier.
     pub fn kid(&self) -> &str {
-        self.key.kid()
+        &self.active.kid
     }
 
     /// The RFC 7517 key set to serve: public parameters only, ACTIVE key first, then every retired
@@ -535,7 +880,7 @@ impl JwtConfig {
     /// mode it avoids is real.
     pub fn jwks(&self) -> Jwks {
         let mut keys = Vec::with_capacity(1 + self.retired.len());
-        keys.push(self.key.public_jwk());
+        keys.push(self.active.clone());
         keys.extend(self.retired.iter().cloned());
         Jwks { keys }
     }
@@ -546,24 +891,94 @@ impl JwtConfig {
     }
 
     /// Serialize and sign one access token into RFC 7515 section 3.1 compact form.
-    pub fn sign_access_token(&self, claims: &AccessTokenClaims) -> Result<String, JwtError> {
+    ///
+    /// ASYNC because [`Es256Signer::sign`] is, which is because the key may not be in this
+    /// process. With the in-process [`EcdsaP256Key`] backend the future is ready on its first poll
+    /// and there is no suspension point.
+    pub async fn sign_access_token(&self, claims: &AccessTokenClaims) -> Result<String, JwtError> {
+        self.finish_signing(self.signing_input(claims)?).await
+    }
+
+    /// The SYNC half: everything up to and including `BASE64URL(header) "." BASE64URL(payload)`.
+    ///
+    /// Split from the await deliberately, and the split is what keeps the token endpoint's future
+    /// small. [`AccessTokenClaims`] is eight owned fields; if it were still live across the
+    /// signature's suspension point it would join the coroutine frame, and that frame is held
+    /// under tokio's 2048-byte debug boxing threshold by `tests/allocation.rs`. Built this way, all
+    /// that crosses the await is this `String` and a borrow of `self`.
+    pub(crate) fn signing_input(&self, claims: &AccessTokenClaims) -> Result<String, JwtError> {
         // The header is PRECOMPUTED (see `JwtConfig::encoded_header`): it is fixed for the life of
         // this configuration, so serializing and encoding it per token produced identical bytes at
         // a cost paid on every token issued.
         let header = &self.encoded_header;
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(claims)
-                .map_err(|e| JwtError(format!("claims serialization: {e}")))?,
-        );
-        // The JWS Signing Input is the ASCII of "header.payload" (RFC 7515 section 5.1 step 5).
-        let signing_input = format!("{header}.{payload}");
-        let signature = self.key.sign_es256(signing_input.as_bytes())?;
-        Ok(format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(signature)
-        ))
+        let claims_json = serde_json::to_vec(claims)
+            .map_err(|e| JwtError(format!("claims serialization: {e}")))?;
+
+        // ONE buffer for the whole token, and the JWS Signing Input is a PREFIX of it rather than
+        // a string of its own (RFC 7515 section 5.1 steps 5 and 7: the signing input is the ASCII
+        // of "header.payload", and the compact serialization is that followed by ".signature").
+        // Built with `format!` this was three intermediate `String`s and two full copies of a
+        // token that is close to a kilobyte: one to build the signing input, one to build the
+        // result from it. Appending instead means the bytes are written once.
+        //
+        // The capacity is EXACT, not an estimate, so the buffer is allocated once and never grown:
+        // base64url without padding is ceil(n * 4 / 3) characters, and an ES256 signature is a
+        // fixed 64 bytes, which is 86.
+        let mut compact =
+            String::with_capacity(header.len() + 1 + base64_len(claims_json.len()) + 1 + 86);
+        compact.push_str(header);
+        compact.push('.');
+        URL_SAFE_NO_PAD.encode_string(&claims_json, &mut compact);
+        Ok(compact)
+    }
+
+    /// The ASYNC half: the signature over what [`JwtConfig::signing_input`] built, appended in
+    /// place so the token's bytes are still written exactly once.
+    pub(crate) async fn finish_signing(&self, mut compact: String) -> Result<String, JwtError> {
+        let signature = self
+            .signer
+            .dyn_sign(compact.as_bytes())
+            .await
+            // The host's own detail is DISCARDED here rather than wrapped: the host wrote the
+            // signer, so it already has the real error on its own channel, and `server.rs` maps
+            // this onto RFC 6749 s5.2 `server_error` without echoing anything about the key.
+            .map_err(|_| JwtError("the ES256 signer could not sign".into()))?;
+        compact.push('.');
+        URL_SAFE_NO_PAD.encode_string(signature, &mut compact);
+        Ok(compact)
     }
 }
+
+impl fmt::Debug for JwtConfig {
+    /// [`crate::ServerConfig`] derives `Debug`, so a host that logs its configuration logs this. It
+    /// prints the PUBLISHED identity, which is public by definition, and says only that a signer is
+    /// present: what the signer is, and what it holds, is the host's and may be a live KMS
+    /// credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JwtConfig")
+            .field("signer", &"<redacted>")
+            .field("active", &self.active)
+            .field("retired", &self.retired)
+            .field("audience", &self.audience)
+            .field("jwks_uri", &self.jwks_uri)
+            .finish()
+    }
+}
+
+impl PartialEq for JwtConfig {
+    /// Over the PUBLISHED IDENTITY only. There is no private scalar to compare once the key may be
+    /// a handle to something in another process, and comparing handles would make two
+    /// configurations over one KMS key unequal for no reason a host could act on. The encoded
+    /// header is a pure function of `active.kid`, so it is not compared separately.
+    fn eq(&self, other: &Self) -> bool {
+        self.active == other.active
+            && self.retired == other.retired
+            && self.audience == other.audience
+            && self.jwks_uri == other.jwks_uri
+    }
+}
+
+impl Eq for JwtConfig {}
 
 /// What the client receives as its `access_token`.
 ///
@@ -918,6 +1333,13 @@ impl<'a> CompactJws<'a> {
 /// `false` for every failure, including a malformed key or a signature of the wrong length: a
 /// caller has exactly one safe reaction to any of them, so distinguishing them would only invite
 /// somebody to treat one as recoverable.
+///
+/// THIS IS THE BUILT-IN BACKEND'S BODY, and it is the crate's ONE implementation of ES256
+/// verification. Everything inside the crate reaches it through [`P256Verifier`] and the
+/// [`Es256Verifier`] seam; it stays public because a host writing the resource-server half of RFC
+/// 9449 in the same tree needs it directly, and because it is what every existing consumer calls.
+#[cfg(feature = "jwt-p256")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
 pub fn verify_es256(jwk: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
     // RFC 7518 section 3.4 fixes the ES256 signature as the fixed-width `r || s` concatenation, 64
     // bytes. The DER form OpenSSL emits by default is NOT this, and accepting both would give one
@@ -1011,13 +1433,28 @@ pub fn verify_hs256(secret: &[u8], signing_input: &[u8], signature: &[u8]) -> bo
 /// inputs cannot demonstrate an attack, and this crate's rule is that a security check is not
 /// trusted until the attack it stops has been watched succeeding without it.
 pub fn compact_jws(header: &[u8], payload: &[u8], sign: impl FnOnce(&str) -> Vec<u8>) -> String {
-    let header = URL_SAFE_NO_PAD.encode(header);
-    let payload = URL_SAFE_NO_PAD.encode(payload);
-    let signing_input = format!("{header}.{payload}");
-    let signature = sign(&signing_input);
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    // ONE buffer, for the reason `sign_access_token` gives: the JWS Signing Input is a PREFIX of
+    // the compact serialization (RFC 7515 section 5.1 steps 5 and 7), so it does not need a string
+    // of its own and the result does not need to be copied out of one.
+    let mut compact =
+        String::with_capacity(base64_len(header.len()) + 1 + base64_len(payload.len()) + 1 + 86);
+    URL_SAFE_NO_PAD.encode_string(header, &mut compact);
+    compact.push('.');
+    URL_SAFE_NO_PAD.encode_string(payload, &mut compact);
+    let signature = sign(&compact);
+    compact.push('.');
+    URL_SAFE_NO_PAD.encode_string(signature, &mut compact);
+    compact
 }
 
+/// How many characters `n` bytes take in base64url WITHOUT padding: four per three bytes, rounded
+/// up. Exact, so a caller sizing a buffer with it allocates once and never grows.
+fn base64_len(n: usize) -> usize {
+    // `div_ceil` is 1.73, comfortably under this crate's measured 1.75 floor.
+    (n * 4).div_ceil(3)
+}
+
+#[cfg(feature = "jwt-p256")]
 impl EcdsaP256Key {
     /// Sign an arbitrary JWS Signing Input with `ES256`: the counterpart of [`verify_es256`], and
     /// the signing half [`compact_jws`] is usually handed.
@@ -1030,13 +1467,6 @@ impl EcdsaP256Key {
     /// `private_key_jwt` key. Same parameters as [`EcdsaP256Key::public_jwk`], which produces the
     /// SERVING shape; there is still no method anywhere in this crate that emits `d`.
     pub fn to_public_jwk(&self) -> PublicJwk {
-        let jwk = self.public_jwk();
-        PublicJwk {
-            kty: jwk.kty.to_string(),
-            crv: jwk.crv.to_string(),
-            x: jwk.x,
-            y: jwk.y,
-            kid: Some(jwk.kid),
-        }
+        Jwk::to_public_jwk(&self.public_jwk())
     }
 }

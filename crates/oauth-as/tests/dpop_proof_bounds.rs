@@ -14,12 +14,21 @@
 //!   request handler, and the request that triggers it is one line of attacker JSON.
 //! - a proof larger than [`oauth_as::dpop::MAX_PROOF_BYTES`] must be refused BEFORE it is parsed.
 //!   The proof arrives in a header, so the crate's `MAX_BODY_BYTES` never applies to it.
-#![cfg(feature = "dpop")]
+#![cfg(all(feature = "dpop", feature = "jwt-p256"))]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::dpop::{verify_proof, DpopFailure, MAX_PROOF_BYTES};
 use oauth_as::jwt::{compact_jws, EcdsaP256Key};
+
+/// The crate's built-in ES256 backend. Verification now goes through the [`oauth_as::jwt::Es256Verifier`] seam,
+/// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
+/// default, which is what keeps these tests measuring the behaviour they always measured.
+#[cfg(feature = "jwt-p256")]
+const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
 
 const TOKEN_ENDPOINT: &str = "https://as.example/token";
 
@@ -68,7 +77,7 @@ fn an_iat_of_u64_max_is_refused_rather_than_panicking() {
     );
 
     assert_eq!(
-        verify_proof(&proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::StaleProof),
         "an iat that cannot be represented is outside every acceptance window"
     );
@@ -89,7 +98,7 @@ fn an_iat_near_u64_max_is_refused_rather_than_panicking() {
             }),
         );
         assert_eq!(
-            verify_proof(&proof, "POST", TOKEN_ENDPOINT, now()),
+            verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
             Err(DpopFailure::StaleProof),
             "iat {iat} is in the future and must be refused"
         );
@@ -118,7 +127,7 @@ fn a_proof_larger_than_the_cap_is_refused_before_it_is_parsed() {
     assert!(proof.len() > MAX_PROOF_BYTES);
 
     assert_eq!(
-        verify_proof(&proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::Malformed),
         "a proof past the cap is refused on size, whatever it would have parsed as"
     );
@@ -144,5 +153,5 @@ fn an_ordinary_proof_is_far_inside_the_cap() {
         "a conforming proof is {} bytes; a cap of {MAX_PROOF_BYTES} must leave room to spare",
         proof.len()
     );
-    assert!(verify_proof(&proof, "POST", TOKEN_ENDPOINT, now()).is_ok());
+    assert!(verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()).is_ok());
 }

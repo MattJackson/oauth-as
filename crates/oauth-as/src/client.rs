@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::grant::GrantType;
+// Aliased to the name this module used when it carried its own copy of the encoder, so the call
+// sites below (and `src/tests/client.rs`, which reaches the private helper) read unchanged. There
+// is one FUNCTION; `crate::hex` owns it, and `tests/hex_single_definition.rs` keeps it at one.
+use crate::hex::encode as hex_lower;
 use crate::scope::ScopeSet;
 
 /// A client identifier (RFC 6749 section 2.2): opaque to this crate, unique per registration.
@@ -146,18 +150,6 @@ impl SecretHash {
     }
 }
 
-/// Lower-case hex of a digest. Written out rather than pulled in: the crate has no hex dependency
-/// and this is four lines.
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(DIGITS[(b >> 4) as usize] as char);
-        out.push(DIGITS[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
 /// The host's client-secret verifier, for [`SecretHash`] schemes this crate does not implement.
 ///
 /// Installed on the server (`AuthorizationServer::with_secret_verifier`) and consulted by
@@ -206,13 +198,12 @@ pub enum ClientAuth {
     /// A confidential client that authenticates with an RFC 7523 signed assertion rather than by
     /// presenting a secret: `private_key_jwt` or `client_secret_jwt`.
     ///
-    /// The keys are held INLINE rather than behind a `Box`, unlike `Client::registration`. A
-    /// `Client` is cloned out of the store on every token-plane request, so the question is what
-    /// this costs a deployment that does not use it, and the answer is nothing: the widest existing
-    /// variant is `ConfidentialSecretHash` (two `String`s), and
+    /// The keys are held INLINE rather than behind a `Box`, unlike `Client::registration`. The
+    /// question is what this costs a deployment that does not use it, and the answer is nothing:
+    /// the widest existing variant is `ConfidentialSecretHash` (two `String`s), and
     /// [`crate::client_assertion::AssertionKeys`] is narrower than that, so `ClientAuth` does not
-    /// grow by a byte. Boxing would have ADDED an allocation to every clone of a client that does
-    /// use it, to save a struct size that was already paid for.
+    /// grow by a byte. Boxing would have ADDED an allocation at registration time to save a struct
+    /// size that was already paid for.
     #[cfg(feature = "client_assertion")]
     ConfidentialAssertion {
         /// What the registration expects the assertion to be signed with. This, and never the
@@ -229,8 +220,8 @@ pub enum ClientAuth {
     /// Carried INLINE rather than boxed, on the same measurement as the assertion variant
     /// above: the widest shape [`crate::mtls::MtlsClientRegistration`] can take is one
     /// `String` plus a discriminant, against `ConfidentialSecretHash`'s two `String`s, so
-    /// this variant does not make `ClientAuth`, or the [`Client`] cloned out of the store on
-    /// every token-plane request, any bigger than it already was.
+    /// this variant does not make `ClientAuth`, or the [`Client`] every host store holds one
+    /// of per registration, any bigger than it already was.
     #[cfg(feature = "mtls")]
     Mtls {
         /// Which RFC 8705 method, and what it expects to see.
@@ -404,11 +395,20 @@ pub struct Client {
     /// Present exactly when this registration was created by RFC 7591 dynamic client
     /// registration, and absent for one the host provisioned itself.
     ///
-    /// BOXED, and this is not a style choice. A `Client` is cloned out of the store on every
-    /// single token-plane request (see `AuthorizationServer::authenticate_client`), so every byte
-    /// added here is paid by every deployment on every request, including the great majority that
-    /// never turn registration on. One null pointer costs 8 bytes and allocates nothing; the
-    /// record itself is allocated only for a client that actually has one.
+    /// BOXED, and this is not a style choice, though the reason is no longer the one it was
+    /// written for. The original argument was that a `Client` is deep cloned out of the store on
+    /// every token-plane request, so every byte here is paid per request;
+    /// [`crate::store::Storage::get_client`] hands back an `Arc<Client>` now, so a read is a
+    /// pointer clone and the struct's SIZE is not on that path at all.
+    ///
+    /// Re-examined on that basis, the box is MORE clearly right than when it was chosen, because
+    /// the optimisation removed its only cost. What it buys is now a memory argument rather than a
+    /// per-request one. MEASURED: `Option<Box<DynamicRegistration>>` is 8 bytes against 104 for
+    /// the record inline, which is the difference between a `Client` of 200 bytes and one of 296,
+    /// paid by every registration in every store whether or not RFC 7591 is enabled. What it USED
+    /// to cost was an extra allocation on every clone of a client that does have one; with `Arc`
+    /// there are no such clones, so that allocation is now paid exactly once, when the
+    /// registration is created.
     ///
     /// It lives on the client rather than in a table of its own because it IS the client: RFC
     /// 7592 section 2 manages a registration through the same identifier the token endpoint

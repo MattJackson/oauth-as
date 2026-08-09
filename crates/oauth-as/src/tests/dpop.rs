@@ -20,6 +20,11 @@ use serde_json::json;
 use super::*;
 use crate::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};
 
+/// The crate's built-in ES256 backend. Verification now goes through the [`crate::jwt::Es256Verifier`] seam,
+/// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
+/// default, which is what keeps these tests measuring the behaviour they always measured.
+const VERIFIER: &crate::jwt::P256Verifier = &crate::jwt::P256Verifier;
+
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
@@ -57,7 +62,7 @@ fn proof_with(
 }
 
 fn verify(proof: &str) -> Result<VerifiedProof, DpopFailure> {
-    verify_proof(proof, HTM, HTU, now())
+    verify_proof(VERIFIER, proof, HTM, HTU, now())
 }
 
 // -------------------------------------------------------------------------------- happy paths
@@ -77,7 +82,14 @@ fn the_request_uri_is_compared_without_its_query_or_fragment() {
     // included them, or a request that carried them, must still match.
     let key = EcdsaP256Key::generate("k");
     let proof = proof_with(&key, &header(&key), &claims());
-    assert!(verify_proof(&proof, HTM, "https://as.example/token?x=1#f", now()).is_ok());
+    assert!(verify_proof(
+        VERIFIER,
+        &proof,
+        HTM,
+        "https://as.example/token?x=1#f",
+        now()
+    )
+    .is_ok());
 
     let mut c = claims();
     c["htu"] = json!("https://as.example/token?x=1");
@@ -350,13 +362,14 @@ fn no_proof_outlives_the_deadline_it_asked_to_be_remembered_until() {
         let proof = proof_with(&key, &header(&key), &c);
         let verified = verify(&proof).unwrap();
         assert_eq!(
-            verify_proof(&proof, HTM, HTU, verified.replay_until),
+            verify_proof(VERIFIER, &proof, HTM, HTU, verified.replay_until),
             Err(DpopFailure::StaleProof),
             "a proof issued {age}s ago is still accepted at its own replay_until"
         );
         // And it is accepted right up to there, so the window is closed rather than shortened.
         assert!(
             verify_proof(
+                VERIFIER,
                 &proof,
                 HTM,
                 HTU,

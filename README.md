@@ -120,13 +120,20 @@ What each optional feature adds on top of the core:
 
 | Feature | Adds | Feature | Adds |
 | ------- | ---- | ------- | ---- |
-| `mtls` | 6 KiB | `jwt` | 64 KiB |
-| `resource-metadata` | 7 KiB | `rar` | 95 KiB |
-| `token-exchange` | 8 KiB | `test-util` | 141 KiB |
-| `par` | 17 KiB | `http` | 193 KiB |
-| `consent` | 24 KiB | `axum` | 405 KiB (212 of it over `http`, and nearly all of that is tokio) |
+| `mtls` | 6 KiB | `jwt` | 34 KiB (the seam and the JWS surface: NO curve implementation) |
+| `resource-metadata` | 6 KiB | `jwt-p256` | 68 KiB (`jwt` plus the built-in backend, so 34 KiB over `jwt`) |
+| `token-exchange` | 8 KiB | `rar` | 95 KiB |
+| `par` | 17 KiB | `test-util` | 148 KiB |
+| `consent` | 24 KiB | `http` | 191 KiB |
+|  |  | `axum` | 405 KiB (214 of it over `http`, and nearly all of that is tokio) |
 
-and on top of `jwt`: `dpop` 46 KiB, `jar` 49 KiB, `client_assertion` 49 KiB, `jwt-pkcs8` 30 KiB.
+and on top of `jwt-p256`: `dpop` 46 KiB, `jar` 45 KiB, `client_assertion` 50 KiB, `jwt-pkcs8`
+30 KiB.
+
+The `jwt` row is the one that moved: it was 64 KiB when the feature implied `p256`. A host that
+brings its own ES256 backend (a cloud KMS, an HSM, or the `ring` it already links through `rustls`)
+now pays 34 KiB and takes no second elliptic curve implementation. A host with no opinion enables
+`jwt-p256` and pays 68 KiB, which is 471 bytes more than the same host paid before the seam.
 
 **Read the caveats, because they change what the numbers mean.**
 

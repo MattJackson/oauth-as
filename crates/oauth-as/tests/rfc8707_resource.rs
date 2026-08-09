@@ -543,7 +543,7 @@ async fn a_device_poll_naming_a_resource_is_refused() {
 /// client did not ask for, which is the blast radius the parameter exists to shrink.
 ///
 /// One resource stays the plain-string form RFC 7519 s4.1.3 allows; several become the array form.
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 #[tokio::test]
 async fn the_requested_resource_replaces_the_configured_aud_claim() {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

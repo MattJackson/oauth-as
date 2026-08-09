@@ -16,7 +16,10 @@
 //! - [`requiring_a_signed_request_object_refuses_the_plain_query_request`]: the downgrade that
 //!   RFC 9101 section 10.5 exists to name.
 
-#![cfg(feature = "jar")]
+#![cfg(all(feature = "jar", feature = "jwt-p256"))]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -141,6 +144,7 @@ async fn an_access_token_is_not_a_request_object() {
             #[cfg(feature = "mtls")]
             cnf: None,
         })
+        .await
         .unwrap();
 
     match server

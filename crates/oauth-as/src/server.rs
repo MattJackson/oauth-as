@@ -29,6 +29,10 @@ use crate::events::{
     RateLimiter,
 };
 use crate::grant::GrantType;
+// The crate's ONE lower-case hex encoder (`client::SecretHash` is the other caller). Aliased to
+// the name this module used when it carried its own copy, which is also the name the measurement
+// in `crate::hex` is written against.
+use crate::hex::encode as hex_encode;
 #[cfg(feature = "jwt")]
 use crate::jwt::{AccessTokenClaims, AccessTokenFormat, Jwks};
 use crate::scope::ScopeSet;
@@ -842,34 +846,17 @@ const USER_CODE_ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 
 /// Fresh OS randomness, hex encoded: `n` bytes of entropy, `2n` characters. Used for device codes
 /// and tokens; 32 bytes = 256 bits, far past any brute-force horizon for a 10-minute artifact.
+///
+/// The DRAW and the ENCODING are separate calls so that one `getrandom` call can feed several
+/// artifacts. `getrandom::fill` is a SYSCALL, and the measurement that matters is that its cost is
+/// almost entirely per CALL rather than per byte: 875 ns for one byte against 1025 ns for
+/// thirty-two on the machine benches/README.md names. So the number of calls is the thing to
+/// reduce, and a caller that needs two 32-byte artifacts should draw 64 bytes once rather than 32
+/// bytes twice. See `issue`.
 pub(crate) fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
     hex_encode(&buf)
-}
-
-/// The lower-case hex alphabet, as a table rather than a format string.
-///
-/// `write!(out, "{b:02x}")` per byte goes through `core::fmt`, which for 32 bytes is 32 trips
-/// through a formatter with width and fill handling that a fixed two-nibble encoding never needs.
-/// MEASURED at 1335 ns against 1092 ns for a 32-byte draw-and-encode. The output is identical, so
-/// nothing about the artifact changes; this is the same string arrived at without the machinery.
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-/// Hex-encode `bytes`, lower case, two characters per byte.
-///
-/// SPLIT from the draw so that one `getrandom` call can feed several artifacts. `getrandom::fill`
-/// is a SYSCALL, and the measurement that matters is that its cost is almost entirely per CALL
-/// rather than per byte: 875 ns for one byte against 1025 ns for thirty-two on the machine
-/// benches/README.md names. So the number of calls is the thing to reduce, and a caller that needs
-/// two 32-byte artifacts should draw 64 bytes once rather than 32 bytes twice. See `issue`.
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
-        out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 /// The rejection-sampling bound: the largest multiple of [`USER_CODE_ALPHABET`]'s length that fits
@@ -1139,6 +1126,15 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
     config: ServerConfig,
     store: S,
     clock: C,
+    /// The RFC 8414 `token_endpoint` this server answers on, derived once from `config`.
+    ///
+    /// It exists as a field because it is compared against on every RFC 9449 proof and every RFC
+    /// 7523 assertion (see [`AuthorizationServer::token_endpoint`]), and it is fixed for the life
+    /// of the server: `config` is moved in here and there is no way to mutate it afterwards.
+    /// `Box<str>` rather than `String` because it is never appended to, which keeps the field at
+    /// 16 bytes instead of 24 on a struct `tests/allocation.rs` holds to a size budget.
+    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    token_endpoint: Box<str>,
     /// The host's optional seams (audit sink, rate limiter, secret verifier). ONE pointer wide and
     /// null until the host installs something: see [`Hooks`] for why the three do not sit here as
     /// three separate fields.
@@ -1156,10 +1152,20 @@ impl<S: Storage> AuthorizationServer<S, SystemClock> {
 impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Construct with an injected clock (tests).
     pub fn with_clock(config: ServerConfig, store: S, clock: C) -> Self {
+        // Derived HERE and not at each use, and derived exactly as
+        // `AuthorizationServerMetadata::from_config` derives it, because a server whose own idea
+        // of its token endpoint differs from the one it publishes refuses every conforming client.
+        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        let token_endpoint: Box<str> = match &config.token_endpoint {
+            Some(endpoint) => endpoint.as_str().into(),
+            None => format!("{}/token", config.issuer.trim_end_matches('/')).into_boxed_str(),
+        };
         AuthorizationServer {
             config,
             store,
             clock,
+            #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+            token_endpoint,
             hooks: Hooks::new(),
         }
     }
@@ -1224,6 +1230,54 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         self
     }
 
+    /// Install the ES256 backend this server VERIFIES signatures with: RFC 9449 DPoP proofs, RFC
+    /// 9101 request objects, RFC 7523 client assertions.
+    ///
+    /// Required unless `jwt-p256` is compiled in, which installs [`crate::jwt::P256Verifier`] as
+    /// the default. With neither, every signed credential is REFUSED, exactly as an absent
+    /// [`crate::par::RequestObjectKeys`] or an absent registration policy refuses: a server that
+    /// cannot check a signature must never behave as though it had checked one.
+    ///
+    /// A verifier installed here WINS over the built-in one, because it was installed. That is the
+    /// whole of the precedence rule, and it is why nothing in this crate's feature set is mutually
+    /// exclusive: a dependency graph that unifies `jwt-p256` on cannot take a host's choice away.
+    ///
+    /// Run [`crate::signer_conformance`] against whatever you install here before you deploy it.
+    // NO `#[must_use]`, for the crate-wide reason `tests/host_api_shape.rs` states and gates: this
+    // is one of twenty-nine consuming builders, all of which move their receiver, so dropping the
+    // result is a compile error at the next use of it rather than a setting silently lost. One
+    // marked builder out of twenty-nine is the state that gate exists to refuse.
+    #[cfg(feature = "jwt")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+    pub fn with_es256_verifier(
+        mut self,
+        verifier: std::sync::Arc<dyn crate::jwt::Es256Verifier>,
+    ) -> Self {
+        self.hooks.install_es256_verifier(verifier);
+        self
+    }
+
+    /// The ES256 verifier this server will use, or `None` when it has none and must refuse.
+    ///
+    /// THE ONE PLACE the precedence rule lives: the host's installed verifier, else the built-in
+    /// `jwt-p256` backend when that feature is compiled in, else nothing. Every caller
+    /// (`verify_dpop`, the RFC 7523 assertion check, the RFC 9101 request object check) asks here
+    /// and refuses on `None`, so there is exactly one definition of "no backend installed" and no
+    /// path that can accidentally read it as "checked out".
+    // Gated on the features that actually VERIFY rather than on `jwt`: a build that signs and
+    // never checks anybody else's signature has no caller for this, and an uncalled resolver is
+    // one more thing a reader has to work out is not reachable.
+    #[cfg(any(feature = "dpop", feature = "jar", feature = "client_assertion"))]
+    pub(crate) fn es256_verifier(&self) -> Option<&dyn crate::jwt::Es256Verifier> {
+        match self.hooks.es256_verifier() {
+            Some(installed) => Some(&**installed),
+            #[cfg(feature = "jwt-p256")]
+            None => Some(&crate::jwt::P256Verifier),
+            #[cfg(not(feature = "jwt-p256"))]
+            None => None,
+        }
+    }
+
     /// The installed host seams, for a host that wants to emit its own events onto the same
     /// channel (a consent decision, say) or to consult its own limiter.
     pub fn hooks(&self) -> &Hooks {
@@ -1239,13 +1293,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Turn the freshly minted random token into what actually goes on the wire: itself when the
     /// format is opaque (the byte-for-byte pre-feature behaviour), or an RFC 9068 access token
     /// carrying it as `jti` when the host configured signing.
+    ///
+    /// SYNC, and it stops one step short of the signature, which is what the awkward return type
+    /// buys. The host's [`crate::jwt::Es256Signer`] may be a network round trip, so signing is
+    /// async; if this function were async instead, the whole [`AccessTokenClaims`] value below
+    /// would live across that suspension point and join the token endpoint's coroutine frame,
+    /// which `tests/allocation.rs` holds under tokio's 2048-byte debug boxing threshold. Splitting
+    /// here means the claims are built and consumed on the sync side and only a `String` crosses
+    /// the await. MEASURED: 1344 bytes before the seam, 1360 after; an async `wire_access_token`
+    /// measured 1656.
     // Eight arguments, since the RFC 8705 binding is a property of the REQUEST rather than of the
     // grant. Same allow and same reason as `issue` below: a private function with one call site,
     // whose arguments would have to live across every await in the token future if they were
     // bundled into a struct to satisfy a lint.
     #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "jwt")]
-    fn wire_access_token(
+    fn access_token_signing_input(
         &self,
         client: &Client,
         subject: Option<&str>,
@@ -1255,7 +1318,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         now: SystemTime,
         jti: String,
         bound: &Bound<'_>,
-    ) -> Result<String, ErrorResponse> {
+    ) -> Result<Result<(&crate::jwt::JwtConfig, String), String>, ErrorResponse> {
         // Only the RFC 8705 binding is read out of it here; without that feature the
         // signed claim set does not depend on how the client authenticated.
         #[cfg(not(feature = "mtls"))]
@@ -1267,7 +1330,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         #[cfg(not(feature = "rar"))]
         let _ = details;
         let jwt = match &self.config.access_token_format {
-            AccessTokenFormat::Opaque => return Ok(jti),
+            // `Err` is not a failure here: it is the OPAQUE arm, carrying the random string
+            // through unchanged. Two arms of one `Result` rather than an `Option` plus a moved-out
+            // `jti`, because the opaque path must not copy the string it already has.
+            AccessTokenFormat::Opaque => return Ok(Err(jti)),
             AccessTokenFormat::Jwt(jwt) => jwt,
         };
         let claims = AccessTokenClaims {
@@ -1329,12 +1395,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 (!cnf.is_empty()).then_some(cnf)
             },
         };
-        jwt.sign_access_token(&claims).map_err(|e| {
-            // The host sees the real error through its own logging of the config it supplied; the
-            // wire gets the opaque code, as with storage failures.
-            let _ = e;
-            ErrorResponse::new(ErrorCode::ServerError)
-        })
+        // `claims` dies HERE, before the caller awaits the signature. See this function's doc.
+        jwt.signing_input(&claims)
+            .map(|input| Ok((&**jwt, input)))
+            .map_err(|e| {
+                // The host sees the real error through its own logging of the config it supplied; the
+                // wire gets the opaque code, as with storage failures.
+                let _ = e;
+                ErrorResponse::new(ErrorCode::ServerError)
+            })
     }
 
     /// The RFC 7517 key set to serve at `jwks_uri`, or `None` when tokens are opaque. PUBLIC key
@@ -1492,7 +1561,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self.store
     }
 
-    /// Register (or replace) a client. Dynamic client registration (RFC 7591) will layer on this.
+    /// Register (or replace) a client the HOST provisioned: no policy is consulted, no credential
+    /// is minted, and whatever is handed in is what the store holds.
+    ///
+    /// This is the out-of-band half of registration. RFC 7591 dynamic client registration is the
+    /// other half and it is built:
+    /// [`AuthorizationServer::register_dynamic_client`] layers on this one, adding the
+    /// [`crate::registration::RegistrationPolicy`] check, the minted `client_id` and secret, and
+    /// the RFC 7592 management credential. A host calling THIS method is asserting that the
+    /// registration was authorised somewhere it can point to.
     pub async fn register_client(&self, client: Client) -> Result<(), StorageError> {
         self.store.put_client(client).await
     }
@@ -1711,12 +1788,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
         // RFC 7523 section 3 (3) admits either the token endpoint URL or, by long-established
         // practice (OpenID Connect Core section 9), the issuer identifier.
-        let token_endpoint = self.token_endpoint();
+        // No ES256 backend means this credential cannot be checked, and an unchecked credential
+        // has authenticated nobody. RFC 6749 s5.2 `invalid_client`, the same answer every other
+        // failed client authentication gets, because telling the caller WHICH way it failed is how
+        // a verifier becomes a client-id oracle.
+        let verifier = self.es256_verifier().ok_or_else(refused)?;
         let verified = verify_assertion(
+            verifier,
             keys,
             assertion,
             client.client_id.as_str(),
-            &[token_endpoint.as_str(), self.issuer_identifier()],
+            &[self.token_endpoint(), self.issuer_identifier()],
             self.clock.now(),
         )
         .map_err(|_| refused())?;
@@ -1750,12 +1832,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// that way: the document tells a client where to send its request and what to put in `aud` and
     /// `htu`, so a server whose own idea of its token endpoint differs from the one it published
     /// refuses every conforming client.
+    ///
+    /// PRECOMPUTED at construction (see [`AuthorizationServer::with_clock`]) and borrowed here.
+    /// The value is fixed for the life of the server, and this is called once per RFC 9449 proof
+    /// verification and once per RFC 7523 assertion verification, so a `private_key_jwt` client
+    /// sending DPoP paid two `format!`s of a constant on every token request. The crate already
+    /// precomputes the metadata document, the JWKS and the JOSE header for exactly this reason.
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
-    fn token_endpoint(&self) -> String {
-        match &self.config.token_endpoint {
-            Some(endpoint) => endpoint.clone(),
-            None => format!("{}/token", self.issuer_identifier()),
-        }
+    fn token_endpoint(&self) -> &str {
+        &self.token_endpoint
     }
 
     /// RFC 9449 section 4.3, and the single-use claim on the proof's `jti`.
@@ -1780,8 +1865,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
             None => return Ok(None),
         };
-        let verified = verify_proof(proof, "POST", &self.token_endpoint(), self.clock.now())
-            .map_err(|_| ErrorResponse::new(ErrorCode::InvalidDpopProof))?;
+        // Resolved BEFORE the proof is parsed: with no backend there is nothing that could make
+        // this proof acceptable, so an unauthenticated caller does not get to spend a base64 decode
+        // and a JSON parse finding that out.
+        let verifier = self.es256_verifier().ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                .with_description("no ES256 verifier is installed")
+        })?;
+        let verified = verify_proof(
+            verifier,
+            proof,
+            "POST",
+            self.token_endpoint(),
+            self.clock.now(),
+        )
+        .map_err(|_| ErrorResponse::new(ErrorCode::InvalidDpopProof))?;
         // Namespaced by THUMBPRINT rather than by client id: a proof is bound to a key, not to a
         // registration (a public client's proof arrives before anything has authenticated), so the
         // key is the only identity available at this point that an attacker cannot choose freely.
@@ -3557,8 +3655,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // by whatever the client will actually present, so RFC 7662 introspection and RFC 7009
         // revocation keep working and a revoked JWT is genuinely dead at this AS rather than
         // merely deprecated.
+        // Bound before it is matched rather than matched directly, so the reader can see that the
+        // only things live across the `await` below are a `&JwtConfig` and a `String`. MEASURED:
+        // this makes no difference to the frame either way (1704 bytes on `--all-features` both
+        // ways); it is written for the reader, and the measurement is recorded so nobody has to
+        // repeat it.
         #[cfg(feature = "jwt")]
-        let access_token = self.wire_access_token(
+        let prepared = self.access_token_signing_input(
             client,
             subject.as_deref(),
             &scope,
@@ -3568,6 +3671,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             access_token,
             bound,
         )?;
+        #[cfg(feature = "jwt")]
+        let access_token = match prepared {
+            Err(opaque) => opaque,
+            // The ONE await the RFC 9068 path adds, and the only thing live across it is this
+            // `String` and a borrow of the configuration. A signer that cannot sign mints NOTHING:
+            // there is no fallback to an opaque token and no unsigned token, because an access
+            // token this server could not sign is one it must not issue.
+            Ok((jwt, input)) => jwt.finish_signing(input).await.map_err(|e| {
+                let _ = e;
+                ErrorResponse::new(ErrorCode::ServerError)
+            })?,
+        };
         self.store
             .put_token(IssuedToken {
                 // RFC 9449 s6: the binding is recorded on the AS side too, not only in the token,

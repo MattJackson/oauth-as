@@ -21,7 +21,10 @@
 //! destructive operation in this file, and a test suite that only ever watched the safe steps
 //! would not notice if dropping quietly did nothing.
 
-#![cfg(feature = "jwt")]
+#![cfg(feature = "jwt-p256")]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use std::time::Duration;
 
@@ -83,13 +86,16 @@ fn kids(jwks: &Jwks) -> Vec<String> {
 // The lifecycle
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn a_token_signed_under_the_old_key_survives_rotation_and_dies_only_when_the_key_is_dropped() {
+// `async` because signing is: an `Es256Signer` may be a KMS. The built-in `jwt-p256` backend does
+// no I/O, so the future is ready on its first poll and nothing about what this test measures moved.
+#[tokio::test]
+async fn a_token_signed_under_the_old_key_survives_rotation_and_dies_only_when_the_key_is_dropped()
+{
     let key_a = EcdsaP256Key::generate("key-a");
     let key_b = EcdsaP256Key::generate("key-b");
 
     let config = JwtConfig::new(key_a, "https://api.example");
-    let signed_under_a = config.sign_access_token(&claims("jti-a")).unwrap();
+    let signed_under_a = config.sign_access_token(&claims("jti-a")).await.unwrap();
 
     // Before any rotation the single-key case is exactly what it always was: one key, and it is
     // the one that signed.
@@ -121,7 +127,7 @@ fn a_token_signed_under_the_old_key_survives_rotation_and_dies_only_when_the_key
     );
 
     // And new tokens are signed under B, so the two coexist.
-    let signed_under_b = config.sign_access_token(&claims("jti-b")).unwrap();
+    let signed_under_b = config.sign_access_token(&claims("jti-b")).await.unwrap();
     let header = CompactJws::parse(&signed_under_b).unwrap();
     assert_eq!(header.header_str("kid"), Some("key-b"));
     assert!(verifies_against(&config.jwks(), &signed_under_b));
@@ -221,9 +227,19 @@ fn client() -> Client {
 /// on the way through would leave every unit test above green.
 #[test]
 fn the_served_key_set_carries_the_retired_keys() {
+    // NOT `#[tokio::test]`: this test builds its own runtime below to drive the server, and a
+    // nested `block_on` panics. Signing is async now (an `Es256Signer` may be a KMS), so the one
+    // token this test needs is minted on that same runtime rather than on a second one.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
     let old = EcdsaP256Key::generate("old");
-    let signed_under_old = JwtConfig::new(old.clone(), "https://api.example")
-        .sign_access_token(&claims("jti-old"))
+    let signed_under_old = rt
+        .block_on(
+            JwtConfig::new(old.clone(), "https://api.example")
+                .sign_access_token(&claims("jti-old")),
+        )
         .unwrap();
 
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
@@ -234,9 +250,6 @@ fn the_served_key_set_carries_the_retired_keys() {
             .rotate_to(EcdsaP256Key::generate("new")),
     ));
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     let served = rt.block_on(async {
         let srv = AuthorizationServer::new(config, MemoryStorage::new());
         srv.register_client(client()).await.unwrap();

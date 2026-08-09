@@ -43,7 +43,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::jwt::{verify_es256, CompactJws, PublicJwk};
+use crate::jwt::{CompactJws, Es256Verifier, PublicJwk};
 
 /// RFC 9449 section 4.2: the `typ` a DPoP proof MUST carry.
 pub const DPOP_PROOF_TYP: &str = "dpop+jwt";
@@ -197,6 +197,12 @@ pub fn htu_of(url: &str) -> &str {
 /// cannot substitute their key without invalidating the signature, and cannot re-sign without the
 /// private half.
 ///
+/// `verifier` is the ES256 backend, which after 0.9.0 is the host's to choose: enable `jwt-p256`
+/// for [`crate::jwt::P256Verifier`], or pass your own. It is a PARAMETER rather than something
+/// this function reaches for, because there is no "none" that could be safe here: a caller with no
+/// verifier has nothing to pass and must refuse the request instead, which is what
+/// `AuthorizationServer` does.
+///
 /// PUBLIC because [`VerifiedProof`] and [`DpopFailure`] are, and a type with no reachable producer
 /// is a type a consumer can read about and never obtain. It is also the function a host needs
 /// directly: RFC 9449 section 7 has the RESOURCE server check a proof on every request, and a host
@@ -204,6 +210,7 @@ pub fn htu_of(url: &str) -> &str {
 /// to do it. Nothing is retained here, so claiming the returned `jti` (see
 /// [`crate::store::Storage::claim_replay_id`]) remains the caller's obligation either way.
 pub fn verify_proof(
+    verifier: &dyn Es256Verifier,
     proof: &str,
     htm: &str,
     htu: &str,
@@ -242,7 +249,7 @@ pub fn verify_proof(
     let jwk = PublicJwk::from_json(jwk).map_err(|_| DpopFailure::BadProofKey)?;
 
     // (6) The signature, under the proof's own key, over the bytes that arrived.
-    if !verify_es256(&jwk, jws.signing_input.as_bytes(), &jws.signature) {
+    if !verifier.verify(&jwk, jws.signing_input.as_bytes(), &jws.signature) {
         return Err(DpopFailure::BadSignature);
     }
 
@@ -304,6 +311,9 @@ pub fn verify_proof(
     })
 }
 
-#[cfg(test)]
+// The unit tests need a key that can SIGN, so they need `jwt-p256`, the built-in ES256 backend.
+// `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at all, and a
+// test that cannot produce a signature cannot test a verifier.
+#[cfg(all(test, feature = "jwt-p256"))]
 #[path = "tests/dpop.rs"]
 mod tests;

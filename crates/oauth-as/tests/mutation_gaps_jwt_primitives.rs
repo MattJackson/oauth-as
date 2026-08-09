@@ -12,7 +12,10 @@
 //! does here: an independently computed RFC 2104 vector, and RFC 8259's own rules about what a
 //! JSON string may contain.
 
-#![cfg(feature = "jwt")]
+#![cfg(feature = "jwt-p256")]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -49,7 +52,14 @@ fn protected_header(kid: &str) -> Vec<u8> {
         EcdsaP256Key::from_scalar_bytes(kid, &SCALAR).expect("a valid P-256 scalar"),
         AUDIENCE,
     );
-    let token = config.sign_access_token(&claims()).expect("signing");
+    // Signing is async because an `Es256Signer` may be a KMS. The built-in `jwt-p256` backend does
+    // no I/O, so this drives the future to completion on a current-thread runtime rather than
+    // making every caller of this helper async for a future that is ready on its first poll.
+    let token = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(config.sign_access_token(&claims()))
+        .expect("signing");
     let first = token
         .split('.')
         .next()

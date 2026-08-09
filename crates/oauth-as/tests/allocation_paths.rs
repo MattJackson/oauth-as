@@ -74,6 +74,7 @@ fn ungated_path_allocation_gates() {
         ("dynamic_registration_bound", dynamic_registration_bound),
         ("par_push_bound", par_push_bound),
         ("par_redemption_bound", par_redemption_bound),
+        #[cfg(all(feature = "dpop", feature = "jwt-p256"))]
         (
             "dpop_proof_verification_bound",
             dpop_proof_verification_bound,
@@ -90,7 +91,11 @@ fn ungated_path_allocation_gates() {
         ("rar_parse_bound", rar_parse_bound),
         ("rar_narrowing_bound", rar_narrowing_bound),
         ("consent_lookup_bound", consent_lookup_bound),
+        // `jwt-p256`, not `jwt`: both fixtures need a key that can actually sign, and after the
+        // `Es256Signer` seam landed `jwt` carries the trait and no curve.
+        #[cfg(feature = "jwt-p256")]
         ("jwks_serving_bound", jwks_serving_bound),
+        #[cfg(feature = "jwt-p256")]
         ("jwt_signing_bound", jwt_signing_bound),
     ];
 
@@ -418,7 +423,7 @@ fn par_redemption_bound() {}
 
 // ------------------------------------------------------------------------------ RFC 9449 DPoP
 
-#[cfg(feature = "dpop")]
+#[cfg(all(feature = "jwt-p256", feature = "dpop"))]
 fn dpop_proof(key: &oauth_as::jwt::EcdsaP256Key, jti: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -447,7 +452,7 @@ fn dpop_proof(key: &oauth_as::jwt::EcdsaP256Key, jti: &str) -> String {
 /// each, an RFC 7638 thumbprint over the embedded JWK, a P-256 signature verification, and a
 /// `claim_replay_id` insert that has to keep the `jti` until the proof's window closes. None of it
 /// was gated before, so nothing would have caught the cost of it doubling.
-#[cfg(feature = "dpop")]
+#[cfg(all(feature = "jwt-p256", feature = "dpop"))]
 fn dpop_proof_verification_bound() {
     let rt = current_thread_runtime();
     let srv = server(&rt, config());
@@ -488,9 +493,6 @@ fn dpop_proof_verification_bound() {
     check("DPoP proof verification", d, DPOP_PROOF);
 }
 
-#[cfg(not(feature = "dpop"))]
-fn dpop_proof_verification_bound() {}
-
 /// What a token request costs under `dpop` when NO proof was presented, which is the number that
 /// says whether enabling the feature taxes the clients that are not using it.
 ///
@@ -504,7 +506,9 @@ fn dpop_proof_verification_bound() {}
 /// costs strictly more. The second half is what stops this gate passing vacuously if the proof
 /// check were ever short-circuited: a DPoP verification that allocated the same as no verification
 /// at all would be doing no work.
-#[cfg(feature = "dpop")]
+// `jwt-p256` as well as the feature itself: the fixture has to SIGN, and after the
+// `Es256Signer` seam landed neither `dpop` nor `client_assertion` implies a curve.
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
 fn token_request_with_no_dpop_proof_bound() {
     let rt = current_thread_runtime();
     let srv = server(&rt, config());
@@ -547,7 +551,7 @@ fn token_request_with_no_dpop_proof_bound() {
     check("token request with no DPoP proof", without, DPOP_ABSENT);
 }
 
-#[cfg(not(feature = "dpop"))]
+#[cfg(not(all(feature = "dpop", feature = "jwt-p256")))]
 fn token_request_with_no_dpop_proof_bound() {}
 
 // -------------------------------------------------------------------- RFC 7523 client assertion
@@ -558,7 +562,9 @@ fn token_request_with_no_dpop_proof_bound() {}
 /// secrets has no alternative to, so it runs on every token request those deployments make.
 /// Dominated by the same JWS machinery DPoP uses plus the single-use `jti` claim, and it had no
 /// gate.
-#[cfg(feature = "client_assertion")]
+// `jwt-p256` as well as the feature itself: the fixture has to SIGN, and after the
+// `Es256Signer` seam landed neither `dpop` nor `client_assertion` implies a curve.
+#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
 fn client_assertion_verification_bound() {
     use oauth_as::client_assertion::{AssertionKeys, CLIENT_ASSERTION_TYPE};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -623,7 +629,7 @@ fn client_assertion_verification_bound() {
     check("client assertion verification", d, CLIENT_ASSERTION);
 }
 
-#[cfg(not(feature = "client_assertion"))]
+#[cfg(not(all(feature = "client_assertion", feature = "jwt-p256")))]
 fn client_assertion_verification_bound() {}
 
 // ------------------------------------------------------------------- RFC 8693 token exchange
@@ -744,7 +750,7 @@ fn consent_lookup_bound() {}
 ///
 /// The bound is therefore not a hot-path budget, it is a record of what that per-fetch rebuild
 /// costs, so that a decision to cache it can be justified with a number.
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 fn jwks_serving_bound() {
     let rt = current_thread_runtime();
     let mut cfg = config();
@@ -762,16 +768,13 @@ fn jwks_serving_bound() {
     check("JWKS document build", d, JWKS_BUILD);
 }
 
-#[cfg(not(feature = "jwt"))]
-fn jwks_serving_bound() {}
-
 /// RFC 9068: issuing ONE `at+jwt` access token, against the same issuance with opaque tokens.
 ///
 /// The difference is what the JWT profile costs per token: a claim set serialized, a JOSE header
 /// serialized, three base64url encodes, one ES256 signature, and the `format!`s that join them.
 /// Opaque tokens are this crate's default precisely because a resource server can introspect
 /// instead, so this gate is what makes the trade a number rather than a preference.
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 fn jwt_signing_bound() {
     let rt = current_thread_runtime();
     let mut cfg = config();
@@ -797,9 +800,6 @@ fn jwt_signing_bound() {
     );
     check("JWT access token issuance", d, JWT_SIGN);
 }
-
-#[cfg(not(feature = "jwt"))]
-fn jwt_signing_bound() {}
 
 // -------------------------------------------------------------------------------- the bounds
 
@@ -861,22 +861,24 @@ const PAR_PUSH: (usize, usize) = (30, 1200);
 #[cfg(feature = "par")]
 const PAR_REDEEM: (usize, usize) = (12, 512);
 
-/// Observed 57 / 4748 `--all-features`, against 12 / 1707 for the same request with no proof: RFC
-/// 9449 verification costs 45 allocations and about 3 KB of transient traffic, nearly all of it
-/// freed again (3955 of 4748). That is the price of turning a bearer token into a
-/// sender-constrained one, and it was 58 before the `Box::pin` came off.
-#[cfg(feature = "dpop")]
+/// Observed 54 / 4670 `--all-features`, against 11 / 1683 for the same request with no proof: RFC
+/// 9449 verification costs 43 allocations and about 3 KB of transient traffic, nearly all of it
+/// freed again. That is the price of turning a bearer token into a sender-constrained one. It was
+/// 58 before the `Box::pin` came off, 57 before `Storage`'s reads returned `Arc`, and 56 before
+/// the server's own token endpoint URL stopped being `format!`ed once per proof.
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
 const DPOP_PROOF: (usize, usize) = (74, 6144);
 
 /// Observed 12 / 1707 `--all-features`, down from 13 / 1875 when the proof check was boxed. This is
 /// a full `client_credentials` issuance and the DPoP feature now adds nothing to it.
-#[cfg(feature = "dpop")]
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
 const DPOP_ABSENT: (usize, usize) = (16, 2224);
 
-/// Observed 38 / 3416 `--all-features`, down from 40 / 3752: one allocation from the assertion
-/// `Box::pin` coming off, one from the DPoP one. For a `private_key_jwt` deployment this is every
-/// token request it makes.
-#[cfg(feature = "client_assertion")]
+/// Observed 35 / 3338 `--all-features`, down from 40 / 3752: one allocation from the assertion
+/// `Box::pin` coming off, one from the DPoP one, and one more from the token endpoint URL being
+/// precomputed on the server rather than formatted per verification. For a `private_key_jwt`
+/// deployment this is every token request it makes.
+#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
 const CLIENT_ASSERTION: (usize, usize) = (49, 4448);
 
 /// Observed 11 / 1051: reading and type-checking the subject token, then a full issuance. Cheaper
@@ -902,21 +904,23 @@ const RAR_NARROW: (usize, usize) = (7, 210);
 #[cfg(feature = "consent")]
 const CONSENT_LOOKUP: (usize, usize) = (0, 0);
 
+/// Observed 19 allocs / 3255 bytes `--all-features`, against 11 / 1683 for the same issuance with
+/// opaque tokens: the RFC 9068 profile costs roughly 8 allocations and 1.6 KB of transient traffic
+/// per token, nearly all of it freed again. It was 28 / 4767 before the JOSE header was
+/// precomputed in `JwtConfig`, 26 / 4733 after that, and 25 / 4709 once `Storage`'s reads returned
+/// `Arc`; the last six came off when the compact serialization stopped being assembled with two
+/// `format!` calls, which had been allocating and fully copying the whole token twice.
+///
+/// This is the number behind opaque tokens being the DEFAULT: a resource server introspects
+/// instead, and introspection is 4 allocations.
+#[cfg(feature = "jwt-p256")]
+const JWT_SIGN: (usize, usize) = (26, 4352);
+
 /// Observed 4 / 226 for a one-key set. Small, and pinned anyway because `jwks()` REBUILDS the
 /// document on every call: the `http` feature serializes it once at router build and hands out a
 /// refcounted `Bytes` afterwards, but a host serving `jwks_uri` itself (the documented contract
 /// when `http` is off) pays this per fetch, and a verifier fetches on every cold cache. Four
 /// allocations is small enough that caching it is not worth an API change; the gate is what would
 /// tell us if that stopped being true.
-/// Observed 26 allocs / 4581 bytes under `--features jwt` and 26 / 4733 `--all-features`, against
-/// 12 / 1707 for the same issuance with opaque tokens: the RFC 9068 profile costs roughly 14
-/// allocations and 3 KB of transient traffic per token, nearly all of it freed again. It was 28 /
-/// 4767 before the JOSE header was precomputed in `JwtConfig` rather than serialized per token.
-///
-/// This is the number behind opaque tokens being the DEFAULT: a resource server introspects
-/// instead, and introspection is 4 allocations.
-#[cfg(feature = "jwt")]
-const JWT_SIGN: (usize, usize) = (34, 6144);
-
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 const JWKS_BUILD: (usize, usize) = (6, 296);

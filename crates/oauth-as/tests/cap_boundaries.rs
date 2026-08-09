@@ -19,6 +19,15 @@ use oauth_as::{ClientId, ErrorCode, TokenRequest};
 
 use support::{server_with, ManualClock, PUBLIC_REDIRECT, RFC7636_VERIFIER};
 
+/// The crate's built-in ES256 backend. Verification now goes through the [`oauth_as::jwt::Es256Verifier`] seam,
+/// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
+/// default, which is what keeps these tests measuring the behaviour they always measured.
+#[cfg(all(
+    feature = "jwt-p256",
+    any(feature = "dpop", feature = "client_assertion")
+))]
+const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
+
 /// `MAX_RESOURCE_INDICATORS` at the TOKEN endpoint. The authorization endpoint's half of this pair
 /// has had an at-cap acceptance case since the cap was added; the token endpoint's had only the
 /// refusal, and the two run through the same `validate_resources`, so an off-by-one there would
@@ -61,7 +70,7 @@ async fn the_token_endpoint_accepts_exactly_the_resource_indicator_cap() {
 /// added; a proof of exactly the cap had not been, and RFC 9449 section 4.2 proofs are not small:
 /// they carry a whole public JWK, so a cap enforced with `>=` would refuse conforming proofs from
 /// clients whose key or `kid` happened to sit on the boundary.
-#[cfg(feature = "dpop")]
+#[cfg(all(feature = "jwt-p256", feature = "dpop"))]
 #[test]
 fn a_proof_of_exactly_the_cap_is_accepted() {
     use oauth_as::dpop::{verify_proof, MAX_PROOF_BYTES};
@@ -89,7 +98,7 @@ fn a_proof_of_exactly_the_cap_is_accepted() {
     let b64_len = |n: usize| n.div_ceil(3) * 4 - (3 - n % 3) % 3;
     let mut found = None;
     for kid_pad in 0..4 {
-        let key = EcdsaP256Key::generate(&format!("boundary{}", "y".repeat(kid_pad)));
+        let key = EcdsaP256Key::generate(format!("boundary{}", "y".repeat(kid_pad)));
         let header = serde_json::to_vec(&serde_json::json!({
             "typ": "dpop+jwt",
             "alg": "ES256",
@@ -116,7 +125,7 @@ fn a_proof_of_exactly_the_cap_is_accepted() {
         "the whole point of this test is that the proof is EXACTLY the cap"
     );
     assert!(
-        verify_proof(&proof, "POST", TOKEN_ENDPOINT, now).is_ok(),
+        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now).is_ok(),
         "a proof of exactly MAX_PROOF_BYTES is inside the cap and must verify; refusing it would \
          be `>=` where the constant means `>`"
     );

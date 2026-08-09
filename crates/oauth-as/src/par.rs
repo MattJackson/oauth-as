@@ -361,10 +361,22 @@ impl std::error::Error for RequestObjectKeyError {}
 pub struct RegisteredRequestObjectKey {
     alg: RequestObjectAlg,
     kid: Option<String>,
-    /// The uncompressed SEC 1 point, `0x04 || x || y`, validated as an actual curve point at
-    /// construction so a malformed registration fails when it is made rather than when a request
-    /// arrives.
-    sec1: [u8; 65],
+    /// The public key, in the ONE shape this crate's [`crate::jwt::Es256Verifier`] seam takes.
+    ///
+    /// It was an uncompressed SEC 1 point (`0x04 || x || y`) through 0.9.0, alongside a PRIVATE
+    /// second copy of ES256 verification in this file that knew how to read one. The seam collapsed
+    /// both into the single implementation behind `crate::jwt`, which is the point: two verifiers
+    /// behind two independent code paths is how a codebase ends up with an algorithm confusion bug
+    /// in whichever half nobody reviewed, and this crate has already had to unify `CLOCK_SKEW_LEEWAY`
+    /// and a hex digit table for the same reason.
+    ///
+    /// ONE CONSEQUENCE, stated because it is a real change rather than a refactor: the "is this
+    /// point actually on P-256" check no longer happens at REGISTRATION, because this crate no
+    /// longer contains an elliptic curve. It happens in the installed verifier, per request, and it
+    /// still fails closed. What the constructors below still catch at registration time is every
+    /// encoding mistake (a trimmed coordinate, a wrong length, non-base64url), which is what a host
+    /// actually gets wrong when it copies a JWK out of its client table.
+    key: crate::jwt::PublicJwk,
 }
 
 #[cfg(feature = "jar")]
@@ -392,18 +404,17 @@ impl RegisteredRequestObjectKey {
         let y = URL_SAFE_NO_PAD
             .decode(y)
             .map_err(|_| RequestObjectKeyError("y is not base64url".into()))?;
-        // RFC 7518 section 6.2.1.2 fixes both coordinates at the curve's full byte length, so a
-        // trimmed leading zero is a different (and unusable) key rather than the same one.
-        if x.len() != 32 || y.len() != 32 {
-            return Err(RequestObjectKeyError(
-                "a P-256 coordinate is exactly 32 bytes".into(),
-            ));
-        }
-        let mut sec1 = [0u8; 65];
-        sec1[0] = 0x04;
-        sec1[1..33].copy_from_slice(&x);
-        sec1[33..].copy_from_slice(&y);
-        Self::es256_from_sec1(kid, &sec1)
+        // The width check is `public_jwk`'s, in ONE place, so that the two constructors cannot
+        // drift apart on what a coordinate is.
+        //
+        // Re-encoded from the DECODED bytes rather than passed through, so that the two
+        // constructors cannot disagree about what they accepted: whatever `x` and `y` spelled, what
+        // is stored is the canonical unpadded base64url of exactly 32 bytes.
+        Ok(RegisteredRequestObjectKey {
+            alg: RequestObjectAlg::Es256,
+            kid,
+            key: public_jwk(&x, &y)?,
+        })
     }
 
     /// Register an ES256 key from an uncompressed SEC 1 point (65 bytes, `0x04 || x || y`).
@@ -416,27 +427,19 @@ impl RegisteredRequestObjectKey {
                 "an uncompressed P-256 point is exactly 65 bytes".into(),
             ));
         }
-        // VALIDATED once, here, so that "the host registered something that is not on the curve" is
-        // a configuration error rather than a per-request verification failure nobody can explain.
-        //
-        // The parsed key is DISCARDED and `verify_es256` re-derives it per request. That is
-        // deliberate and it is a size trade, not an oversight: a `p256::ecdsa::VerifyingKey` is an
-        // affine point in Montgomery form, and holding one would grow this registration from 65
-        // bytes of SEC 1 plus a `kid` to roughly twice that, for every registered key a host keeps,
-        // to save a curve-equation check on a path that runs once per RFC 9101 request object.
-        // MEASURED: the re-derivation allocates NOTHING (p256 is stack-only here), so it does not
-        // appear in any gate in `tests/allocation_paths.rs`; what it costs is CPU, which
-        // `benches/` is the place to price. The comment said "parsed once" before, which was true
-        // of the validation and false of the parse, and the difference is exactly what a reader
-        // would have needed to know.
-        p256::ecdsa::VerifyingKey::from_sec1_bytes(sec1)
-            .map_err(|_| RequestObjectKeyError("not a point on P-256".into()))?;
-        let mut owned = [0u8; 65];
-        owned.copy_from_slice(sec1);
+        // The leading byte is checked because it is the one thing that says which SEC 1 encoding
+        // this is: 0x02 and 0x03 are the COMPRESSED forms, which are 33 bytes and so cannot arrive
+        // here, but 0x00 or 0x04 written by hand from a truncated buffer can. A host handing in 65
+        // bytes that do not start 0x04 has not handed in the point it thinks it has.
+        if sec1[0] != 0x04 {
+            return Err(RequestObjectKeyError(
+                "an uncompressed P-256 point begins with 0x04".into(),
+            ));
+        }
         Ok(RegisteredRequestObjectKey {
             alg: RequestObjectAlg::Es256,
             kid,
-            sec1: owned,
+            key: public_jwk(&sec1[1..33], &sec1[33..])?,
         })
     }
 
@@ -518,40 +521,46 @@ impl RequestObjectClaims {
 }
 
 /// One base64url (unpadded) segment of a JWS compact serialization.
+///
+/// `refusal` is the WHOLE description rather than the name of the segment, and it is
+/// `&'static str`, so the refusal borrows a constant instead of formatting one. There are exactly
+/// three call sites and three sentences (below), and this is the authorization endpoint: nothing
+/// has authenticated at this point, so the caller chooses how many of these it asks for.
 #[cfg(feature = "jar")]
-fn decode_segment(segment: &str, what: &str) -> Result<Vec<u8>, ErrorResponse> {
-    URL_SAFE_NO_PAD.decode(segment).map_err(|_| {
-        ErrorResponse::new(ErrorCode::InvalidRequestObject)
-            .with_description(format!("the {what} is not base64url"))
-    })
+fn decode_segment(segment: &str, refusal: &'static str) -> Result<Vec<u8>, ErrorResponse> {
+    URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|_| ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(refusal))
 }
 
-/// Verify an ES256 signature over `signing_input`.
-///
-/// SEAM, and marked as one deliberately. Another slice of this release is adding JWS VERIFICATION
-/// primitives to `src/jwt.rs` for RFC 7523 client assertions and RFC 9449 DPoP proofs; when they
-/// land, this function's body becomes a call to them and everything above it stays as it is. What
-/// it needs from those primitives is exactly this signature: "does this 64 byte `r || s` verify
-/// over these bytes under this SEC 1 public key", with no algorithm negotiation inside it, because
-/// the algorithm was already decided by the registration before this is reached.
+/// The three refusals [`decode_segment`] can produce, spelled out so the call sites read as they
+/// did when the sentence was built from the segment's name.
 #[cfg(feature = "jar")]
-fn verify_es256(sec1_public_key: &[u8; 65], signing_input: &[u8], signature: &[u8]) -> bool {
-    use p256::ecdsa::signature::Verifier as _;
-    // RFC 7518 section 3.4: an ES256 signature is the fixed-width 64 byte `r || s`, NOT the DER
-    // form. A DER-encoded signature is refused here rather than re-encoded, because accepting two
-    // encodings of one signature is how signature malleability gets in.
-    if signature.len() != 64 {
-        return false;
+const HEADER_NOT_BASE64URL: &str = "the header is not base64url";
+#[cfg(feature = "jar")]
+const PAYLOAD_NOT_BASE64URL: &str = "the payload is not base64url";
+#[cfg(feature = "jar")]
+const SIGNATURE_NOT_BASE64URL: &str = "the signature is not base64url";
+
+/// One [`crate::jwt::PublicJwk`] from two 32-byte coordinates.
+///
+/// THE SEAM NOTE THAT USED TO BE HERE IS DISCHARGED. Through 0.9.0 this file carried its own
+/// private `verify_es256` over `p256::ecdsa::VerifyingKey`, a second copy of the same twenty lines
+/// that `src/jwt.rs` held for RFC 7523 client assertions and RFC 9449 DPoP proofs, with a comment
+/// promising it would become a call to them. It now is one: this function converts the registered
+/// key into the shape the [`crate::jwt::Es256Verifier`] seam takes, and the verification itself
+/// happens in the single implementation behind that trait.
+#[cfg(feature = "jar")]
+fn public_jwk(x: &[u8], y: &[u8]) -> Result<crate::jwt::PublicJwk, RequestObjectKeyError> {
+    // RFC 7518 section 6.2.1.2 fixes both coordinates at the curve's full byte length, so a
+    // trimmed leading zero is a different (and unusable) key rather than the same one.
+    if x.len() != 32 || y.len() != 32 {
+        return Err(RequestObjectKeyError(
+            "a P-256 coordinate is exactly 32 bytes".into(),
+        ));
     }
-    let key = match p256::ecdsa::VerifyingKey::from_sec1_bytes(sec1_public_key) {
-        Ok(key) => key,
-        Err(_) => return false,
-    };
-    let signature = match p256::ecdsa::Signature::from_slice(signature) {
-        Ok(signature) => signature,
-        Err(_) => return false,
-    };
-    key.verify(signing_input, &signature).is_ok()
+    crate::jwt::PublicJwk::from_coordinates(&URL_SAFE_NO_PAD.encode(x), &URL_SAFE_NO_PAD.encode(y))
+        .map_err(|_| RequestObjectKeyError("a P-256 coordinate is exactly 32 bytes".into()))
 }
 
 /// Read one claim that RFC 9101 section 4 requires to be a JSON string.
@@ -886,6 +895,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             ErrorResponse::new(ErrorCode::InvalidRequestObject)
                 .with_description("the client registered no request object key")
         })?;
+        // The SAME refusal shape, one seam along: with no ES256 backend installed this server
+        // cannot check the signature, and a server that cannot check a signature must never behave
+        // as though it had checked one. Resolved before any segment is decoded, so an unverifiable
+        // request object costs an unauthenticated caller nothing but the lookup.
+        let verifier = self.es256_verifier().ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("no ES256 verifier is installed")
+        })?;
 
         // RFC 7515 section 3.1 compact serialization: exactly three parts. A five-part token is a
         // JWE, which RFC 9101 section 6.1 defines and this server does not implement; refusing it
@@ -901,10 +918,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             };
 
         let header: serde_json::Value =
-            serde_json::from_slice(&decode_segment(header_b64, "header")?).map_err(|_| {
-                ErrorResponse::new(ErrorCode::InvalidRequestObject)
-                    .with_description("the header is not JSON")
-            })?;
+            serde_json::from_slice(&decode_segment(header_b64, HEADER_NOT_BASE64URL)?).map_err(
+                |_| {
+                    ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                        .with_description("the header is not JSON")
+                },
+            )?;
         let alg = header
             .get("alg")
             .and_then(serde_json::Value::as_str)
@@ -948,23 +967,25 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         }
 
-        let signature = decode_segment(signature_b64, "signature")?;
+        let signature = decode_segment(signature_b64, SIGNATURE_NOT_BASE64URL)?;
         // The JWS Signing Input is the ASCII of "header.payload" (RFC 7515 section 5.2 step 8),
         // taken from the ORIGINAL text rather than re-encoded: re-encoding would verify a
         // normalisation of the token instead of the token, which is how a signature check gets
         // decoupled from what it is supposed to be checking.
         let signing_input = &request_object.as_bytes()[..header_b64.len() + 1 + payload_b64.len()];
-        if !verify_es256(&registered.sec1, signing_input, &signature) {
+        if !verifier.verify(&registered.key, signing_input, &signature) {
             return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
                 .with_description("the signature did not verify"));
         }
 
         // Only now is anything in the payload worth reading.
         let payload: serde_json::Value =
-            serde_json::from_slice(&decode_segment(payload_b64, "payload")?).map_err(|_| {
-                ErrorResponse::new(ErrorCode::InvalidRequestObject)
-                    .with_description("the payload is not JSON")
-            })?;
+            serde_json::from_slice(&decode_segment(payload_b64, PAYLOAD_NOT_BASE64URL)?).map_err(
+                |_| {
+                    ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                        .with_description("the payload is not JSON")
+                },
+            )?;
         let claims = payload.as_object().ok_or_else(|| {
             ErrorResponse::new(ErrorCode::InvalidRequestObject)
                 .with_description("the payload is not a JSON object")

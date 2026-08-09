@@ -12,7 +12,10 @@
 //! Those are two different oracles for the same fact and only one of them is available to a
 //! resource server that verifies an RFC 9068 JWT locally, which is the deployment DPoP is for; a
 //! suite that checks only introspection cannot see a `cnf` that never reached the JWT at all.
-#![cfg(feature = "dpop")]
+#![cfg(all(feature = "dpop", feature = "jwt-p256"))]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use oauth_as::server::UserApproval;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -17,6 +17,11 @@ use serde_json::json;
 use super::*;
 use crate::jwt::{compact_jws, hmac_sha256, EcdsaP256Key, PublicJwk};
 
+/// The crate's built-in ES256 backend. Verification now goes through the [`crate::jwt::Es256Verifier`] seam,
+/// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
+/// default, which is what keeps these tests measuring the behaviour they always measured.
+const VERIFIER: &crate::jwt::P256Verifier = &crate::jwt::P256Verifier;
+
 /// A fixed instant, so every window in this file is arithmetic rather than a race.
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000)
@@ -78,7 +83,7 @@ fn key_pair() -> (EcdsaP256Key, AssertionKeys) {
 }
 
 fn verify(keys: &AssertionKeys, assertion: &str) -> Result<VerifiedAssertion, AssertionFailure> {
-    verify_assertion(keys, assertion, CLIENT, &audiences(), now())
+    verify_assertion(VERIFIER, keys, assertion, CLIENT, &audiences(), now())
 }
 
 fn base64_url(bytes: &[u8]) -> String {

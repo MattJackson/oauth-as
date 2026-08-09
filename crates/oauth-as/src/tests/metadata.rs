@@ -71,7 +71,7 @@ fn the_issuer_path_is_only_what_follows_the_authority() {
 /// access tokens. Both directions are load-bearing. Advertising keys for an AS whose tokens are
 /// opaque points every resource server at a key set that verifies nothing; signing without
 /// advertising leaves them unable to verify at all.
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 #[test]
 fn jwks_uri_is_advertised_exactly_when_the_server_signs() {
     use crate::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};

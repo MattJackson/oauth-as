@@ -62,14 +62,53 @@ pub fn config() -> ServerConfig {
     config
 }
 
+/// A host-supplied `Es256Signer` that does no arithmetic, for the `f-jwt` row.
+///
+/// The whole point of the `jwt` row after the seam landed is to measure what a host with its OWN
+/// backend pays: the JWS serialization, the JWKS, the claim set, and NO curve. A probe that
+/// reached for `EcdsaP256Key` here would link p256 into that row and the number would be a lie.
+#[cfg(all(feature = "f-jwt", not(feature = "f-jwt-p256")))]
+struct ProbeSigner;
+
+#[cfg(all(feature = "f-jwt", not(feature = "f-jwt-p256")))]
+impl oauth_as::jwt::Es256Signer for ProbeSigner {
+    fn sign(
+        &self,
+        _signing_input: &[u8],
+    ) -> impl std::future::Future<Output = Result<[u8; 64], oauth_as::jwt::SignerError>> + Send
+    {
+        async { Ok([0x5Au8; 64]) }
+    }
+
+    fn public_jwk(&self) -> oauth_as::jwt::Jwk {
+        // 43 base64url characters decode to exactly the 32 bytes RFC 7518 s6.2.1.2 fixes a P-256
+        // coordinate at. All-zero rather than a real point, and spelled out rather than encoded,
+        // so the probe takes no `base64` dependency of its own: nothing here verifies anything,
+        // and a coordinate that is well FORMED is all the JWKS serialization path reads.
+        oauth_as::jwt::Jwk {
+            kty: "EC",
+            crv: "P-256",
+            x: "A".repeat(43),
+            y: "A".repeat(43),
+            kid: "probe-host-1".to_string(),
+            use_: "sig",
+            alg: "ES256",
+        }
+    }
+}
+
 #[cfg(feature = "f-jwt")]
 fn jwt_format() -> oauth_as::jwt::AccessTokenFormat {
-    use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
-    // Generated rather than hard coded: a key material constant in a repository is a habit worth
-    // not forming even in a measurement tool, and generation is on the `jwt` cost anyway.
-    let key = EcdsaP256Key::generate("probe-es256-1");
+    use oauth_as::jwt::{AccessTokenFormat, JwtConfig};
+    // Generated rather than hard coded, where there is a key at all: a key material constant in a
+    // repository is a habit worth not forming even in a measurement tool, and generation is on the
+    // `jwt-p256` cost anyway.
+    #[cfg(feature = "f-jwt-p256")]
+    let signer = oauth_as::jwt::EcdsaP256Key::generate("probe-es256-1");
+    #[cfg(not(feature = "f-jwt-p256"))]
+    let signer = ProbeSigner;
     AccessTokenFormat::Jwt(Box::new(
-        JwtConfig::new(key, "https://rs.probe.example").with_jwks_uri(format!("{ISSUER}/jwks")),
+        JwtConfig::new(signer, "https://rs.probe.example").with_jwks_uri(format!("{ISSUER}/jwks")),
     ))
 }
 

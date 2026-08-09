@@ -11,7 +11,10 @@
 //! redaction is the one that matters most: `ServerConfig` derives `Debug`, so a host that logs its
 //! config at startup logs whatever this type chooses to print.
 
-#![cfg(feature = "jwt")]
+#![cfg(feature = "jwt-p256")]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 use oauth_as::server::ServerConfig;
@@ -67,9 +70,14 @@ fn key_errors_name_the_problem_and_never_carry_key_material() {
     let text = zero.to_string();
     assert!(text.contains("not a valid P-256 private scalar"), "{text}");
 
-    let der = EcdsaP256Key::from_pkcs8_der("k", b"not der").expect_err("not PKCS#8");
-    let text = der.to_string();
-    assert!(text.contains("PKCS#8"), "{text}");
+    // The PKCS#8 loader is behind `jwt-pkcs8`, which is a feature of the p256 BACKEND rather than
+    // of `jwt` (see Cargo.toml): a build with the DER decoder off has no such refusal to display.
+    #[cfg(feature = "jwt-pkcs8")]
+    {
+        let der = EcdsaP256Key::from_pkcs8_der("k", b"not der").expect_err("not PKCS#8");
+        let text = der.to_string();
+        assert!(text.contains("PKCS#8"), "{text}");
+    }
 
     // The rejected bytes must not come back out in the diagnostic.
     let secret = [0x11u8; 31];

@@ -22,10 +22,25 @@
 #[path = "harness/mod.rs"]
 mod harness;
 
-#[cfg(feature = "jwt")]
+#[cfg(all(
+    feature = "jwt-p256",
+    any(feature = "dpop", feature = "client_assertion")
+))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "jwt")]
+/// The crate's built-in ES256 backend. Verification goes through the `Es256Verifier` seam, so a
+/// verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
+/// default, which is what keeps these benchmarks measuring what they always measured.
+#[cfg(all(
+    feature = "jwt-p256",
+    any(feature = "dpop", feature = "client_assertion")
+))]
+const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
+
+#[cfg(all(
+    feature = "jwt-p256",
+    any(feature = "dpop", feature = "client_assertion")
+))]
 fn secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .expect("after the epoch")
@@ -38,7 +53,7 @@ fn main() {
     let mut b = harness::Bench::from_args("optional features");
 
     // ==================================================================== RFC 9068 JWT access tokens
-    #[cfg(feature = "jwt")]
+    #[cfg(feature = "jwt-p256")]
     {
         use oauth_as::jwt::{compact_jws, AccessTokenFormat, EcdsaP256Key, JwtConfig};
         use oauth_as::{
@@ -112,7 +127,7 @@ fn main() {
     }
 
     // ================================================================================ RFC 9449 DPoP
-    #[cfg(feature = "dpop")]
+    #[cfg(all(feature = "dpop", feature = "jwt-p256"))]
     {
         use oauth_as::dpop::{verify_proof, DpopFailure};
         use oauth_as::jwt::{compact_jws, EcdsaP256Key};
@@ -142,7 +157,7 @@ fn main() {
             |input| key.sign_signing_input(input).unwrap(),
         );
         assert!(
-            verify_proof(&proof, HTM, HTU, now).is_ok(),
+            verify_proof(VERIFIER, &proof, HTM, HTU, now).is_ok(),
             "the fixture proof must verify, or this row measures a refusal"
         );
 
@@ -150,7 +165,9 @@ fn main() {
         // (verify is roughly twice sign on P-256), and a resource server that requires DPoP pays it
         // on every request. That makes this row the single most consequential number in the file
         // for a DPoP deployment.
-        b.bench_fast("dpop_verify_proof", || verify_proof(&proof, HTM, HTU, now));
+        b.bench_fast("dpop_verify_proof", || {
+            verify_proof(VERIFIER, &proof, HTM, HTU, now)
+        });
 
         // The refusal, driven by an attacker who has no key. TWO of them, because they are not
         // the same cost and conflating them would misreport what a garbage proof buys an attacker:
@@ -183,25 +200,25 @@ fn main() {
         // to measure. These two rows exist precisely to be compared against each other, so the
         // one that must cost a full ES256 verify has to be the one that actually ran one.
         assert_eq!(
-            verify_proof(malformed, HTM, HTU, now),
+            verify_proof(VERIFIER, malformed, HTM, HTU, now),
             Err(DpopFailure::Malformed),
             "this row must measure the PARSER refusing, before any curve arithmetic"
         );
         assert_eq!(
-            verify_proof(&wrong_signature, HTM, HTU, now),
+            verify_proof(VERIFIER, &wrong_signature, HTM, HTU, now),
             Err(DpopFailure::BadSignature),
             "this row must measure a COMPLETED ES256 verification that failed, not an earlier              refusal that skipped it"
         );
         b.bench_fast("dpop_verify_proof_malformed", || {
-            verify_proof(malformed, HTM, HTU, now)
+            verify_proof(VERIFIER, malformed, HTM, HTU, now)
         });
         b.bench_fast("dpop_verify_proof_bad_signature", || {
-            verify_proof(&wrong_signature, HTM, HTU, now)
+            verify_proof(VERIFIER, &wrong_signature, HTM, HTU, now)
         });
     }
 
     // ====================================================================== RFC 7523 client assertion
-    #[cfg(feature = "client_assertion")]
+    #[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
     {
         use oauth_as::client_assertion::{verify_assertion, AssertionKeys, ClientSecretKey};
         use oauth_as::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};
@@ -231,11 +248,11 @@ fn main() {
             hmac_sha256(SECRET.as_bytes(), input.as_bytes()).to_vec()
         });
         assert!(
-            verify_assertion(&hs_keys, &hs, CLIENT, &audiences, now).is_ok(),
+            verify_assertion(VERIFIER, &hs_keys, &hs, CLIENT, &audiences, now).is_ok(),
             "the HS256 fixture must verify"
         );
         b.bench_fast("client_secret_jwt_hs256_verify", || {
-            verify_assertion(&hs_keys, &hs, CLIENT, &audiences, now)
+            verify_assertion(VERIFIER, &hs_keys, &hs, CLIENT, &audiences, now)
         });
 
         // private_key_jwt: ES256, asymmetric, and the reason a deployment whose policy forbids
@@ -249,11 +266,11 @@ fn main() {
             key.sign_signing_input(input).unwrap()
         });
         assert!(
-            verify_assertion(&es_keys, &es, CLIENT, &audiences, now).is_ok(),
+            verify_assertion(VERIFIER, &es_keys, &es, CLIENT, &audiences, now).is_ok(),
             "the ES256 fixture must verify"
         );
         b.bench_fast("private_key_jwt_es256_verify", || {
-            verify_assertion(&es_keys, &es, CLIENT, &audiences, now)
+            verify_assertion(VERIFIER, &es_keys, &es, CLIENT, &audiences, now)
         });
     }
 

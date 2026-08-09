@@ -9,7 +9,10 @@
 //! here is the one that matters most, because an implementation that verifies the signature and
 //! forgets the `jti` passes every other test in both files while shipping a credential anybody who
 //! observed one request can send again.
-#![cfg(feature = "client_assertion")]
+#![cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+// Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
+// signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
+// all, so in that build there is nothing here that could run.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

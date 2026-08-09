@@ -393,6 +393,11 @@ struct Installed {
     registration_policy: Option<Box<dyn RegistrationPolicy>>,
     #[cfg(feature = "jar")]
     request_object_keys: Option<Box<dyn crate::par::RequestObjectKeys>>,
+    /// The host's ES256 backend for VERIFICATION (RFC 9449 DPoP proofs, RFC 9101 request objects,
+    /// RFC 7523 client assertions). `Arc` rather than `Box` because it is also what a host hands
+    /// to [`crate::signer_conformance`] and may share with its own resource-server half.
+    #[cfg(feature = "jwt")]
+    es256_verifier: Option<std::sync::Arc<dyn crate::jwt::Es256Verifier>>,
 }
 
 /// The server's slot for the host seams: exactly one pointer wide, and null until the host
@@ -441,6 +446,29 @@ impl Hooks {
     #[cfg(feature = "jar")]
     pub fn install_request_object_keys(&mut self, keys: Box<dyn crate::par::RequestObjectKeys>) {
         self.installed().request_object_keys = Some(keys);
+    }
+
+    /// Install the ES256 backend used to VERIFY signatures, replacing any previous one.
+    #[cfg(feature = "jwt")]
+    pub fn install_es256_verifier(
+        &mut self,
+        verifier: std::sync::Arc<dyn crate::jwt::Es256Verifier>,
+    ) {
+        self.installed().es256_verifier = Some(verifier);
+    }
+
+    /// The installed ES256 verifier, or `None`.
+    ///
+    /// `None` is NOT read as "accept anything": every caller refuses instead. Callers inside this
+    /// crate reach the verifier through a private resolver on `AuthorizationServer`, which is what
+    /// applies the `jwt-p256` fallback; this method reports only what the HOST installed, so that
+    /// fallback lives in exactly one place.
+    #[cfg(feature = "jwt")]
+    pub fn es256_verifier(&self) -> Option<&std::sync::Arc<dyn crate::jwt::Es256Verifier>> {
+        match &self.0 {
+            Some(installed) => installed.es256_verifier.as_ref(),
+            None => None,
+        }
     }
 
     /// The installed RFC 9101 request object key source.

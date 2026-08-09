@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::jwt::{verify_es256, verify_hs256, CompactJws, PublicJwk};
+use crate::jwt::{verify_hs256, CompactJws, Es256Verifier, PublicJwk};
 
 /// RFC 7521 section 4.2: the `client_assertion_type` a JWT bearer assertion must carry.
 pub const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -315,11 +315,17 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 ///    up telling an attacker which client ids exist.
 /// 3. Everything after that is the section 3 claim set, in the section's own order.
 ///
+/// `verifier` is the ES256 backend, the host's to choose after 0.9.0: enable `jwt-p256` for
+/// [`crate::jwt::P256Verifier`], or pass your own. It is a parameter and not an `Option` for the
+/// same reason as in [`crate::dpop::verify_proof`]: a caller holding no verifier must refuse the
+/// credential, not verify it leniently.
+///
 /// PUBLIC because [`VerifiedAssertion`] and [`AssertionFailure`] are, and a type no consumer can
 /// obtain is a type that should not have been exported. It is also the other half of
 /// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
 /// while hiding the verification it exists to feed left the safe path out of reach.
 pub fn verify_assertion(
+    verifier: &dyn Es256Verifier,
     keys: &AssertionKeys,
     assertion: &str,
     client_id: &str,
@@ -353,7 +359,7 @@ pub fn verify_assertion(
         // Any ONE registered key is enough: see `AssertionKeys::PublicKeys` on rotation.
         AssertionKeys::PublicKeys { keys } => keys
             .iter()
-            .any(|key| verify_es256(key, jws.signing_input.as_bytes(), &jws.signature)),
+            .any(|key| verifier.verify(key, jws.signing_input.as_bytes(), &jws.signature)),
     };
     if !signed {
         return Err(AssertionFailure::BadSignature);
@@ -462,6 +468,9 @@ fn audience_matches(jws: &CompactJws<'_>, audiences: &[&str]) -> bool {
     }
 }
 
-#[cfg(test)]
+// The unit tests need a key that can SIGN, so they need `jwt-p256`, the built-in ES256 backend.
+// `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at all, and a
+// test that cannot produce a signature cannot test a verifier.
+#[cfg(all(test, feature = "jwt-p256"))]
 #[path = "tests/client_assertion.rs"]
 mod tests;
