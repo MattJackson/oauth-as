@@ -6,6 +6,11 @@ resolver = "2"
 members = [
     "crates/oauth-as",
     "crates/oauth-as-conformance",
+    # The first DATABASE-BACKED Storage implementation. A separate crate, never a feature of the
+    # core: a Postgres driver is a large tree that must not appear in the publishable crate's
+    # manifest even optionally, and implementing the trait from OUTSIDE is what proves the seam is
+    # usable through the public API alone. Not published; see its own README.
+    "crates/oauth-as-postgres",
 ]
 
 # COMPILE SETTINGS, and an honest note about their reach.
