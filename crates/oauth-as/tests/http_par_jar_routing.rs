@@ -444,10 +444,17 @@ async fn requiring_par_refuses_the_same_request_in_the_query() {
 /// The client's registered request object key, and the private half so this test can sign as the
 /// client. A host only ever holds the public half; this file needs both because it plays both
 /// parts.
-#[cfg(feature = "jar")]
+///
+/// Every item in this section is gated on `jwt-p256` as well as `jar`, and NOT on `jar` alone,
+/// because signing as the client needs a signing KEY: since the ES256 seam `jar` implies `jwt`,
+/// which is the trait surface with no curve arithmetic behind it, and `EcdsaP256Key` is the
+/// built-in backend's type. Gated on `jar` alone this file did not compile in any build without
+/// the backend, which until the no-backend CI job gained `http` was every build except
+/// --all-features, so nothing ever tried.
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 struct JarKeys(oauth_as::par::RegisteredRequestObjectKey);
 
-#[cfg(feature = "jar")]
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 impl oauth_as::par::RequestObjectKeys for JarKeys {
     fn registered_key(
         &self,
@@ -458,7 +465,7 @@ impl oauth_as::par::RequestObjectKeys for JarKeys {
 }
 
 /// A server with signed request objects enabled, served on an ephemeral port.
-#[cfg(feature = "jar")]
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -513,14 +520,14 @@ async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
 }
 
 /// Sign a request object as the client would (RFC 9101 section 6.1, ES256 compact JWS).
-#[cfg(feature = "jar")]
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 fn request_object(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str) -> String {
     request_object_with(key, issuer, "")
 }
 
 /// The same object with `extra` spliced in before the closing brace, so a test can sign a claim
 /// the base object does not carry. `extra` is raw JSON and must begin with its own comma.
-#[cfg(feature = "jar")]
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 fn request_object_with(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str, extra: &str) -> String {
     let header = format!(
         r#"{{"alg":"ES256","typ":"{}","kid":"{}"}}"#,
@@ -542,7 +549,7 @@ fn request_object_with(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str, extra: &
 /// this router has to hand it to the verifier rather than treat it as an unknown parameter. A
 /// server that ignored it would authorize whatever the QUERY said, which is precisely the request
 /// the signature was there to stop anyone editing.
-#[cfg(feature = "jar")]
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 #[tokio::test]
 async fn a_signed_request_object_is_accepted_at_the_authorization_endpoint() {
     let (addr, key) = start_jar().await;
@@ -576,7 +583,7 @@ async fn a_signed_request_object_is_accepted_at_the_authorization_endpoint() {
 /// RFC 9101 section 5: a client MUST NOT send both. Refused rather than resolved by precedence,
 /// because a server that silently prefers one is a server whose choice an intermediary can rely
 /// on.
-#[cfg(feature = "jar")]
+#[cfg(all(feature = "jar", feature = "jwt-p256"))]
 #[tokio::test]
 async fn request_and_request_uri_together_are_refused() {
     let (addr, key) = start_jar().await;
@@ -708,7 +715,7 @@ async fn a_max_age_in_the_query_beside_a_request_uri_is_ignored() {
 /// and `max_age` read off the unsigned query is a `max_age` an intermediary CAN rewrite. A client
 /// answering a step-up challenge puts it inside the object (section 4); a server that looks only
 /// at the query never sees it.
-#[cfg(all(feature = "jar", feature = "consent"))]
+#[cfg(all(feature = "jar", feature = "jwt-p256", feature = "consent"))]
 #[tokio::test]
 async fn a_max_age_inside_the_signed_object_is_the_one_that_counts() {
     let (addr, key) = start_jar().await;
@@ -742,7 +749,7 @@ async fn a_max_age_inside_the_signed_object_is_the_one_that_counts() {
 /// The mirror: a `max_age` an intermediary APPENDED to the query of a JAR request counts for
 /// nothing, because RFC 9101 section 6.3 says the server MUST use only the object's parameters
 /// "even if the same parameter is provided in the query parameter".
-#[cfg(all(feature = "jar", feature = "consent"))]
+#[cfg(all(feature = "jar", feature = "jwt-p256", feature = "consent"))]
 #[tokio::test]
 async fn a_max_age_appended_to_the_query_of_a_signed_request_is_ignored() {
     let (addr, key) = start_jar().await;

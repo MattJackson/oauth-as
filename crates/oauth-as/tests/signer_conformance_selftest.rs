@@ -19,6 +19,15 @@
 //! it is the only one. That is deliberate: a signer whose `public_jwk()` is not its signing key
 //! genuinely fails more than one thing, and an exclusivity assertion would only be satisfiable by
 //! faults too artificial to be the ones a host writes.
+//!
+//! # The coverage guard guards a fault, not a name
+//!
+//! [`planted_faults`] is the single place a check name and the fault that drives it are written
+//! down together, and `every_check_has_a_planted_fault` RUNS all of it. The earlier shape compared
+//! `CHECKS` against a hand-maintained literal list of NAMES and stopped there, so it proved a name
+//! had been typed and nothing more: an entry whose fault had rotted, or whose `#[test]` had been
+//! deleted, passed it in silence. That is the same overclaim as the `Storage` harness's, in the
+//! file written to make the `Storage` harness's overclaim impossible.
 
 #![cfg(all(feature = "test-util", feature = "jwt-p256"))]
 
@@ -326,95 +335,199 @@ fn the_selftest_backend_with_no_faults_passes_every_check() {
 
 // ------------------------------------------------------------------- one red per check name
 
+/// THE ONE LIST: every check the harness reports, paired with the fault that drives it red.
+///
+/// This is the only place a check name and a `Faults` value are written down together. The
+/// per-fault `#[test]`s below do not carry their own `Faults`; they look themselves up here, so a
+/// name and its fault cannot drift apart, and `every_check_has_a_planted_fault` RUNS every entry,
+/// so an entry is a claim this file makes good on rather than a name somebody typed.
+///
+/// The previous shape of this file compared `CHECKS` against a hand-maintained literal list and
+/// nothing else. That guarded only that a name had been WRITTEN DOWN: an entry whose fault had
+/// been deleted, or whose `#[test]` had been renamed away, or that had never had a fault at all,
+/// passed it silently. That is exactly the defect the `Storage` harness shipped with (nine checks
+/// with no planted fault, one with no caller), which is the failure this file exists to make
+/// impossible, so the guard was weaker than its own name.
+fn planted_faults() -> Vec<(&'static str, Faults)> {
+    vec![
+        (
+            "verifier/rfc7515_appendix_a3_vector",
+            Faults {
+                verifier_always_false: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/rejects_a_foreign_key",
+            Faults {
+                verifier_ignores_the_key: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/rejects_a_tampered_signing_input",
+            Faults {
+                verifier_ignores_the_input: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/rejects_a_tampered_signature",
+            Faults {
+                verifier_ignores_the_signature: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/rejects_the_der_encoding",
+            Faults {
+                verifier_accepts_der: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/signs",
+            Faults {
+                signer_refuses: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/output_is_not_der",
+            Faults {
+                signer_returns_der: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/verifies_under_its_own_public_jwk",
+            Faults {
+                signer_uses_a_foreign_key: true,
+                ..Default::default()
+            },
+        ),
+        // The ONLY way this one can go red, and saying so is the point: no signer can produce a
+        // signature that verifies under a key whose private half it does not hold, so a red here
+        // always means the verifier.
+        (
+            "signer/does_not_verify_under_another_key",
+            Faults {
+                verifier_always_true: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/binds_the_signing_input",
+            Faults {
+                signer_ignores_its_argument: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/public_jwk_is_stable",
+            Faults {
+                public_jwk_drifts: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/public_jwk_is_an_es256_p256_key",
+            Faults {
+                public_jwk_trims_a_coordinate: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/public_jwk_has_a_kid",
+            Faults {
+                public_jwk_has_no_kid: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/is_not_the_published_example_key",
+            Faults {
+                signs_with_the_published_example_key: true,
+                ..Default::default()
+            },
+        ),
+    ]
+}
+
+/// Look the named check's planted fault up and drive it. The per-fault `#[test]`s below exist for
+/// GRANULARITY: a failure then names one check rather than the whole table.
+fn assert_planted(check: &str) {
+    let faults = planted_faults()
+        .into_iter()
+        .find(|(name, _)| *name == check)
+        .unwrap_or_else(|| panic!("{check} has no entry in planted_faults()"))
+        .1;
+    assert_reports(faults, check);
+}
+
+/// The guard, and it now means what it is called: for every check the harness reports, a fault is
+/// planted AND driven, here, in this test, and observed to make that check go red.
+///
+/// Both directions are asserted. A check with no entry is a check nobody has watched fail. An
+/// entry naming a check `CHECKS` does not contain is a fault aimed at nothing, which is how a
+/// table stays green while the thing it guards has been renamed out from under it.
 #[test]
 fn every_check_has_a_planted_fault() {
-    // The list below is the whole of `CHECKS`, paired with the fault that drives it red. Its job
-    // is to fail the day a check is added without one, which is the exact defect the `Storage`
-    // harness shipped with.
-    let planted: Vec<&str> = vec![
-        "verifier/rfc7515_appendix_a3_vector",
-        "verifier/rejects_a_foreign_key",
-        "verifier/rejects_a_tampered_signing_input",
-        "verifier/rejects_a_tampered_signature",
-        "verifier/rejects_the_der_encoding",
-        "signer/signs",
-        "signer/output_is_not_der",
-        "signer/verifies_under_its_own_public_jwk",
-        "signer/does_not_verify_under_another_key",
-        "signer/binds_the_signing_input",
-        "signer/public_jwk_is_stable",
-        "signer/public_jwk_is_an_es256_p256_key",
-        "signer/public_jwk_has_a_kid",
-        "signer/is_not_the_published_example_key",
-    ];
-    let mut missing: Vec<&&str> = CHECKS.iter().filter(|c| !planted.contains(c)).collect();
+    let planted = planted_faults();
+
+    let mut missing: Vec<&&str> = CHECKS
+        .iter()
+        .filter(|c| !planted.iter().any(|(name, _)| name == *c))
+        .collect();
     missing.sort_unstable();
     assert!(
         missing.is_empty(),
         "these checks have no planted fault in this file, so nobody has watched them fail: \
          {missing:?}"
     );
-    for name in &planted {
-        assert!(
-            CHECKS.contains(name),
-            "{name} is not a check the harness reports"
-        );
+
+    let mut aimed_at_nothing: Vec<&str> = planted
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !CHECKS.contains(name))
+        .collect();
+    aimed_at_nothing.sort_unstable();
+    assert!(
+        aimed_at_nothing.is_empty(),
+        "these entries name a check the harness does not report, so the fault proves nothing: \
+         {aimed_at_nothing:?}"
+    );
+
+    // And RUN every one. This is the half the old guard did not have: without it, "has a planted
+    // fault" meant "has a name in a list", and a fault that no longer worked would never say so.
+    for (name, faults) in &planted {
+        assert_reports(*faults, name);
     }
 }
 
 #[test]
 fn a_verifier_that_says_no_fails_the_rfc_vector() {
-    assert_reports(
-        Faults {
-            verifier_always_false: true,
-            ..Default::default()
-        },
-        "verifier/rfc7515_appendix_a3_vector",
-    );
+    assert_planted("verifier/rfc7515_appendix_a3_vector");
 }
 
 #[test]
 fn a_verifier_that_ignores_its_key_is_caught() {
-    assert_reports(
-        Faults {
-            verifier_ignores_the_key: true,
-            ..Default::default()
-        },
-        "verifier/rejects_a_foreign_key",
-    );
+    assert_planted("verifier/rejects_a_foreign_key");
 }
 
 #[test]
 fn a_verifier_that_ignores_its_input_is_caught() {
-    assert_reports(
-        Faults {
-            verifier_ignores_the_input: true,
-            ..Default::default()
-        },
-        "verifier/rejects_a_tampered_signing_input",
-    );
+    assert_planted("verifier/rejects_a_tampered_signing_input");
 }
 
 #[test]
 fn a_verifier_that_ignores_its_signature_is_caught() {
-    assert_reports(
-        Faults {
-            verifier_ignores_the_signature: true,
-            ..Default::default()
-        },
-        "verifier/rejects_a_tampered_signature",
-    );
+    assert_planted("verifier/rejects_a_tampered_signature");
 }
 
 #[test]
 fn a_verifier_that_also_accepts_der_is_caught() {
-    assert_reports(
-        Faults {
-            verifier_accepts_der: true,
-            ..Default::default()
-        },
-        "verifier/rejects_the_der_encoding",
-    );
+    assert_planted("verifier/rejects_the_der_encoding");
 }
 
 #[test]
@@ -422,99 +535,45 @@ fn a_verifier_that_says_yes_to_everything_is_caught_by_the_foreign_key_check() {
     // This is the ONLY way `signer/does_not_verify_under_another_key` can go red, and saying so
     // is the point: no signer can produce a signature that verifies under a key whose private half
     // it does not hold, so a red here always means the verifier.
-    assert_reports(
-        Faults {
-            verifier_always_true: true,
-            ..Default::default()
-        },
-        "signer/does_not_verify_under_another_key",
-    );
+    assert_planted("signer/does_not_verify_under_another_key");
 }
 
 #[test]
 fn a_signer_that_refuses_is_caught() {
-    assert_reports(
-        Faults {
-            signer_refuses: true,
-            ..Default::default()
-        },
-        "signer/signs",
-    );
+    assert_planted("signer/signs");
 }
 
 #[test]
 fn a_signer_that_returns_der_is_caught_by_name() {
-    assert_reports(
-        Faults {
-            signer_returns_der: true,
-            ..Default::default()
-        },
-        "signer/output_is_not_der",
-    );
+    assert_planted("signer/output_is_not_der");
 }
 
 #[test]
 fn a_signer_that_publishes_a_key_it_does_not_sign_with_is_caught() {
-    assert_reports(
-        Faults {
-            signer_uses_a_foreign_key: true,
-            ..Default::default()
-        },
-        "signer/verifies_under_its_own_public_jwk",
-    );
+    assert_planted("signer/verifies_under_its_own_public_jwk");
 }
 
 #[test]
 fn a_signer_that_ignores_the_bytes_it_was_handed_is_caught() {
-    assert_reports(
-        Faults {
-            signer_ignores_its_argument: true,
-            ..Default::default()
-        },
-        "signer/binds_the_signing_input",
-    );
+    assert_planted("signer/binds_the_signing_input");
 }
 
 #[test]
 fn a_public_jwk_that_is_not_cached_is_caught() {
-    assert_reports(
-        Faults {
-            public_jwk_drifts: true,
-            ..Default::default()
-        },
-        "signer/public_jwk_is_stable",
-    );
+    assert_planted("signer/public_jwk_is_stable");
 }
 
 #[test]
 fn a_trimmed_coordinate_is_caught() {
-    assert_reports(
-        Faults {
-            public_jwk_trims_a_coordinate: true,
-            ..Default::default()
-        },
-        "signer/public_jwk_is_an_es256_p256_key",
-    );
+    assert_planted("signer/public_jwk_is_an_es256_p256_key");
 }
 
 #[test]
 fn a_public_jwk_with_no_kid_is_caught() {
-    assert_reports(
-        Faults {
-            public_jwk_has_no_kid: true,
-            ..Default::default()
-        },
-        "signer/public_jwk_has_a_kid",
-    );
+    assert_planted("signer/public_jwk_has_a_kid");
 }
 
 #[test]
 fn signing_with_the_rfcs_own_example_key_is_caught() {
-    assert_reports(
-        Faults {
-            signs_with_the_published_example_key: true,
-            ..Default::default()
-        },
-        "signer/is_not_the_published_example_key",
-    );
+    assert_planted("signer/is_not_the_published_example_key");
 }

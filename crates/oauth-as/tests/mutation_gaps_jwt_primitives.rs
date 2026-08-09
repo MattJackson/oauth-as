@@ -39,7 +39,11 @@ fn claims() -> AccessTokenClaims {
         scope: None,
         #[cfg(feature = "rar")]
         authorization_details: Default::default(),
-        #[cfg(feature = "mtls")]
+        // The cfg MATCHES THE FIELD's, which is `any(dpop, mtls)` (see `AccessTokenClaims`), and
+        // not `mtls` alone: `cnf` carries the RFC 9449 s6 DPoP thumbprint as well as the RFC 8705
+        // s3.1 certificate one. Gated on `mtls` alone, this file did not compile at all in a
+        // `dpop`-without-`mtls` build.
+        #[cfg(any(feature = "dpop", feature = "mtls"))]
         cnf: None,
     }
 }

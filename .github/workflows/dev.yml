@@ -46,14 +46,30 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
       - name: tests (all features)
         run: cargo test -p oauth-as --locked --all-features
-      # THE NO-BACKEND REFUSALS, which --all-features cannot reach. With `jwt-p256` compiled in,
+      # THE NO-BACKEND BUILD, which --all-features cannot reach. With `jwt-p256` compiled in,
       # `P256Verifier` is installed as the default and "no ES256 backend" is not a state the server
-      # can be in. This feature set is the only one where it is, and `tests/verifier_refusal.rs`
-      # asserts that a DPoP proof, a request object and a client assertion are each refused there
-      # and each accepted once a verifier is installed. Without this step those six tests would be
-      # compiled out of every job and nobody would notice.
-      - name: tests (verification features, NO backend installed)
-        run: cargo test -p oauth-as --locked --features dpop,jar,client_assertion,par,test-util
+      # can be in. This step is the only place it is, so it is the only place `client_assertion`
+      # without a backend, `dpop` without a backend, and `jar` without a backend are ever executed.
+      #
+      # THE FEATURE SET IS "EVERYTHING EXCEPT THE BACKEND", and it is written that way on purpose
+      # rather than as a hand-picked list. It used to read `dpop,jar,client_assertion,par,test-util`
+      # and the omission that mattered was `http`: `tests/wire_reachability.rs` is
+      # `#![cfg(feature = "http")]`, so the ONE suite whose job is to prove that every capability
+      # the RFC 8414 document advertises is reachable over the wire was compiled out of the ONE
+      # configuration where the advertisement can be false. `client_secret_jwt` then shipped broken
+      # in exactly that configuration, refused by a server whose own metadata invited clients to
+      # use it, and the gate built to catch that class could not see the class.
+      #
+      # So the rule for this line is now a rule and not a list: it is `--all-features` minus
+      # `jwt-p256` and minus `jwt-pkcs8` (which requires it). Anything added to [features] in
+      # crates/oauth-as/Cargo.toml belongs here too unless it pulls an ES256 backend in.
+      # `axum` rather than `http` because it implies `http` and adds the router adapter's own
+      # tests, which are gated `#![cfg(feature = "axum")]` and were compiled out here for the same
+      # reason.
+      - name: tests (every feature EXCEPT the ES256 backend)
+        run: |
+          cargo test -p oauth-as --locked --features \
+            axum,jwt,mtls,par,jar,client_assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
       # RUSTDOC, and it is a gate rather than a nicety. Nothing here ran rustdoc, and the cost of
       # that was measurable: 23 warnings at 0.9.0, including public documentation pointing readers
       # at pub(crate) items they cannot see, and two links to a type (`RouterBuilder`) renamed in

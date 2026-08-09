@@ -17,6 +17,16 @@
 //! question "is the seam wired" from the question "is the arithmetic right", which is
 //! `signer_conformance` and `signer_conformance_selftest`'s job. A host that installed this one in
 //! production would have no signature checking at all, which is why the harness exists.
+//!
+//! # The rule is "no ES256 backend", NOT "no signature checking"
+//!
+//! Every other case in this file is an ES256 signature, and for a while every case was, which made
+//! the file read as though the absent backend refused SIGNED CREDENTIALS in general. It does not,
+//! and the difference shipped as a real defect: RFC 7523 `client_secret_jwt` is an HS256 HMAC over
+//! the secret the registration already holds (RFC 7518 section 3.2), there is no curve on that
+//! path at all, and it was being refused here because a verifier was demanded before the key kind
+//! was inspected. So `an_hmac_assertion_authenticates_with_no_verifier` below is the negative
+//! space this file was missing: the one credential that must still work.
 
 #![cfg(all(
     not(feature = "jwt-p256"),
@@ -267,12 +277,18 @@ mod client_assertion {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use oauth_as::client_assertion::AssertionKeys;
+    use oauth_as::client_assertion::{AssertionKeys, ClientSecretKey};
+    use oauth_as::jwt::hmac_sha256;
     use oauth_as::{
         AuthorizationServer, Client, ClientAuth, ClientCredential, ClientId, ErrorCode, GrantType,
         MemoryStorage, ScopeSet, ServerConfig, TokenRequest, TokenRequestContext,
         CLIENT_ASSERTION_TYPE,
     };
+
+    /// The HMAC key a `client_secret_jwt` client shares with this server. Long enough to clear
+    /// [`ClientSecretKey`]'s entropy floor, which is the only thing this fixture needs of it.
+    const HMAC_SECRET: &str = "a-high-entropy-registered-client-secret";
+    const HMAC_CLIENT: &str = "hmac-app";
 
     fn assertion() -> String {
         let now = SystemTime::now()
@@ -356,5 +372,130 @@ mod client_assertion {
         srv.token_with_context(request(), context(&assertion))
             .await
             .expect("an installed verifier is what makes the assertion checkable");
+    }
+
+    // ------------------------------------------- the other half: HS256 needs no backend at all
+
+    /// A conforming RFC 7523 section 3 claim set signed the one way a `client_secret_jwt` client
+    /// can sign it: HMAC-SHA-256 over the registered secret (RFC 7523 section 2.2 with RFC 7518
+    /// section 3.2). The `jti` is a parameter because section 3 makes it single use, so a test
+    /// that authenticates twice needs two.
+    fn hmac_assertion(jti: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        compact_jws(
+            br#"{"alg":"HS256","typ":"JWT"}"#,
+            &serde_json::to_vec(&serde_json::json!({
+                "iss": HMAC_CLIENT,
+                "sub": HMAC_CLIENT,
+                "aud": "https://as.example/token",
+                "jti": jti,
+                "iat": now,
+                "exp": now + 60,
+            }))
+            .unwrap(),
+            |input| hmac_sha256(HMAC_SECRET.as_bytes(), input.as_bytes()).to_vec(),
+        )
+    }
+
+    async fn hmac_server() -> AuthorizationServer<MemoryStorage> {
+        let srv = AuthorizationServer::new(
+            ServerConfig::new("https://as.example", "https://as.example/device"),
+            MemoryStorage::new(),
+        );
+        srv.register_client(Client {
+            client_id: ClientId::new(HMAC_CLIENT),
+            auth: ClientAuth::ConfidentialAssertion {
+                keys: AssertionKeys::ClientSecret {
+                    secret: ClientSecretKey::new(HMAC_SECRET)
+                        .expect("the fixture secret clears the entropy floor"),
+                },
+            },
+            grant_types: vec![GrantType::ClientCredentials],
+            redirect_uris: vec![],
+            allowed_scopes: ScopeSet::parse("read").unwrap(),
+            default_scopes: ScopeSet::parse("read").unwrap(),
+            name: None,
+            registration: None,
+        })
+        .await
+        .unwrap();
+        srv
+    }
+
+    fn hmac_request() -> TokenRequest {
+        TokenRequest::ClientCredentials {
+            client_id: ClientId::new(HMAC_CLIENT),
+            client_secret: None,
+            scope: None,
+        }
+    }
+
+    /// THE CASE THIS FILE WAS MISSING, and the one that shipped broken.
+    ///
+    /// Everything above says "no ES256 backend means refused". That is true of ES256 credentials
+    /// and of nothing else, and stating only the refusing half is what let the accepting half be
+    /// implemented backwards: `client_secret_jwt` was refused in this exact build because the
+    /// server resolved an `Es256Verifier` before it looked at what KIND of key the registration
+    /// held, and an HMAC key needs none. No curve, no backend, no verifier: RFC 7523 section 2.2
+    /// says the secret itself is the key.
+    #[tokio::test]
+    async fn an_hmac_assertion_authenticates_with_no_verifier() {
+        let srv = hmac_server().await;
+        let assertion = hmac_assertion("hmac-refusal-1");
+        srv.token_with_context(hmac_request(), context(&assertion))
+            .await
+            .expect(
+                "client_secret_jwt is an HMAC over the registered secret and needs no ES256 \
+                 backend to be checkable",
+            );
+    }
+
+    /// And it is still a CHECK. Without this, the test above is equally satisfied by a build that
+    /// stopped verifying HS256 altogether, which is the failure mode with no symptom.
+    #[tokio::test]
+    async fn an_hmac_under_the_wrong_secret_is_still_refused_with_no_verifier() {
+        let srv = hmac_server().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let forged = compact_jws(
+            br#"{"alg":"HS256","typ":"JWT"}"#,
+            &serde_json::to_vec(&serde_json::json!({
+                "iss": HMAC_CLIENT,
+                "sub": HMAC_CLIENT,
+                "aud": "https://as.example/token",
+                "jti": "hmac-refusal-2",
+                "iat": now,
+                "exp": now + 60,
+            }))
+            .unwrap(),
+            |input| hmac_sha256(b"not-the-registered-secret-at-all", input.as_bytes()).to_vec(),
+        );
+        let error = srv
+            .token_with_context(hmac_request(), context(&forged))
+            .await
+            .expect_err("an HMAC computed under the wrong key authenticates nobody");
+        assert_eq!(error.error, ErrorCode::InvalidClient);
+    }
+
+    /// RFC 7523 section 3: the `jti` is single use, and that has to survive the acceptance above.
+    /// A path that short-circuited the verifier resolve and skipped the replay check with it would
+    /// pass both tests above while handing out a replayable credential.
+    #[tokio::test]
+    async fn the_hmac_assertion_is_still_single_use_with_no_verifier() {
+        let srv = hmac_server().await;
+        let assertion = hmac_assertion("hmac-refusal-3");
+        srv.token_with_context(hmac_request(), context(&assertion))
+            .await
+            .expect("the first use authenticates");
+        let error = srv
+            .token_with_context(hmac_request(), context(&assertion))
+            .await
+            .expect_err("RFC 7523 s3 makes the jti single use within the assertion's validity");
+        assert_eq!(error.error, ErrorCode::InvalidClient);
     }
 }

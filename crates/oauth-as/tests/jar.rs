@@ -139,9 +139,14 @@ async fn an_access_token_is_not_a_request_object() {
             scope: Some("read".to_string()),
             #[cfg(feature = "rar")]
             authorization_details: Default::default(),
-            // Not certificate bound: this fixture is testing that an access token is
+            // Not confirmation bound: this fixture is testing that an access token is
             // not a request object, and a binding would say nothing about that.
-            #[cfg(feature = "mtls")]
+            //
+            // The cfg MATCHES THE FIELD's, which is `any(dpop, mtls)` (see `AccessTokenClaims`),
+            // and not `mtls` alone: `cnf` carries the RFC 9449 s6 DPoP thumbprint as well as the
+            // RFC 8705 s3.1 certificate one. Gated on `mtls` alone, this file did not compile at
+            // all in a `dpop`-without-`mtls` build.
+            #[cfg(any(feature = "dpop", feature = "mtls"))]
             cnf: None,
         })
         .await

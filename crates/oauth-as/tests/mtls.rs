@@ -578,7 +578,11 @@ fn the_metadata_document_advertises_both_methods_and_the_binding() {
 /// RFC 8705 s3.1: with the `jwt` feature the binding also travels INSIDE the signed access token,
 /// so a resource server that validates the JWT itself never has to call introspection to discover
 /// that the token is constrained.
-#[cfg(feature = "jwt")]
+// A signing KEY, so `jwt-p256` and not `jwt`: since the ES256 seam `jwt` is the trait
+// surface with no curve arithmetic behind it, and `EcdsaP256Key` is the built-in
+// backend's type. Gated on `jwt` alone this file did not compile in any build without
+// the backend, which until now was every build except --all-features.
+#[cfg(feature = "jwt-p256")]
 #[tokio::test]
 async fn a_signed_access_token_carries_the_cnf_claim() {
     use base64::Engine as _;

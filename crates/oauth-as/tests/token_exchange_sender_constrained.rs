@@ -81,7 +81,12 @@ fn exchange<'a>(stolen: &'a str, gateway_id: &'a ClientId) -> TokenExchangeReque
 }
 
 /// RFC 9449: a DPoP-bound access token, exchanged, must not come back out as a bearer token.
-#[cfg(feature = "dpop")]
+// A signing KEY, so `jwt-p256` and not `dpop`: minting a proof needs an ES256 signer, and since
+// the seam `dpop` implies only `jwt`, the trait surface with no curve arithmetic behind it.
+// `EcdsaP256Key` is the built-in backend's type. Gated on `dpop` alone this file did not compile
+// in any `dpop`-without-backend build, which nothing ever tried until the no-backend CI job
+// gained the rest of the feature set.
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
 #[tokio::test]
 async fn a_dpop_bound_subject_token_cannot_be_exchanged_into_a_bearer_token() {
     use oauth_as::jwt::{compact_jws, EcdsaP256Key};

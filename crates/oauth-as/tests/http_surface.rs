@@ -1302,7 +1302,10 @@ fn base64_standard(s: &str) -> String {
 /// A server that signs its access tokens: the same fixture as [`start_wired`] plus an ES256 key
 /// and a `jwks_uri` under the issuer. Returns the address and the key identifier the JWKS must
 /// name.
-#[cfg(feature = "jwt")]
+// A signing KEY, so `jwt-p256` and not `jwt`: since the ES256 seam `jwt` is the trait surface
+// with no curve arithmetic behind it, and `EcdsaP256Key` is the built-in backend's type.
+// Gated on `jwt` alone this file did not compile in an `axum` build without the backend.
+#[cfg(feature = "jwt-p256")]
 async fn start_signing() -> (SocketAddr, String) {
     use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 
@@ -1343,7 +1346,7 @@ async fn start_signing() -> (SocketAddr, String) {
 /// non-empty `keys` array, and the key it publishes is the one it signs with. A resource server
 /// that cannot fetch these bytes cannot verify a single RFC 9068 token, so the advertised URI
 /// 404ing is the same unrecoverable lie as any other missing endpoint.
-#[cfg(feature = "jwt")]
+#[cfg(feature = "jwt-p256")]
 #[tokio::test]
 async fn a_signing_server_serves_the_key_set_it_advertises() {
     let (addr, kid) = start_signing().await;

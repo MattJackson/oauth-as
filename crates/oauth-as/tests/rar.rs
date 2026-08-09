@@ -665,7 +665,11 @@ fn the_metadata_document_advertises_the_supported_types() {
 /// RFC 9396 s9.1: the AS is RECOMMENDED to put the details in the access token as a top-level
 /// claim, so a resource server holding a JWT does not have to call introspection to learn what it
 /// is allowed to do.
-#[cfg(feature = "jwt")]
+// A signing KEY, so `jwt-p256` and not `jwt`: since the ES256 seam `jwt` is the trait
+// surface with no curve arithmetic behind it, and `EcdsaP256Key` is the built-in
+// backend's type. Gated on `jwt` alone this file did not compile in any build without
+// the backend, which until now was every build except --all-features.
+#[cfg(feature = "jwt-p256")]
 #[tokio::test]
 async fn the_jwt_access_token_carries_the_authorization_details_claim() {
     use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
@@ -705,7 +709,11 @@ async fn the_jwt_access_token_carries_the_authorization_details_claim() {
 
 /// A token from a grant with no details must not carry an empty claim: an empty array reads as
 /// "authorized for nothing in particular", which is a statement, and the truth is silence.
-#[cfg(feature = "jwt")]
+// A signing KEY, so `jwt-p256` and not `jwt`: since the ES256 seam `jwt` is the trait
+// surface with no curve arithmetic behind it, and `EcdsaP256Key` is the built-in
+// backend's type. Gated on `jwt` alone this file did not compile in any build without
+// the backend, which until now was every build except --all-features.
+#[cfg(feature = "jwt-p256")]
 #[tokio::test]
 async fn a_grant_with_no_details_signs_no_claim() {
     use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};

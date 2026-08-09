@@ -103,6 +103,13 @@ env:
 jobs:
   # Everything dev.yml proves, re-run here because a push to qa is not required to have gone
   # through dev.yml first (e.g. a fast-forward or a direct promotion), so qa must be self-contained.
+  #
+  # THAT CLAIM WAS FALSE until 0.9.0 and the correction is the point of the extra steps below.
+  # This job ran three commands, all at DEFAULT features, while dev.yml ran seven; a promotion to
+  # qa therefore ran a STRICTLY WEAKER gate than the branch it was promoted from. Default features
+  # is roughly 320 of this crate's 710 tests, so every feature-gated suite, and every no-backend
+  # suite with it, reached the promotion branch unexecuted. If a step is added to dev.yml's
+  # lint-and-test job it belongs here too, or this comment goes back to being untrue.
   lint-and-test:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
@@ -119,6 +126,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: tests
         run: cargo test --workspace --locked
+      - name: clippy (all features)
+        run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
+      - name: tests (all features)
+        run: cargo test -p oauth-as --locked --all-features
+      # The no-backend build. See the long comment on the matching step in dev.yml for why the
+      # feature set is "--all-features minus jwt-p256" expressed as a rule rather than a list.
+      - name: tests (every feature EXCEPT the ES256 backend)
+        run: |
+          cargo test -p oauth-as --locked --features \
+            axum,jwt,mtls,par,jar,client_assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+      - name: rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc -p oauth-as --locked --all-features --no-deps
+      - name: doc tests (all features)
+        run: cargo test -p oauth-as --locked --all-features --doc
 
   # MSRV verification. The floor is 1.75, and it is MEASURED rather than declared: 1.74 fails on
   # return-position impl Trait in the Storage trait, and 1.75 compiles clean. A declared floor
