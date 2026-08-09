@@ -93,7 +93,7 @@ use crate::events::{Attempt, AttemptOutcome, RateLimitDecision};
 use crate::grant::GrantType;
 use crate::metadata::{well_known_path, AuthorizationServerMetadata};
 use crate::scope::ScopeSet;
-use crate::server::{AuthorizationServer, Clock, DeviceApprovalError, TokenRequest};
+use crate::server::{AuthorizationServer, Clock, DeviceApprovalError, TokenRequest, UserApproval};
 use crate::store::Storage;
 use crate::token::TokenTypeHint;
 
@@ -2383,8 +2383,10 @@ async fn authorize_handler<S: Storage, C: Clock>(
     let issued = state
         .server
         .issue_authorization_code_with_authentication(
-            &validated,
-            subject.clone(),
+            // The assertion `UserApproval::granted` makes is exactly what this service has just
+            // finished doing: the consent resolver returned `Approve` for THIS request, on behalf
+            // of the subject the host's own resolver named. Nowhere else in this file may mint one.
+            UserApproval::granted(&validated, subject.clone()),
             &validated.authentication_requirement,
             authentication.as_ref(),
         )
@@ -2392,7 +2394,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
     #[cfg(not(feature = "consent"))]
     let issued = state
         .server
-        .issue_authorization_code(&validated, subject)
+        .issue_authorization_code(UserApproval::granted(&validated, subject))
         .await;
 
     // AFTER issuance, and only on success: a consent records that the user granted something, and

@@ -323,7 +323,7 @@ pub use scope::{Scope, ScopeSet};
 // error type of a re-exported method was an oversight rather than a decision.
 pub use server::{
     AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ServerConfig, SystemClock,
-    TokenRequest, TokenRequestContext, MIN_USER_CODE_LENGTH,
+    TokenRequest, TokenRequestContext, UserApproval, MIN_USER_CODE_LENGTH,
 };
 pub use store::{MemoryStorage, Storage, StorageError};
 #[cfg(feature = "dpop")]
