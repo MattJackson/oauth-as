@@ -65,6 +65,30 @@
 //! [`server::AuthorizationServer::new`] (plus whatever `Storage` the host constructs to pass in),
 //! so "enabled by config" for a host means exactly "construct the value when config says so".
 //!
+//! # THE SWEEP: an obligation that comes with the no-background-tasks promise
+//!
+//! "No background tasks" has a price and the HOST pays it. Nothing here reclaims an expired
+//! record; [`store::Storage::sweep_expired`] does, and it runs when the host calls it and at no
+//! other time. A host that never calls it has a store that only grows, and the growth is
+//! ATTACKER-PACED: the RFC 8628 section 3.1 device authorization endpoint takes no credential
+//! from a public client, so anyone who can open a socket can allocate a device grant per request
+//! forever. Expiry is enforced on read, so an unswept deployment is not insecure, it is unbounded,
+//! which is a process that dies rather than a grant that leaks.
+//!
+//! So: spawn one task per process, on an interval well under the shortest artifact lifetime
+//! ([`server::ServerConfig::device_code_ttl`], 600 seconds by default), log a failure and retry on
+//! the next tick rather than returning. `examples/production_server.rs` does exactly that, with
+//! the reasoning, alongside every other seam a real deployment has to wire.
+//!
+//! # A worked production wiring
+//!
+//! `examples/production_server.rs` is the one to copy: it wires the storage contract, a rate
+//! limiter, a real consent screen, the device form's CSRF tokens, a session-backed subject
+//! resolver, the sweeper, an audit sink and signing key management, and says at each site what
+//! breaks if you get it wrong. `examples/conformance_server.rs` is NOT: it is a fixture for the
+//! black-box harness, and it auto-approves consent, disables the CSRF protection and signs with a
+//! key printed in an RFC.
+//!
 //! # Concurrency contract
 //!
 //! Single-use artifacts (device codes at redemption, rotating refresh tokens) are consumed through

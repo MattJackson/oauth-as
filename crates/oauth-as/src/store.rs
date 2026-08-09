@@ -12,6 +12,19 @@
 //!   stay single use under concurrency. A shared
 //!   multi-node store must implement them with a genuinely atomic primitive (compare-and-set,
 //!   `DELETE ... RETURNING`, or equivalent); a plain read-then-delete reintroduces the double-spend.
+//! - PURE READS hand back `Arc<T>`, and `take_*` hand back owned `T`. The split is deliberate and
+//!   it is NOT a weakening of the atomicity contract above. A read is a question about a record
+//!   that STAYS in the store, so the answer can be a second pointer to it; a `take_*` REMOVES the
+//!   record, so there is nothing left for a shared pointer to be shared with, and handing back an
+//!   owned value is what makes "exactly one caller got it" expressible in the type. A host must not
+//!   read that asymmetry as "reads are cheap so they may be stale": an `Arc` this crate holds is a
+//!   snapshot of the record as of the read, exactly as the previous owned clone was.
+//!   MEASURED, with the counting allocator in `tests/allocation.rs`: `get_client` returning an
+//!   owned `Client` cost 8 allocations per authenticated call against `MemoryStorage` (auth,
+//!   grant types, redirect URIs, scope sets, name), and every token-plane request pays it. A store
+//!   that already holds `Arc<Client>` now pays one atomic increment instead. A SQL-backed store
+//!   that builds the `Client` per query pays ONE extra allocation for the `Arc` itself, on a path
+//!   that has already done I/O.
 //! - `put_device_grant` upserts by `device_code` and must keep any user-code index consistent.
 //!   "Consistent" has two halves, and both are load bearing: a put that CHANGES a grant's user
 //!   code must retire the old index entry, and a put whose user code is already indexed for a
@@ -23,14 +36,18 @@
 //!   assertions and RFC 9449 DPoP proofs single use. A store that implements it as "look, then
 //!   insert" has reintroduced exactly the replay the two RFCs require to be prevented, and unlike
 //!   the `take_*` operations the damage is silent: nothing else in the system notices.
-//! - Nothing in this crate evicts anything on a timer: there is no background task, by design.
-//!   Expired records are reclaimed only when the HOST calls [`Storage::sweep_expired`]. A host
-//!   that never calls it has a store that only grows.
+//! - SWEEPING IS THE HOST'S JOB AND IT IS NOT OPTIONAL. Nothing in this crate evicts anything on
+//!   a timer: there is no background task, by design. Expired records are reclaimed only when the
+//!   HOST calls [`Storage::sweep_expired`] on a schedule of its own. A host that never calls it
+//!   has not merely an untidy store: the RFC 8628 section 3.1 device authorization endpoint takes
+//!   no credential from a public client, so an unswept deployment hands anyone who can open a
+//!   socket an unbounded allocation loop. See [`Storage::sweep_expired`] for the obligation in
+//!   full, and `examples/production_server.rs` for it wired up.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::authorization::AuthorizationCodeRecord;
 use crate::client::{Client, ClientId};
@@ -63,10 +80,16 @@ impl std::error::Error for StorageError {}
 /// server can be driven from any multi-threaded async runtime.
 pub trait Storage: Send + Sync {
     /// Look up a registered client.
+    ///
+    /// `Arc` rather than an owned `Client` because this is the single most called read in the
+    /// crate: every authenticated request on the token plane starts here, and the record is only
+    /// ever READ. A store that keeps its clients as `Arc<Client>` answers with a pointer clone; a
+    /// store that materialises one per query wraps what it built. See the module docs for the
+    /// measurement and for why this does not touch the `take_*` atomicity contract.
     fn get_client(
         &self,
         client_id: &ClientId,
-    ) -> impl Future<Output = Result<Option<Client>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Arc<Client>>, StorageError>> + Send;
 
     /// Insert or replace a client registration.
     fn put_client(&self, client: Client) -> impl Future<Output = Result<(), StorageError>> + Send;
@@ -358,13 +381,47 @@ pub trait Storage: Send + Sync {
 
     /// Remove every record that is dead at `now`, and return how many were removed.
     ///
-    /// The HOST must call this, on whatever schedule it likes; this crate has no background task
-    /// and will never grow one (see the crate docs on zero cost until enabled). Nothing else
-    /// reclaims storage: consumed authorization codes are retained deliberately until their
-    /// expiry, spent refresh records are retained deliberately until theirs, and expired access
-    /// tokens and abandoned device grants are simply never looked at again. RFC 8628 section 3.1
-    /// lets any client entitled to the device grant allocate a grant per request, so without a
-    /// sweep the growth is attacker-paced.
+    /// # THE HOST MUST CALL THIS, ON A TIMER, FOREVER
+    ///
+    /// It is an OBLIGATION of running this crate, not a tuning knob. This crate has no background
+    /// task and will never grow one (see the crate docs on zero cost until enabled), so this
+    /// method runs when the host runs it and at no other time. Nothing else reclaims storage:
+    /// consumed authorization codes are retained deliberately until their expiry, spent refresh
+    /// records are retained deliberately until theirs, and expired access tokens and abandoned
+    /// device grants are simply never looked at again.
+    ///
+    /// What a host that never calls it has built is a MEMORY EXHAUSTION PATH, not an untidy
+    /// store. The RFC 8628 section 3.1 device authorization endpoint takes no client credential
+    /// from a public client (it sends only its `client_id`, which RFC 6749 section 2.2 says is
+    /// not a secret), so anyone who can open a socket can allocate a device grant plus a
+    /// user-code index entry per request, in a loop, and none of it is ever reclaimed. The growth
+    /// is attacker-paced and it ends with the process dying.
+    ///
+    /// Expiry ITSELF is enforced on read, so an unswept store is not INSECURE, it is UNBOUNDED.
+    /// That is why the interval matters much less than the existence of the task: sweeping every
+    /// few minutes and sweeping every few seconds are both fine, and never sweeping is not.
+    ///
+    /// One task per PROCESS. It must be safe to call concurrently with request handling (see
+    /// below), so every node sweeping is harmless; a host that would rather not have N nodes
+    /// deleting the same rows runs it from one of them, or from a scheduled job that calls the
+    /// same method. A sweep failure must be logged and retried on the next tick, never allowed
+    /// to end the task: a silently stopped sweeper shows up hours later as memory growth.
+    ///
+    /// `crates/oauth-as/examples/production_server.rs` wires this, with the interval reasoning.
+    ///
+    /// ```ignore
+    /// // Once per process, at startup.
+    /// tokio::spawn(async move {
+    ///     let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ///     loop {
+    ///         ticker.tick().await;
+    ///         if let Err(e) = server.store().sweep_expired(SystemTime::now()).await {
+    ///             // Log and continue. Do not return: returning stops the sweep forever.
+    ///             eprintln!("sweep failed, retrying next tick: {e}");
+    ///         }
+    ///     }
+    /// });
+    /// ```
     ///
     /// "Dead at `now`" means, for each kind:
     ///
@@ -386,7 +443,10 @@ pub trait Storage: Send + Sync {
 
 #[derive(Default)]
 struct MemoryInner {
-    clients: HashMap<String, Client>,
+    /// `Arc` so that [`Storage::get_client`] answers with a pointer clone rather than a deep copy
+    /// of the registration on every authenticated request. MEASURED: 8 allocations per call before,
+    /// one atomic increment after.
+    clients: HashMap<String, Arc<Client>>,
     device_by_code: HashMap<String, DeviceGrant>,
     /// normalized user code -> device_code
     user_code_index: HashMap<String, String>,
@@ -428,14 +488,18 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
-    async fn get_client(&self, client_id: &ClientId) -> Result<Option<Client>, StorageError> {
+    async fn get_client(&self, client_id: &ClientId) -> Result<Option<Arc<Client>>, StorageError> {
+        // `Arc::clone` through `Option::cloned`: one atomic increment, no deep copy of the
+        // registration. This is the hot read the module docs' measurement is about.
         Ok(self.lock().clients.get(client_id.as_str()).cloned())
     }
 
     async fn put_client(&self, client: Client) -> Result<(), StorageError> {
+        // The one allocation the `Arc` costs is paid HERE, on registration, which happens once per
+        // client, rather than on `get_client`, which happens once per authenticated request.
         self.lock()
             .clients
-            .insert(client.client_id.as_str().to_string(), client);
+            .insert(client.client_id.as_str().to_string(), Arc::new(client));
         Ok(())
     }
 

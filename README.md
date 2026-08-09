@@ -81,6 +81,31 @@ Measured, not asserted:
   real regressions, including a 2 KB per-request allocation caused by crossing tokio's 2048 byte
   future boxing threshold.
 
+### What it costs you to run
+
+The other half of "no background tasks, no globals, nothing until you ask" is that some things are
+now **yours to do**. None of these is optional, and the first one is the one people forget:
+
+- **Sweep expired records on a timer.** `Storage::sweep_expired` is the only thing that reclaims
+  anything, and it runs when you call it and never otherwise. The RFC 8628 device authorization
+  endpoint takes no credential from a public client, so an unswept deployment is an unbounded
+  allocation loop available to anyone who can open a socket. Expiry is enforced on read, so this
+  is not a security hole, it is a memory exhaustion one. Spawn one task per process, sweep well
+  inside the shortest artifact lifetime, log failures and keep going.
+- **Rate limit.** RFC 8628 s5.1 makes device user code entropy adequate only in combination with
+  it, and this library never sees a request, so it has no caller to count.
+- **Show a real consent screen.** Naming the user is not the same as asking them.
+- **Wire the CSRF seam** on the device verification form, and give the subject resolver a session
+  your server established rather than a header a caller chose.
+- **Implement `take_*` and `claim_replay_id` atomically.** Read-then-delete double-spends refresh
+  tokens across nodes and destroys reuse detection. Check yours with the `test-util` conformance
+  harness rather than by reading it.
+
+**`crates/oauth-as/examples/production_server.rs` wires all of them in one file**, with a comment
+at each site saying what breaks if you get it wrong. Copy that one. Do not copy
+`conformance_server.rs`: it is a black-box test fixture and it says so at the top, in the loudest
+available terms.
+
 ## Minimum supported Rust version
 
 Measured per feature, because there is not one number, and each is built at exactly that toolchain
@@ -148,7 +173,8 @@ that.
 
 ## Layout
 
-- `crates/oauth-as` is the library.
+- `crates/oauth-as` is the library. `examples/production_server.rs` is the worked wiring a real
+  deployment starts from; `examples/conformance_server.rs` is a harness fixture and is not.
 - `crates/oauth-as-conformance` is the independent harness. It contains no code from `oauth-as`,
   never links against it, and is never published.
 - `scripts/oauth-conformance.sh` runs it: `--selftest` proves the gate can go red, `--check` runs
