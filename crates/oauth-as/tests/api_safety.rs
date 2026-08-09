@@ -36,6 +36,43 @@ fn step_up_failure_is_a_std_error() {
     assert_eq!(boxed.to_string(), "authentication older than max_age");
 }
 
+/// The same gap, in the same shape, one type over. `ClientAuthFailure` is the `Err` payload of
+/// `mtls.rs`'s `authenticate_via_mtls` exactly as `AssertionFailure`, `DpopFailure`,
+/// `StepUpFailure`, `RegistrationFailure` and `MtlsRegistrationError` are the payloads of theirs,
+/// and it was the only one of the six a host could not put behind `?` or in a `Box<dyn Error>`.
+#[test]
+fn client_auth_failure_is_a_std_error() {
+    fn assert_error<E: std::error::Error + 'static>(e: E) -> Box<dyn std::error::Error> {
+        Box::new(e)
+    }
+
+    let boxed = assert_error(oauth_as::ClientAuthFailure::UnknownClient);
+    assert_eq!(boxed.to_string(), "no registration for that client_id");
+    // The audit channel separates these deliberately (see the type's docs), so the DISPLAY forms
+    // have to separate them too: a host that logs the message must not be told the same sentence
+    // for "no such client" and "wrong secret".
+    // `mut` only when a feature below pushes onto it; a default build compares three.
+    #[allow(unused_mut)]
+    let mut seen: Vec<String> = vec![
+        oauth_as::ClientAuthFailure::UnknownClient.to_string(),
+        oauth_as::ClientAuthFailure::SecretMismatch.to_string(),
+        oauth_as::ClientAuthFailure::RateLimited.to_string(),
+    ];
+    #[cfg(feature = "mtls")]
+    {
+        seen.push(oauth_as::ClientAuthFailure::NoCertificatePresented.to_string());
+        seen.push(oauth_as::ClientAuthFailure::CertificateMismatch.to_string());
+    }
+    #[cfg(feature = "client_assertion")]
+    seen.push(oauth_as::ClientAuthFailure::AssertionInvalid.to_string());
+    let distinct = seen.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        seen.len(),
+        "two ClientAuthFailure variants render the same message: {seen:?}"
+    );
+}
+
 /// `from_jwks` refuses a key set that yields no certificate, because such a registration can never
 /// authenticate anybody. `from_thumbprints` accepted the identical empty state in silence, and
 /// `from_der_certificates` accepted an empty iterator, so the same misconfiguration was a refusal

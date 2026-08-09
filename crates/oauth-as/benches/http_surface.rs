@@ -167,6 +167,21 @@ fn main() {
     // `request_construction_only` is the control: it builds the same `http::Request` and does not
     // call `handle`, so the `String` clone that every row above pays inside its own closure can be
     // subtracted rather than guessed at.
+    //
+    // WHAT THIS SWEEP MEASURES NOW. It found the answer to be about 1000x, so `src/http.rs` grew
+    // `MAX_FORM_PARAMETERS` (64) and every row here past the cap is a REFUSAL rather than a
+    // decode. Measured on one aarch64 laptop, before the cap and after it:
+    //
+    //     n        before      after
+    //     0       2.65 us    2.67 us
+    //    64       7.55 us    2.15 us   (refused, so cheaper than the grant it skips)
+    //   256      22.15 us    4.46 us
+    //  1024      83.33 us   14.50 us
+    //
+    // The sweep is kept, and kept at these sizes, because what it now proves is that the cap
+    // HOLDS: the remaining growth is buffering and UTF-8 validating the body, which
+    // `MAX_BODY_BYTES` bounds and which nothing can avoid, and the ns/element column must keep
+    // falling rather than flattening at the per-parameter cost.
     const PARAM_COUNTS: &[usize] = &[0, 64, 256, 1024];
     {
         let base = format!(

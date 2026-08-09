@@ -71,6 +71,25 @@ mod time;
 
 pub use time::{from_nanos, to_nanos};
 
+/// How many rows one batch of [`oauth_as::store::Storage::sweep_expired`] removes per statement.
+///
+/// The sweep deletes in batches and commits each one, per table, until the table has nothing left
+/// that is dead. This constant is the size of the LOCK WINDOW, not a limit on what a call
+/// reclaims: a single call still drains the whole backlog, and the count it returns is still the
+/// rows it actually removed. Through 0.9.0 each table was one unbounded `DELETE` inside one
+/// transaction, which on a table with millions of dead rows holds a lock on every one of them
+/// until the whole statement finishes, blocking the live redemptions that touch them.
+///
+/// FIVE THOUSAND, which is a compromise between two costs that pull opposite ways. Too small and
+/// the sweep is dominated by round trips: a backlog of a million rows is 200 statements at this
+/// size and 1000 at 1000, each one a network round trip that a sweep on a timer has no reason to
+/// pay. Too large and the batch stops being a short lock, which is the entire point: at 5000 rows
+/// a delete over the expiry index is single-digit milliseconds on ordinary hardware, comfortably
+/// shorter than the round trip that carried it. It is not configurable because a host that needs
+/// it to be has a different problem (a sweep interval too long for its issuance rate), and a knob
+/// would let that problem be tuned around rather than found.
+pub const SWEEP_BATCH_ROWS: usize = 5_000;
+
 /// A [`oauth_as::store::Storage`] backed by a PostgreSQL connection pool.
 ///
 /// Cheap to clone in the sense that matters: it holds a [`sqlx::PgPool`], which is itself an

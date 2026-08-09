@@ -200,8 +200,27 @@ allocation on every token request. The trade is refused, with the number, in the
   practice), with room for a long `htu` and future claims. A host's HTTP server usually caps header
   size too, so this is defence in depth rather than the only line; it is here because this library
   never sees the socket and because `verify_proof` is public. Over the cap is `DpopFailure::Malformed`.
-- `impl std::error::Error for StepUpFailure`. It was the only error-shaped type in the crate
-  without one.
+- **`oauth_as::http::MAX_FORM_PARAMETERS` (64)**, a cap on how many form or query parameters one
+  request may carry, checked before any of them is decoded. `MAX_BODY_BYTES` bounded the BYTES an
+  anonymous caller could make the service hold and did not bound the WORK, because decoding is per
+  parameter: measured with `benches/http_surface.rs` before and after, `POST /token` cost 2.65 us
+  with no extra parameters and 83.33 us with 1024 ignored ones, against 163 ns for a 404; with the
+  cap the same request costs 14.50 us, and what remains is buffering the body rather than decoding
+  it. 64 KiB of `&a=b` pairs is roughly 2300 parameters, so one unauthenticated packet bought about
+  three orders of magnitude more work than the cheapest thing the service can do, and the GET
+  endpoints were worse because their parameters arrive in a URL the body cap never applied to.
+  64 is about three times the
+  largest request this crate can construct (an RFC 9126 push carrying every authorization
+  parameter is about twenty), with the headroom left for repeated RFC 8707 `resource` indicators
+  and for extension parameters the server ignores. Over the cap is a 413 with no protocol body, the
+  same shape the byte cap uses, decided by a count of `&` separators that stops reading at the cap.
+- `impl std::error::Error` (and `Display`) `for ClientAuthFailure`. It is the `Err` payload of
+  `authenticate_via_mtls`, exactly as `AssertionFailure`, `DpopFailure`, `StepUpFailure`,
+  `RegistrationFailure` and `MtlsRegistrationError` are of theirs, and it was the last one a host
+  could not put behind `?` or into a `Box<dyn Error>`. The `Display` strings are the OPERATOR's
+  sentences: the wire still collapses every variant into one `invalid_client`.
+- `impl std::error::Error for StepUpFailure`. It was one of the two error-shaped types in the crate
+  without one; `ClientAuthFailure`, above, was the other.
 - `ServerConfig::refresh_token_ttl` and `ServerConfig::include_verification_uri_complete` document
   the risk their defaults carry, matching what `allowed_resources` already did: `None` on a refresh
   chain means a token exfiltrated once is a credential forever, and RFC 9700 s4.14.2 reuse
@@ -210,6 +229,52 @@ allocation on every token request. The trade is refused, with the number, in the
   load-bearing caveat: `MtlsClientRegistration::accepts`, `ClientCertificate::from_der` (both back
   to the `mtls` trust boundary section) and `Authentication::at` (do not stamp `auth_time` with
   `now`).
+
+### Changed: one clock-skew constant instead of two that had to be kept equal
+
+- **`dpop::CLOCK_SKEW_LEEWAY` and `client_assertion::CLOCK_SKEW_LEEWAY` are now the same
+  constant**, defined once in a private module and re-exported by both. NOT a breaking change: both
+  public paths still resolve and the value is unchanged (60 seconds). They were two `pub const`
+  declarations of the same number, one of whose doc comments pointed at the other "for the same
+  reason", which is a comment admitting that two values had to be kept in step by hand. Neither
+  module could own it, because `dpop` and `client_assertion` are independent features and a build
+  may have either alone. `tests/clock_skew_single_definition.rs` scans the source and fails if a
+  second definition appears.
+
+### Changed: a refusal that allocated, and a sweep that took one long lock
+
+- **A missing-required-parameter refusal borrows its description** instead of formatting one.
+  `http.rs`'s `required()` built a `String` per refusal although the parameter name is always a
+  `&'static str` from a set of six; every other refusal in the file passes a literal into
+  `error_description`, which is a `Cow<'static, str>`. The rule is the one `tests/allocation.rs`
+  states on `refused_token_request_allocation_bound`: a refusal is work an attacker sets the rate
+  of. The unit test reads the call sites out of `http.rs`'s own source, so a new `required(..)`
+  whose name is not in the borrowing table fails rather than quietly allocating again.
+- **`oauth-as-postgres`: `sweep_expired` deletes in committed batches** of
+  `oauth_as_postgres::SWEEP_BATCH_ROWS` (5000) per table, looping until the table is drained,
+  instead of one unbounded `DELETE` per table inside one transaction. The old form took a row lock
+  on every dead row and held all of them until the statement finished, so a table with millions of
+  dead rows blocked the live redemptions that touched them. The CONTRACT is unchanged: one call
+  still removes every record dead at `now` and still returns how many it removed. The transaction
+  is gone deliberately and is not a weakening, because every row removed is one the server already
+  refuses on time alone, and because locks are released at commit, so batching inside one
+  transaction would have held every lock to the end exactly as the single statement did. Batches
+  use `FOR UPDATE SKIP LOCKED`, so several nodes sweeping at once no longer queue behind each
+  other; each call's count is what that call removed.
+
+### Documented
+
+- **`oauth-as-postgres`: `delete_client` is not a kill switch**, stated where a host reads it (the
+  crate README and the `src/store.rs` module docs). It removes the registration and everything the
+  store holds for it as of the moment it runs, in one transaction, and a token request that read
+  the registration before the delete committed still writes its token after. No store can close
+  that window: a foreign key would turn the losing write into a `server_error` on a request that
+  did nothing wrong (and would break the legitimate writes the schema's no-foreign-keys note
+  already describes), PostgreSQL's serializable isolation only detects a conflict between
+  transactions that are both `SERIALIZABLE` (`put_token` is a single autocommit statement), and the
+  statement order inside one transaction is invisible from outside it. The obligation is the
+  host's: stop issuing for a client before deleting it, and delete a second time once in-flight
+  requests have drained.
 
 ## [0.9.0] - 2026-08-08 (release candidate; not yet published to crates.io)
 

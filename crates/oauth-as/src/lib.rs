@@ -237,6 +237,11 @@ pub mod registration;
 pub mod resource_metadata;
 pub mod scope;
 pub mod server;
+// PRIVATE, and one item long: the clock-skew allowance that `client_assertion` and `dpop` both
+// PUBLISH. It lives here because those two are independent features and neither can own a
+// constant the other must still see; both re-export it, so the public paths are unchanged.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+mod skew;
 #[cfg(feature = "test-util")]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub mod storage_conformance;

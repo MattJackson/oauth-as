@@ -15,6 +15,12 @@ fn headers_with(auth: &str) -> HeaderMap {
     h
 }
 
+/// [`parse_pairs`] for the tests that are not about [`MAX_FORM_PARAMETERS`]: every input below is
+/// a handful of parameters, so the cap can only be an obstacle to reading them.
+fn pairs_of(input: &str) -> Vec<Pair<'_>> {
+    parse_pairs(input).unwrap_or_else(|_| panic!("this fixture is within the parameter cap"))
+}
+
 /// The refusal, or a panic naming what came back instead.
 ///
 /// `Result::expect_err` cannot be used here: it formats the `Ok` value with `Debug`, and
@@ -61,7 +67,7 @@ fn a_stray_percent_is_passed_through_not_fatal() {
 
 #[test]
 fn parse_pairs_keeps_present_but_empty_parameters() {
-    let pairs = parse_pairs("a=1&b=&c");
+    let pairs = pairs_of("a=1&b=&c");
     assert_eq!(param(&pairs, "a"), Some("1"));
     // RFC 6749 distinguishes an empty value from an absent parameter (an empty `client_id` is a
     // present-and-invalid client id, not a missing one), so both must survive parsing.
@@ -70,11 +76,28 @@ fn parse_pairs_keeps_present_but_empty_parameters() {
     assert_eq!(param(&pairs, "d"), None);
 }
 
+/// The exact boundary of [`MAX_FORM_PARAMETERS`], because an off-by-one here is either a hole in
+/// the cap or a refusal of a request a client is entitled to send.
+#[test]
+fn the_parameter_cap_is_exact_at_its_boundary() {
+    let at_the_cap = vec!["a=1"; MAX_FORM_PARAMETERS].join("&");
+    assert_eq!(
+        parse_pairs(&at_the_cap).map(|p| p.len()).ok(),
+        Some(MAX_FORM_PARAMETERS),
+        "a request with exactly MAX_FORM_PARAMETERS parameters is within the cap"
+    );
+    let one_over = vec!["a=1"; MAX_FORM_PARAMETERS + 1].join("&");
+    assert!(
+        parse_pairs(&one_over).is_err(),
+        "one parameter past the cap is refused"
+    );
+}
+
 #[test]
 fn a_repeated_parameter_keeps_the_first() {
     // RFC 6749 s3.1: a parameter MUST NOT be sent more than once. First-wins denies a smuggled
     // duplicate the ability to override what earlier layers parsed.
-    let pairs = parse_pairs("grant_type=authorization_code&grant_type=client_credentials");
+    let pairs = pairs_of("grant_type=authorization_code&grant_type=client_credentials");
     assert_eq!(param(&pairs, "grant_type"), Some("authorization_code"));
 }
 
@@ -119,12 +142,12 @@ fn two_authentication_methods_are_refused() {
     // RFC 6749 s2.3: "The client MUST NOT use more than one authentication method in each
     // request."
     let raw = BASE64_STANDARD.encode("client:secret");
-    let form = parse_pairs("client_id=client&client_secret=secret");
+    let form = pairs_of("client_id=client&client_secret=secret");
     let err = refusal(credentials(&headers_with(&format!("Basic {raw}")), &form));
     assert_eq!(err.error, ErrorCode::InvalidRequest);
 
     // Even a bare client_id alongside Basic is two methods' worth of identity claims.
-    let form = parse_pairs("client_id=client");
+    let form = pairs_of("client_id=client");
     let err = refusal(credentials(&headers_with(&format!("Basic {raw}")), &form));
     assert_eq!(err.error, ErrorCode::InvalidRequest);
 }
@@ -139,7 +162,7 @@ fn two_authentication_methods_are_refused() {
 fn a_pushed_request_may_carry_client_id_alongside_basic() {
     let raw = BASE64_STANDARD.encode("client:secret");
     let headers = headers_with(&format!("Basic {raw}"));
-    let form = parse_pairs("client_id=client&response_type=code");
+    let form = pairs_of("client_id=client&response_type=code");
 
     // The token endpoint's rule is unchanged.
     assert_eq!(
@@ -155,7 +178,7 @@ fn a_pushed_request_may_carry_client_id_alongside_basic() {
     assert_eq!(creds.client_secret.as_deref(), Some("secret"));
 
     // A real second CREDENTIAL is still two methods.
-    let both = parse_pairs("client_id=client&client_secret=secret");
+    let both = pairs_of("client_id=client&client_secret=secret");
     assert_eq!(
         refusal(pushed_request_credentials(&headers, &both)).error,
         ErrorCode::InvalidRequest
@@ -165,7 +188,7 @@ fn a_pushed_request_may_carry_client_id_alongside_basic() {
 #[test]
 fn a_public_client_may_present_a_bare_client_id() {
     // RFC 6749 s3.2.1: a client that is not authenticating still identifies itself.
-    let creds = credentials(&HeaderMap::new(), &parse_pairs("client_id=public")).expect("ok");
+    let creds = credentials(&HeaderMap::new(), &pairs_of("client_id=public")).expect("ok");
     assert_eq!(creds.client_id, "public");
     assert_eq!(creds.client_secret, None);
 }
@@ -173,7 +196,7 @@ fn a_public_client_may_present_a_bare_client_id() {
 #[test]
 fn no_credentials_at_all_is_invalid_client() {
     // RFC 6749 s5.2 lists "no client authentication included" under invalid_client by name.
-    let err = refusal(credentials(&HeaderMap::new(), &parse_pairs("grant_type=x")));
+    let err = refusal(credentials(&HeaderMap::new(), &pairs_of("grant_type=x")));
     assert_eq!(err.error, ErrorCode::InvalidClient);
 }
 
@@ -477,9 +500,8 @@ fn a_truncated_escape_at_the_end_is_passed_through_rather_than_read_past() {
 /// first-wins rule in [`param`] must not be applied to.
 #[test]
 fn every_resource_indicator_survives_including_repeats() {
-    let pairs = parse_pairs(
-        "resource=https%3A%2F%2Fa.example&client_id=c&resource=https%3A%2F%2Fb.example",
-    );
+    let pairs =
+        pairs_of("resource=https%3A%2F%2Fa.example&client_id=c&resource=https%3A%2F%2Fb.example");
     assert_eq!(
         resource_indicators(&pairs),
         vec![
@@ -487,7 +509,59 @@ fn every_resource_indicator_survives_including_repeats() {
             "https://b.example".to_string()
         ]
     );
-    assert!(resource_indicators(&parse_pairs("client_id=c")).is_empty());
+    assert!(resource_indicators(&pairs_of("client_id=c")).is_empty());
+}
+
+/// A missing-parameter refusal must BORROW its description, not build one.
+///
+/// The rule is the one `tests/allocation.rs` states on
+/// `refused_token_request_allocation_bound`: a refusal is work an ATTACKER sets the rate of, so a
+/// refusal that allocates is an allocation an unauthenticated caller can ask for as fast as it can
+/// open sockets. Roughly fifty of this crate's description sites pass a literal;
+/// [`required`] was the one that formatted, although `name` is always a `&'static str` from a
+/// finite set. `error_description` is a `Cow<'static, str>`, so `Cow::Borrowed` IS the assertion
+/// that nothing was copied onto the heap: this needs no allocator instrumentation to be exact.
+///
+/// The set of names is read out of this module's own SOURCE rather than listed here, so a new
+/// `required(..)` call site whose name was never added to the borrowing match fails this test
+/// instead of silently reintroducing the allocation.
+#[test]
+fn a_missing_required_parameter_borrows_its_description() {
+    let source = include_str!("../http.rs");
+    let mut names: Vec<&str> = Vec::new();
+    for (at, _) in source.match_indices("required(") {
+        let from = at + "required(".len();
+        let rest = &source[from..(from + 128).min(source.len())];
+        // `required(&form, "code")` and `required(form, "subject_token")`: the name is the
+        // literal between the first pair of quotes after the call.
+        let Some(open) = rest.find('"') else { continue };
+        let Some(close) = rest[open + 1..].find('"') else {
+            continue;
+        };
+        let name = &rest[open + 1..open + 1 + close];
+        // Only names in the same statement, never a quote from some later line.
+        if rest[..open].contains(';') || !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            continue;
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    assert!(
+        names.len() >= 6,
+        "the source scan found only {names:?}; it is meant to find every required() call site"
+    );
+
+    for name in names {
+        let err = required(&[], name).expect_err("no parameters means every one of them is absent");
+        match err.error_description {
+            Some(Cow::Borrowed(_)) => {}
+            other => panic!(
+                "required({name:?}) built its description on the heap ({other:?}): add the \
+                 parameter to the borrowing match in http.rs"
+            ),
+        }
+    }
 }
 
 /// A supplied `scope` has to be READ, and a malformed one has to be `invalid_scope` rather than
@@ -495,17 +569,17 @@ fn every_resource_indicator_survives_including_repeats() {
 /// registered DEFAULT scopes instead of refusing, which is a quiet upgrade of what it asked for.
 #[test]
 fn a_supplied_scope_is_parsed_and_a_malformed_one_is_invalid_scope() {
-    assert!(optional_scope(&parse_pairs("grant_type=x"))
+    assert!(optional_scope(&pairs_of("grant_type=x"))
         .expect("absent is not an error")
         .is_none());
 
-    let parsed = optional_scope(&parse_pairs("scope=read+write"))
+    let parsed = optional_scope(&pairs_of("scope=read+write"))
         .expect("a well-formed scope")
         .expect("present");
     assert_eq!(parsed.to_string(), "read write");
 
     // RFC 6749 s3.3 scope tokens exclude the double quote and the backslash.
-    let err = optional_scope(&parse_pairs("scope=%22read%22")).expect_err("not a scope list");
+    let err = optional_scope(&pairs_of("scope=%22read%22")).expect_err("not a scope list");
     assert_eq!(err.error, ErrorCode::InvalidScope);
 }
 

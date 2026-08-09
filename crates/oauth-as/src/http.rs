@@ -734,6 +734,40 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
 /// hold" is set here.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// The largest number of form or query parameters any endpoint this service serves will decode.
+///
+/// [`MAX_BODY_BYTES`] does NOT bound this, and that is why the constant exists. Decoding is per
+/// PARAMETER, not per byte: every pair is split, percent-decoded and pushed onto a vector, and
+/// every later `param` lookup is a linear scan across all of them. MEASURED with
+/// `benches/http_surface.rs`, on an aarch64 macOS laptop, before this cap existed: `POST /token`
+/// costs 2.65 us with no extra parameters, 7.55 us with 64 ignored ones, 22.15 us with 256 and
+/// 83.33 us with 1024, against 163 ns for a 404 on an unrouted path. The growth is LINEAR (81 to
+/// 118 ns per parameter across that sweep), which is the problem rather than the reassurance: 64
+/// KiB of `&a=b` pairs is roughly 2300 parameters, so a byte cap alone left one unauthenticated
+/// packet buying about three orders of magnitude more work than the service's cheapest answer.
+/// The GET endpoints are worse still: their parameters arrive in a URL, which [`MAX_BODY_BYTES`]
+/// never applied to at all.
+///
+/// With the cap, the same 1024-parameter request costs 14.50 us, and what is left is not decoding:
+/// it is buffering and UTF-8 validating the body, which [`MAX_BODY_BYTES`] already bounds and which
+/// no parameter cap can avoid, since the count cannot be known before the bytes have arrived.
+///
+/// SIXTY-FOUR, counted from the largest legitimate request rather than rounded. The biggest form
+/// this crate defines is an RFC 9126 push of an authorization request, which can carry
+/// `response_type`, `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`,
+/// `code_challenge_method`, `nonce`, `prompt`, `login_hint`, `max_age`, `acr_values`, `request`,
+/// `authorization_details` and up to four of client authentication's parameters: about twenty.
+/// After it comes an RFC 8693 exchange at about thirteen. RFC 8707 s2 allows `resource` to repeat,
+/// which is the one parameter a conforming client can send many of, and RFC 6749 s3.1 lets a
+/// deployment define extension parameters this server ignores. Sixty-four is therefore roughly
+/// three times the largest request this crate can construct, with the whole of that headroom left
+/// for repetition and extensions, and it is still 36 times below what the byte cap alone allowed.
+///
+/// The check is a count of `&` separators with an early exit, so REFUSING is cheaper than parsing
+/// even the first pair: it stops reading the input at the sixty-fourth separator. That matters
+/// because a refusal is work an attacker chooses the rate of.
+pub const MAX_FORM_PARAMETERS: usize = 64;
+
 /// The absolute request path an advertised URL occupies, measured from the ORIGIN's root.
 ///
 /// Origin-rooted rather than issuer-relative because that is what a router matches against. For
@@ -1326,6 +1360,24 @@ fn hex_pair(a: Option<u8>, b: Option<u8>) -> Option<(u8, u8)> {
 
 type Pair<'a> = (Cow<'a, str>, Cow<'a, str>);
 
+/// A request carrying more parameters than [`MAX_FORM_PARAMETERS`], refused before it is decoded.
+struct TooManyParameters;
+
+/// The answer to one of those.
+///
+/// A bare 413 rather than an RFC 6749 s5.2 error body, for exactly the reason [`body_error`] is
+/// one: nothing has been parsed, so there is no `grant_type`, no authenticated client and no
+/// validated redirect URI to shape a protocol error around, and 413 is what every proxy between
+/// here and the caller already understands. It says PAYLOAD even when the parameters came from a
+/// query string, because the payload being refused is the parameter list; 414 would assert the
+/// URI was too long in BYTES, which it need not be.
+fn too_many_parameters() -> Response {
+    respond(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request carries too many parameters",
+    )
+}
+
 /// Split a form body or query string into decoded pairs. A parameter with no `=` is kept with an
 /// empty value, which is how a client spells "present but empty" and must not be mistaken for
 /// absent.
@@ -1334,8 +1386,25 @@ type Pair<'a> = (Cow<'a, str>, Cow<'a, str>);
 /// each time. Counting the separators is one linear pass over bytes that are about to be walked
 /// anyway, and it is an exact upper bound (empty segments are filtered out, so it can only
 /// overshoot). This runs on EVERY routed request, which is what makes a free win worth taking.
-fn parse_pairs(input: &str) -> Vec<Pair<'_>> {
-    let bound = input.bytes().filter(|b| *b == b'&').count() + 1;
+///
+/// THE SAME PASS ENFORCES [`MAX_FORM_PARAMETERS`], and it is the reason the count is taken here
+/// rather than at the eight call sites: decoding is per parameter, so a cap any one caller could
+/// forget to apply is not a cap. The loop returns at the separator that crosses the ceiling, so a
+/// 64 KiB body of junk is refused after reading the first few hundred bytes of it and allocating
+/// nothing at all. Separators rather than parameters is a conservative over-count (`a&&&&b` is two
+/// parameters and five segments), which is the right direction for a bound whose only job is to
+/// stop absurd requests: nothing legitimate sends empty segments.
+fn parse_pairs(input: &str) -> Result<Vec<Pair<'_>>, TooManyParameters> {
+    let mut separators = 0usize;
+    for b in input.bytes() {
+        if b == b'&' {
+            separators += 1;
+            if separators >= MAX_FORM_PARAMETERS {
+                return Err(TooManyParameters);
+            }
+        }
+    }
+    let bound = separators + 1;
     let mut pairs = Vec::with_capacity(bound);
     pairs.extend(
         input
@@ -1346,7 +1415,7 @@ fn parse_pairs(input: &str) -> Vec<Pair<'_>> {
                 None => (decode_component(part), Cow::Borrowed("")),
             }),
     );
-    pairs
+    Ok(pairs)
 }
 
 /// The FIRST occurrence of a parameter.
@@ -1362,10 +1431,30 @@ fn param<'a>(pairs: &'a [Pair<'a>], name: &str) -> Option<&'a str> {
 }
 
 /// A required parameter, or the RFC 6749 s5.2 `invalid_request` naming it.
+///
+/// The description is BORROWED from the table below rather than formatted, and the reason is the
+/// rule `tests/allocation.rs` states on `refused_token_request_allocation_bound`: a refusal is
+/// work an attacker sets the rate of, so a refusal that allocates is an allocation anyone who can
+/// open a socket may ask for at whatever rate they like. Every other refusal in this file already
+/// passes a literal into `error_description`, which is a `Cow<'static, str>`; this one formatted,
+/// although `name` is a `&'static str` drawn from the finite set of parameters the endpoints
+/// below actually demand. `src/tests/http.rs` reads that set out of this file's source and fails
+/// if a call site's name is missing from the table, so the fallback cannot quietly become the
+/// common case.
 fn required<'a>(pairs: &'a [Pair<'a>], name: &'static str) -> Result<&'a str, ErrorResponse> {
     param(pairs, name).ok_or_else(|| {
-        ErrorResponse::new(ErrorCode::InvalidRequest)
-            .with_description(format!("missing required parameter {name}"))
+        let description: Cow<'static, str> = match name {
+            "code" => Cow::Borrowed("missing required parameter code"),
+            "device_code" => Cow::Borrowed("missing required parameter device_code"),
+            "refresh_token" => Cow::Borrowed("missing required parameter refresh_token"),
+            "token" => Cow::Borrowed("missing required parameter token"),
+            "subject_token" => Cow::Borrowed("missing required parameter subject_token"),
+            "subject_token_type" => Cow::Borrowed("missing required parameter subject_token_type"),
+            // Unreachable from this file today, and kept total rather than made a panic: a
+            // refusal is the wrong place to introduce a way for the process to die.
+            other => Cow::Owned(format!("missing required parameter {other}")),
+        };
+        ErrorResponse::new(ErrorCode::InvalidRequest).with_description(description)
     })
 }
 
@@ -1644,7 +1733,10 @@ async fn token_handler<S: Storage, C: Clock>(
 ) -> Response {
     let via_header = basic_attempted(headers);
     let text = String::from_utf8_lossy(body);
-    let form = parse_pairs(&text);
+    let form = match parse_pairs(&text) {
+        Ok(form) => form,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
 
     // grant_type is resolved BEFORE client authentication so that a request naming a grant this
     // server does not implement gets `unsupported_grant_type` rather than a client-auth error
@@ -1898,7 +1990,10 @@ async fn device_authorization_handler<S: Storage, C: Clock>(
 ) -> Response {
     let via_header = basic_attempted(headers);
     let text = String::from_utf8_lossy(body);
-    let form = parse_pairs(&text);
+    let form = match parse_pairs(&text) {
+        Ok(form) => form,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
 
     let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
@@ -1938,7 +2033,10 @@ async fn pushed_authorization_handler<S: Storage, C: Clock>(
 ) -> Response {
     let via_header = basic_attempted(headers);
     let text = String::from_utf8_lossy(body);
-    let form = parse_pairs(&text);
+    let form = match parse_pairs(&text) {
+        Ok(form) => form,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
 
     let mut creds = match pushed_request_credentials(headers, &form) {
         Ok(c) => c,
@@ -1983,7 +2081,10 @@ async fn introspect_handler<S: Storage, C: Clock>(
 ) -> Response {
     let via_header = basic_attempted(headers);
     let text = String::from_utf8_lossy(body);
-    let form = parse_pairs(&text);
+    let form = match parse_pairs(&text) {
+        Ok(form) => form,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
 
     let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
@@ -2015,7 +2116,10 @@ async fn revoke_handler<S: Storage, C: Clock>(
 ) -> Response {
     let via_header = basic_attempted(headers);
     let text = String::from_utf8_lossy(body);
-    let form = parse_pairs(&text);
+    let form = match parse_pairs(&text) {
+        Ok(form) => form,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
 
     let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
@@ -2303,7 +2407,10 @@ async fn authorize_handler<S: Storage, C: Clock>(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Response {
-    let pairs = parse_pairs(uri.query().unwrap_or_default());
+    let pairs = match parse_pairs(uri.query().unwrap_or_default()) {
+        Ok(pairs) => pairs,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
 
     let validated = match resolve_authorization_request(state, &pairs).await {
         Ok(v) => v,
@@ -2574,6 +2681,15 @@ async fn pending_grant<S: Storage, C: Clock>(
         // Cloned out of the shared `Arc<Client>` (see `Storage::get_client`): this renders a human
         // facing verification page, so one string copy per page view is not a cost worth shaping
         // the storage seam around.
+        //
+        // A storage FAILURE here is deliberately not fatal to the page, and the reason is what the
+        // page actually shows: `verification_page` renders the `client_id` and the scope whatever
+        // happens, and falls back to the `client_id` when there is no name, because a registration
+        // is entitled to have none and because a pretty name is the part a phishing registration
+        // chooses. So a failed lookup degrades to exactly the page a nameless registration gets,
+        // which still identifies the client (RFC 8628 s3.3) and still requires an affirmative
+        // click. Refusing to render at all would mean an unrelated store hiccup ended a login the
+        // user is in the middle of, and would do it on the ONE screen where the user is watching.
         .and_then(|c| c.name.clone());
     Some((grant, name))
 }
@@ -2639,7 +2755,10 @@ async fn verification_page_handler<S: Storage, C: Clock>(
     // does: RFC 8628 s5.4 (Remote Phishing) is explicit that this deep link removes the one
     // friction point that made the attack harder, so what it lands on has to be a page naming
     // the client and the scope, with the approval still one deliberate click away.
-    let pairs = parse_pairs(uri.query().unwrap_or_default());
+    let pairs = match parse_pairs(uri.query().unwrap_or_default()) {
+        Ok(pairs) => pairs,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
     let prefill = param(&pairs, "user_code").unwrap_or_default();
     render_verification(state, headers, prefill, StatusCode::OK, None).await
 }
@@ -2660,7 +2779,10 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
     }
 
     let text = String::from_utf8_lossy(body);
-    let form = parse_pairs(&text);
+    let form = match parse_pairs(&text) {
+        Ok(form) => form,
+        Err(TooManyParameters) => return too_many_parameters(),
+    };
     let user_code = param(&form, "user_code").unwrap_or_default();
 
     // RFC 6749 s10.12, defence in depth, in the order that refuses soonest. A host that has

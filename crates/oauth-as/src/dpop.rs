@@ -74,8 +74,14 @@ pub const DPOP_SIGNING_ALG_VALUES_SUPPORTED: &[&str] = &["ES256"];
 pub const MAX_PROOF_AGE: Duration = Duration::from_secs(300);
 
 /// How far a client's clock may be AHEAD of this server's before `iat` is refused. Granted in that
-/// direction only, for the same reason as in [`crate::client_assertion`].
-pub const CLOCK_SKEW_LEEWAY: Duration = Duration::from_secs(60);
+/// direction only.
+///
+/// The SAME constant `client_assertion` publishes for RFC 7523 assertions, re-exported rather than
+/// duplicated: one value defined in `src/skew.rs`, which is where the reasoning for the number is.
+/// It used to be a second `pub const` here whose doc comment said "for the same reason as in
+/// `crate::client_assertion`", which is a comment admitting two numbers had to be kept equal by
+/// hand.
+pub use crate::skew::CLOCK_SKEW_LEEWAY;
 
 /// The largest DPoP proof [`verify_proof`] will look at, in bytes, checked BEFORE it is parsed.
 ///

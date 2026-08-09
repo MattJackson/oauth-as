@@ -23,6 +23,42 @@
 //!   raced.
 //!
 //! The cascade is therefore explicit, inside ONE transaction, which is what the trait asks for.
+//!
+//! # THE DELETE IS NOT A KILL SWITCH, and a host must not use it as one
+//!
+//! [`Storage::delete_client`] removes the registration and everything the store holds for it AS OF
+//! THE MOMENT IT RUNS. It cannot remove what is issued a millisecond later, and an authorization
+//! server that is still serving that client will issue exactly that: a token request already in
+//! flight read the registration BEFORE the delete committed, so its `put_token` lands after, and
+//! the row it writes is a live credential for a client that no longer exists. The token stays
+//! spendable until its own expiry.
+//!
+//! This is a property of the SEQUENCE, not of this implementation, and nothing inside a store can
+//! close it:
+//!
+//! - A FOREIGN KEY would turn the losing write into a constraint violation, which the server maps
+//!   to `server_error` on a request that had done nothing wrong, and would break the legitimate
+//!   writes described above. See the section above.
+//! - A HIGHER ISOLATION LEVEL does not see it. PostgreSQL's serializable snapshot isolation only
+//!   detects a conflict between transactions that are BOTH `SERIALIZABLE`, and `put_token` is a
+//!   single autocommit statement at the pool's default; promoting only the delete detects nothing
+//!   at all. Promoting both would find the conflict and abort one of them, which is the same
+//!   `server_error` the foreign key produces, arrived at more expensively.
+//! - REORDERING THE STATEMENTS inside the delete changes nothing, because they are one
+//!   transaction: no other session sees any of it until the commit, so there is no ordering of
+//!   them that is visible from outside.
+//!
+//! So the obligation is the HOST's, and it is one sentence: STOP ISSUING FOR A CLIENT BEFORE
+//! DELETING IT, and treat the deletion as complete only once no request that read the
+//! registration can still be in flight. In practice that means removing the client from whatever
+//! admits requests (client authentication reads this store, so once the registration row is gone
+//! no NEW request can be authenticated for it), then calling [`Storage::delete_client`] a SECOND
+//! time once every request that could have read the registration has drained. The second call is
+//! cheap, it is `Ok(false)` because the registration is already gone, and it removes anything the
+//! race admitted: the cascade runs whether or not the client row exists, which is exactly why it
+//! is written to. A deployment that cannot wait for that drain has to reach the resource server
+//! instead: a deployment that needs "revoked NOW" needs introspection at the resource server or
+//! short token lifetimes, not a registration delete.
 
 use oauth_as::authorization::AuthorizationCodeRecord;
 use oauth_as::client::{Client, ClientId};
@@ -35,7 +71,7 @@ use sqlx::Row;
 
 use crate::error;
 use crate::time::to_nanos;
-use crate::PostgresStorage;
+use crate::{PostgresStorage, SWEEP_BATCH_ROWS};
 
 /// The `payload` column, serialized. See `migrations/0001_core.sql` for why the whole record goes
 /// in one jsonb column instead of a column per field.
@@ -127,6 +163,10 @@ impl Storage for PostgresStorage {
     /// registration and invalidates what that registration holds, and a delete that half
     /// succeeded is either an orphaned credential set that can still call resource servers or a
     /// registration nobody can reach.
+    ///
+    /// It is NOT a kill switch: a grant that read the registration before this committed still
+    /// writes its token after, and that token lives out its own expiry. See the module docs for
+    /// why no store can close that window and what the host owes instead.
     async fn delete_client(&self, client_id: &ClientId) -> Result<bool, StorageError> {
         const OP: &str = "delete_client";
         let id = client_id.as_str();
@@ -694,8 +734,32 @@ impl Storage for PostgresStorage {
         Ok(row.is_some())
     }
 
-    /// One statement per table, all inside one transaction so the returned count describes a
-    /// single consistent state of the store rather than a state that moved underneath it.
+    /// IN BATCHES, each one its own committed statement, looping per table until the table has
+    /// nothing left that is dead at `now`.
+    ///
+    /// WHY NOT ONE UNBOUNDED `DELETE` PER TABLE, which is what this was through 0.9.0. That form
+    /// takes a row lock on every dead row and holds all of them until the statement finishes, so a
+    /// table with millions of dead rows blocks the redemptions that touch them for as long as the
+    /// scan runs, and it is a single write transaction whose WAL record and dead-tuple bloat both
+    /// arrive in one lump. The work is the same either way; what batching changes is the size of
+    /// the window during which the store is holding it. [`SWEEP_BATCH_ROWS`] is the size of that
+    /// window.
+    ///
+    /// WHY THE TRANSACTION IS GONE, and why that is not a weakening. It never bought atomicity
+    /// anybody could observe: every row this removes is one the server ALREADY refuses on time
+    /// alone (expiry is enforced on read, which is why an unswept store is unbounded rather than
+    /// insecure), so a reader cannot tell a half-finished sweep from a finished one except by
+    /// counting rows nothing is allowed to hand out. Keeping one transaction around a batched
+    /// sweep would also defeat the batching exactly: locks are released at COMMIT, so batches
+    /// inside one transaction hold every lock to the end just as the single statement did.
+    ///
+    /// THE COUNT STAYS TRUTHFUL, which the trait requires: it is the sum of the rows this call
+    /// actually removed, and the loop leaves a table only when a batch comes back short, so a
+    /// single call still reclaims the whole backlog. Two exceptions, both of which UNDERSTATE and
+    /// neither of which loses a row: a concurrent sweeper's locked rows are skipped (see
+    /// `SKIP LOCKED` below) and left for whichever sweeper holds them, and a record that expires
+    /// while the pass is running may not be seen by it. Both are reclaimed by the next tick, which
+    /// is why the trait asks for a sweep on a TIMER rather than a sweep that must be complete.
     ///
     /// "Dead at `now`" is `expires_at <= now`, NOT `<`: the core's harness plants a record
     /// exactly on the boundary, because a store using `<` keeps a record the server already
@@ -703,42 +767,71 @@ impl Storage for PostgresStorage {
     async fn sweep_expired(&self, now: std::time::SystemTime) -> Result<u64, StorageError> {
         const OP: &str = "sweep_expired";
         let cutoff = to_nanos(now);
-        let mut tx = self.begin(OP).await?;
         let mut removed = 0u64;
 
+        // `ctid` rather than the primary key, so the batch is bounded without a second index
+        // lookup: the subquery walks the expiry index and hands the delete the physical row
+        // addresses it already found. `FOR UPDATE SKIP LOCKED` is what makes N nodes sweeping at
+        // once harmless rather than N nodes queueing behind each other, which the trait's "it
+        // must be safe to call concurrently" invites a host to do.
+        //
         // The user-code index is not swept separately and is not counted separately: it is a
         // column of the grant, so it dies with the row it points at.
         // `mut` only when a feature below pushes onto it; a default build sweeps four tables.
         #[allow(unused_mut)]
         let mut statements: Vec<&str> = vec![
-            "DELETE FROM oauth_as_device_grants WHERE expires_at_ns <= $1",
-            "DELETE FROM oauth_as_authorization_codes WHERE expires_at_ns <= $1",
-            "DELETE FROM oauth_as_access_tokens WHERE expires_at_ns <= $1",
+            "DELETE FROM oauth_as_device_grants WHERE ctid IN ( \
+                 SELECT ctid FROM oauth_as_device_grants WHERE expires_at_ns <= $1 \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+            "DELETE FROM oauth_as_authorization_codes WHERE ctid IN ( \
+                 SELECT ctid FROM oauth_as_authorization_codes WHERE expires_at_ns <= $1 \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+            "DELETE FROM oauth_as_access_tokens WHERE ctid IN ( \
+                 SELECT ctid FROM oauth_as_access_tokens WHERE expires_at_ns <= $1 \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED)",
             // `IS NOT NULL` is the whole of the `Option<SystemTime>` contract: a chain with no
             // absolute lifetime is not dead however old it is. SQL would already answer false to
             // `NULL <= $1`, but this is the one place where being wrong logs every long-lived
             // client out, so the predicate is written where a reader can see it.
-            "DELETE FROM oauth_as_refresh_tokens WHERE expires_at_ns IS NOT NULL \
-             AND expires_at_ns <= $1",
+            "DELETE FROM oauth_as_refresh_tokens WHERE ctid IN ( \
+                 SELECT ctid FROM oauth_as_refresh_tokens \
+                 WHERE expires_at_ns IS NOT NULL AND expires_at_ns <= $1 \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED)",
         ];
         // RFC 9126 s4: an expired request_uri MUST be rejected, and once expired there is nothing
         // left to recognise it for.
         #[cfg(feature = "par")]
-        statements.push("DELETE FROM oauth_as_pushed_requests WHERE expires_at_ns <= $1");
+        statements.push(
+            "DELETE FROM oauth_as_pushed_requests WHERE ctid IN ( \
+                 SELECT ctid FROM oauth_as_pushed_requests WHERE expires_at_ns <= $1 \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        );
         // The replay set is the one table an unauthenticated caller can grow: every
         // refused-but-well-formed assertion or proof adds a row.
         #[cfg(any(feature = "client_assertion", feature = "dpop"))]
-        statements.push("DELETE FROM oauth_as_replay_ids WHERE expires_at_ns <= $1");
+        statements.push(
+            "DELETE FROM oauth_as_replay_ids WHERE ctid IN ( \
+                 SELECT ctid FROM oauth_as_replay_ids WHERE expires_at_ns <= $1 \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        );
 
         for stmt in statements {
-            removed += sqlx::query(stmt)
-                .bind(cutoff)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| error::db(OP, e))?
-                .rows_affected();
+            loop {
+                let batch = sqlx::query(stmt)
+                    .bind(cutoff)
+                    .bind(SWEEP_BATCH_ROWS as i64)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| error::db(OP, e))?
+                    .rows_affected();
+                removed += batch;
+                // A short batch means the table had nothing more to give: either it is drained, or
+                // what is left is locked by another sweeper, which is that sweeper's to count.
+                if batch < SWEEP_BATCH_ROWS as u64 {
+                    break;
+                }
+            }
         }
-        tx.commit().await.map_err(|e| error::db(OP, e))?;
         Ok(removed)
     }
 }

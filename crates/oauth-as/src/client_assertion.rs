@@ -149,7 +149,10 @@ pub const MAX_ASSERTION_LIFETIME: Duration = Duration::from_secs(600);
 /// Granted in that direction only. Leeway that lets an assertion be accepted slightly early can
 /// only ever refuse a request that was going to be fine anyway; leeway on `exp` would keep a dead
 /// credential alive, so [`verify_assertion`] does not grant any there.
-pub const CLOCK_SKEW_LEEWAY: Duration = Duration::from_secs(60);
+///
+/// The SAME constant [`crate::dpop`] publishes for RFC 9449 proofs, re-exported rather than
+/// duplicated: see `src/skew.rs` for why one definition rather than two equal ones.
+pub use crate::skew::CLOCK_SKEW_LEEWAY;
 
 /// What a registration expects a client assertion to be signed with.
 ///

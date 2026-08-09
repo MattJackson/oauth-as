@@ -114,6 +114,34 @@ pub enum ClientAuthFailure {
     AssertionInvalid,
 }
 
+/// The OPERATOR's sentence, never the client's. Everything here is what the wire deliberately
+/// refuses to distinguish (see the type's docs), so these strings must not reach a response body.
+impl std::fmt::Display for ClientAuthFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ClientAuthFailure::UnknownClient => "no registration for that client_id",
+            ClientAuthFailure::SecretMismatch => "the presented client credential did not verify",
+            ClientAuthFailure::RateLimited => "the host's rate limiter refused the attempt",
+            #[cfg(feature = "mtls")]
+            ClientAuthFailure::NoCertificatePresented => {
+                "the registration authenticates with mutual TLS and no certificate was presented"
+            }
+            #[cfg(feature = "mtls")]
+            ClientAuthFailure::CertificateMismatch => {
+                "the presented certificate is not one this registration authenticates with"
+            }
+            #[cfg(feature = "client_assertion")]
+            ClientAuthFailure::AssertionInvalid => "the client assertion did not verify",
+        })
+    }
+}
+
+/// It is the `Err` payload of `crate::mtls::authenticate_via_mtls`, so a host handling that with
+/// `?` or collecting it into a `Box<dyn Error>` needs this, exactly as `DpopFailure` and
+/// `AssertionFailure` do for theirs. (Plain text rather than intra-doc links: those two types are
+/// behind features this one is not, so a link would dangle in a default build.)
+impl std::error::Error for ClientAuthFailure {}
+
 /// Something the authorization server did, or refused to do, worth recording.
 ///
 /// Every field borrows: an event costs no allocation to build, which is what lets a host with a

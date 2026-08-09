@@ -102,6 +102,24 @@ payload; the column exists so the sweep can range-scan.
 
 There are **no foreign keys**, deliberately. See the module docs at the top of `src/store.rs`.
 
+## Two obligations this store puts on the host
+
+**Sweep on a timer, forever.** Nothing here evicts anything by itself; `Storage::sweep_expired` runs
+when the host runs it and at no other time. The sweep deletes in batches of `SWEEP_BATCH_ROWS`,
+committing each one, so reclaiming a large backlog is a sequence of short row locks rather than one
+long lock over every dead row in the store. A single call still drains the whole backlog and still
+returns how many rows it removed; what batching changes is how long the store holds a lock while
+doing it.
+
+**Stop issuing for a client before deleting it.** `delete_client` removes the registration and
+everything the store holds for it *as of the moment it runs*, in one transaction. It is not a kill
+switch: a token request that read the registration before the delete committed will write its token
+after, and that token stays spendable until its own expiry. No store can close that window, and the
+module docs in `src/store.rs` work through why a foreign key, a higher isolation level and a
+different statement order each fail to. Deleting a second time once in-flight requests have drained
+removes anything the race admitted; a deployment that needs *revoked now* needs introspection at the
+resource server or short token lifetimes.
+
 ## Errors
 
 Nothing from the driver's own message reaches `StorageError`. That text becomes a line in the host's
