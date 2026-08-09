@@ -159,7 +159,8 @@ pub fn dpop() -> u64 {
     let mut acc = htu_of("https://as.probe.example/token?x=1").len() as u64;
     // No client here to mint a real proof, so this is the refusal arm: it still runs the compact
     // JWS parse, the `typ` and `alg` checks and the failure mapping, which is most of the code.
-    match verify_proof(VERIFIER, 
+    match verify_proof(
+        VERIFIER,
         "not.a.proof",
         "POST",
         "https://as.probe.example/token",
@@ -182,7 +183,8 @@ pub fn client_assertion() -> u64 {
     if let Ok(secret) = ClientSecretKey::new("probe-secret-0123456789abcdefghij") {
         let keys = AssertionKeys::ClientSecret { secret };
         acc = acc.wrapping_add(keys.token_endpoint_auth_method().len() as u64);
-        if let Err(failure) = verify_assertion(VERIFIER, 
+        if let Err(failure) = verify_assertion(
+            Some(VERIFIER as &dyn oauth_as::jwt::Es256Verifier),
             &keys,
             "not.an.assertion",
             "probe-confidential",
@@ -197,7 +199,8 @@ pub fn client_assertion() -> u64 {
         if let Ok(public) = oauth_as::jwt::PublicJwk::from_json(&value) {
             let keys = AssertionKeys::PublicKeys { keys: vec![public] };
             acc = acc.wrapping_add(keys.signing_alg().len() as u64);
-            if let Err(failure) = verify_assertion(VERIFIER, 
+            if let Err(failure) = verify_assertion(
+                Some(VERIFIER as &dyn oauth_as::jwt::Es256Verifier),
                 &keys,
                 "not.an.assertion",
                 "probe-confidential",

@@ -740,7 +740,12 @@ async fn a_grant_with_no_details_signs_no_claim() {
 
 /// base64url without padding (RFC 7515 s2), hand-rolled here rather than pulling `base64` into the
 /// dev-dependency set for one call.
-#[cfg(feature = "jwt")]
+///
+/// Gated on `jwt-p256`, matching its two callers, NOT on `jwt`: since the backend split, `jwt` is
+/// the surface and the traits with no crypto behind them, so a `jwt`-without-a-backend build has
+/// no signer, cannot mint an access token to decode, and compiles this helper with nothing calling
+/// it. That build is a CI job and `-D warnings` makes an uncalled function fatal there.
+#[cfg(feature = "jwt-p256")]
 fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
