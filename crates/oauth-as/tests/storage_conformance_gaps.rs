@@ -368,7 +368,9 @@ impl Storage for Faulty {
             let mut best: Option<Arc<oauth_as::ConsentRecord>> = None;
             for c in all {
                 if &c.client_id == client_id
-                    && best.as_ref().is_none_or(|b| c.consent_id > b.consent_id)
+                    // `Option::is_none_or` reads better and is stable only since 1.82. This crate
+                    // declares 1.75 and the MSRV job builds the whole package, tests included.
+                    && best.as_ref().map_or(true, |b| c.consent_id > b.consent_id)
                 {
                     best = Some(c);
                 }
