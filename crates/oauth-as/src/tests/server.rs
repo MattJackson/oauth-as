@@ -201,3 +201,54 @@ fn c13_token_request_debug_still_names_the_grant() {
     // The requested scope is a permission boundary the operator must be able to read.
     assert!(printed.contains("read"), "{printed}");
 }
+
+/// The replay-set key is what makes RFC 7523 s3 and RFC 9449 s4.3 single use MEAN single use, and
+/// its shape is not observable through either endpoint: any injective function of the three parts
+/// gives the same accept/refuse answers. So the shape is pinned here, directly.
+///
+/// The separator matters. Without it, `("ca", "ab", "c")` and `("ca", "a", "bc")` are the same key,
+/// so one client could spend a `jti` belonging to another client whose id is a prefix of its own.
+/// That is precisely the collision the namespacing exists to prevent.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[test]
+fn a_replay_key_separates_its_three_parts() {
+    assert_eq!(replay_key("ca", "client-1", "jti-1"), "ca:client-1:jti-1");
+    assert_eq!(replay_key("dpop", "thumb", "jti-1"), "dpop:thumb:jti-1");
+    // The two mechanisms never share a key even when the owner and the `jti` are identical: a
+    // captured DPoP proof's `jti` must not be spendable as a client assertion's, or the two replay
+    // caches would lock each other out.
+    assert_ne!(replay_key("ca", "x", "j"), replay_key("dpop", "x", "j"));
+    // Prefix collision, stated as the assertion it is.
+    assert_ne!(replay_key("ca", "ab", "c"), replay_key("ca", "a", "bc"));
+}
+
+/// The capacity hint is EXACT, so building a replay key is one allocation with no slack.
+///
+/// This is bought on the hottest path a DPoP deployment has: one of these is built for every single
+/// token request, and it is thrown away immediately. A hint that is too small makes `push_str`
+/// reallocate (two allocations and a copy for a string that was sized in advance); a hint that is
+/// too large asks the allocator for bytes that are never written. `String::with_capacity` allocates
+/// exactly what it is asked for, so both are visible as the pair of facts below: the capacity is
+/// what the arithmetic in `replay_key` computes, and the string ends up exactly full.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[test]
+fn a_replay_key_is_built_in_exactly_one_correctly_sized_allocation() {
+    for (kind, owner, jti) in [
+        ("ca", "client-1", "jti-1"),
+        ("dpop", "0OXy9SbXe0Y7YQ8Xw3sYQ2h1lKQ", "01234567-89ab-cdef"),
+        ("ca", "", ""),
+    ] {
+        let key = replay_key(kind, owner, jti);
+        let exact = kind.len() + owner.len() + jti.len() + 2;
+        assert_eq!(
+            key.len(),
+            exact,
+            "the two separators are the whole of the difference between the parts and the key"
+        );
+        assert_eq!(
+            key.capacity(),
+            exact,
+            "the hint must be exactly the final length: smaller reallocates, larger over-asks"
+        );
+    }
+}
