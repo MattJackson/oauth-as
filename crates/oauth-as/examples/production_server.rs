@@ -317,8 +317,16 @@ fn csrf_consume(state: &Arc<HostState>, headers: &HeaderMap) -> Option<String> {
 /// THE KEY IS THE REQUEST, not the client. An approval recorded as "the user said yes to client
 /// X" would be spent by a later request from client X for a WIDER scope, which is precisely the
 /// escalation a consent screen exists to prevent.
+///
+/// LENGTH PREFIXED, so the two parts cannot be re-split. A separator alone is not enough here for
+/// the same reason it was not enough for the crate's own replay key: `ClientId::new` restricts no
+/// character, and RFC 6749 s3.3's `scope-token` charset (`%x21 / %x23-5B / %x5D-7E`) contains the
+/// separator too, so `("a|read", "")` and `("a", "read|")` are one key under a plain join. In a
+/// consent store that is an approval for one request being spent by another, which is the exact
+/// escalation this key exists to prevent. With the byte length of the client id in front, the
+/// split point is stated rather than searched for and every part is recoverable.
 fn approval_key(client_id: &str, scope: &ScopeSet) -> String {
-    format!("{client_id}|{scope}")
+    format!("{}|{client_id}|{scope}", client_id.len())
 }
 
 /// The RFC 6749 s10.12 consent step: has this user KNOWINGLY agreed to this exact request?
