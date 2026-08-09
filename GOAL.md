@@ -79,10 +79,29 @@ the server's behaviour. No assertion was ever weakened to obtain green.
 ### Gate 4: the tests actually constrain the code
 - [x] `cargo mutants -p oauth-as` run to completion
 - [ ] Every surviving mutant is either killed by a new test, or recorded in writing as equivalent
-      with the reason. **NOT MET.** Every survivor on the measured surface is closed, but eight
-      modules (registration, resource_metadata, token_exchange, par, rar, dpop, mtls,
-      client_assertion) landed AFTER that run and have never been mutation tested. That is the
-      same position `http.rs` was in before this session. See MUTANTS.md.
+      with the reason. **NOT MET.** See MUTANTS.md for the full record.
+
+      The measured surface is now the WHOLE crate, which is what every previous statement of this
+      gate was waiting for: `cargo mutants -p oauth-as --all-features --timeout 300 -j 16` at
+      commit `47418ff`, nothing excluded, gave **1514 mutants: 1173 caught, 93 missed, 237
+      unviable, 11 timeouts**.
+
+      Of the 93: **46 are killed by new tests, 4 are argued as equivalent or not worth a test, and
+      43 remain.** Six of the 43 were already argued in MUTANTS.md before this pass, so about 36
+      are genuinely open. The three modules the previous entry named as untriaged
+      (`storage_conformance.rs`, `store.rs`, `registration.rs`) are now fully accounted for: 39 of
+      their 43 survivors killed, 4 argued.
+
+      WHAT REMAINS, exactly: about 36 survivors, concentrated in `src/http.rs` (16), `src/par.rs`
+      (6) and `src/rar.rs` (4), with singles in `jwt.rs`, `consent.rs`, `dpop.rs`,
+      `client_assertion.rs`, `token.rs`, `token_exchange.rs` and `server.rs`. They are listed
+      individually in MUTANTS.md. Several are in code where a surviving mutant is a reason to stop
+      and look rather than to schedule: `jwt.rs:894 replace || with && in verify_es256`,
+      `http.rs:2068 bearer_token`, `http.rs:1536 credentials_where`, and the RFC 9101 request
+      object time bounds at `par.rs:997`.
+
+      The gate is met when those are killed or argued to the bar MUTANTS.md sets, and a fresh
+      run at the release commit comes back with nothing else.
 
 CHECK: the mutants report is clean or annotated. A surviving mutant is a hole in the suite, not a
 curiosity.
