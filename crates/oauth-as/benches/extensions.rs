@@ -150,16 +150,34 @@ fn main() {
         // for a DPoP deployment.
         b.bench_fast("dpop_verify_proof", || verify_proof(&proof, HTM, HTU, now));
 
-        // The refusal, driven by an attacker who has no key: it must not be dramatically more
-        // expensive than the success path.
-        let tampered = {
-            let mut t = proof.clone();
-            t.pop();
-            t.push(if proof.ends_with('A') { 'B' } else { 'A' });
-            t
+        // The refusal, driven by an attacker who has no key. TWO of them, because they are not
+        // the same cost and conflating them would misreport what a garbage proof buys an attacker:
+        //
+        //   * MALFORMED: the proof is not even three base64url segments, so it is rejected by the
+        //     parser before any curve arithmetic happens.
+        //   * WELL FORMED, WRONG SIGNATURE: everything parses, the embedded JWK is a real key, and
+        //     the ES256 verification runs to completion and fails. This one costs a full verify.
+        //
+        // The tampering is done INSIDE the signature segment rather than at the end of the string,
+        // and it is done to a character that stays inside the base64url alphabet. Flipping the
+        // final character (which the first draft of this file did) sometimes produced non-canonical
+        // trailing bits and so sometimes failed in the decoder instead, which made this row report
+        // 774 ns on one run and 135 us on the next. A benchmark whose answer depends on a random
+        // key is not measuring the code.
+        let malformed = "not.a.proof";
+        let wrong_signature = {
+            let (head, sig) = proof
+                .rsplit_once('.')
+                .expect("compact JWS has three segments");
+            let mut sig: Vec<char> = sig.chars().collect();
+            sig[10] = if sig[10] == 'a' { 'b' } else { 'a' };
+            format!("{head}.{}", sig.into_iter().collect::<String>())
         };
+        b.bench_fast("dpop_verify_proof_malformed", || {
+            verify_proof(malformed, HTM, HTU, now)
+        });
         b.bench_fast("dpop_verify_proof_bad_signature", || {
-            verify_proof(&tampered, HTM, HTU, now)
+            verify_proof(&wrong_signature, HTM, HTU, now)
         });
     }
 
