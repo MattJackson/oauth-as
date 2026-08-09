@@ -1026,6 +1026,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // signed claim set does not depend on how the client authenticated.
         #[cfg(not(feature = "mtls"))]
         let _ = bound;
+        // Likewise the RFC 9396 details, which reach the claim set only under `rar`. This is not
+        // decoration: `http,jwt` without `rar` is exactly what the conformance server builds, and
+        // neither a default build (where this function does not exist) nor `--all-features` (where
+        // `details` IS read) compiles that combination. CI caught it; local testing had not.
+        #[cfg(not(feature = "rar"))]
+        let _ = details;
         let jwt = match &self.config.access_token_format {
             AccessTokenFormat::Opaque => return Ok(jti),
             AccessTokenFormat::Jwt(jwt) => jwt,

@@ -46,6 +46,28 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
       - name: tests (all features)
         run: cargo test -p oauth-as --locked --all-features
+      # FEATURE COMBINATIONS, and this job exists because of a real escape rather than on
+      # principle. Twelve optional features means default and --all-features are two points in a
+      # large space, and code gated `#[cfg(feature = "a")]` inside a function only compiled under
+      # feature "b" is invisible to both. A `details` parameter used only under `rar` went out in
+      # a `http,jwt` build (exactly what the conformance server compiles) and neither matrix saw
+      # it; the conformance job caught it after the push.
+      #
+      # These are the combinations a real consumer plausibly picks, not an exhaustive product.
+      - name: build feature combinations
+        run: |
+          set -e
+          for f in "" "http" "jwt" "http,jwt" "jwt,rar" "http,jwt,dpop" "jwt,mtls" \
+                   "jwt,client_assertion" "http,jwt,par,jar" "jwt,token-exchange" \
+                   "consent" "resource-metadata" "test-util"; do
+            echo "::group::features: ${f:-<default>}"
+            if [ -z "$f" ]; then
+              cargo build -p oauth-as --locked
+            else
+              cargo build -p oauth-as --locked --features "$f"
+            fi
+            echo "::endgroup::"
+          done
 
   # The independent conformance harness, on EVERY push rather than only at `qa`.
   #
