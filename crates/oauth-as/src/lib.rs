@@ -122,6 +122,7 @@ pub mod pkce;
 /// such as which account a payment comes out of.
 #[cfg(feature = "rar")]
 pub mod rar;
+pub mod rate_limit;
 pub mod registration;
 /// RFC 9728 protected resource metadata, behind the `resource-metadata` cargo feature
 /// (off by default). Read the module docs before using it: the document RFC 9728 defines
@@ -200,6 +201,7 @@ pub use rar::{
     AuthorizationDetail, AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES,
     MAX_AUTHORIZATION_DETAILS_DEPTH, MAX_AUTHORIZATION_DETAILS_ELEMENTS,
 };
+pub use rate_limit::{FixedWindowRateLimiter, RateLimitConfig};
 pub use registration::{
     ClientInformation, ClientMetadata, RegistrationAttempt, RegistrationConfig,
     RegistrationDecision, RegistrationErrorCode, RegistrationErrorResponse, RegistrationFailure,
