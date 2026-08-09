@@ -54,7 +54,7 @@ default = []
 # 0.x major in the ONLY entry point the feature had: a host on a different axum major could not
 # turn the feature on at all, and an axum major bump would have been a breaking change to this
 # crate for reasons unconnected to OAuth. See the `axum` feature below.
-http = ["dep:http", "dep:http-body", "dep:bytes"]
+http = ["dep:http", "dep:http-body", "dep:bytes", "dep:serde_json"]
 # The axum ADAPTER: `impl From<AuthorizationService<..>> for axum::Router`, plus the tokio a host
 # needs to bind a listener with `axum::serve`. About thirty lines, and the whole of this crate's
 # exposure to a pre-1.0 framework. A host on axum 0.7, or on 0.9 when it lands, leaves this off
@@ -64,14 +64,14 @@ axum = ["http", "dep:axum", "dep:tokio"]
 # resource server verify them without calling this server. Opaque tokens remain the DEFAULT: JWT
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
 # servers are separate processes that should not have to call introspection on every request.
-jwt = ["dep:p256"]
+jwt = ["dep:p256", "dep:serde_json"]
 # RFC 8705 mutual-TLS client authentication and certificate-bound access tokens.
 # OFF by default, and it adds NO dependency: TLS termination is the host's job in this
 # crate (it never sees a socket), so the host hands in a certificate it has already
 # verified and parsed, and the only arithmetic RFC 8705 defines on it is the section 3.1
 # SHA-256 thumbprint. `sha2` and `base64` are already here for RFC 7636 PKCE. An X.509
 # parser would add attack surface to recompute what the host must already know.
-mtls = []
+mtls = ["dep:serde_json"]
 # RFC 9126 pushed authorization requests: the client POSTs the authorization request to a
 # back-channel endpoint and gets a single-use `request_uri` handle, so the parameters (the PKCE
 # challenge above all) never traverse the browser. Adds no dependency: it is storage plus the
@@ -97,6 +97,12 @@ client_assertion = ["jwt"]
 # every request. Without it every token this crate issues is a bearer token, so a stolen one is
 # usable by whoever stole it; this changes what a leak costs. IMPLIES `jwt` for the reason above.
 dpop = ["jwt"]
+# PKCS#8 key loading for the `jwt` signing key, so a host can hand this crate the DER its KMS or
+# its `openssl` already emits rather than a raw 32-byte scalar. Separate from `jwt` because it is
+# a DER decoder (~16.7 KiB linked, measured) that a host loading a scalar with
+# `EcdsaP256Key::from_scalar_bytes` never executes, and one more crate in the tree of every `jwt`
+# consumer. Adds no crate beyond `pkcs8` itself.
+jwt-pkcs8 = ["jwt", "p256/pkcs8"]
 # RFC 9728 protected resource metadata. This crate is an AUTHORIZATION SERVER, not a
 # resource server, so what this feature adds is the TYPE a host publishes for its OWN
 # resource, plus the section 4 `protected_resources` member on the AS metadata document.
@@ -121,11 +127,10 @@ consent = []
 # the authorization endpoint: a server that has not decided it needs this should not be
 # parsing it.
 #
-# NO NEW DEPENDENCY: serde_json is already an unconditional dependency of this crate and is
-# all this needs. If serde_json is ever made optional, this feature MUST gain
-# `dep:serde_json`; it is written as an empty list today only because a `dep:` entry naming
-# a non-optional dependency is a cargo error.
-rar = []
+# The one dependency it needs is `serde_json`, which is optional now (it was not when this
+# feature landed, and the comment here said in as many words that this line would have to gain
+# `dep:serde_json` on the day that changed; this is that day).
+rar = ["dep:serde_json"]
 # A RUNNABLE conformance harness for the `Storage` contract, for a HOST to call from its
 # own test suite against its own implementation (crates/oauth-as/src/storage_conformance.rs).
 #
@@ -146,7 +151,16 @@ test-util = []
 # implies an async runtime, an HTTP stack, or a persistence layer; the HOST owns all three.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# OPTIONAL, and pulled in by every feature that actually parses or emits JSON: `http`, `jwt`
+# (and therefore `jar`, `dpop`, `client_assertion`), `mtls`, `rar`.
+#
+# It was unconditional through 0.9.0, and MEASURED, that was three crates (itoa, ryu, memchr)
+# compiled by every default build that reaches none of them: the crate's own JSON use sites are
+# all behind those features, and `#[derive(Serialize)]` needs `serde` only, never a format crate.
+# Zero LINKED bytes were at stake, because the linker already dropped what nothing called; what
+# was at stake is the sentence a default consumer can check, which is now three dependencies
+# rather than five, and three fewer crates in their audit.
+serde_json = { version = "1", optional = true }
 getrandom = "0.3"
 sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
 base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
@@ -180,14 +194,23 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # WHY ES256 AND NOT RS256: RFC 9068 fixes neither, but an ES256 signature is 64 bytes against
 # RSA-2048's 256, and a P-256 public key is 64 bytes against 259. That difference is paid on every
 # token issued and every JWKS fetch.
+#
+# `pkcs8` is NOT here: it is behind this crate's own `jwt-pkcs8` feature. MEASURED on a release
+# binary (opt-level = "z", strip): a host that enables `jwt` and never calls the two PKCS#8
+# constructors paid ZERO for it under `lto = true`, and 192 bytes without LTO, because the linker
+# already dropped what nothing called. The 16.7 KiB of DER decoder is paid only by a host that
+# actually calls it. What the split buys is one crate (pkcs8 v0.10.2) off a `--features jwt`
+# dependency tree, which is this crate's stated dependency policy rather than a byte count.
 p256 = { version = "0.13", default-features = false, features = [
     "ecdsa",  # ECDSA/P-256/SHA-256 signing, which is ES256 (RFC 7518 s3.4)
-    "pkcs8",  # so a host can load the key format its KMS or openssl already emits
     "std",    # this crate is std anyway; adds no crate to the tree, only alloc/error impls
 ], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+# A DEV dependency now that the runtime one is optional: the test suite and the examples build JSON
+# fixtures by hand on paths where the library itself does not need a JSON crate at all.
+serde_json = "1"
 # IN-TREE CONFORMANCE CHECKS (dev-only; never in any shipped binary):
 #   - `oauth2` is a widely used third-party OAuth 2 CLIENT. tests/third_party_client.rs drives it
 #     against this AS as a black box through its pluggable HTTP-client seam, so the CLIENT library

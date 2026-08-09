@@ -416,8 +416,19 @@ impl RegisteredRequestObjectKey {
                 "an uncompressed P-256 point is exactly 65 bytes".into(),
             ));
         }
-        // Parsed once, here, so that "the host registered something that is not on the curve" is a
-        // configuration error rather than a per-request verification failure nobody can explain.
+        // VALIDATED once, here, so that "the host registered something that is not on the curve" is
+        // a configuration error rather than a per-request verification failure nobody can explain.
+        //
+        // The parsed key is DISCARDED and `verify_es256` re-derives it per request. That is
+        // deliberate and it is a size trade, not an oversight: a `p256::ecdsa::VerifyingKey` is an
+        // affine point in Montgomery form, and holding one would grow this registration from 65
+        // bytes of SEC 1 plus a `kid` to roughly twice that, for every registered key a host keeps,
+        // to save a curve-equation check on a path that runs once per RFC 9101 request object.
+        // MEASURED: the re-derivation allocates NOTHING (p256 is stack-only here), so it does not
+        // appear in any gate in `tests/allocation_paths.rs`; what it costs is CPU, which
+        // `benches/` is the place to price. The comment said "parsed once" before, which was true
+        // of the validation and false of the parse, and the difference is exactly what a reader
+        // would have needed to know.
         p256::ecdsa::VerifyingKey::from_sec1_bytes(sec1)
             .map_err(|_| RequestObjectKeyError("not a point on P-256".into()))?;
         let mut owned = [0u8; 65];

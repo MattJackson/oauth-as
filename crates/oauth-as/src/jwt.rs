@@ -63,6 +63,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+#[cfg(feature = "jwt-pkcs8")]
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,12 @@ impl EcdsaP256Key {
 
     /// Load from a PKCS#8 (RFC 5208) `PrivateKeyInfo` DER document, the format `openssl pkcs8`
     /// and most KMS exports emit.
+    ///
+    /// Behind `jwt-pkcs8` rather than `jwt`, because the DER decoder this needs is 20,764 linked
+    /// bytes (measured: more than `sha2` and `base64` combined) and a host whose key material
+    /// arrives as a raw scalar reaches it through [`EcdsaP256Key::from_scalar_bytes`] instead.
+    #[cfg(feature = "jwt-pkcs8")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jwt-pkcs8")))]
     pub fn from_pkcs8_der(kid: impl Into<String>, der: &[u8]) -> Result<Self, KeyError> {
         let secret = SecretKey::from_pkcs8_der(der)
             .map_err(|_| KeyError("not a valid PKCS#8 P-256 private key".into()))?;
@@ -159,6 +166,10 @@ impl EcdsaP256Key {
 
     /// Export as PKCS#8 DER. PRIVATE KEY MATERIAL: the caller is responsible for where this goes.
     /// Present so a host can persist a key it generated; nothing in this crate calls it.
+    ///
+    /// Behind `jwt-pkcs8`, for the reason on [`EcdsaP256Key::from_pkcs8_der`].
+    #[cfg(feature = "jwt-pkcs8")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jwt-pkcs8")))]
     pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, KeyError> {
         let doc = SecretKey::from(&self.signing)
             .to_pkcs8_der()
@@ -334,16 +345,6 @@ pub struct AccessTokenClaims {
     pub cnf: Option<crate::token::Confirmation>,
 }
 
-/// The JOSE protected header. RFC 9068 section 2.1 fixes `typ` to `at+jwt`, which exists to stop a
-/// resource server confusing an access token with an ID token or any other JWT the same issuer
-/// signs with the same key.
-#[derive(Debug, Serialize)]
-struct JoseHeader<'a> {
-    alg: &'static str,
-    typ: &'static str,
-    kid: &'a str,
-}
-
 /// Everything needed to issue RFC 9068 access tokens: the ACTIVE signing key, any RETIRED keys
 /// still being published so tokens already signed under them keep verifying, the audience, and the
 /// URL the host serves the key set from.
@@ -375,6 +376,46 @@ pub struct JwtConfig {
     retired: Vec<Jwk>,
     audience: Audience,
     jwks_uri: Option<String>,
+    /// The base64url form of the JOSE protected header, PRECOMPUTED.
+    ///
+    /// It is a function of the active key's `kid` and two constants, so it is fixed for the life of
+    /// a `JwtConfig` and changes only at [`JwtConfig::rotate_to`]. Building it per token cost a
+    /// `serde_json::to_vec` and a base64 `String` on every access token this server signs, to
+    /// produce the same bytes every time. MEASURED on one `client_credentials` issuance under
+    /// `--features jwt`: 28 allocations / 4767 bytes before, 25 / 4560 after.
+    encoded_header: Box<str>,
+}
+
+/// The base64url form of the RFC 7515 s4.1 protected header for `kid`.
+///
+/// Built by hand rather than through `serde_json`, and that is not an optimisation: it is what
+/// makes precomputing this INFALLIBLE. `serde_json::to_vec` returns a `Result`, which would make
+/// [`JwtConfig::new`] and [`JwtConfig::rotate_to`] fallible (or force an `expect` into a library
+/// that must not panic on a host's input) for an error that cannot occur. The header has exactly
+/// three members, two of them constants, and the third is a string; the only work is escaping it.
+fn encoded_jose_header(kid: &str) -> Box<str> {
+    // RFC 9068 s2.1 fixes `typ`; `alg` is a constant here, so no code path in this crate can emit
+    // an unsigned access token. Member order matches what `JoseHeader`'s derive produced, so the
+    // bytes on the wire are unchanged by this precomputation.
+    let mut json = String::with_capacity(40 + kid.len());
+    json.push_str(r#"{"alg":"ES256","typ":"at+jwt","kid":""#);
+    // RFC 8259 s7: a JSON string escapes the quote, the backslash, and everything below 0x20.
+    // Nothing else needs escaping, and in particular a `kid` is not required to be ASCII.
+    for c in kid.chars() {
+        match c {
+            '"' => json.push_str("\\\""),
+            '\\' => json.push_str("\\\\"),
+            '\n' => json.push_str("\\n"),
+            '\r' => json.push_str("\\r"),
+            '\t' => json.push_str("\\t"),
+            '\u{8}' => json.push_str("\\b"),
+            '\u{c}' => json.push_str("\\f"),
+            c if (c as u32) < 0x20 => json.push_str(&format!("\\u{:04x}", c as u32)),
+            c => json.push(c),
+        }
+    }
+    json.push_str(r#""}"#);
+    URL_SAFE_NO_PAD.encode(json).into_boxed_str()
 }
 
 impl JwtConfig {
@@ -383,6 +424,7 @@ impl JwtConfig {
     /// guessed `aud` is a token that is valid somewhere nobody intended.
     pub fn new(key: EcdsaP256Key, audience: impl Into<String>) -> Self {
         JwtConfig {
+            encoded_header: encoded_jose_header(key.kid()),
             key,
             // A brand new configuration has retired nothing. The single-key deployment, which is
             // most of them, never touches anything below and keeps exactly the API it had.
@@ -407,6 +449,8 @@ impl JwtConfig {
     pub fn rotate_to(mut self, new_active: EcdsaP256Key) -> Self {
         let retiring = self.key.public_jwk();
         self.key = new_active;
+        // The header names the ACTIVE key, so it is rebuilt exactly here and nowhere else.
+        self.encoded_header = encoded_jose_header(self.key.kid());
         let active_kid = self.key.kid();
         // A kid appears at most once in the published set: any older entry sharing a name with the
         // key just retired, or with the new active key, goes.
@@ -500,17 +544,10 @@ impl JwtConfig {
 
     /// Serialize and sign one access token into RFC 7515 section 3.1 compact form.
     pub fn sign_access_token(&self, claims: &AccessTokenClaims) -> Result<String, JwtError> {
-        let header = JoseHeader {
-            // RFC 9068 section 2.1: the algorithm MUST NOT be `none`. It is a constant here, so
-            // there is no code path in this crate that can emit an unsigned access token.
-            alg: "ES256",
-            typ: "at+jwt",
-            kid: self.key.kid(),
-        };
-        let header = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&header)
-                .map_err(|e| JwtError(format!("header serialization: {e}")))?,
-        );
+        // The header is PRECOMPUTED (see `JwtConfig::encoded_header`): it is fixed for the life of
+        // this configuration, so serializing and encoding it per token produced identical bytes at
+        // a cost paid on every token issued.
+        let header = &self.encoded_header;
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(claims)
                 .map_err(|e| JwtError(format!("claims serialization: {e}")))?,

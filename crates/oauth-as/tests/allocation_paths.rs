@@ -28,6 +28,16 @@
 //! and thread creation touches the allocator outside any lock this crate can take, so the whole
 //! file is one `#[test]` running its gates in sequence and collecting failures.
 
+// `measure(|| ...)` closures return the endpoint's own `Result`, so clippy sees a large `Err` here
+// that it does not see at the endpoints themselves. The finding was MEASURED and REJECTED rather
+// than silenced blind: `AuthorizationError` is 128 bytes (`Direct(ErrorResponse)` 56,
+// `Redirect(AuthorizationErrorRedirect)` 128), and boxing the redirect variant would take it to 64.
+// But the `Result` these functions return is 232 bytes either way, because
+// `ValidatedAuthorizationRequest` is 232 and an enum is as wide as its widest arm. So the box would
+// buy nothing at the call sites that exist, and would ADD one heap allocation to every
+// redirect-form refusal, which is a path an attacker sets the rate of. Strictly worse, measured.
+#![allow(clippy::result_large_err)]
+
 mod support;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -81,6 +91,7 @@ fn ungated_path_allocation_gates() {
         ("rar_narrowing_bound", rar_narrowing_bound),
         ("consent_lookup_bound", consent_lookup_bound),
         ("jwks_serving_bound", jwks_serving_bound),
+        ("jwt_signing_bound", jwt_signing_bound),
     ];
 
     let mut failures = Vec::new();
@@ -754,6 +765,42 @@ fn jwks_serving_bound() {
 #[cfg(not(feature = "jwt"))]
 fn jwks_serving_bound() {}
 
+/// RFC 9068: issuing ONE `at+jwt` access token, against the same issuance with opaque tokens.
+///
+/// The difference is what the JWT profile costs per token: a claim set serialized, a JOSE header
+/// serialized, three base64url encodes, one ES256 signature, and the `format!`s that join them.
+/// Opaque tokens are this crate's default precisely because a resource server can introspect
+/// instead, so this gate is what makes the trade a number rather than a preference.
+#[cfg(feature = "jwt")]
+fn jwt_signing_bound() {
+    let rt = current_thread_runtime();
+    let mut cfg = config();
+    cfg.access_token_format =
+        oauth_as::jwt::AccessTokenFormat::Jwt(Box::new(oauth_as::jwt::JwtConfig::new(
+            oauth_as::jwt::EcdsaP256Key::generate("sign"),
+            "https://rs.example",
+        )));
+    let srv = server(&rt, cfg);
+    let credentials = || TokenRequest::ClientCredentials {
+        client_id: ClientId::new("app"),
+        client_secret: Some(SECRET.to_string()),
+        scope: None,
+    };
+    // Warm: the token map's first bucket table, and p256's first signature.
+    rt.block_on(srv.token(credentials())).unwrap();
+
+    let request = credentials();
+    let (response, d) = measure(|| rt.block_on(srv.token(request)));
+    assert!(
+        response.unwrap().access_token.starts_with("eyJ"),
+        "the fixture must actually be signing JWTs"
+    );
+    check("JWT access token issuance", d, JWT_SIGN);
+}
+
+#[cfg(not(feature = "jwt"))]
+fn jwt_signing_bound() {}
+
 // -------------------------------------------------------------------------------- the bounds
 
 /// Check one measurement against its bound and report the observed figure either way, so a passing
@@ -861,5 +908,15 @@ const CONSENT_LOOKUP: (usize, usize) = (0, 0);
 /// when `http` is off) pays this per fetch, and a verifier fetches on every cold cache. Four
 /// allocations is small enough that caching it is not worth an API change; the gate is what would
 /// tell us if that stopped being true.
+/// Observed 26 allocs / 4581 bytes under `--features jwt` and 26 / 4733 `--all-features`, against
+/// 12 / 1707 for the same issuance with opaque tokens: the RFC 9068 profile costs roughly 14
+/// allocations and 3 KB of transient traffic per token, nearly all of it freed again. It was 28 /
+/// 4767 before the JOSE header was precomputed in `JwtConfig` rather than serialized per token.
+///
+/// This is the number behind opaque tokens being the DEFAULT: a resource server introspects
+/// instead, and introspection is 4 allocations.
+#[cfg(feature = "jwt")]
+const JWT_SIGN: (usize, usize) = (34, 6144);
+
 #[cfg(feature = "jwt")]
 const JWKS_BUILD: (usize, usize) = (6, 296);

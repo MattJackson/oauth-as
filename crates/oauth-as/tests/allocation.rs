@@ -865,6 +865,90 @@ fn core_public_types_stay_within_their_size_budget() {
         "IssuedToken grew past its size budget: {}",
         size_of::<IssuedToken>()
     );
+
+    // THE STORED RECORDS, which had no size gate at all until this pass. `IssuedToken` above was
+    // the only one, and it is the only one of them stored behind an `Arc`; the records the store
+    // holds BY VALUE (`DeviceGrant`, `AuthorizationCodeRecord`,
+    // `par::PushedAuthorizationRequest`) pay a new field TWICE, once in the record and once in
+    // the bucket table's value slot, which `tests/allocation_footprint.rs` measures directly.
+    // Budgets are roughly 15% over what is measured today, per feature set and additive, for the
+    // reason stated above: a deployment that does not enable a feature must not be charged for it.
+
+    // `Client` is read on every authenticated request. Measured 200 on EVERY feature set, and
+    // exactly the sum of its fields with no padding: ClientId 24, ClientAuth 48, two Vec 24,
+    // two ScopeSet 24, Option<String> 24, Option<Box<DynamicRegistration>> 8.
+    assert!(
+        size_of::<Client>() <= 232,
+        "Client grew past its size budget: {}",
+        size_of::<Client>()
+    );
+    // `ClientAuth` is the classic box-the-large-variant candidate and it has already been handled:
+    // 48 bytes on EVERY feature set, so `client_assertion`'s `AssertionKeys` and `mtls`'s
+    // `MtlsClientRegistration` both already fit inside what `ConfidentialSecret`'s `String` and
+    // `ConfidentialSecretHash`'s `SecretHash` need. A future variant that did not would show up
+    // here as `Client` growing for every deployment, including the ones that never use it.
+    assert!(
+        size_of::<ClientAuth>() <= 56,
+        "ClientAuth grew past its size budget, which every Client pays: {}",
+        size_of::<ClientAuth>()
+    );
+    // Measured 184 on every feature set: `DeviceGrant` has no `#[cfg]` field. Stored by value.
+    assert!(
+        size_of::<oauth_as::DeviceGrant>() <= 208,
+        "DeviceGrant grew past its size budget: {}",
+        size_of::<oauth_as::DeviceGrant>()
+    );
+    // Measured 168 default, 224 all-features: the same four optional bindings `IssuedToken`
+    // carries, because a refresh chain has to remember every constraint the grant was issued under
+    // or the binding is decorative past the first rotation.
+    let refresh_budget = 192
+        + if cfg!(feature = "rar") { 24 } else { 0 }
+        + if cfg!(feature = "dpop") { 16 } else { 0 }
+        + if cfg!(feature = "mtls") { 8 } else { 0 }
+        + if cfg!(feature = "consent") { 8 } else { 0 };
+    assert!(
+        size_of::<oauth_as::RefreshTokenRecord>() <= refresh_budget,
+        "RefreshTokenRecord grew past its size budget: {}",
+        size_of::<oauth_as::RefreshTokenRecord>()
+    );
+    // Measured 232 default, 264 all-features. The widest record in the store, and stored BY VALUE,
+    // so every byte here is paid twice in resident heap.
+    //
+    // 48 of the 232 are `AuthorizationCodeState::Consumed`'s inline `String` and `Option<String>`,
+    // carried by every code including the `Issued` ones that have no tokens to name. Boxing that
+    // variant was measured and NOT taken: see the note in the report for this pass. It would save
+    // 40 bytes of struct and 80 of resident heap per live code, at the cost of one allocation on
+    // the redemption path, which is the hot one and is gated at 39.
+    let code_budget = 264
+        + if cfg!(feature = "rar") { 24 } else { 0 }
+        + if cfg!(feature = "consent") { 8 } else { 0 };
+    assert!(
+        size_of::<oauth_as::AuthorizationCodeRecord>() <= code_budget,
+        "AuthorizationCodeRecord grew past its size budget: {}",
+        size_of::<oauth_as::AuthorizationCodeRecord>()
+    );
+    // Measured 128, and it is the one record with NO TTL: a consent is resident until the user
+    // withdraws it, so this is the size a deployment multiplies by its user count rather than by
+    // its request rate.
+    #[cfg(feature = "consent")]
+    assert!(
+        size_of::<oauth_as::consent::ConsentRecord>() <= 144,
+        "ConsentRecord grew past its size budget: {}",
+        size_of::<oauth_as::consent::ConsentRecord>()
+    );
+    // Measured 232 under `par` alone, 304 with `rar` and `consent`. Stored by value, and it holds
+    // one owned `String` per authorization parameter because every one of them arrives borrowed.
+    #[cfg(feature = "par")]
+    {
+        let pushed_budget = 264
+            + if cfg!(feature = "rar") { 24 } else { 0 }
+            + if cfg!(feature = "consent") { 48 } else { 0 };
+        assert!(
+            size_of::<oauth_as::par::PushedAuthorizationRequest>() <= pushed_budget,
+            "PushedAuthorizationRequest grew past its size budget: {}",
+            size_of::<oauth_as::par::PushedAuthorizationRequest>()
+        );
+    }
 }
 
 /// The token endpoint's future must stay under tokio's DEBUG BOXING THRESHOLD.

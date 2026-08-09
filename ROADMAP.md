@@ -61,24 +61,58 @@ every adopter:
   to copy a `&'static str`. Size neutral, measured: 24 bytes either way, and
   `ErrorResponse` is 56 bytes before and after.
 
-Five findings are still OPEN. They are recorded here rather than in a release
-heading because none of them breaks an API, so none of them has to wait for a
-particular number:
+All five of the remaining findings have now been MEASURED. Three were acted
+on, two were rejected with the number, and one of the five turned out to have
+been measuring the wrong thing about itself:
 
-- **`Box<str>` on the stored records**: 23 to 32 percent off `IssuedToken`,
-  `DeviceGrant` and `RefreshTokenRecord`. `IssuedToken::jkt` already does this
-  and carries the reasoning.
-- **`serde_json` declared unconditionally** while every use site is behind a
-  feature. Zero linked bytes at stake, but four crates compiled by every default
-  build that uses none of them.
-- **`p256`'s `pkcs8` feature costs 20,764 linked bytes for ONE constructor**,
-  more than `sha2` and `base64` combined. Wants its own sub-feature.
-- **Serialize-once violations under `jwt`**: the JWKS is recomputed per fetch and
-  the JOSE header per token, both fixed for the life of the config, and `par.rs`
-  re-parses a verifying key per request while its own comment says it is parsed
-  once.
-- **`registration` is the only capability with no cargo feature**, so a host that
-  never enables dynamic registration still compiles all of it.
+- **`Box<str>` on the stored records: MEASURED, NOT TAKEN.** The 23 to 32
+  percent figure was about STRUCT size and it is roughly right there:
+  `IssuedToken` 176 to 136, `RefreshTokenRecord` 168 to 128, `DeviceGrant` 184
+  to 160 (13 percent, not 23). What a deployment feels is RESIDENT heap, which
+  is now measured (`tests/allocation_footprint.rs`): an access token is 672
+  bytes resident, a refresh token 707, a device grant 1009. The saving is 40,
+  40 and 48 bytes, so 5 to 6 percent, not 23 to 32. At 10k live records of each
+  it is about 1.25 MiB out of 23 MiB. The cost is changing `ClientId(String)`
+  and every owned field on the three records a host constructs and reads, which
+  is the widest API break left on the table. Recorded here with the corrected
+  number rather than left looking like a 30 percent win nobody had taken.
+- **`serde_json` is now optional. DONE.** It was unreachable in a default build
+  (every use site is behind `http`, `jwt`, `rar`, `mtls` or `client_assertion`;
+  `#[derive(Serialize)]` needs `serde` only). Measured: a default build's
+  dependency graph goes from 23 packages to 19, so the "five dependencies"
+  sentence is now three, and `serde_json`, `itoa`, `ryu` and `memchr` leave the
+  audit surface of a consumer who never asked for JSON.
+- **`p256`'s `pkcs8` is now this crate's own `jwt-pkcs8` feature. DONE, and the
+  20,764 figure was WRONG in an important way.** Measured on a release binary
+  (`opt-level = "z"`, `strip`): a host that enables `jwt` and never calls
+  `from_pkcs8_der` paid ZERO for it under `lto = true` and 192 bytes without
+  LTO, because the linker had already dropped what nothing called. The 16.7 KiB
+  of DER decoder is paid only by a host that actually calls it. What the split
+  genuinely buys is one crate (`pkcs8` v0.10.2) off a `--features jwt` tree,
+  which is the crate's stated dependency policy rather than a byte count.
+- **Serialize-once under `jwt`: one real violation fixed, two corrected.** The
+  JOSE header WAS re-serialized per token, and it is a function of the active
+  key's `kid` and two constants; it is precomputed now, in `JwtConfig`, rebuilt
+  only at `rotate_to`. Measured on one `client_credentials` issuance under
+  `--features jwt`: 28 allocations / 4767 bytes to 26 / 4581. The JWKS is NOT
+  recomputed per fetch on the `http` path (it is serialized once at router build
+  and handed out as a refcounted `Bytes`); it IS rebuilt per call for a host
+  serving `jwks_uri` itself, and that rebuild is now gated at 4 allocations /
+  226 bytes, which is small enough not to be worth an API change. `par.rs`'s
+  "parsed once" comment was misleading rather than wrong, and now says what is
+  actually true: the curve check happens once at registration, the point decode
+  happens per request, deliberately, because holding a `VerifyingKey` would
+  roughly double every registered key and the re-derivation allocates nothing.
+- **`registration` having no cargo feature: MEASURED, NOT TAKEN.** The runtime
+  cost is already near zero and deliberately so: `ServerConfig::registration`
+  defaults to `None` and `Client::registration` is an 8-byte null pointer
+  (`Option<Box<DynamicRegistration>>`), so a host that never registers anything
+  dynamically allocates nothing for it. What a feature gate would buy is compile
+  time. What it would cost is a `#[cfg]` on a PUBLIC FIELD of `Client`, which
+  every host constructs by literal, plus a `#[cfg]` on `Storage::delete_client`,
+  which exists solely for RFC 7592 s2.3's cascade and which every host
+  implements. That is an API break on both traits a host implements and the one
+  struct it builds, to remove code that costs a running deployment nothing.
 
 What this is still NOT is the surface area of Keycloak, Ory Hydra, Auth0 or
 Okta: no user store, no admin UI, no federation, no OIDC. That is the design,

@@ -100,6 +100,42 @@ mutated.
   down from one. The struct is 56 bytes before and after: `Option<Cow<'static, str>>` and
   `Option<String>` are both 24.
 
+### Changed (BREAKING): `serde_json` is optional, and PKCS#8 key loading has its own feature
+
+Both are dependency-surface changes, both measured, and both free to make now.
+
+- **`serde_json` is an optional dependency**, enabled by `http`, `jwt` (and so `jar`, `dpop`,
+  `client_assertion`), `mtls` and `rar`. It was unconditional, and MEASURED, no default build could
+  reach it: every use site is behind one of those features, and `#[derive(Serialize)]` needs
+  `serde` only, never a format crate. A default build's dependency graph goes from 23 packages to
+  19, dropping `serde_json`, `itoa`, `ryu` and `memchr`. Zero linked bytes were at stake (the
+  linker already dropped what nothing called); what was at stake is four crates in the audit
+  surface of a consumer who never asked for JSON. Nothing a host writes changes unless it was
+  relying on this crate to pull `serde_json` into its own tree.
+- **`EcdsaP256Key::from_pkcs8_der` and `to_pkcs8_der` now require the `jwt-pkcs8` feature**, which
+  is `jwt` plus `p256/pkcs8`. This one comes with a CORRECTION to the figure that motivated it.
+  ROADMAP recorded "20,764 linked bytes for ONE constructor". Measured on a release binary
+  (`opt-level = "z"`, `strip = true`): a host that enables `jwt` and never calls the loaders paid
+  ZERO under `lto = true`, and 192 bytes without LTO, because the linker had already dropped it.
+  The ~16.7 KiB of DER decoder is paid only by a host that actually calls it, which is the host
+  that wants it. What the split really buys is one crate (`pkcs8` v0.10.2) off a `--features jwt`
+  dependency tree, which is this crate's stated dependency policy rather than a byte count.
+
+  Migration: a host loading PKCS#8 DER adds `features = ["jwt-pkcs8"]`. A host loading a raw
+  32-byte scalar through `EcdsaP256Key::from_scalar_bytes` changes nothing.
+
+### Changed: the RFC 9068 JOSE header is serialized once, not once per token
+
+`JwtConfig` now precomputes the base64url protected header. It is a function of the active key's
+`kid` and two constants, fixed for the life of a configuration and rebuilt only by `rotate_to`, and
+it was being serialized and encoded again for every access token signed, producing identical bytes
+every time. MEASURED on one `client_credentials` issuance under `--features jwt`: 28 allocations /
+4767 bytes before, 26 / 4581 after. The wire bytes are unchanged.
+
+It is built without `serde_json`, and that is what makes precomputing it INFALLIBLE: a `Result` here
+would have made `JwtConfig::new` and `rotate_to` fallible, or forced an `expect` into a library that
+must not panic, for an error that cannot occur on three string members.
+
 ### Changed: two `Box::pin`s that had stopped paying for themselves
 
 Both were introduced with a measurement and both were RE-measured rather than trusted, which is the

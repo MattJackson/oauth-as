@@ -500,6 +500,9 @@ async fn jwks_uri_is_advertised_when_signing_is_configured() {
 // Key handling
 // ---------------------------------------------------------------------------------------------
 
+/// The PKCS#8 loaders live behind `jwt-pkcs8` rather than `jwt`, because their DER decoder is
+/// 20,764 linked bytes a host loading a raw scalar never reaches, so this test follows them there.
+#[cfg(feature = "jwt-pkcs8")]
 #[test]
 fn keys_load_from_raw_scalar_and_from_pkcs8_and_agree() {
     // A fixed scalar, so this is a statement about the two loaders and not about randomness.
