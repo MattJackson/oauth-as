@@ -152,6 +152,46 @@ overloaded machine timing out is a statement about the machine. The baseline sui
 13s and tests in 13s, so a 300 second timeout is a 23x margin, and a timeout under it is a genuine
 non-terminating mutant rather than load.
 
+## Where this actually stands (updated at 0.9.0)
+
+**First full `--all-features` run**, on a dedicated 192 vCPU box because the laptop could not do
+it in a usable time:
+
+    cargo mutants -p oauth-as --all-features --timeout 300 -j 48
+    1354 mutants: 1019 caught, 121 missed, 204 unviable, 10 timeout, 13 minutes
+
+The numbers are trustworthy, which is not a given for a mutation run. Baseline on that box was a
+12 second build and a 2.3 second test, so the 300 second timeout is a ~130x margin, and only 10 of
+1354 (0.7%) timed out against 185 on the earlier busy-laptop run. All 10 are in the known
+genuinely non-terminating class: loop counters that stop advancing, and rejection sampling that can
+never accept.
+
+### What has been done with the 121, and what has not
+
+Closed since: the wire-text batch (the `Display` impls across nine modules, which could all return
+`Ok(Default::default())` undetected), the DPoP and client-assertion verifier unit tests, and two
+that were real holes rather than curiosities, both watched failing first and recorded in
+`tests/mutation_gaps.rs`:
+
+- `rar::is_empty_list` could return a constant, and constant `true` DROPS every `actions`,
+  `locations`, `datatypes` and `privileges` list from the serialized authorization detail. A
+  resource server would be handed a detail whose action list had vanished.
+- The RFC 8705 s2.1.1 `tls_client_auth_san_ip` arm could be deleted, and it does not fail closed:
+  it falls through to the `_ => continue` meant for unrelated registration members, so a
+  registration naming only an IP SAN parses as naming no subject at all.
+
+A scoped re-run over the six security-critical modules (`par`, `token_exchange`, `rar`, `mtls`,
+`client_assertion`, `dpop`, 267 mutants) confirms the security-critical survivors from the snapshot
+were largely already dead: they were killed by fixes and tests that landed AFTER the snapshot was
+taken, which is the hazard of reading any mutation report as current.
+
+**GATE 4 IS NOT MET, and the honest reason is scope rather than effort.** The remaining survivors
+are concentrated in `storage_conformance.rs` (the reporter's own violation-accumulation logic),
+`store.rs` and `registration.rs`, and they have not been individually triaged. A mutation report is
+also a SNAPSHOT: this one predates several fixes, so some of its 121 are already dead and code
+written since was never measured. The gate is met when a run at the release commit, over the
+feature set that ships, comes back with every survivor killed or argued here.
+
 ## Where this actually stands, so nobody reads the file above as "done"
 
 Last authoritative run: `cargo mutants -p oauth-as --features http,jwt --timeout 180`, at commit
