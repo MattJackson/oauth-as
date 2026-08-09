@@ -22,6 +22,20 @@ categories = ["authentication", "web-programming"]
 # because it is the only worked demonstration of wiring the optional http service.
 exclude = ["conformance-serve.sh"]
 
+# DOCS.RS BUILDS THE WHOLE CRATE, and it has to be told to, because `default = []` here means a
+# docs.rs build with no configuration would render the core library and NOTHING ELSE: no HTTP
+# service, no JWT, no DPoP, no PAR, no consent, and none of the crate-root re-exports behind them.
+# That is most of what this crate is, and a reader evaluating it from docs.rs would conclude the
+# feature table in README.md was aspirational.
+#
+# `--cfg docsrs` is what turns on the `doc_cfg` attributes in src/lib.rs, so every item that needs
+# a feature says which one on its own page. Without it an all-features build renders everything
+# unlabelled, which is a different lie: the reader cannot tell what a default build would give
+# them.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 # FEATURES. The default set is EMPTY and stays that way. A consumer who wants only the library
 # gets no HTTP stack and no async runtime: the whole premise of this crate is that the host owns
 # the listener, so an optional feature is the only place a web framework may appear.
