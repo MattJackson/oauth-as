@@ -128,8 +128,42 @@ allocation out of the 39 a code redemption already costs. This crate has crossed
 twice, once for 120 bytes and once for 344, and the failure mode on the other side is a 2 KB heap
 allocation on every token request. The trade is refused, with the number, in the function's docs.
 
+### Fixed (security)
+
+- **BEHAVIOUR CHANGE: RFC 8693 token exchange REFUSES a sender-constrained subject token.** A
+  DPoP-bound (RFC 9449 `cnf.jkt`) or certificate-bound (RFC 8705 `x5t#S256`) access token presented
+  as `subject_token` was exchanged into a new UNBOUND bearer token, with no proof of possession
+  asked for at any point: the exchange read neither binding off the record it introspected. That
+  hands anyone who can authenticate as any client registered for the grant, an insider, a
+  compromised service, a leaked client secret, a laundry for stolen bound tokens, and destroys the
+  one property sender constraining is bought for, which is that a leaked token is worth nothing
+  without the key. The answer is now `invalid_request`, which RFC 8693 s2.2.2 names for a
+  `subject_token` that is unacceptable based on policy. Propagating the `cnf` instead was
+  considered and rejected: the issued token belongs to the EXCHANGING client, which does not hold
+  the original client's key, so the token would be unusable at any resource server that checks the
+  binding (RFC 9449 s7.1) while looking as though possession had been proven. An unbound subject
+  token exchanges exactly as before. See the module docs in `src/token_exchange.rs`.
+- **Three `SystemTime` overflow panics on attacker-supplied time claims**, all reachable from an
+  unauthenticated request: `iat` in a DPoP proof (`src/dpop.rs`), and `exp`, `nbf` and `iat` in an
+  RFC 7523 client assertion (`src/client_assertion.rs`). Each value is a `u64` out of JSON that
+  nobody has authenticated yet, and `UNIX_EPOCH + Duration::from_secs(u64::MAX)` panics rather than
+  wrapping, before any bound was compared: a `DPoP` header reading `{"iat": 18446744073709551615}`
+  panicked the request. In a library that panic unwinds into the host's request handler. The
+  arithmetic is `checked_add` now, and an unrepresentable instant takes the refusal the module
+  already had for a time claim it will not accept (`DpopFailure::StaleProof`,
+  `AssertionFailure::Expired`, `AssertionFailure::NotYetValid`), which is correct on the merits: a
+  time that cannot be represented is outside every acceptance window a server could pick.
+
 ### Added
 
+- **`oauth_as::dpop::MAX_PROOF_BYTES` (4096)**, the first bound this crate has ever put on a DPoP
+  proof, checked BEFORE the proof is parsed. The proof arrives in a request HEADER, so the `http`
+  feature's 64 KiB body cap never applied to it, and an unauthenticated string went straight into a
+  base64 decode and two JSON parses. 4096 is derived from what RFC 9449 s4.2 says a proof contains
+  (a P-256 JWK, `htm`, `htu`, `iat`, `jti`, an ES256 signature: a little over 500 bytes in
+  practice), with room for a long `htu` and future claims. A host's HTTP server usually caps header
+  size too, so this is defence in depth rather than the only line; it is here because this library
+  never sees the socket and because `verify_proof` is public. Over the cap is `DpopFailure::Malformed`.
 - `impl std::error::Error for StepUpFailure`. It was the only error-shaped type in the crate
   without one.
 - `ServerConfig::refresh_token_ttl` and `ServerConfig::include_verification_uri_complete` document
