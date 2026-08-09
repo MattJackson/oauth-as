@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
-//! An OPTIONAL axum router over [`AuthorizationServer`], behind the `http` cargo feature.
+//! An OPTIONAL HTTP service over [`AuthorizationServer`], behind the `http` cargo feature.
 //!
 //! # Why this is optional, and stays optional
 //!
@@ -11,13 +11,33 @@
 //! exists. Turning the feature on is the host saying "serve the RFC-shaped wire surface for me
 //! rather than making me write it"; leaving it off costs nothing, not even a compiled dependency.
 //!
+//! # Why there is no web framework in this module's PUBLIC API
+//!
+//! This module speaks `http` 1.x and `http-body` 1.x and nothing else: [`AuthorizationService`]
+//! is an `async fn` from an [`http::Request`] to an [`http::Response`]. Those two crates are 1.0
+//! and their major has never moved, so a host may mount this service under whatever server it
+//! already runs.
+//!
+//! That is a deliberate correction. Until 0.9 this module handed back an `axum::Router`, which
+//! put a 0.x major in the signature of the only way to use the feature: a host on any other axum
+//! major could not enable `http` AT ALL, and an axum major bump would have been a breaking change
+//! to THIS crate for reasons that have nothing to do with OAuth. axum is now a thin ADAPTER
+//! behind the separate `axum` feature (`impl From<AuthorizationService<..>> for axum::Router`),
+//! so the hazard is confined to hosts that opt into it.
+//!
+//! Nothing was hand-rolled to get there. This module already wrote its own percent-decoder, form
+//! parser, first-wins parameter logic, Basic-auth decoder and response builders, precisely so that
+//! the RFC-mandated headers land on the same response as the body they describe; it used a
+//! framework for exactly three things (route matching, one dynamic path segment, and body
+//! collection with a cap), and those three are what [`Routes`] and [`collect_body`] now do.
+//!
 //! # What it serves
 //!
 //! Exactly the endpoints [`AuthorizationServerMetadata`] advertises, at exactly the paths it
 //! advertises them, plus the RFC 8628 `verification_uri`. The paths are DERIVED from the metadata
 //! document rather than hard-coded, because an advertised endpoint that 404s is a lie a client
 //! cannot recover from: if a host overrides `token_endpoint`, the route moves with it or
-//! [`RouterBuilder::build`] refuses to produce a router at all.
+//! [`ServiceBuilder::build`] refuses to produce a service at all.
 //!
 //! Under the `jwt` feature that includes `jwks_uri`: the document advertises it exactly when the
 //! server signs its access tokens, and this router serves the RFC 7517 key set there. A resource
@@ -39,15 +59,15 @@
 //! Three things this module cannot invent, each with a seam, and each of which REFUSES when the
 //! seam is not wired:
 //!
-//! 1. Authenticating the RESOURCE OWNER ([`RouterBuilder::with_subject_resolver`]). This module
+//! 1. Authenticating the RESOURCE OWNER ([`ServiceBuilder::with_subject_resolver`]). This module
 //!    cannot know how a host logs a user in.
-//! 2. CONSENT at the authorization endpoint ([`RouterBuilder::with_consent_resolver`]). RFC 6749
+//! 2. CONSENT at the authorization endpoint ([`ServiceBuilder::with_consent_resolver`]). RFC 6749
 //!    s10.12 requires the AS to ensure the resource owner is aware of, and explicitly consents
 //!    to, the authorization. A subject resolver answers "who is this"; it does not answer "did
 //!    they agree", and treating the first as the second is an AS that silently authorizes any
 //!    registered client on any cross-site navigation.
 //! 3. A CSRF token bound to the host's session, for the device verification form
-//!    ([`RouterBuilder::with_csrf_tokens`]). This crate has no session store, so it cannot mint
+//!    ([`ServiceBuilder::with_csrf_tokens`]). This crate has no session store, so it cannot mint
 //!    one; RFC 6749 s10.12 still requires the protection, so an unwired host gets a refusal and
 //!    is never served a submittable, forgeable form.
 //!
@@ -56,14 +76,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use bytes::{Buf as _, Bytes};
+use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -79,17 +95,118 @@ use crate::server::{AuthorizationServer, Clock, DeviceApprovalError, TokenReques
 use crate::store::Storage;
 use crate::token::TokenTypeHint;
 
+/// The response body this module produces: a single in-memory buffer, already complete.
+///
+/// Every response an authorization server emits is a short JSON document, a small HTML page, or
+/// nothing at all, and all of them are finished before the first byte is written. So the body type
+/// is a `Bytes` rather than a stream: there is nothing to stream, and a boxed
+/// `dyn http_body::Body` would add an allocation and a virtual call per response to express a
+/// capability this module never uses.
+///
+/// It implements [`http_body::Body`] with an INFALLIBLE error type and an EXACT size hint. The
+/// second matters on the wire: a server that knows the length emits `Content-Length` rather than
+/// falling back to chunked transfer encoding.
+#[derive(Debug, Default, Clone)]
+pub struct Body(Option<Bytes>);
+
+impl Body {
+    /// A body with no bytes at all. RFC 7009 s2.2's revocation success and RFC 7592 s2.3's
+    /// deletion both answer with one.
+    pub fn empty() -> Self {
+        Body(None)
+    }
+
+    /// The bytes, consuming the body.
+    pub fn into_bytes(self) -> Bytes {
+        self.0.unwrap_or_default()
+    }
+}
+
+impl From<Bytes> for Body {
+    fn from(bytes: Bytes) -> Self {
+        // An empty `Bytes` and "no frame at all" are the same response on the wire, and
+        // collapsing them here means `is_end_stream` is true from the start for an empty body,
+        // so a server need not poll for a frame it will never get.
+        match bytes.is_empty() {
+            true => Body(None),
+            false => Body(Some(bytes)),
+        }
+    }
+}
+
+// Spelled out one type at a time rather than as `impl<T: Into<Bytes>>`, which cannot be written:
+// it would overlap with the standard library's reflexive `From<T> for T` and coherence has no way
+// to rule that out.
+impl From<Vec<u8>> for Body {
+    fn from(value: Vec<u8>) -> Self {
+        Body::from(Bytes::from(value))
+    }
+}
+
+impl From<String> for Body {
+    fn from(value: String) -> Self {
+        Body::from(Bytes::from(value))
+    }
+}
+
+impl From<&'static str> for Body {
+    fn from(value: &'static str) -> Self {
+        Body::from(Bytes::from_static(value.as_bytes()))
+    }
+}
+
+impl http_body::Body for Body {
+    type Data = Bytes;
+    // This body is already in memory, so there is no read that could fail. Naming that in the
+    // type means a host mounting the service never has to write an error arm that cannot happen.
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.take().map(|b| Ok(http_body::Frame::data(b))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.0.as_ref().map_or(0, |b| b.len() as u64))
+    }
+}
+
+/// The response type this module produces, and the one
+/// [`ConsentDecision::Respond`] carries.
+///
+/// A plain [`http::Response`], deliberately: the host that renders a consent screen builds it with
+/// whatever it already has, and `http` 1.x is the one HTTP vocabulary every Rust web framework
+/// agrees on.
+pub type Response = http::Response<Body>;
+
+/// Build a response with a status and a complete body, and no headers yet.
+///
+/// Every caller sets its own `Content-Type` (and, on the token plane, the RFC 6749 s5.1 caching
+/// directives), so nothing is guessed here. That is the same reason this module never used a JSON
+/// extractor: the RFC-mandated headers and the body they describe are set in one place.
+fn respond(status: StatusCode, body: impl Into<Body>) -> Response {
+    let mut resp = Response::new(body.into());
+    *resp.status_mut() = status;
+    resp
+}
+
 /// How the host names the authenticated resource owner for the interactive endpoints.
 ///
 /// The `HeaderMap` is the request's, so a host can read its own session cookie or a
 /// reverse-proxy assertion header. `None` means "nobody is logged in", which is a refusal, not
-/// an error: see [`RouterBuilder::with_subject_resolver`].
+/// an error: see [`ServiceBuilder::with_subject_resolver`].
 pub type SubjectResolver = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
 /// A CSRF token hook: issue one for, or take one back from, the session this request carries.
 ///
 /// `None` means "this request has no session", which is a refusal. See
-/// [`RouterBuilder::with_csrf_tokens`] for the contract the two hooks satisfy together.
+/// [`ServiceBuilder::with_csrf_tokens`] for the contract the two hooks satisfy together.
 pub type CsrfTokenHook = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
 /// What the host's consent step decided about one authorization request.
@@ -152,7 +269,7 @@ pub struct ConsentRequest<'a> {
 }
 
 /// How the host makes the RFC 6749 s10.12 consent decision. See
-/// [`RouterBuilder::with_consent_resolver`].
+/// [`ServiceBuilder::with_consent_resolver`].
 pub type ConsentResolver = Arc<dyn Fn(&ConsentRequest<'_>) -> ConsentDecision + Send + Sync>;
 
 /// How the host answers "when, and how, did you authenticate this user".
@@ -160,7 +277,7 @@ pub type ConsentResolver = Arc<dyn Fn(&ConsentRequest<'_>) -> ConsentDecision + 
 /// The third identity seam, and the one RFC 9470 needs: a subject resolver answers WHO, a consent
 /// resolver answers WHETHER THEY AGREED, and this answers HOW STRONGLY AND HOW RECENTLY. `None`
 /// means the host is not reporting one, which satisfies no `acr_values` and no `max_age`; see
-/// [`RouterBuilder::with_authentication_reporter`].
+/// [`ServiceBuilder::with_authentication_reporter`].
 #[cfg(feature = "consent")]
 pub type AuthenticationReporter =
     Arc<dyn Fn(&HeaderMap) -> Option<crate::consent::Authentication> + Send + Sync>;
@@ -168,7 +285,7 @@ pub type AuthenticationReporter =
 /// How the device verification form is protected against RFC 6749 s10.12 cross-site forced
 /// approval.
 enum VerificationProtection {
-    /// No seam wired. Every interactive path refuses; see [`RouterBuilder::with_csrf_tokens`].
+    /// No seam wired. Every interactive path refuses; see [`ServiceBuilder::with_csrf_tokens`].
     Unwired,
     /// The host mints and takes back a session-bound token.
     Tokens {
@@ -178,14 +295,14 @@ enum VerificationProtection {
         consume: CsrfTokenHook,
     },
     /// Explicitly disabled by the host. See
-    /// [`RouterBuilder::dangerously_disable_verification_protections`].
+    /// [`ServiceBuilder::dangerously_disable_verification_protections`].
     Disabled,
 }
 
 /// Why a router could not be built. Every variant is a host configuration mistake that would
 /// otherwise become a runtime 404 on an endpoint the metadata document promises.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouterError {
+pub enum ServiceError {
     /// An advertised endpoint is not under the issuer, so this router cannot serve it. The host
     /// is either fronting a separate service or has a typo; either way, silently not routing it
     /// would publish a promise nothing keeps.
@@ -215,29 +332,29 @@ pub enum RouterError {
     },
 }
 
-impl std::fmt::Display for RouterError {
+impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RouterError::EndpointOutsideIssuer { endpoint, url } => write!(
+            ServiceError::EndpointOutsideIssuer { endpoint, url } => write!(
                 f,
                 "advertised {endpoint} ({url}) is not under the issuer, so this router cannot \
                  serve it"
             ),
-            RouterError::DuplicatePath { path } => {
+            ServiceError::DuplicatePath { path } => {
                 write!(f, "two endpoints resolve to the same path {path}")
             }
-            RouterError::MetadataNotSerializable { detail } => {
+            ServiceError::MetadataNotSerializable { detail } => {
                 write!(f, "RFC 8414 metadata could not be serialized: {detail}")
             }
             #[cfg(feature = "jwt")]
-            RouterError::JwksNotSerializable { detail } => {
+            ServiceError::JwksNotSerializable { detail } => {
                 write!(f, "RFC 7517 key set could not be serialized: {detail}")
             }
         }
     }
 }
 
-impl std::error::Error for RouterError {}
+impl std::error::Error for ServiceError {}
 
 /// Everything a handler needs, built once and shared by refcount.
 struct Inner<S: Storage, C: Clock> {
@@ -260,6 +377,8 @@ struct Inner<S: Storage, C: Clock> {
     #[cfg(feature = "consent")]
     authentication: Option<AuthenticationReporter>,
     verification: VerificationProtection,
+    /// The paths, derived from the metadata document when the service was built.
+    routes: Routes,
 }
 
 impl<S: Storage, C: Clock> Inner<S, C> {
@@ -270,17 +389,17 @@ impl<S: Storage, C: Clock> Inner<S, C> {
 }
 
 /// Builds the router. Construct, attach the seams the interactive endpoints need, then
-/// [`build`](RouterBuilder::build).
+/// [`build`](ServiceBuilder::build).
 ///
 /// # The interactive endpoints refuse until they are wired
 ///
-/// [`with_subject_resolver`](RouterBuilder::with_subject_resolver) alone is NOT enough to run an
+/// [`with_subject_resolver`](ServiceBuilder::with_subject_resolver) alone is NOT enough to run an
 /// authorization server safely, and this is the one thing to read in this file. It answers "who
 /// is this user"; RFC 6749 s10.12 also demands "did the user knowingly agree". Wire
-/// [`with_consent_resolver`](RouterBuilder::with_consent_resolver) and
-/// [`with_csrf_tokens`](RouterBuilder::with_csrf_tokens) too, or the authorization endpoint and
+/// [`with_consent_resolver`](ServiceBuilder::with_consent_resolver) and
+/// [`with_csrf_tokens`](ServiceBuilder::with_csrf_tokens) too, or the authorization endpoint and
 /// the device verification form refuse rather than guessing that silence means yes.
-pub struct RouterBuilder<S: Storage, C: Clock> {
+pub struct ServiceBuilder<S: Storage, C: Clock> {
     server: Arc<AuthorizationServer<S, C>>,
     subject: Option<SubjectResolver>,
     consent: Option<ConsentResolver>,
@@ -289,11 +408,11 @@ pub struct RouterBuilder<S: Storage, C: Clock> {
     verification: VerificationProtection,
 }
 
-impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
+impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
     /// Start from a running server. `Arc` rather than ownership so the host keeps its handle for
     /// administration (client registration, sweeping) while the router serves the same instance.
     pub fn new(server: Arc<AuthorizationServer<S, C>>) -> Self {
-        RouterBuilder {
+        ServiceBuilder {
             server,
             subject: None,
             consent: None,
@@ -311,7 +430,7 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
     /// inventing a user.
     ///
     /// This resolver is IDENTITY ONLY. It does not express consent; see
-    /// [`with_consent_resolver`](RouterBuilder::with_consent_resolver).
+    /// [`with_consent_resolver`](ServiceBuilder::with_consent_resolver).
     pub fn with_subject_resolver<F>(mut self, resolver: F) -> Self
     where
         F: Fn(&HeaderMap) -> Option<String> + Send + Sync + 'static,
@@ -331,7 +450,7 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
     ///
     /// With NO resolver the authorization endpoint refuses with 403 and issues nothing. That is
     /// deliberate and it is a behaviour change: a host that previously wired only
-    /// [`with_subject_resolver`](RouterBuilder::with_subject_resolver) was running an
+    /// [`with_subject_resolver`](ServiceBuilder::with_subject_resolver) was running an
     /// AUTO-APPROVING authorization server, and the fix is to say what the consent step is rather
     /// than to leave it implied.
     ///
@@ -413,12 +532,12 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         self
     }
 
-    /// Derive the routes from the metadata document and build the router.
+    /// Derive the routes from the metadata document and build the service.
     ///
     /// # Errors
     ///
-    /// [`RouterError`] when the configuration advertises something this router cannot serve.
-    pub fn build(self) -> Result<Router, RouterError> {
+    /// [`ServiceError`] when the configuration advertises something this service cannot serve.
+    pub fn build(self) -> Result<AuthorizationService<S, C>, ServiceError> {
         let config = self.server.config();
         let meta = AuthorizationServerMetadata::from_config(config);
         // `from_config` trims the issuer, and derives every default endpoint from that trimmed
@@ -455,8 +574,12 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         };
         // RFC 7592 s3 `registration_client_uri`: `{registration_endpoint}/{client_id}`, which is
         // exactly what `registration::register_dynamic_client` hands the client, so the URL it is
-        // told to use is the URL this router answers on.
-        let manage = register
+        // told to use is the URL this service answers on.
+        //
+        // Stored as the PREFIX (with the trailing slash) because that is what the matcher needs;
+        // the pattern form below exists only so the collision check and its error message name
+        // something a host can recognise in its own configuration.
+        let manage_prefix = register
             .as_ref()
             .filter(|_| {
                 config
@@ -464,7 +587,8 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
                     .as_ref()
                     .is_some_and(|r| r.management_enabled)
             })
-            .map(|p| format!("{p}/{{client_id}}"));
+            .map(|p| format!("{p}/"));
+        let manage = manage_prefix.as_ref().map(|p| format!("{p}{{client_id}}"));
         // The verification URI is NOT part of the RFC 8414 document (it is announced in each RFC
         // 8628 s3.2 response), and a host may legitimately host its device page on a different
         // origin entirely. So an off-issuer verification URI is not an error, it just means the
@@ -504,7 +628,7 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         #[cfg(feature = "jwt")]
         let jwks = match (&jwks_path, self.server.jwks()) {
             (Some(_), Some(keys)) => Some(Bytes::from(serde_json::to_vec(&keys).map_err(|e| {
-                RouterError::JwksNotSerializable {
+                ServiceError::JwksNotSerializable {
                     detail: e.to_string(),
                 }
             })?)),
@@ -520,27 +644,10 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         let well_known = well_known_path(&issuer);
 
         let metadata = serde_json::to_vec(&meta)
-            .map_err(|e| RouterError::MetadataNotSerializable {
+            .map_err(|e| ServiceError::MetadataNotSerializable {
                 detail: e.to_string(),
             })?
             .into();
-
-        let inner = Arc::new(Inner {
-            server: self.server,
-            metadata,
-            #[cfg(feature = "jwt")]
-            jwks,
-            // RFC 7617 s2: the realm is a quoted string. The issuer is a URL and so contains no
-            // double quote or backslash, which is what would need escaping here.
-            challenge: HeaderValue::from_str(&format!("Basic realm=\"{issuer}\""))
-                .unwrap_or_else(|_| HeaderValue::from_static("Basic realm=\"oauth\"")),
-            origin: issuer_origin(&issuer).to_string(),
-            subject: self.subject,
-            consent: self.consent,
-            #[cfg(feature = "consent")]
-            authentication: self.authentication,
-            verification: self.verification,
-        });
 
         let mut paths: Vec<&str> = vec![&well_known, &authorize, &token, &device];
         paths.extend(introspect.as_deref());
@@ -554,60 +661,51 @@ impl<S: Storage + 'static, C: Clock + 'static> RouterBuilder<S, C> {
         paths.extend(jwks_path.as_deref());
         for i in 0..paths.len() {
             if paths[i + 1..].contains(&paths[i]) {
-                return Err(RouterError::DuplicatePath {
+                return Err(ServiceError::DuplicatePath {
                     path: paths[i].to_string(),
                 });
             }
         }
 
-        let mut router = Router::new()
-            .route(&well_known, get(metadata_handler::<S, C>))
-            .route(&authorize, get(authorize_handler::<S, C>))
-            .route(&token, post(token_handler::<S, C>))
-            .route(&device, post(device_authorization_handler::<S, C>));
-        if let Some(path) = &introspect {
-            router = router.route(path, post(introspect_handler::<S, C>));
-        }
-        if let Some(path) = &revoke {
-            router = router.route(path, post(revoke_handler::<S, C>));
-        }
-        if let Some(path) = &verification {
-            router = router.route(
-                path,
-                get(verification_page_handler::<S, C>).post(verification_submit_handler::<S, C>),
-            );
-        }
-        if let Some(path) = &register {
-            router = router.route(path, post(register_handler::<S, C>));
-        }
-        if let Some(path) = &manage {
-            router = router.route(
-                path,
-                get(read_registration_handler::<S, C>)
-                    .put(update_registration_handler::<S, C>)
-                    .delete(delete_registration_handler::<S, C>),
-            );
-        }
-        #[cfg(feature = "par")]
-        if let Some(path) = &par {
-            router = router.route(path, post(pushed_authorization_handler::<S, C>));
-        }
-        #[cfg(feature = "jwt")]
-        if let Some(path) = &jwks_path {
-            router = router.route(path, get(jwks_handler::<S, C>));
-        }
-        // Every POST here is read into memory whole before it is parsed, and every one of these
-        // endpoints is reachable BEFORE the client is authenticated (authentication is in the body
-        // for `client_secret_post`, so it cannot be checked first). An unbounded body on such an
-        // endpoint is a memory exhaustion primitive available to anyone who can open a socket, so
-        // the cap is stated here rather than inherited: see [`MAX_BODY_BYTES`].
-        Ok(router
-            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-            .with_state(inner))
+        let routes = Routes {
+            well_known,
+            authorize,
+            token,
+            device,
+            introspect,
+            revoke,
+            verification,
+            register,
+            manage: manage_prefix,
+            #[cfg(feature = "par")]
+            par,
+            #[cfg(feature = "jwt")]
+            jwks: jwks_path,
+        };
+
+        Ok(AuthorizationService {
+            inner: Arc::new(Inner {
+                server: self.server,
+                metadata,
+                #[cfg(feature = "jwt")]
+                jwks,
+                // RFC 7617 s2: the realm is a quoted string. The issuer is a URL and so contains
+                // no double quote or backslash, which is what would need escaping here.
+                challenge: HeaderValue::from_str(&format!("Basic realm=\"{issuer}\""))
+                    .unwrap_or_else(|_| HeaderValue::from_static("Basic realm=\"oauth\"")),
+                origin: issuer_origin(&issuer).to_string(),
+                subject: self.subject,
+                consent: self.consent,
+                #[cfg(feature = "consent")]
+                authentication: self.authentication,
+                verification: self.verification,
+                routes,
+            }),
+        })
     }
 }
 
-/// The largest request body any endpoint this router serves will read.
+/// The largest request body any endpoint this service serves will read.
 ///
 /// 64 KiB, chosen against the largest legitimate body rather than picked round. The biggest is an
 /// RFC 7591 s2 client metadata document (a registration with many redirect URIs and a `jwks`), and
@@ -627,7 +725,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// an issuer with no path the two are the same string; for `https://as.example/tenant1` the
 /// token endpoint is served at `/tenant1/token`, so a host can build one router per tenant and
 /// merge them without any of them colliding.
-fn endpoint_path(issuer: &str, endpoint: &'static str, url: &str) -> Result<String, RouterError> {
+fn endpoint_path(issuer: &str, endpoint: &'static str, url: &str) -> Result<String, ServiceError> {
     match url.strip_prefix(issuer) {
         Some(rest) if rest.starts_with('/') => {
             let prefix = crate::metadata::issuer_path(issuer);
@@ -636,7 +734,7 @@ fn endpoint_path(issuer: &str, endpoint: &'static str, url: &str) -> Result<Stri
             path.push_str(rest);
             Ok(path)
         }
-        _ => Err(RouterError::EndpointOutsideIssuer {
+        _ => Err(ServiceError::EndpointOutsideIssuer {
             endpoint,
             url: url.to_string(),
         }),
@@ -650,6 +748,386 @@ fn issuer_origin(issuer: &str) -> &str {
     match path.is_empty() {
         true => issuer.trim_end_matches('/'),
         false => issuer[..issuer.len() - path.len()].trim_end_matches('/'),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The service, its route table, and its body reader
+// ---------------------------------------------------------------------------------------------
+
+/// The paths this service answers on, derived once by [`ServiceBuilder::build`].
+///
+/// Every field is an ORIGIN-ROOTED absolute path, and every optional one is `Some` exactly when
+/// the RFC 8414 document advertises the corresponding endpoint. That equivalence is the point:
+/// [`ServiceBuilder::build`] derives both from the same document, so "advertised" and "routed"
+/// cannot drift apart, and it refuses to build when two of them land on one path.
+#[derive(Debug)]
+struct Routes {
+    well_known: String,
+    authorize: String,
+    token: String,
+    device: String,
+    introspect: Option<String>,
+    revoke: Option<String>,
+    verification: Option<String>,
+    register: Option<String>,
+    /// RFC 7592 `{registration_endpoint}/{client_id}`, held as the prefix INCLUDING its trailing
+    /// slash. The one dynamic segment this service has.
+    manage: Option<String>,
+    #[cfg(feature = "par")]
+    par: Option<String>,
+    #[cfg(feature = "jwt")]
+    jwks: Option<String>,
+}
+
+/// Which endpoint a request path resolved to, plus anything captured out of the path.
+enum Route<'a> {
+    Metadata,
+    Authorize,
+    Token,
+    Device,
+    Introspect,
+    Revoke,
+    Verification,
+    Register,
+    /// RFC 7592: the `client_id` segment, still percent-encoded.
+    Manage(&'a str),
+    #[cfg(feature = "par")]
+    Par,
+    #[cfg(feature = "jwt")]
+    Jwks,
+}
+
+impl Routes {
+    /// Resolve a request path, or `None` for a 404.
+    ///
+    /// STATIC PATHS ARE TRIED FIRST, and that ordering is load bearing rather than incidental.
+    /// The one dynamic route (RFC 7592 management, `{register}/{client_id}`) is a prefix match, so
+    /// a host whose configuration puts some other endpoint underneath the registration endpoint
+    /// would otherwise see that endpoint shadowed by a client id that can never exist. The
+    /// duplicate-path check in [`ServiceBuilder::build`] compares literal strings and cannot see
+    /// that case, so the matcher settles it the same way a trie-based router would: a literal
+    /// segment beats a parameter.
+    fn resolve<'a>(&self, path: &'a str) -> Option<Route<'a>> {
+        // A linear walk over at most eleven short strings. A trie would be the right shape for a
+        // table of hundreds; here it would be more code, more allocation at build time, and
+        // slower, because the first comparison usually fails on its first byte.
+        if path == self.well_known {
+            return Some(Route::Metadata);
+        }
+        if path == self.authorize {
+            return Some(Route::Authorize);
+        }
+        if path == self.token {
+            return Some(Route::Token);
+        }
+        if path == self.device {
+            return Some(Route::Device);
+        }
+        if self.introspect.as_deref() == Some(path) {
+            return Some(Route::Introspect);
+        }
+        if self.revoke.as_deref() == Some(path) {
+            return Some(Route::Revoke);
+        }
+        if self.verification.as_deref() == Some(path) {
+            return Some(Route::Verification);
+        }
+        if self.register.as_deref() == Some(path) {
+            return Some(Route::Register);
+        }
+        #[cfg(feature = "par")]
+        if self.par.as_deref() == Some(path) {
+            return Some(Route::Par);
+        }
+        #[cfg(feature = "jwt")]
+        if self.jwks.as_deref() == Some(path) {
+            return Some(Route::Jwks);
+        }
+        // ONE segment, and a non-empty one. A `client_id` containing a slash would have been
+        // percent-encoded into the URL this server itself minted (RFC 7592 s3
+        // `registration_client_uri`), so a raw slash here is a different path, not a client id.
+        if let Some(prefix) = &self.manage {
+            if let Some(rest) = path.strip_prefix(prefix.as_str()) {
+                if !rest.is_empty() && !rest.contains('/') {
+                    return Some(Route::Manage(rest));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The methods a route answers, for the RFC 9110 s15.5.6 `Allow` header a 405 must carry.
+fn allowed(route: &Route<'_>) -> &'static str {
+    match route {
+        // HEAD is listed wherever GET is, because it is served: RFC 9110 s9.3.2 defines it as GET
+        // with the body dropped, and a client (or a health check) that probes with HEAD must not
+        // be told the endpoint does not accept it.
+        Route::Metadata | Route::Authorize => "GET, HEAD",
+        #[cfg(feature = "jwt")]
+        Route::Jwks => "GET, HEAD",
+        Route::Token | Route::Device | Route::Introspect | Route::Revoke | Route::Register => {
+            "POST"
+        }
+        #[cfg(feature = "par")]
+        Route::Par => "POST",
+        Route::Verification => "GET, HEAD, POST",
+        Route::Manage(_) => "GET, HEAD, PUT, DELETE",
+    }
+}
+
+/// An RFC-shaped authorization server as an HTTP service.
+///
+/// Built by [`ServiceBuilder`]. Cheap to clone (one refcount bump) and safe to share, so a host
+/// clones one per connection or per task without duplicating any of the state or re-serializing
+/// anything.
+///
+/// # Mounting it
+///
+/// With the `axum` feature, `axum::Router::from(service)` is the whole wiring. Without it, call
+/// [`handle`](AuthorizationService::handle) from whatever the host's own server hands it: it takes
+/// an [`http::Request`] over any [`http_body::Body`] and answers with an
+/// [`http::Response<Body>`](Response).
+pub struct AuthorizationService<S: Storage, C: Clock> {
+    inner: Arc<Inner<S, C>>,
+}
+
+// The route table and nothing else. Every field of `Inner` beyond it is either a host-supplied
+// closure (which has no useful representation) or bytes already published on the wire, so the
+// paths are the only part a host debugging a 404 wants to see. Hand written rather than derived
+// for the same reason `Clone` is, and because a derive would print the whole metadata document.
+impl<S: Storage, C: Clock> std::fmt::Debug for AuthorizationService<S, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationService")
+            .field("routes", &self.inner.routes)
+            .finish_non_exhaustive()
+    }
+}
+
+// Hand written rather than derived: `#[derive(Clone)]` would demand `S: Clone` and `C: Clone`,
+// which is a bound on the HOST's storage that nothing here needs, since the only field is an
+// `Arc`.
+impl<S: Storage, C: Clock> Clone for AuthorizationService<S, C> {
+    fn clone(&self) -> Self {
+        AuthorizationService {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S: Storage, C: Clock> AuthorizationService<S, C> {
+    /// Answer one request.
+    ///
+    /// Generic over the request body so that a host on any HTTP server can call it: `hyper`,
+    /// `axum`, a test harness holding a `String`. The body is read whole, up to
+    /// [`MAX_BODY_BYTES`], before it is parsed, which is what these endpoints require (client
+    /// authentication for `client_secret_post` is IN the body, so nothing can be checked before
+    /// it has all arrived).
+    pub async fn handle<B>(&self, request: Request<B>) -> Response
+    where
+        B: http_body::Body,
+    {
+        let state = &*self.inner;
+        let (parts, body) = request.into_parts();
+        let method = parts.method;
+        let headers = parts.headers;
+        let uri = parts.uri;
+
+        let route = match state.routes.resolve(uri.path()) {
+            Some(route) => route,
+            None => return respond(StatusCode::NOT_FOUND, Body::empty()),
+        };
+
+        // RFC 9110 s9.3.2: HEAD is GET with the body suppressed. Handled here, once, rather than
+        // in eleven handlers: the response is produced exactly as it would have been for GET
+        // (headers included, `Content-Length` above all) and only the bytes are dropped.
+        let head = method == Method::HEAD;
+        let method = match head {
+            true => Method::GET,
+            false => method,
+        };
+
+        let response = self.dispatch(route, &method, headers, &uri, body).await;
+        match head {
+            true => response.map(|_| Body::empty()),
+            false => response,
+        }
+    }
+
+    /// The method check and the body read, then the handler.
+    async fn dispatch<B>(
+        &self,
+        route: Route<'_>,
+        method: &Method,
+        headers: HeaderMap,
+        uri: &Uri,
+        body: B,
+    ) -> Response
+    where
+        B: http_body::Body,
+    {
+        let state = &*self.inner;
+        // Read the body only where a body is read. A GET whose sender attached one is not this
+        // service's problem, and buffering it would be a memory cost with no reader.
+        macro_rules! form_body {
+            () => {
+                match collect_body(body, MAX_BODY_BYTES).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return body_error(e),
+                }
+            };
+        }
+        match (route, method.as_str()) {
+            (Route::Metadata, "GET") => metadata_handler(state),
+            #[cfg(feature = "jwt")]
+            (Route::Jwks, "GET") => jwks_handler(state),
+            (Route::Authorize, "GET") => authorize_handler(state, &headers, uri).await,
+            (Route::Token, "POST") => token_handler(state, &headers, &form_body!()).await,
+            (Route::Device, "POST") => {
+                device_authorization_handler(state, &headers, &form_body!()).await
+            }
+            (Route::Introspect, "POST") => introspect_handler(state, &headers, &form_body!()).await,
+            (Route::Revoke, "POST") => revoke_handler(state, &headers, &form_body!()).await,
+            #[cfg(feature = "par")]
+            (Route::Par, "POST") => {
+                pushed_authorization_handler(state, &headers, &form_body!()).await
+            }
+            (Route::Verification, "GET") => verification_page_handler(state, &headers, uri).await,
+            (Route::Verification, "POST") => {
+                verification_submit_handler(state, &headers, &form_body!()).await
+            }
+            (Route::Register, "POST") => register_handler(state, &headers, &form_body!()).await,
+            // The captured segment is still percent-encoded, because that is what travelled in
+            // the `registration_client_uri` this server minted (RFC 7592 s3) and a client id may
+            // contain characters a path segment reserves.
+            (Route::Manage(client_id), "GET") => {
+                read_registration_handler(state, &headers, &decode_path_segment(client_id)).await
+            }
+            (Route::Manage(client_id), "PUT") => {
+                let id = decode_path_segment(client_id).into_owned();
+                update_registration_handler(state, &headers, &id, &form_body!()).await
+            }
+            (Route::Manage(client_id), "DELETE") => {
+                delete_registration_handler(state, &headers, &decode_path_segment(client_id)).await
+            }
+            // RFC 9110 s15.5.6: a 405 MUST carry `Allow`. Without it a client cannot tell a
+            // wrong method from a route that does not exist.
+            (route, _) => {
+                let mut resp = respond(StatusCode::METHOD_NOT_ALLOWED, Body::empty());
+                resp.headers_mut()
+                    .insert(header::ALLOW, HeaderValue::from_static(allowed(&route)));
+                resp
+            }
+        }
+    }
+}
+
+/// Why a request body could not be read.
+enum BodyError {
+    /// It exceeded [`MAX_BODY_BYTES`].
+    TooLarge,
+    /// The transport gave up: a truncated body, a broken connection, a bad chunk encoding.
+    Incomplete,
+}
+
+/// The answer to a body that could not be read.
+///
+/// Not an RFC 6749 s5.2 error body, and deliberately not: section 5.2 describes what the server
+/// says about a REQUEST it managed to parse, and neither of these got that far. A 413 and a 400
+/// are what an HTTP client (and every proxy between it and here) already understands.
+fn body_error(e: BodyError) -> Response {
+    match e {
+        BodyError::TooLarge => respond(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds this server's limit",
+        ),
+        BodyError::Incomplete => respond(StatusCode::BAD_REQUEST, "request body was not received"),
+    }
+}
+
+/// Read a request body whole, refusing at `limit` bytes.
+///
+/// The cap is checked TWICE and both checks are needed. The size hint catches a declared
+/// `Content-Length` before a single byte is buffered, which is what makes a hostile
+/// `Content-Length: 4000000000` cost nothing; the running total catches a chunked body that
+/// declares nothing and just keeps sending, which is the case the first check cannot see.
+async fn collect_body<B>(body: B, limit: usize) -> Result<Bytes, BodyError>
+where
+    B: http_body::Body,
+{
+    let hint = body.size_hint();
+    if hint.lower() > limit as u64 {
+        return Err(BodyError::TooLarge);
+    }
+    // Sized from the hint when there is one, so the common case (a form body with a
+    // `Content-Length`) allocates exactly once. Clamped to the limit so the hint cannot itself be
+    // the allocation primitive.
+    let expected = hint.upper().unwrap_or(hint.lower()).min(limit as u64) as usize;
+    let mut collected: Vec<u8> = Vec::with_capacity(expected);
+
+    // Pinned on the stack: `poll_frame` needs `Pin<&mut B>` and `B` is not required to be
+    // `Unpin`, so boxing would be the only alternative and it would allocate on every request.
+    let mut body = std::pin::pin!(body);
+    loop {
+        match std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+            None => break,
+            Some(Err(_)) => return Err(BodyError::Incomplete),
+            Some(Ok(frame)) => {
+                // Trailers carry no request content. `into_data` hands them back rather than
+                // panicking, and they are dropped.
+                if let Ok(mut data) = frame.into_data() {
+                    if collected.len().saturating_add(data.remaining()) > limit {
+                        return Err(BodyError::TooLarge);
+                    }
+                    while data.has_remaining() {
+                        let chunk = data.chunk();
+                        collected.extend_from_slice(chunk);
+                        let n = chunk.len();
+                        data.advance(n);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Bytes::from(collected))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The axum adapter, behind the `axum` cargo feature
+// ---------------------------------------------------------------------------------------------
+
+/// Mount the service on axum.
+///
+/// This is the ENTIRE axum surface of this crate, and it is one function on purpose. axum is a
+/// 0.x crate: its major has moved before and will move again, and every earlier version of this
+/// module put `axum::Router` in the return type of the only way to use the `http` feature, which
+/// meant a host on a different axum major could not enable the feature at all. Confining axum to
+/// an adapter behind its own feature makes that a per-host decision instead of this crate's.
+///
+/// A `fallback` rather than a route per endpoint: the route table is DERIVED from the metadata
+/// document at build time (see [`Routes`]), so re-declaring it here in axum's syntax would create
+/// a second table that could disagree with the first. A 404 from
+/// [`AuthorizationService::handle`] is a path this server does not serve, which is exactly what a
+/// fallback means.
+#[cfg(feature = "axum")]
+impl<S, C> From<AuthorizationService<S, C>> for axum::Router
+where
+    S: Storage + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+{
+    fn from(service: AuthorizationService<S, C>) -> axum::Router {
+        axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let service = service.clone();
+            async move {
+                // `Body` is already a complete `Bytes`, so this is a move, not a copy or a
+                // stream adapter.
+                service
+                    .handle(request)
+                    .await
+                    .map(|body| axum::body::Body::from(body.into_bytes()))
+            }
+        })
     }
 }
 
@@ -695,7 +1173,7 @@ fn no_store(headers: &mut HeaderMap) {
 
 /// A successful JSON response on the token plane.
 fn ok_json<T: Serialize>(value: &T) -> Response {
-    let mut resp = (StatusCode::OK, json_body(value)).into_response();
+    let mut resp = respond(StatusCode::OK, json_body(value));
     let headers = resp.headers_mut();
     headers.insert(header::CONTENT_TYPE, json_content_type());
     no_store(headers);
@@ -716,7 +1194,7 @@ fn error_response(err: &ErrorResponse, via_header: bool, challenge: &HeaderValue
     if status == StatusCode::UNAUTHORIZED && !via_header {
         status = StatusCode::BAD_REQUEST;
     }
-    let mut resp = (status, json_body(err)).into_response();
+    let mut resp = respond(status, json_body(err));
     let headers = resp.headers_mut();
     headers.insert(header::CONTENT_TYPE, json_content_type());
     no_store(headers);
@@ -727,7 +1205,7 @@ fn error_response(err: &ErrorResponse, via_header: bool, challenge: &HeaderValue
 }
 
 fn html_response(status: StatusCode, body: String) -> Response {
-    let mut resp = (status, body).into_response();
+    let mut resp = respond(status, body);
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, html_content_type());
     resp
@@ -752,7 +1230,26 @@ fn hex_value(b: u8) -> Option<u8> {
 /// and every opaque token this server issues (hex and base64url need no escaping). Only a value
 /// that actually contains `%` or `+` costs an allocation.
 fn decode_component(raw: &str) -> Cow<'_, str> {
-    if !raw.bytes().any(|b| b == b'%' || b == b'+') {
+    percent_decode(raw, true)
+}
+
+/// Decode ONE path segment: percent escapes only.
+///
+/// A `+` in a path segment is a literal plus (RFC 3986 s3.3 puts it in `sub-delims`); only
+/// `application/x-www-form-urlencoded` gives it the "space" meaning. Decoding it as a space here
+/// would rewrite the RFC 7592 s3 `registration_client_uri` this server itself minted, and a client
+/// whose id contains a plus would find its own management URL pointing at a different client.
+fn decode_path_segment(raw: &str) -> Cow<'_, str> {
+    percent_decode(raw, false)
+}
+
+/// The shared decoder. Borrows when there is nothing to unescape, which is what keeps the common
+/// case free.
+fn percent_decode(raw: &str, plus_is_space: bool) -> Cow<'_, str> {
+    if !raw
+        .bytes()
+        .any(|b| b == b'%' || (plus_is_space && b == b'+'))
+    {
         return Cow::Borrowed(raw);
     }
     let bytes = raw.as_bytes();
@@ -760,7 +1257,7 @@ fn decode_component(raw: &str) -> Cow<'_, str> {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -1087,8 +1584,8 @@ fn credentials_where(
 // ---------------------------------------------------------------------------------------------
 
 /// RFC 8414 s3.1. Served from the bytes produced when the router was built.
-async fn metadata_handler<S: Storage, C: Clock>(State(state): State<Arc<Inner<S, C>>>) -> Response {
-    let mut resp = (StatusCode::OK, state.metadata.clone()).into_response();
+fn metadata_handler<S: Storage, C: Clock>(state: &Inner<S, C>) -> Response {
+    let mut resp = respond(StatusCode::OK, state.metadata.clone());
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, json_content_type());
     resp
@@ -1101,27 +1598,27 @@ async fn metadata_handler<S: Storage, C: Clock>(State(state): State<Arc<Inner<S,
 /// carries no credential, and a key set that may not be cached would be re-fetched by every
 /// verifier on every token, which is how rotation-capable deployments fall over.
 #[cfg(feature = "jwt")]
-async fn jwks_handler<S: Storage, C: Clock>(State(state): State<Arc<Inner<S, C>>>) -> Response {
+fn jwks_handler<S: Storage, C: Clock>(state: &Inner<S, C>) -> Response {
     match &state.jwks {
         Some(bytes) => {
-            let mut resp = (StatusCode::OK, bytes.clone()).into_response();
+            let mut resp = respond(StatusCode::OK, bytes.clone());
             resp.headers_mut()
                 .insert(header::CONTENT_TYPE, jwks_content_type());
             resp
         }
         // Unreachable: `build` routes this path only when it has the bytes.
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => respond(StatusCode::NOT_FOUND, Body::empty()),
     }
 }
 
 /// RFC 6749 s3.2, plus RFC 8628 s3.4 for the device grant.
 async fn token_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
-    let via_header = basic_attempted(&headers);
-    let text = String::from_utf8_lossy(&body);
+    let via_header = basic_attempted(headers);
+    let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
     // grant_type is resolved BEFORE client authentication so that a request naming a grant this
@@ -1370,12 +1867,12 @@ async fn token_exchange_response<S: Storage, C: Clock>(
 
 /// RFC 8628 s3.1: the device authorization request.
 async fn device_authorization_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
-    let via_header = basic_attempted(&headers);
-    let text = String::from_utf8_lossy(&body);
+    let via_header = basic_attempted(headers);
+    let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
     let mut creds = match credentials(&headers, &form) {
@@ -1410,12 +1907,12 @@ async fn device_authorization_handler<S: Storage, C: Clock>(
 /// differs is the success status, which s2.2 states rather than suggests: 201, not 200.
 #[cfg(feature = "par")]
 async fn pushed_authorization_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
-    let via_header = basic_attempted(&headers);
-    let text = String::from_utf8_lossy(&body);
+    let via_header = basic_attempted(headers);
+    let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
     let mut creds = match pushed_request_credentials(&headers, &form) {
@@ -1443,7 +1940,7 @@ async fn pushed_authorization_handler<S: Storage, C: Clock>(
             // written here twice, so the wire status and the type's own answer cannot drift.
             let status =
                 StatusCode::from_u16(response.http_status()).unwrap_or(StatusCode::CREATED);
-            let mut resp = (status, json_body(&response)).into_response();
+            let mut resp = respond(status, json_body(&response));
             let h = resp.headers_mut();
             h.insert(header::CONTENT_TYPE, json_content_type());
             no_store(h);
@@ -1455,12 +1952,12 @@ async fn pushed_authorization_handler<S: Storage, C: Clock>(
 
 /// RFC 7662 s2.1: token introspection, for a caller that authenticates as a client.
 async fn introspect_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
-    let via_header = basic_attempted(&headers);
-    let text = String::from_utf8_lossy(&body);
+    let via_header = basic_attempted(headers);
+    let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
     let mut creds = match credentials(&headers, &form) {
@@ -1487,12 +1984,12 @@ async fn introspect_handler<S: Storage, C: Clock>(
 
 /// RFC 7009 s2.1: token revocation. Success is a 200 with an empty body (s2.2).
 async fn revoke_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
-    let via_header = basic_attempted(&headers);
-    let text = String::from_utf8_lossy(&body);
+    let via_header = basic_attempted(headers);
+    let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
     let mut creds = match credentials(&headers, &form) {
@@ -1519,7 +2016,7 @@ async fn revoke_handler<S: Storage, C: Clock>(
         .await
     {
         Ok(()) => {
-            let mut resp = StatusCode::OK.into_response();
+            let mut resp = respond(StatusCode::OK, Body::empty());
             no_store(resp.headers_mut());
             resp
         }
@@ -1561,10 +2058,8 @@ fn registration_error(failure: &crate::registration::RegistrationFailure) -> Res
     let status =
         StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut resp = match failure {
-        crate::registration::RegistrationFailure::Invalid(body) => {
-            (status, json_body(body)).into_response()
-        }
-        _ => status.into_response(),
+        crate::registration::RegistrationFailure::Invalid(body) => respond(status, json_body(body)),
+        _ => respond(status, Body::empty()),
     };
     let headers = resp.headers_mut();
     headers.insert(header::CONTENT_TYPE, json_content_type());
@@ -1602,24 +2097,24 @@ fn client_metadata(body: &Bytes) -> Result<crate::registration::ClientMetadata, 
 
 /// RFC 7591 s3.1: the client registration request. Success is a 201 (s3.2.1).
 async fn register_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
-    let metadata = match client_metadata(&body) {
+    let metadata = match client_metadata(body) {
         Ok(m) => m,
         Err(response) => return *response,
     };
     match state
         .server
-        .register_dynamic_client(&metadata, bearer_token(&headers))
+        .register_dynamic_client(&metadata, bearer_token(headers))
         .await
     {
         Ok(info) => {
             // s3.2.1: "201 Created", and the body carries a client secret and a registration
             // access token, so the s5.1 caching rules of RFC 6749 apply exactly as they do to a
             // token response.
-            let mut resp = (StatusCode::CREATED, json_body(&info)).into_response();
+            let mut resp = respond(StatusCode::CREATED, json_body(&info));
             let h = resp.headers_mut();
             h.insert(header::CONTENT_TYPE, json_content_type());
             no_store(h);
@@ -1631,11 +2126,11 @@ async fn register_handler<S: Storage, C: Clock>(
 
 /// RFC 7592 s2.1: read a registration.
 async fn read_registration_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    axum::extract::Path(client_id): axum::extract::Path<String>,
-    headers: HeaderMap,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    client_id: &str,
 ) -> Response {
-    let token = bearer_token(&headers).unwrap_or_default();
+    let token = bearer_token(headers).unwrap_or_default();
     match state
         .server
         .read_registration(&ClientId::new(client_id), token)
@@ -1648,16 +2143,16 @@ async fn read_registration_handler<S: Storage, C: Clock>(
 
 /// RFC 7592 s2.2: replace a registration's metadata.
 async fn update_registration_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    axum::extract::Path(client_id): axum::extract::Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    client_id: &str,
+    body: &Bytes,
 ) -> Response {
-    let metadata = match client_metadata(&body) {
+    let metadata = match client_metadata(body) {
         Ok(m) => m,
         Err(response) => return *response,
     };
-    let token = bearer_token(&headers).unwrap_or_default();
+    let token = bearer_token(headers).unwrap_or_default();
     match state
         .server
         .update_registration(&ClientId::new(client_id), token, &metadata)
@@ -1670,18 +2165,18 @@ async fn update_registration_handler<S: Storage, C: Clock>(
 
 /// RFC 7592 s2.3: delete a registration. Success is a 204 with no body.
 async fn delete_registration_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    axum::extract::Path(client_id): axum::extract::Path<String>,
-    headers: HeaderMap,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    client_id: &str,
 ) -> Response {
-    let token = bearer_token(&headers).unwrap_or_default();
+    let token = bearer_token(headers).unwrap_or_default();
     match state
         .server
         .delete_registration(&ClientId::new(client_id), token)
         .await
     {
         Ok(()) => {
-            let mut resp = StatusCode::NO_CONTENT.into_response();
+            let mut resp = respond(StatusCode::NO_CONTENT, Body::empty());
             no_store(resp.headers_mut());
             resp
         }
@@ -1779,9 +2274,9 @@ async fn resolve_authorization_request<S: Storage, C: Clock>(
 
 /// RFC 6749 s4.1.1: the authorization endpoint.
 async fn authorize_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    uri: Uri,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response {
     let pairs = parse_pairs(uri.query().unwrap_or_default());
 
@@ -1835,7 +2330,9 @@ async fn authorize_handler<S: Storage, C: Clock>(
             state: validated.state.as_deref(),
             uri: &uri,
             #[cfg(feature = "consent")]
-            remembered: remembered.as_ref(),
+            // Deref through the shared `Arc<ConsentRecord>` the storage seam now returns: the
+            // resolver borrows for the length of the call and never needs the handle.
+            remembered: remembered.as_deref(),
         }),
         None => {
             return unwired(
@@ -1915,7 +2412,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
 /// or a decision. Never a redirect, for the reason above.
 fn unwired(why: &'static str) -> Response {
     let err = ErrorResponse::new(ErrorCode::AccessDenied).with_description(why);
-    let mut resp = (StatusCode::FORBIDDEN, json_body(&err)).into_response();
+    let mut resp = respond(StatusCode::FORBIDDEN, json_body(&err));
     let headers = resp.headers_mut();
     headers.insert(header::CONTENT_TYPE, json_content_type());
     no_store(headers);
@@ -1930,7 +2427,11 @@ fn unwired(why: &'static str) -> Response {
 /// unreachable rather than load-bearing.
 fn redirect(location: String) -> Response {
     match HeaderValue::from_str(&location) {
-        Ok(value) => (StatusCode::FOUND, [(header::LOCATION, value)]).into_response(),
+        Ok(value) => {
+            let mut resp = respond(StatusCode::FOUND, Body::empty());
+            resp.headers_mut().insert(header::LOCATION, value);
+            resp
+        }
         Err(_) => error_response(
             &ErrorResponse::new(ErrorCode::ServerError),
             false,
@@ -2043,7 +2544,10 @@ async fn pending_grant<S: Storage, C: Clock>(
         .await
         .ok()
         .flatten()
-        .and_then(|c| c.name);
+        // Cloned out of the shared `Arc<Client>` (see `Storage::get_client`): this renders a human
+        // facing verification page, so one string copy per page view is not a cost worth shaping
+        // the storage seam around.
+        .and_then(|c| c.name.clone());
     Some((grant, name))
 }
 
@@ -2099,9 +2603,9 @@ async fn render_verification<S: Storage, C: Clock>(
 
 /// RFC 8628 s3.3: the page a user visits to enter the code shown on the device.
 async fn verification_page_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    uri: Uri,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response {
     // `verification_uri_complete` (RFC 8628 s3.3.1) carries the code in the query so the user
     // does not retype it; prefilling is the entire point of that member. Prefilling is ALL it
@@ -2115,13 +2619,13 @@ async fn verification_page_handler<S: Storage, C: Clock>(
 
 /// The verification form's submission: the user has entered the code shown on their device.
 async fn verification_submit_handler<S: Storage, C: Clock>(
-    State(state): State<Arc<Inner<S, C>>>,
-    headers: HeaderMap,
-    body: Bytes,
+    state: &Inner<S, C>,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Response {
     // Checked before the body is even parsed, and before the unprotected escape hatch is
     // consulted, because it is the one guard that costs a conforming browser nothing.
-    if !is_form_urlencoded(&headers) {
+    if !is_form_urlencoded(headers) {
         return html_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             verification_message("Expected an application/x-www-form-urlencoded submission."),

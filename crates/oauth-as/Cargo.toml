@@ -19,7 +19,7 @@ categories = ["authentication", "web-programming"]
 # conformance-serve.sh is launched by scripts/oauth-conformance.sh from a git checkout and
 # resolves the workspace root as ../.., which does not exist in an unpacked tarball. It is broken
 # by construction for a consumer, so shipping it would only mislead. The EXAMPLE it runs is kept,
-# because it is the only worked demonstration of wiring the optional http router.
+# because it is the only worked demonstration of wiring the optional http service.
 exclude = ["conformance-serve.sh"]
 
 # FEATURES. The default set is EMPTY and stays that way. A consumer who wants only the library
@@ -27,10 +27,25 @@ exclude = ["conformance-serve.sh"]
 # the listener, so an optional feature is the only place a web framework may appear.
 [features]
 default = []
-# `http` adds an axum router over AuthorizationServer, for hosts that want the RFC-shaped wire
+# `http` adds an HTTP service over AuthorizationServer, for hosts that want the RFC-shaped wire
 # surface rather than writing it themselves, and for the black-box conformance harness (which
 # needs an external process to talk to). Nothing in the library depends on it.
-http = ["dep:axum", "dep:tokio"]
+#
+# NO WEB FRAMEWORK, and that is the point. It is `http` 1.x and `http-body` 1.x, both 1.0 and
+# both the vocabulary every Rust HTTP server already speaks, so the public signature is
+# `async fn handle(http::Request<B>) -> http::Response<Body>` and a host mounts it under whatever
+# it already runs. No async runtime is pulled in either: the service never touches a socket.
+#
+# WHY IT IS NOT axum ANY MORE. Through 0.9 this feature returned an `axum::Router`, which put a
+# 0.x major in the ONLY entry point the feature had: a host on a different axum major could not
+# turn the feature on at all, and an axum major bump would have been a breaking change to this
+# crate for reasons unconnected to OAuth. See the `axum` feature below.
+http = ["dep:http", "dep:http-body", "dep:bytes"]
+# The axum ADAPTER: `impl From<AuthorizationService<..>> for axum::Router`, plus the tokio a host
+# needs to bind a listener with `axum::serve`. About thirty lines, and the whole of this crate's
+# exposure to a pre-1.0 framework. A host on axum 0.7, or on 0.9 when it lands, leaves this off
+# and mounts `http` directly; nothing else in the crate changes.
+axum = ["http", "dep:axum", "dep:tokio"]
 # RFC 9068 `at+jwt` access tokens signed with ES256, plus the RFC 7517 JWKS document that lets a
 # resource server verify them without calling this server. Opaque tokens remain the DEFAULT: JWT
 # is an optional profile, not an OAuth 2.1 requirement, and it earns its keep only when resource
@@ -122,12 +137,21 @@ getrandom = "0.3"
 sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
 base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
 
-# OPTIONAL, feature `http` only. `default-features = false` keeps the pulled-in tree to what the
-# router actually uses: no JSON extractor (bodies are serialized here so the RFC-mandated headers
-# are set on the same response), no tracing, no multipart.
+# OPTIONAL, feature `http` only. The HTTP vocabulary, and nothing above it.
+#
+# All three are 1.0 with a major that has never moved, which is the property the `http` feature
+# now rests on: they may appear in this crate's public signatures without making a framework
+# upgrade in a host's tree a breaking change here. `http-body` 1.x is what makes `handle` generic
+# over the request body, so hyper, axum and a test harness holding a String all fit.
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+
+# OPTIONAL, feature `axum` only: the adapter, and the runtime a host needs to bind a listener.
+# `default-features = false` keeps the pulled-in tree to what the adapter actually uses: no JSON
+# extractor (bodies are serialized in src/http.rs so the RFC-mandated headers are set on the same
+# response), no tracing, no multipart. Nothing in the `http` feature depends on either of these.
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
-# Needed only because `axum::serve` (and therefore any host or example that binds a listener)
-# needs a runtime. The router itself is runtime-agnostic.
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 
 # OPTIONAL, feature `jwt` only. ES256 signing for RFC 9068 access tokens.
@@ -179,17 +203,31 @@ url = "2"
 # the deterministic fixtures the black-box harness's launch contract asks for; the LIBRARY must
 # never ship conformance fixtures, so they live here and nowhere else.
 #
-# `jwt` is required as well as `http` because the harness verifies the issued access token as an
+# `jwt` is required as well as `axum` because the harness verifies the issued access token as an
 # RFC 9068 `at+jwt` against the advertised jwks_uri. Requiring it, rather than degrading to opaque
 # tokens when the feature is off, keeps the failure at build time and legible: a conformance
 # fixture that quietly stops exercising signing is worse than one that refuses to build.
 [[example]]
 name = "conformance_server"
-required-features = ["http", "jwt"]
+required-features = ["axum", "jwt"]
+
+# The WORKED PRODUCTION WIRING: what a real host must do at every seam this crate deliberately
+# leaves open (storage atomicity, rate limiting, consent, CSRF, session-backed subject
+# resolution, the expiry sweep, audit, and signing key management). It is documentation that
+# compiles, and it is compiled in CI so it cannot rot into advice that no longer builds.
+#
+# `axum` (which implies `http`) but NOT `jwt`: the example binds a listener, and `axum::serve` is
+# how it does that. Opaque access tokens are this crate's default and the right choice for most
+# deployments, so requiring `jwt` to read the production example would imply the opposite. The
+# signing section inside it is behind `#[cfg(feature = "jwt")]`, so an all-features build
+# exercises it and a plain `--features axum` build still gets the example.
+[[example]]
+name = "production_server"
+required-features = ["axum"]
 
 # The RFC 9728 fixture resource (see the example's own module docs for why an AUTHORIZATION SERVER
-# crate ships a resource-server example, and for what it deliberately is not). `http` for the
+# crate ships a resource-server example, and for what it deliberately is not). `axum` for the
 # listener, `resource-metadata` for the type it serves.
 [[example]]
 name = "protected_resource_fixture"
-required-features = ["http", "resource-metadata"]
+required-features = ["axum", "resource-metadata"]

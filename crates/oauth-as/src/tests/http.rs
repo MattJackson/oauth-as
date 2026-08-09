@@ -207,7 +207,7 @@ fn routes_are_derived_from_the_advertised_urls() {
         "https://other.example/token",
     )
     .unwrap_err();
-    assert!(matches!(err, RouterError::EndpointOutsideIssuer { .. }));
+    assert!(matches!(err, ServiceError::EndpointOutsideIssuer { .. }));
     // A prefix match that is not a PATH boundary is not a match either.
     assert!(endpoint_path(
         "https://as.example",
@@ -355,8 +355,8 @@ fn a_router_refuses_to_publish_a_path_it_would_shadow() {
         config,
         crate::store::MemoryStorage::new(),
     ));
-    let err = RouterBuilder::new(server).build().unwrap_err();
-    assert!(matches!(err, RouterError::DuplicatePath { .. }), "{err}");
+    let err = ServiceBuilder::new(server).build().unwrap_err();
+    assert!(matches!(err, ServiceError::DuplicatePath { .. }), "{err}");
 }
 
 /// RFC 8414 s2 with RFC 9068 s4: a server that signs must publish keys somewhere a resource
@@ -378,9 +378,9 @@ fn a_jwks_uri_off_the_issuer_refuses_to_build() {
         config,
         crate::store::MemoryStorage::new(),
     ));
-    let err = RouterBuilder::new(server).build().unwrap_err();
+    let err = ServiceBuilder::new(server).build().unwrap_err();
     assert!(
-        matches!(err, RouterError::EndpointOutsideIssuer { endpoint, .. } if endpoint == "jwks_uri"),
+        matches!(err, ServiceError::EndpointOutsideIssuer { endpoint, .. } if endpoint == "jwks_uri"),
         "{err}"
     );
 }
@@ -403,8 +403,8 @@ fn a_jwks_uri_colliding_with_another_endpoint_refuses_to_build() {
         config,
         crate::store::MemoryStorage::new(),
     ));
-    let err = RouterBuilder::new(server).build().unwrap_err();
-    assert!(matches!(err, RouterError::DuplicatePath { .. }), "{err}");
+    let err = ServiceBuilder::new(server).build().unwrap_err();
+    assert!(matches!(err, ServiceError::DuplicatePath { .. }), "{err}");
 }
 
 #[test]
@@ -416,7 +416,7 @@ fn a_verification_uri_off_the_issuer_is_not_an_error() {
         config,
         crate::store::MemoryStorage::new(),
     ));
-    assert!(RouterBuilder::new(server).build().is_ok());
+    assert!(ServiceBuilder::new(server).build().is_ok());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -509,11 +509,11 @@ fn a_supplied_scope_is_parsed_and_a_malformed_one_is_invalid_scope() {
     assert_eq!(err.error, ErrorCode::InvalidScope);
 }
 
-/// Every [`RouterError`] is a host configuration mistake, and the message is the only thing that
+/// Every [`ServiceError`] is a host configuration mistake, and the message is the only thing that
 /// tells the host WHICH one. An empty message turns a five-second fix into a hunt.
 #[test]
 fn router_errors_name_the_endpoint_or_the_path_at_fault() {
-    let text = RouterError::EndpointOutsideIssuer {
+    let text = ServiceError::EndpointOutsideIssuer {
         endpoint: "token_endpoint",
         url: "https://other.example/token".to_string(),
     }
@@ -521,13 +521,13 @@ fn router_errors_name_the_endpoint_or_the_path_at_fault() {
     assert!(text.contains("token_endpoint"), "{text}");
     assert!(text.contains("https://other.example/token"), "{text}");
 
-    let text = RouterError::DuplicatePath {
+    let text = ServiceError::DuplicatePath {
         path: "/same".to_string(),
     }
     .to_string();
     assert!(text.contains("/same"), "{text}");
 
-    let text = RouterError::MetadataNotSerializable {
+    let text = ServiceError::MetadataNotSerializable {
         detail: "serializer said no".to_string(),
     }
     .to_string();
@@ -535,7 +535,7 @@ fn router_errors_name_the_endpoint_or_the_path_at_fault() {
 
     #[cfg(feature = "jwt")]
     {
-        let text = RouterError::JwksNotSerializable {
+        let text = ServiceError::JwksNotSerializable {
             detail: "serializer said no".to_string(),
         }
         .to_string();

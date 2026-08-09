@@ -15,7 +15,7 @@
 //! not catch that because it left the CONSENT seam unwired too, so the refusal came from the
 //! consent check one step later.
 
-#![cfg(feature = "http")]
+#![cfg(feature = "axum")]
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::device::{DeviceGrant, DeviceGrantState};
 use oauth_as::events::{Attempt, RateLimitDecision, RateLimiter};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, RouterBuilder};
+use oauth_as::http::{ConsentDecision, ServiceBuilder};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig, SystemClock};
 use oauth_as::store::{MemoryStorage, Storage, StorageError};
@@ -135,7 +135,7 @@ impl Storage for LookupFails {
     fn get_client(
         &self,
         client_id: &ClientId,
-    ) -> impl Future<Output = Result<Option<Client>, StorageError>> + Send {
+    ) -> impl Future<Output = Result<Option<std::sync::Arc<Client>>, StorageError>> + Send {
         self.0.get_client(client_id)
     }
     fn put_client(&self, client: Client) -> impl Future<Output = Result<(), StorageError>> + Send {
@@ -357,7 +357,7 @@ async fn serve<S: Storage + 'static>(
         .await
         .expect("register");
 
-    let mut builder = RouterBuilder::new(Arc::clone(&server));
+    let mut builder = ServiceBuilder::new(Arc::clone(&server));
     if wiring.subject {
         builder = builder.with_subject_resolver(|_headers| Some(SUBJECT.to_string()));
     }
@@ -380,14 +380,14 @@ async fn serve<S: Storage + 'static>(
             move |headers| consume.lock().unwrap().remove(&session_id(headers)?),
         );
     }
-    let router = builder.build().expect("router");
+    let router = axum::Router::from(builder.build().expect("service"));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
     (addr, server)
 }
 
-fn session_id(headers: &axum::http::HeaderMap) -> Option<String> {
+fn session_id(headers: &http::HeaderMap) -> Option<String> {
     headers
         .get("cookie")?
         .to_str()

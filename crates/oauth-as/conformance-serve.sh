@@ -31,11 +31,15 @@ export OAUTH_AS_ADDR="${OAUTH_AS_ADDR:-127.0.0.1:8914}"
 # Build first, then exec the built binary. `cargo run` would leave cargo itself as the process the
 # harness kills, and cargo does not always pass the signal on to the child.
 #
-# `jwt` as well as `http`: the harness verifies the access token as an RFC 9068 `at+jwt` against
-# the advertised jwks_uri, and both the signing and the key set live behind that feature. Neither
+# `axum` rather than `http`: `http` is the framework-free service (it never binds a socket), and
+# this shim must produce a PROCESS the harness can talk to, so it needs the crate's axum adapter
+# and the tokio that comes with it. `axum` implies `http`.
+#
+# `jwt` as well: the harness verifies the access token as an RFC 9068 `at+jwt` against the
+# advertised jwks_uri, and both the signing and the key set live behind that feature. Neither
 # feature is on by default, so a consumer who enables neither still gets opaque tokens and a
 # metadata document with no jwks_uri.
 cargo build --locked --manifest-path "$CRATE_DIR/Cargo.toml" \
-  --features http,jwt --example conformance_server >&2
+  --features axum,jwt --example conformance_server >&2
 
 exec "$ROOT/target/debug/examples/conformance_server"

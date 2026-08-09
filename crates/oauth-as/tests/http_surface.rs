@@ -13,15 +13,14 @@
 //! happy-path suite while being unusable, so most of what follows drives the error paths and
 //! pins the code, the status, and the headers each one is required to carry.
 
-#![cfg(feature = "http")]
+#![cfg(feature = "axum")]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::response::IntoResponse as _;
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, RouterBuilder};
+use oauth_as::http::{ConsentDecision, ServiceBuilder};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
 use oauth_as::store::MemoryStorage;
@@ -124,11 +123,11 @@ async fn request(
 /// test that does not name a seam is testing the unwired behaviour on purpose.
 #[derive(Default, Clone, Copy)]
 struct Wiring {
-    /// [`RouterBuilder::with_subject_resolver`]: a logged-in user.
+    /// [`ServiceBuilder::with_subject_resolver`]: a logged-in user.
     subject: bool,
-    /// [`RouterBuilder::with_consent_resolver`]: the RFC 6749 s10.12 consent step.
+    /// [`ServiceBuilder::with_consent_resolver`]: the RFC 6749 s10.12 consent step.
     consent: Consent,
-    /// [`RouterBuilder::with_csrf_tokens`]: session-bound CSRF tokens for the device form.
+    /// [`ServiceBuilder::with_csrf_tokens`]: session-bound CSRF tokens for the device form.
     csrf: bool,
 }
 
@@ -167,7 +166,7 @@ impl Wiring {
 type CsrfSessions = Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
 
 /// The session id this request carries, from a `Cookie: sid=...`. `None` means not signed in.
-fn session_id(headers: &axum::http::HeaderMap) -> Option<String> {
+fn session_id(headers: &http::HeaderMap) -> Option<String> {
     headers
         .get("cookie")?
         .to_str()
@@ -240,7 +239,7 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
 
     let sessions: CsrfSessions = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    let mut builder = RouterBuilder::new(server);
+    let mut builder = ServiceBuilder::new(server);
     if wiring.subject {
         // A host reads its own session; this one calls every request the same user, which is
         // what makes the CSRF tests meaningful (the attacker's forced request resolves to the
@@ -256,7 +255,12 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
             body.push_str(req.client_id.as_str());
             body.push_str(" scope ");
             body.push_str(&req.scope.to_string());
-            ConsentDecision::Respond(Box::new((axum::http::StatusCode::OK, body).into_response()))
+            // A plain `http::Response`, which is the whole point of the seam: a host builds the
+            // consent screen with the HTTP vocabulary it already has, not with this crate's
+            // framework of the week.
+            let mut screen = http::Response::new(oauth_as::http::Body::from(body));
+            *screen.status_mut() = http::StatusCode::OK;
+            ConsentDecision::Respond(Box::new(screen))
         }),
     };
     if wiring.csrf {
@@ -273,7 +277,7 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
             move |headers| consume.lock().unwrap().remove(&session_id(headers)?),
         );
     }
-    let router = builder.build().expect("router");
+    let router = axum::Router::from(builder.build().expect("service"));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -1118,7 +1122,7 @@ async fn c12_well_known_document_lives_under_the_issuer_path() {
     let issuer = format!("http://{addr}/tenant1");
     let config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
-    let router = RouterBuilder::new(server).build().expect("router");
+    let router = axum::Router::from(ServiceBuilder::new(server).build().expect("service"));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -1322,7 +1326,7 @@ async fn start_signing() -> (SocketAddr, String) {
         })
         .await
         .expect("register confidential");
-    let router = RouterBuilder::new(server).build().expect("router");
+    let router = axum::Router::from(ServiceBuilder::new(server).build().expect("service"));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

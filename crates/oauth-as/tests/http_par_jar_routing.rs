@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, RouterBuilder};
+use oauth_as::http::{ConsentDecision, ServiceBuilder};
 use oauth_as::par::ParConfig;
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
@@ -141,11 +141,12 @@ async fn start(require_par: bool) -> SocketAddr {
         .await
         .expect("register confidential");
 
-    let router = RouterBuilder::new(server)
+    let service = ServiceBuilder::new(server)
         .with_subject_resolver(|_headers| Some("test-user".to_string()))
         .with_consent_resolver(|_req| ConsentDecision::Approve)
         .build()
-        .expect("router");
+        .expect("service");
+    let router = axum::Router::from(service);
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -375,7 +376,7 @@ async fn no_par_endpoint_is_routed_when_the_host_did_not_enable_par() {
     // No `config.par`, which is the default.
     let config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
-    let router = RouterBuilder::new(server).build().expect("router");
+    let router = axum::Router::from(ServiceBuilder::new(server).build().expect("service"));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -494,11 +495,12 @@ async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
         .await
         .expect("register confidential");
 
-    let router = RouterBuilder::new(server)
+    let service = ServiceBuilder::new(server)
         .with_subject_resolver(|_headers| Some("test-user".to_string()))
         .with_consent_resolver(|_req| ConsentDecision::Approve)
         .build()
-        .expect("router");
+        .expect("service");
+    let router = axum::Router::from(service);
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

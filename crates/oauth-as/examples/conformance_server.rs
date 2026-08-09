@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
-//! A runnable authorization server over the optional `http` feature, and the target of the
-//! independent black-box conformance harness.
+//! A runnable authorization server over the optional `http` feature, mounted on axum through the
+//! optional `axum` adapter, and the target of the independent black-box conformance harness.
 //!
 //! # Why the fixtures live here and not in the library
 //!
@@ -10,8 +10,15 @@
 //! can drive without a browser. None of that belongs in a published library. A crate that ships a
 //! client called `conformance-public` with a hard-coded secret has shipped a backdoor and an
 //! excuse; so the fixtures live in this example, which is never published as a binary and is
-//! compiled only when the `http` and `jwt` features are both on (the harness verifies the access
+//! compiled only when the `axum` and `jwt` features are both on (the harness verifies the access
 //! token as an RFC 9068 JWT, so the fixture must sign).
+//!
+//! # Why axum appears here and not in the library
+//!
+//! The library's `http` feature is an `http`/`http-body` 1.x service that never touches a socket.
+//! Something has to bind one, and for a conformance fixture that something is the crate's own
+//! `axum` adapter: one `axum::Router::from(service)` and `axum::serve`. A host on a different
+//! axum major replaces these three lines and nothing else.
 //!
 //! # Environment
 //!
@@ -32,7 +39,7 @@
 //! have: the RFC 6749 s10.12 consent step, and the CSRF protection on the RFC 8628 verification
 //! form. They are off because the harness is not a browser, and they are spelled out by name at
 //! the wiring site below so that copying them is a deliberate act rather than an accident. Do not
-//! copy them. See `RouterBuilder::with_consent_resolver` and `RouterBuilder::with_csrf_tokens`
+//! copy them. See `ServiceBuilder::with_consent_resolver` and `ServiceBuilder::with_csrf_tokens`
 //! for what a production host wires instead.
 //!
 //! It also signs with a key whose private half is printed in an RFC and therefore known to
@@ -43,7 +50,7 @@ use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, RouterBuilder};
+use oauth_as::http::{ConsentDecision, ServiceBuilder};
 use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
@@ -133,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed_fixtures(&server).await?;
     }
 
-    let mut builder = RouterBuilder::new(Arc::clone(&server));
+    let mut builder = ServiceBuilder::new(Arc::clone(&server));
     if seed {
         // ############################################################################
         // # CONFORMANCE FIXTURE ONLY. NEVER COPY ANY OF THIS INTO A PRODUCTION HOST.  #
@@ -162,7 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_consent_resolver(|_request| ConsentDecision::Approve)
             .dangerously_disable_verification_protections();
     }
-    let router = builder.build()?;
+    // The library hands back a framework-free service; the adapter is what puts it on axum.
+    let router = axum::Router::from(builder.build()?);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     // The harness waits for the RFC 8414 document to answer before it starts, so announcing the

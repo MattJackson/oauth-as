@@ -119,7 +119,9 @@ pub mod dpop;
 pub mod error;
 pub mod events;
 pub mod grant;
-/// An OPTIONAL axum router over the server, behind the `http` cargo feature (off by default).
+/// An OPTIONAL HTTP service over the server, behind the `http` cargo feature (off by default).
+/// It speaks `http` 1.x and `http-body` 1.x and no web framework; the `axum` feature adds a thin
+/// adapter for hosts that want one.
 #[cfg(feature = "http")]
 pub mod http;
 /// RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, behind the `jwt` cargo feature
@@ -200,8 +202,8 @@ pub use events::{
 pub use grant::GrantType;
 #[cfg(feature = "http")]
 pub use http::{
-    ConsentDecision, ConsentRequest, ConsentResolver, CsrfTokenHook, RouterBuilder, RouterError,
-    SubjectResolver,
+    AuthorizationService, Body, ConsentDecision, ConsentRequest, ConsentResolver, CsrfTokenHook,
+    ServiceBuilder, ServiceError, SubjectResolver,
 };
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
 #[cfg(feature = "mtls")]

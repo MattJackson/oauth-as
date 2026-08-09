@@ -513,12 +513,12 @@ fn a_host_that_never_registers_anything_pays_one_pointer() {
 /// The `http` feature's routes for RFC 7591 and RFC 7592, driven over a real socket for the same
 /// reason `tests/http_surface.rs` gives: the things being pinned here are the STATUS LINE (201 for
 /// section 3.2.1, 204 for RFC 7592 section 2.3) and the headers, which a convenience client hides.
-#[cfg(feature = "http")]
+#[cfg(feature = "axum")]
 mod wire {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use oauth_as::http::RouterBuilder;
+    use oauth_as::http::ServiceBuilder;
     use oauth_as::{
         AuthorizationServer, MemoryStorage, RegistrationConfig, ScopeSet, ServerConfig,
     };
@@ -603,7 +603,8 @@ mod wire {
         if policy {
             srv = srv.with_registration_policy(Box::new(super::OpenPolicy));
         }
-        let router = RouterBuilder::new(Arc::new(srv)).build().expect("router");
+        let router =
+            axum::Router::from(ServiceBuilder::new(Arc::new(srv)).build().expect("service"));
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
