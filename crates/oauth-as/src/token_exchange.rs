@@ -51,6 +51,42 @@
 //! registered for `read` could hold someone else's `write` token for a minute and mint itself a
 //! `write` token of its own, which is the registration boundary defeated by a bearer string.
 //!
+//! # A SENDER-CONSTRAINED subject token is REFUSED, and this is the argued part
+//!
+//! RFC 9449 (DPoP) and RFC 8705 (mutual TLS) exist to buy ONE property: a token that leaks is worth
+//! nothing to whoever finds it, because spending it needs a private key or a client certificate
+//! that never left the legitimate client. An exchange takes a token STRING and returns a different
+//! token. If it ignores the subject token's binding, then anyone able to authenticate as any client
+//! registered for this grant, an insider, a compromised service, a leaked client secret, posts a
+//! stolen bound token and receives a plain bearer token with the same subject, scope and audience.
+//! The binding is gone and the theft is spendable. That is the exact property the deployment paid
+//! for, defeated by one request.
+//!
+//! RFC 8693 does not settle this, so the choice is stated rather than assumed. Three candidates:
+//!
+//! - DOWNGRADE SILENTLY, which is what this crate did through 0.9.0 and is the one answer that is
+//!   definitely wrong: the operator who turned DPoP on has no way to learn that a grant they also
+//!   turned on removes it again.
+//! - PROPAGATE the binding, so the issued token inherits the subject token's `cnf`. Attractive and
+//!   still wrong here: the new token is issued TO THE EXCHANGING CLIENT, which does not hold the
+//!   original client's key. The result is a token no conforming resource server would let its
+//!   holder use (RFC 9449 section 7.1 requires a proof under the bound key on every request), which
+//!   is a broken grant dressed as a secure one. Worse, it reads at a glance as though possession
+//!   was proven, when nobody proved anything: the exchanging client presented a bearer string.
+//! - REFUSE, which is what this crate does. A sender-constrained subject token is "unacceptable
+//!   based on policy" in the sense of RFC 8693 section 2.2.2, and the section names `invalid_request`
+//!   for exactly that. The refusal is loud, it happens at the AS rather than at some resource server
+//!   later, and it cannot be mistaken for success.
+//!
+//! What would make an exchange of a bound token safe is the exchanging client PROVING possession of
+//! the key the subject token is bound to, which is the RFC 9449 section 7 check a resource server
+//! performs. That is a real design and it is deliberately not faked here: [`TokenExchangeRequest`]
+//! carries no proof and no certificate, so there is nothing to check, and a seam that accepted one
+//! would also have to bind the ISSUED token to the same key, at which point the exchange is a
+//! delegation between two holders of one key rather than between two clients. If a deployment needs
+//! that, it is an additive change to this request type and to the refusal below; it is not
+//! something to approximate by waving the check through.
+//!
 //! # What this grant does NOT do, stated rather than left to be discovered
 //!
 //! - No refresh token is issued. RFC 8693 section 2.2.1 says one "will typically not be issued
@@ -444,6 +480,20 @@ fn storage_error(e: StorageError) -> ErrorResponse {
     ErrorResponse::new(ErrorCode::ServerError)
 }
 
+/// The refusal for a sender-constrained subject token. One function for both mechanisms, so DPoP
+/// and mutual TLS cannot drift into two different answers for one rule.
+///
+/// Feature gated because both of its callers are, and a function with no caller is a warning the
+/// gate treats as an error.
+#[cfg(any(feature = "dpop", feature = "mtls"))]
+fn sender_constrained_refusal(mechanism: &str) -> ErrorResponse {
+    ErrorResponse::new(ErrorCode::InvalidRequest).with_description(format!(
+        "subject_token is sender constrained by {mechanism} and cannot be exchanged for a token \
+         that is not, because the issued token would belong to a client that cannot prove \
+         possession of the binding key"
+    ))
+}
+
 /// The exchange itself. Split out of the trait method so the audit emission above wraps every exit
 /// from it, exactly as `AuthorizationServer::emit_refusal` wraps the other four grants.
 async fn exchange<S: Storage, C: Clock>(
@@ -507,6 +557,26 @@ async fn exchange<S: Storage, C: Clock>(
             ErrorResponse::new(ErrorCode::InvalidRequest)
                 .with_description("subject_token is not a live access token")
         })?;
+
+    // 3b. The subject token's SENDER CONSTRAINING (RFC 9449 section 6, RFC 8705 section 3). A bound
+    //     token may not be exchanged, because the token this server would issue is a BEARER token
+    //     for a different client, and issuing it converts a token that survives theft into one that
+    //     does not. The exchanging client proved possession of its own secret and of nothing else:
+    //     it presented the subject token as a string, which is precisely what a thief also has. See
+    //     the module docs for why this is a refusal rather than a propagated `cnf`.
+    //
+    //     RFC 8693 section 2.2.2 gives `invalid_request` for a subject token that is unacceptable
+    //     based on policy, which is what this is. The description names the mechanism because a
+    //     legitimate client hitting this needs to know WHY, and it is not a secret: the client just
+    //     presented the token that carries the binding.
+    #[cfg(feature = "dpop")]
+    if subject.jkt.is_some() {
+        return Err(sender_constrained_refusal("DPoP (RFC 9449)"));
+    }
+    #[cfg(feature = "mtls")]
+    if subject.x5t_s256.is_some() {
+        return Err(sender_constrained_refusal("mutual TLS (RFC 8705)"));
+    }
 
     // 4. The actor token (section 2.1), which is what makes this delegation rather than
     //    impersonation (section 1.1).
