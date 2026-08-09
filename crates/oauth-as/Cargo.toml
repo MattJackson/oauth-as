@@ -20,7 +20,20 @@ categories = ["authentication", "web-programming"]
 # resolves the workspace root as ../.., which does not exist in an unpacked tarball. It is broken
 # by construction for a consumer, so shipping it would only mislead. The EXAMPLE it runs is kept,
 # because it is the only worked demonstration of wiring the optional http service.
-exclude = ["conformance-serve.sh"]
+#
+# `benches` is excluded so that adding a benchmark suite left `cargo package --list` BYTE FOR BYTE
+# unchanged, which is the property the release review in GOAL.md Gate 9 rests on: a reviewer who
+# read that list once should not have to re-read it because somebody added a timing harness. The
+# suite is also the one part of this repository a consumer genuinely cannot use, since the numbers
+# only mean anything measured against the machine and the profile stated beside them in
+# benches/README.md, and a tarball is not the place a reader finds either.
+#
+# CONSEQUENCE, so it is not a surprise at release time: `cargo package` prints one
+# "ignoring benchmark `x` as `benches/x.rs` is not included in the published package" warning per
+# bench target. That is cargo doing exactly what is being asked of it. Deleting the word "benches"
+# from this line is all it takes to ship them instead, at the cost of six lines in the package
+# list and about 65 KB in the tarball.
+exclude = ["conformance-serve.sh", "benches"]
 
 # DOCS.RS BUILDS THE WHOLE CRATE, and it has to be told to, because `default = []` here means a
 # docs.rs build with no configuration would render the core library and NOTHING ELSE: no HTTP
@@ -98,10 +111,19 @@ client_assertion = ["jwt"]
 # usable by whoever stole it; this changes what a leak costs. IMPLIES `jwt` for the reason above.
 dpop = ["jwt"]
 # PKCS#8 key loading for the `jwt` signing key, so a host can hand this crate the DER its KMS or
-# its `openssl` already emits rather than a raw 32-byte scalar. Separate from `jwt` because it is
-# a DER decoder (~16.7 KiB linked, measured) that a host loading a scalar with
-# `EcdsaP256Key::from_scalar_bytes` never executes, and one more crate in the tree of every `jwt`
-# consumer. Adds no crate beyond `pkcs8` itself.
+# its `openssl` already emits rather than a raw 32-byte scalar.
+#
+# Separate from `jwt` for the DEPENDENCY, not for the bytes, and the difference matters because the
+# obvious claim is the false one. Measured on aarch64-apple-darwin under this workspace's release
+# profile (`lto = "fat"`, `codegen-units = 1`): a build with this feature ON but the two
+# constructors never CALLED is byte for byte identical to one with the feature off. LTO already
+# deletes what nothing reaches, so a host loading a raw scalar was never paying for the DER
+# decoder. Called, it is about 30 KiB, which is the honest number and is a cost only the host that
+# uses it pays.
+#
+# What the split actually buys is one CRATE off a `--features jwt` dependency tree, `pkcs8` itself:
+# `der`, `spki`, `const_oid`, `base64ct` and `zeroize` are already there via `sec1`/`elliptic-curve`.
+# That is compile time and audit surface, not binary size.
 jwt-pkcs8 = ["jwt", "p256/pkcs8"]
 # RFC 9728 protected resource metadata. This crate is an AUTHORIZATION SERVER, not a
 # resource server, so what this feature adds is the TYPE a host publishes for its OWN
@@ -195,12 +217,10 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # RSA-2048's 256, and a P-256 public key is 64 bytes against 259. That difference is paid on every
 # token issued and every JWKS fetch.
 #
-# `pkcs8` is NOT here: it is behind this crate's own `jwt-pkcs8` feature. MEASURED on a release
-# binary (opt-level = "z", strip): a host that enables `jwt` and never calls the two PKCS#8
-# constructors paid ZERO for it under `lto = true`, and 192 bytes without LTO, because the linker
-# already dropped what nothing called. The 16.7 KiB of DER decoder is paid only by a host that
-# actually calls it. What the split buys is one crate (pkcs8 v0.10.2) off a `--features jwt`
-# dependency tree, which is this crate's stated dependency policy rather than a byte count.
+# `pkcs8` is NOT here: it is behind this crate's own `jwt-pkcs8` feature. See that feature's note
+# for the measurement, and in particular for what it does NOT buy: a host that never calls the two
+# PKCS#8 constructors pays zero bytes for them either way, because LTO deletes them. The split is
+# for the dependency tree.
 p256 = { version = "0.13", default-features = false, features = [
     "ecdsa",  # ECDSA/P-256/SHA-256 signing, which is ES256 (RFC 7518 s3.4)
     "std",    # this crate is std anyway; adds no crate to the tree, only alloc/error impls
@@ -268,3 +288,48 @@ required-features = ["axum"]
 [[example]]
 name = "protected_resource_fixture"
 required-features = ["axum", "resource-metadata"]
+
+# BENCHMARKS. `cargo bench -p oauth-as --all-features`; see benches/README.md for the machine, the
+# profile, and what these numbers do NOT mean.
+#
+# `harness = false` on every one of them, because the suite uses a HAND-ROLLED timing harness
+# (benches/harness/mod.rs) rather than criterion or divan. That was measured, not preferred:
+# criterion 0.8 declares rust-version 1.86 and criterion 0.5 resolves an edition-2024 `clap_lex`
+# that cargo 1.75 cannot parse, and divan 0.1.21 declares 1.80 and resolves the same crate. Either
+# one turns `cargo +1.75 test -p oauth-as --locked`, GOAL.md Gate 6's own CHECK command, from
+# green to red for a charting library. The full reasoning and the measured package counts are in
+# the module docs of benches/harness/mod.rs.
+#
+# `test = false` on every one of them too. Without it, `cargo test --workspace` runs the bench
+# binaries in test mode on every commit, which would add minutes to the gate in CONTRIBUTING.md
+# for no assertion. Rot protection instead comes from `cargo bench --no-run`, which CI runs and
+# which compiles every target here without timing anything.
+[[bench]]
+name = "token"
+harness = false
+test = false
+
+[[bench]]
+name = "scaling"
+harness = false
+test = false
+
+[[bench]]
+name = "parsing"
+harness = false
+test = false
+
+[[bench]]
+name = "constant_time"
+harness = false
+test = false
+
+[[bench]]
+name = "extensions"
+harness = false
+test = false
+
+[[bench]]
+name = "http_surface"
+harness = false
+test = false

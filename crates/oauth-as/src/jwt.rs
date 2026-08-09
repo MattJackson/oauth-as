@@ -129,9 +129,12 @@ impl EcdsaP256Key {
     /// Load from a PKCS#8 (RFC 5208) `PrivateKeyInfo` DER document, the format `openssl pkcs8`
     /// and most KMS exports emit.
     ///
-    /// Behind `jwt-pkcs8` rather than `jwt`, because the DER decoder this needs is 20,764 linked
-    /// bytes (measured: more than `sha2` and `base64` combined) and a host whose key material
-    /// arrives as a raw scalar reaches it through [`EcdsaP256Key::from_scalar_bytes`] instead.
+    /// Behind `jwt-pkcs8` rather than `jwt`, for the DEPENDENCY rather than for the bytes: the
+    /// split takes the `pkcs8` crate off a `--features jwt` tree. It does NOT save a host any
+    /// linked size, because a build with the feature on and these two constructors never called
+    /// measures byte for byte identical to one with it off; LTO deletes what nothing reaches. A
+    /// host whose key material arrives as a raw scalar uses [`EcdsaP256Key::from_scalar_bytes`]
+    /// and pays nothing either way.
     #[cfg(feature = "jwt-pkcs8")]
     #[cfg_attr(docsrs, doc(cfg(feature = "jwt-pkcs8")))]
     pub fn from_pkcs8_der(kid: impl Into<String>, der: &[u8]) -> Result<Self, KeyError> {
