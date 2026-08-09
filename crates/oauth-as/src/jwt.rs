@@ -315,11 +315,35 @@ struct JoseHeader<'a> {
     kid: &'a str,
 }
 
-/// Everything needed to issue RFC 9068 access tokens: the key, the audience, and the URL the host
-/// serves the key set from.
+/// Everything needed to issue RFC 9068 access tokens: the ACTIVE signing key, any RETIRED keys
+/// still being published so tokens already signed under them keep verifying, the audience, and the
+/// URL the host serves the key set from.
+///
+/// # Rotation
+///
+/// Signing always uses the active key, and its `kid` goes on every token (RFC 7515 section 4.1.4).
+/// [`JwtConfig::rotate_to`] promotes a new key and RETIRES the previous one: the retired key's
+/// PUBLIC half stays in [`JwtConfig::jwks`], so a resource server that fetches the key set can
+/// still select and verify a token minted a minute before the swap. Without that, rotation would
+/// invalidate every live access token at the instant of the swap, which is why an AS that can hold
+/// only one key has no rotation story at all, scheduled or on compromise.
+///
+/// Retired keys are dropped by the host, explicitly, with
+/// [`JwtConfig::forget_retired_key_breaking_its_live_tokens`]. There is deliberately NO timer here:
+/// this crate has no background tasks by design (see the crate doc's "Zero cost until enabled"),
+/// and the host is the only party that knows its own [`crate::ServerConfig::access_token_ttl`],
+/// which is the number that decides when dropping is safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtConfig {
     key: EcdsaP256Key,
+    /// The PUBLIC halves of previously active keys, most recently retired first.
+    ///
+    /// Public halves, not [`EcdsaP256Key`]s, and that is the point: a retired key must never sign
+    /// again, and dropping the private scalar at retirement makes that structural rather than a
+    /// promise the code merely keeps today. It is also the cheaper representation, which matters
+    /// because [`JwtConfig`] sits behind the box in [`AccessTokenFormat::Jwt`] precisely to keep
+    /// key material out of every [`crate::ServerConfig`].
+    retired: Vec<Jwk>,
     audience: Audience,
     jwks_uri: Option<String>,
 }
@@ -331,9 +355,70 @@ impl JwtConfig {
     pub fn new(key: EcdsaP256Key, audience: impl Into<String>) -> Self {
         JwtConfig {
             key,
+            // A brand new configuration has retired nothing. The single-key deployment, which is
+            // most of them, never touches anything below and keeps exactly the API it had.
+            retired: Vec::new(),
             audience: Audience::One(audience.into()),
             jwks_uri: None,
         }
+    }
+
+    /// Promote `new_active` to the signing key and RETIRE the current one.
+    ///
+    /// After this call: new tokens are signed under `new_active`'s `kid`, and the previous key's
+    /// public half is still published by [`JwtConfig::jwks`], so tokens signed under it keep
+    /// verifying until the host drops it. That is the whole mechanism RFC 7517 section 4.5 and RFC
+    /// 7515 section 4.1.4 exist to enable: the token names its key, so a verifier selects rather
+    /// than trials, and two generations of key can be live at once.
+    ///
+    /// Rotating to a `kid` that is already published REPLACES that entry rather than publishing
+    /// the name twice, because two JWKs sharing a `kid` make selection ambiguous, which is the one
+    /// thing `kid` exists to prevent. A host that reuses a `kid` for a genuinely different key is
+    /// making a mistake this crate cannot detect, and the RFC's advice is simply to not do that.
+    pub fn rotate_to(mut self, new_active: EcdsaP256Key) -> Self {
+        let retiring = self.key.public_jwk();
+        self.key = new_active;
+        let active_kid = self.key.kid();
+        // A kid appears at most once in the published set: any older entry sharing a name with the
+        // key just retired, or with the new active key, goes.
+        self.retired
+            .retain(|jwk| jwk.kid != retiring.kid && jwk.kid != active_kid);
+        if retiring.kid != active_kid {
+            // Most recently retired FIRST: it is the one with the most tokens still alive, so it
+            // is the one a verifier is most likely to need after the active key itself.
+            self.retired.insert(0, retiring);
+        }
+        self
+    }
+
+    /// The `kid`s of the retired keys still being published, most recently retired first.
+    ///
+    /// This is what a host consults to decide what it may drop: a key retired longer ago than
+    /// [`crate::ServerConfig::access_token_ttl`] has no live tokens left.
+    pub fn retired_kids(&self) -> impl Iterator<Item = &str> {
+        self.retired.iter().map(|jwk| jwk.kid.as_str())
+    }
+
+    /// Stop publishing the retired key named `kid`. THIS BREAKS EVERY UNEXPIRED TOKEN SIGNED UNDER
+    /// IT: once the key leaves the JWKS, a resource server has nothing to verify those tokens
+    /// with, and the client sees them fail mid-session rather than at a renewal boundary.
+    ///
+    /// The rule: keep a key retired for AT LEAST [`crate::ServerConfig::access_token_ttl`] after
+    /// the [`JwtConfig::rotate_to`] that retired it, plus whatever the deployment's resource
+    /// servers cache the JWKS for, since a cached copy is not refetched the moment this changes.
+    /// Only after that is every token signed under it certain to have expired on its own.
+    ///
+    /// The one time to call this SOONER is a key compromise, where the point is exactly to
+    /// invalidate those tokens, and the breakage is the goal rather than the cost.
+    ///
+    /// Naming a `kid` that is not retired (including the ACTIVE `kid`) does nothing. Letting a host
+    /// drop its own signing key by naming it would leave an AS signing with a key it does not
+    /// publish: no token it issues would verify anywhere, which is strictly worse than the state
+    /// the host was trying to leave.
+    #[must_use = "this returns the updated configuration; the receiver is consumed"]
+    pub fn forget_retired_key_breaking_its_live_tokens(mut self, kid: &str) -> Self {
+        self.retired.retain(|jwk| jwk.kid != kid);
+        self
     }
 
     /// Configure signing for several audiences (RFC 7519 section 4.1.3 array form).
@@ -360,11 +445,23 @@ impl JwtConfig {
         self.key.kid()
     }
 
-    /// The RFC 7517 key set to serve: public parameters only.
+    /// The RFC 7517 key set to serve: public parameters only, ACTIVE key first, then every retired
+    /// key most recently retired first.
+    ///
+    /// Publishing the retired keys is what makes rotation non-destructive: a resource server that
+    /// fetched this document after the swap can still select, by `kid`, the key a token minted
+    /// before the swap was signed under (RFC 7515 section 4.1.4).
+    ///
+    /// RFC 7517 section 5 places no ordering requirement on `keys`, so the order here is chosen
+    /// rather than mandated: active first means a verifier that ignores `kid` and takes the first
+    /// `alg`-compatible key is right for the tokens it will mostly be handed. Such a verifier is
+    /// wrong in general, which is why `kid` exists, but the ordering costs nothing and the failure
+    /// mode it avoids is real.
     pub fn jwks(&self) -> Jwks {
-        Jwks {
-            keys: vec![self.key.public_jwk()],
-        }
+        let mut keys = Vec::with_capacity(1 + self.retired.len());
+        keys.push(self.key.public_jwk());
+        keys.extend(self.retired.iter().cloned());
+        Jwks { keys }
     }
 
     /// The `aud` value tokens from this config carry.
