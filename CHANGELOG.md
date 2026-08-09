@@ -12,6 +12,52 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+### Fixed: RFC 7009 revocation refused every public client, and RFC 8693 was unreachable over HTTP
+
+Two defects with one shape: a capability the RFC 8414 metadata document ADVERTISES, which no
+client could actually use, and which nothing noticed because the tests that covered it drove the
+library API rather than the wire.
+
+- **A public client may now revoke its own token.** `AuthorizationServer::revoke` and
+  `revoke_with_credential` refused every `ClientAuth::Public` caller with `invalid_client`. RFC
+  7009 s2.1 scopes the credential check in a parenthesis, "(in case of a confidential client)",
+  and makes the OWNERSHIP check the unconditional half; s5 names "a valid `client_id`, in the case
+  of a public client" as what such a request carries, and settles the objection in terms: a caller
+  holding somebody's token "could do much worse damage by using the token elsewhere than by
+  revoking it". This server issues tokens to public clients through code + PKCE and through the
+  device grant, so the refusal left every native and browser app with no standard way to make a
+  logout mean anything.
+
+  **A host that read the old refusal as a security property should read this paragraph.** What
+  replaces it is not nothing: the ownership check against the stored RECORD is unchanged and is
+  what refuses a caller presenting somebody else's token, so naming a public client id buys an
+  attacker no token they did not already hold. INTROSPECTION IS UNCHANGED and still refuses a
+  public client, because RFC 7662 s4 says that endpoint "MUST NOT be publicly available": it
+  DESCRIBES a token rather than destroying one, which is a capability the holder of a leaked
+  string does not otherwise have. The two arrived bundled under one citation pair and only the
+  RFC 7662 half of it held.
+- **RFC 8693 token exchange is reachable over the HTTP surface.** The token handler resolved the
+  client's credential and then passed `None` into the exchange, because every other grant now
+  carries its credential on the request context. `exchange_token` refuses a client that is not
+  confidential, so the grant was advertised in the metadata document and answered `invalid_client`
+  to every client under every authentication method.
+
+### Tested: every advertised capability, proven over the wire
+
+`tests/wire_reachability.rs` derives its checklist from the SERVED RFC 8414 document rather than
+from the router: it iterates `grant_types_supported`, `token_endpoint_auth_methods_supported`,
+`response_types_supported` and `code_challenge_methods_supported` at runtime and fails on any
+value with no wire proof, and it probes every member named `*_endpoint` (plus `jwks_uri`) for a
+non-404 with no per-endpoint list written down. Adding an advertised capability without proving it
+over HTTP is now a test failure rather than an oversight.
+
+Recorded there rather than fixed, because it is a deliberate trust boundary: the two RFC 8705
+authentication methods (`tls_client_auth`, `self_signed_tls_client_auth`) are advertised by an
+`mtls` build and CANNOT succeed through `oauth_as::http::AuthorizationService`, which never sees
+the TLS layer and therefore always passes `certificate: None`. A host terminating mTLS must call
+`token_with_context` (or the `*_with_credential` entry points) with a certificate it verified
+itself; a host mounting only the HTTP service should not register mTLS clients.
+
 ### Changed (BREAKING): types that made the wrong thing easy
 
 Every item here is an API-safety change, pre-1.0, and the crate's existing posture applied

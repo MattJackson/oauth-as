@@ -3936,6 +3936,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// `token_type_hint` (section 2.1) is an optimisation, not a constraint: the RFC requires the
     /// server to keep looking if the hint is wrong, so a wrong hint costs a second lookup and
     /// nothing else.
+    ///
+    /// PUBLIC CLIENTS MAY REVOKE THEIR OWN TOKENS here, presenting a `client_id` and no secret,
+    /// which is section 2.1's own rule ("in case of a confidential client" scopes the credential
+    /// check) and section 5's ("a valid `client_id`, in the case of a public client"). What stops
+    /// a caller who merely knows a public client's id is the OWNERSHIP check, made against the
+    /// stored record: another client's token is untouched, and answered `Ok(())` all the same.
+    /// This is deliberately NOT what
+    /// [`introspection_response`](AuthorizationServer::introspection_response) does; see the
+    /// comment inside [`revoke_with_credential`](AuthorizationServer::revoke_with_credential) for
+    /// why the two RFCs differ.
     pub async fn revoke(
         &self,
         client_id: &ClientId,
@@ -3964,14 +3974,31 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         token_type_hint: Option<TokenTypeHint>,
     ) -> Result<(), ErrorResponse> {
         let client = self.authenticate_client(client_id, cred).await?;
-        // RFC 7009 section 2.1 requires client authentication here and requires the server to
-        // verify the token was issued to the requesting client. A public client cannot satisfy the
-        // first, so it cannot be held to the second: anyone may name a public client id, which
-        // would make this an unauthenticated kill switch for every token that client holds.
-        if matches!(client.auth, crate::client::ClientAuth::Public) {
-            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
-                .with_description("revocation requires a confidential client"));
-        }
+        // PUBLIC CLIENTS ARE ADMITTED HERE, and deliberately, which is the opposite of
+        // `introspection_response_with_credential` a few hundred lines above. The two arrived
+        // together under one citation pair and only the introspection half of it held.
+        //
+        // RFC 7009 section 2.1 scopes credential validation in as many words: the server "first
+        // validates the client credentials (in case of a confidential client) and then verifies
+        // whether the token was issued to the client making the revocation request". Section 5
+        // says the same thing from the other side, naming "a valid client_id, in the case of a
+        // public client". So the OWNERSHIP check below, not client authentication, is what this
+        // endpoint's access control rests on for a public client, and the checks below already
+        // perform it: a record whose `client_id` is not this one is untouched and answered 200.
+        //
+        // Why this matters rather than being a conformance detail: this server issues tokens to
+        // public clients through code+PKCE and through the device grant, so refusing them
+        // revocation left a native or browser app with no standard way to make a logout mean
+        // anything. The token stayed live for its whole TTL and the refresh chain outlived the
+        // user's decision entirely.
+        //
+        // What an attacker gains is bounded by what they must already have: the token STRING. A
+        // caller who holds it can already use it, so being able to destroy it is a strictly
+        // smaller capability than the one they have; and holding somebody else's token buys
+        // nothing here, because the comparison is against the record, not against the asserted
+        // identity. Introspection is refused for exactly the reason this is allowed: it is a
+        // request to DESCRIBE a token rather than to destroy one, and RFC 7662 section 4 says it
+        // MUST NOT be publicly available.
 
         let try_refresh = || async {
             // READ, then take. Section 2.1's ownership check is a question ABOUT someone else's

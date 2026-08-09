@@ -73,6 +73,23 @@
 //!    is never served a submittable, forgeable form.
 //!
 //! Every non-interactive endpoint works regardless of all three.
+//!
+//! # What this service CANNOT do, and a host must not advertise through it
+//!
+//! RFC 8705 mutual-TLS client authentication. A build with the `mtls` feature advertises
+//! `tls_client_auth` and `self_signed_tls_client_auth` in
+//! [`AuthorizationServerMetadata::token_endpoint_auth_methods_supported`], and a client that reads
+//! them and authenticates that way THROUGH THIS SERVICE is refused with `invalid_client`, every
+//! time. That is not an oversight: this module is handed an already-parsed request, it never
+//! terminates TLS and never sees the connection, so there is no certificate here that anybody
+//! verified. Reading one out of a proxy header would trust that header on every deployment's
+//! behalf rather than on the one host that knows whether its terminator can be trusted; the
+//! `oauth_as::mtls` module's trust boundary section is the argument in full.
+//!
+//! So a host that terminates mTLS must call `AuthorizationServer::token_with_context` (or the
+//! other `*_with_credential` entry points) itself, passing the `ClientCredential::certificate` it
+//! verified. A host that mounts only this service should not register mTLS clients at all,
+//! because the metadata document will invite them and this endpoint will refuse them.
 
 use std::borrow::Cow;
 use std::sync::Arc;
