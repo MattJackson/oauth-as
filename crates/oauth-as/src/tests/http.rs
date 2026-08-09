@@ -560,3 +560,209 @@ fn a_message_page_carries_its_message_and_escapes_it() {
     assert!(!html.contains("<script>"), "{html}");
     assert!(html.contains("&lt;script&gt;"), "{html}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The route matcher and the body reader, which replaced the framework's. Both are new surface,
+// so both are pinned here rather than only at the socket in tests/http_surface.rs.
+// ---------------------------------------------------------------------------------------------
+
+/// A route table with the one dynamic route and a static route that lives UNDER it, which is the
+/// case a prefix matcher gets wrong.
+fn routes_with_management() -> Routes {
+    Routes {
+        well_known: "/.well-known/oauth-authorization-server".to_string(),
+        authorize: "/authorize".to_string(),
+        token: "/token".to_string(),
+        device: "/device_authorization".to_string(),
+        introspect: Some("/introspect".to_string()),
+        revoke: None,
+        verification: Some("/device".to_string()),
+        register: Some("/register".to_string()),
+        manage: Some("/register/".to_string()),
+        #[cfg(feature = "par")]
+        par: None,
+        #[cfg(feature = "jwt")]
+        jwks: None,
+    }
+}
+
+#[test]
+fn every_configured_path_resolves_and_nothing_else_does() {
+    let routes = routes_with_management();
+    assert!(matches!(
+        routes.resolve("/.well-known/oauth-authorization-server"),
+        Some(Route::Metadata)
+    ));
+    assert!(matches!(routes.resolve("/token"), Some(Route::Token)));
+    assert!(matches!(
+        routes.resolve("/introspect"),
+        Some(Route::Introspect)
+    ));
+    // Not configured on this table, so it is a 404 rather than a route that happens to exist.
+    assert!(routes.resolve("/revoke").is_none());
+    // A prefix of a route is not the route, and neither is a suffix.
+    assert!(routes.resolve("/tok").is_none());
+    assert!(routes.resolve("/token/").is_none());
+    assert!(routes.resolve("/xtoken").is_none());
+}
+
+/// RFC 7592 s3: the management URL this server mints is `{registration_endpoint}/{client_id}`,
+/// ONE segment. A deeper path is a different resource, and an empty one is the registration
+/// endpoint with a stray slash, not a client with an empty id.
+#[test]
+fn the_management_route_captures_exactly_one_segment() {
+    let routes = routes_with_management();
+    assert!(matches!(routes.resolve("/register/abc"), Some(Route::Manage(id)) if id == "abc"));
+    assert!(routes.resolve("/register/abc/extra").is_none());
+    assert!(routes.resolve("/register/").is_none());
+    // The registration endpoint itself is still the registration endpoint.
+    assert!(matches!(routes.resolve("/register"), Some(Route::Register)));
+}
+
+/// A STATIC route underneath the dynamic one must win, exactly as a trie-based router would have
+/// it. Without the ordering, a host whose configuration nests an endpoint under the registration
+/// endpoint would find it shadowed by a client id that can never exist, and the build-time
+/// duplicate check cannot see it because the two strings differ.
+#[test]
+fn a_static_route_beats_the_dynamic_one() {
+    let mut routes = routes_with_management();
+    routes.token = "/register/token".to_string();
+    assert!(matches!(
+        routes.resolve("/register/token"),
+        Some(Route::Token)
+    ));
+    assert!(matches!(routes.resolve("/register/other"), Some(Route::Manage(id)) if id == "other"));
+}
+
+/// RFC 3986 s3.3 puts `+` in `sub-delims`, so it is a literal in a path segment; only
+/// `application/x-www-form-urlencoded` gives it the "space" meaning. Decoding it as a space would
+/// rewrite the `registration_client_uri` this server itself minted for a client whose id has one.
+#[test]
+fn a_path_segment_decodes_percent_escapes_but_not_plus() {
+    assert_eq!(decode_path_segment("a+b"), "a+b");
+    assert_eq!(decode_component("a+b"), "a b");
+    assert_eq!(decode_path_segment("a%2Bb"), "a+b");
+    assert_eq!(decode_path_segment("client%20one"), "client one");
+    // Still borrows when there is nothing to unescape.
+    assert!(matches!(
+        decode_path_segment("plain-id"),
+        Cow::Borrowed("plain-id")
+    ));
+    assert!(matches!(decode_path_segment("a+b"), Cow::Borrowed("a+b")));
+}
+
+/// RFC 9110 s15.5.6 makes `Allow` mandatory on a 405, and HEAD is listed wherever GET is because
+/// it is actually served (s9.3.2 defines it as GET with the body dropped).
+#[test]
+fn the_allow_header_lists_head_wherever_get_is_served() {
+    assert_eq!(allowed(&Route::Metadata), "GET, HEAD");
+    assert_eq!(allowed(&Route::Token), "POST");
+    assert_eq!(allowed(&Route::Verification), "GET, HEAD, POST");
+    assert_eq!(allowed(&Route::Manage("c")), "GET, HEAD, PUT, DELETE");
+}
+
+/// A body that declares nothing and just keeps sending: the size hint cannot see it, so only the
+/// running total can. This is the shape `Content-Length` does not cover and the one an attacker
+/// picks.
+struct Dribble {
+    remaining: usize,
+    chunk: usize,
+}
+
+impl http_body::Body for Dribble {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        let n = self.chunk.min(self.remaining);
+        self.remaining -= n;
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from(vec![b'x'; n])))))
+    }
+
+    // Deliberately the default: unknown length, which is what a chunked body reports.
+}
+
+#[tokio::test]
+async fn a_body_within_the_cap_is_read_whole() {
+    let body = Dribble {
+        remaining: 100,
+        chunk: 7,
+    };
+    let bytes = match collect_body(body, MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => panic!("a 100 byte body is inside a 64 KiB cap"),
+    };
+    assert_eq!(bytes.len(), 100);
+    assert!(bytes.iter().all(|b| *b == b'x'));
+}
+
+/// The security property [`MAX_BODY_BYTES`] exists for: these endpoints buffer the whole body
+/// before parsing and are reachable before the client is authenticated, so an unbounded body is a
+/// memory exhaustion primitive available to anyone who can open a socket.
+#[tokio::test]
+async fn a_body_over_the_cap_is_refused_rather_than_buffered() {
+    let body = Dribble {
+        remaining: 5_000,
+        chunk: 64,
+    };
+    assert!(matches!(
+        collect_body(body, 1_000).await,
+        Err(BodyError::TooLarge)
+    ));
+    // Exactly at the cap is inside it; one byte more is not.
+    assert!(collect_body(
+        Dribble {
+            remaining: 1_000,
+            chunk: 64
+        },
+        1_000
+    )
+    .await
+    .is_ok());
+    assert!(collect_body(
+        Dribble {
+            remaining: 1_001,
+            chunk: 64
+        },
+        1_000
+    )
+    .await
+    .is_err());
+}
+
+/// The other half of the cap: a DECLARED length over the limit is refused before a single byte is
+/// buffered, so a hostile `Content-Length: 4000000000` costs nothing at all.
+#[tokio::test]
+async fn a_declared_length_over_the_cap_is_refused_before_reading() {
+    // `Body` reports an exact size hint, which is the same thing a `Content-Length` gives.
+    let huge = Body::from(Bytes::from(vec![b'x'; 2_000]));
+    assert!(matches!(
+        collect_body(huge, 1_000).await,
+        Err(BodyError::TooLarge)
+    ));
+}
+
+/// The response body has to report an EXACT length, or a server emits chunked transfer encoding
+/// for a response it knows the size of, and `is_end_stream` has to be true for an empty body so
+/// nothing polls for a frame that will never come.
+#[test]
+fn the_response_body_reports_an_exact_length() {
+    use http_body::Body as _;
+    let empty = Body::empty();
+    assert!(empty.is_end_stream());
+    assert_eq!(empty.size_hint().exact(), Some(0));
+
+    let full = Body::from("hello".to_string());
+    assert!(!full.is_end_stream());
+    assert_eq!(full.size_hint().exact(), Some(5));
+    assert_eq!(full.into_bytes(), Bytes::from_static(b"hello"));
+
+    // An empty `Bytes` and no body at all are the same response on the wire.
+    assert!(Body::from(Bytes::new()).is_end_stream());
+}

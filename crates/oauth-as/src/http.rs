@@ -29,7 +29,8 @@
 //! parser, first-wins parameter logic, Basic-auth decoder and response builders, precisely so that
 //! the RFC-mandated headers land on the same response as the body they describe; it used a
 //! framework for exactly three things (route matching, one dynamic path segment, and body
-//! collection with a cap), and those three are what [`Routes`] and [`collect_body`] now do.
+//! collection with a cap), and those three are what `Routes::resolve` and `collect_body` now do
+//! in this file.
 //!
 //! # What it serves
 //!
@@ -78,8 +79,9 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use bytes::{Buf as _, Bytes};
+use bytes::Buf as _;
 use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
+use http_body::Body as _;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -94,6 +96,10 @@ use crate::scope::ScopeSet;
 use crate::server::{AuthorizationServer, Clock, DeviceApprovalError, TokenRequest};
 use crate::store::Storage;
 use crate::token::TokenTypeHint;
+
+/// Re-exported so a host building a [`ConsentDecision::Respond`] body does not have to name
+/// `bytes` in its own manifest just to agree with this crate about which version it means.
+pub use bytes::Bytes;
 
 /// The response body this module produces: a single in-memory buffer, already complete.
 ///
@@ -920,8 +926,8 @@ impl<S: Storage, C: Clock> AuthorizationService<S, C> {
     /// Answer one request.
     ///
     /// Generic over the request body so that a host on any HTTP server can call it: `hyper`,
-    /// `axum`, a test harness holding a `String`. The body is read whole, up to
-    /// [`MAX_BODY_BYTES`], before it is parsed, which is what these endpoints require (client
+    /// `axum`, a test harness holding a `String`. The body is read whole, up to 64 KiB, before it
+    /// is parsed, which is what these endpoints require (client
     /// authentication for `client_secret_post` is IN the body, so nothing can be checked before
     /// it has all arrived).
     pub async fn handle<B>(&self, request: Request<B>) -> Response
@@ -948,11 +954,21 @@ impl<S: Storage, C: Clock> AuthorizationService<S, C> {
             false => method,
         };
 
-        let response = self.dispatch(route, &method, headers, &uri, body).await;
-        match head {
-            true => response.map(|_| Body::empty()),
-            false => response,
+        let mut response = self.dispatch(route, &method, headers, &uri, body).await;
+        if head {
+            // The LENGTH is kept and only the bytes are dropped. RFC 9110 s9.3.2 says a HEAD
+            // response's header fields SHOULD be identical to the GET's, and `Content-Length` is
+            // the one a cache and a health check actually read; answering zero would tell them
+            // the representation is empty. Setting it here rather than leaving the full body for
+            // the transport to suppress means a host that does not special-case HEAD still emits
+            // a correct response instead of content the RFC forbids.
+            let length = response.body().size_hint().exact().unwrap_or(0);
+            *response.body_mut() = Body::empty();
+            if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+                response.headers_mut().insert(header::CONTENT_LENGTH, value);
+            }
         }
+        response
     }
 
     /// The method check and the body read, then the handler.
@@ -1106,7 +1122,7 @@ where
 /// an adapter behind its own feature makes that a per-host decision instead of this crate's.
 ///
 /// A `fallback` rather than a route per endpoint: the route table is DERIVED from the metadata
-/// document at build time (see [`Routes`]), so re-declaring it here in axum's syntax would create
+/// document at build time, so re-declaring it here in axum's syntax would create
 /// a second table that could disagree with the first. A 404 from
 /// [`AuthorizationService::handle`] is a path this server does not serve, which is exactly what a
 /// fallback means.

@@ -53,6 +53,12 @@ impl Resp {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Whether the body is something other than a JSON object, which is how a refusal that is
+    /// NOT an RFC 6749 s5.2 error is told apart from one that is.
+    fn json_is_absent(&self) -> bool {
+        serde_json::from_str::<Value>(&self.body).is_err()
+    }
+
     fn json(&self) -> Value {
         serde_json::from_str(&self.body)
             .unwrap_or_else(|e| panic!("body is not JSON ({e}): {:?}", self.body))
@@ -1427,4 +1433,126 @@ async fn an_opaque_server_advertises_no_key_set_and_routes_none() {
         "opaque tokens: nothing to publish"
     );
     assert_eq!(request(addr, "GET", "/jwks", &[], None).await.status, 404);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The routing layer itself, now that it is this crate's rather than a framework's. Every
+// assertion below is about bytes on the wire, which is the only place the difference shows.
+// ---------------------------------------------------------------------------------------------
+
+/// RFC 9110 s9.3.2: HEAD is GET with the body dropped, and the header fields SHOULD be identical.
+/// A health check or a cache that probes with HEAD must get the length it would have got from
+/// GET, not a 405 and not a zero.
+#[tokio::test]
+async fn head_answers_like_get_with_no_body() {
+    let addr = start(true).await;
+    let path = "/.well-known/oauth-authorization-server";
+    let get = request(addr, "GET", path, &[], None).await;
+    let head = request(addr, "HEAD", path, &[], None).await;
+
+    assert_eq!(head.status, 200);
+    assert_eq!(head.body, "", "HEAD must not carry a body");
+    assert_eq!(
+        head.header("content-type"),
+        get.header("content-type"),
+        "HEAD and GET must describe the same representation"
+    );
+    assert_eq!(
+        head.header("content-length").and_then(|v| v.parse().ok()),
+        Some(get.body.len()),
+        "HEAD must report the length GET would have sent"
+    );
+}
+
+/// RFC 9110 s15.5.6: a 405 MUST carry `Allow`. Without it a client cannot tell a wrong method from
+/// a route that does not exist, which on an authorization server is the difference between "retry
+/// as a POST" and "this deployment has no such endpoint".
+#[tokio::test]
+async fn the_wrong_method_is_405_with_an_allow_header() {
+    let addr = start(true).await;
+
+    // The token endpoint is POST only (RFC 6749 s3.2: "The client MUST use the HTTP POST method").
+    let resp = request(addr, "GET", "/token", &[], None).await;
+    assert_eq!(resp.status, 405);
+    assert_eq!(resp.header("allow"), Some("POST"));
+
+    // The authorization endpoint is a browser navigation, so GET; a POST to it is the same error.
+    let resp = request(addr, "POST", "/authorize", &[], Some("x=1")).await;
+    assert_eq!(resp.status, 405);
+    assert_eq!(resp.header("allow"), Some("GET, HEAD"));
+
+    // A path this server does not serve at all is a 404, not a 405: there is no `Allow` to give.
+    let resp = request(addr, "POST", "/not-an-endpoint", &[], Some("x=1")).await;
+    assert_eq!(resp.status, 404);
+    assert_eq!(resp.header("allow"), None);
+}
+
+/// The body cap, over a socket. These endpoints buffer the whole body before parsing and are
+/// reachable BEFORE the client is authenticated (`client_secret_post` puts the credential in the
+/// body), so an unbounded body is a memory exhaustion primitive available to anyone who can open
+/// a socket. 64 KiB is the stated ceiling; a body over it is refused rather than buffered.
+#[tokio::test]
+async fn a_body_over_the_cap_is_refused_at_the_token_endpoint() {
+    let addr = start(true).await;
+
+    // Just inside the cap: accepted as a request, and refused on its MERITS (an OAuth error),
+    // which is what proves the cap did not fire.
+    let inside = format!(
+        "grant_type=client_credentials&client_id=x&junk={}",
+        "a".repeat(60_000)
+    );
+    let resp = request(addr, "POST", "/token", &[], Some(&inside)).await;
+    assert_ne!(resp.status, 413, "60 KB is inside the 64 KiB cap");
+    assert_eq!(resp.json()["error"], "invalid_client");
+
+    // Over it: refused as a body, before any of it is parsed.
+    let over = format!("grant_type=client_credentials&junk={}", "a".repeat(70_000));
+    let resp = oversized(addr, &over).await;
+    assert_eq!(resp.status, 413, "an oversized body must be refused");
+    // The refusal must not be an OAuth error, because nothing was parsed to have an error about.
+    assert!(resp.json_is_absent(), "{:?}", resp.body);
+}
+
+/// [`request`], but tolerating the connection reset a refused body earns.
+///
+/// The server answers 413 and closes WITHOUT draining the rest of the request, which is the whole
+/// point of the cap: it must not read what it has already refused. On a socket that means the
+/// peer may see ECONNRESET while it is still writing or reading, so this exchange treats a reset
+/// after a complete response head as the end of the response rather than as a failure.
+async fn oversized(addr: SocketAddr, body: &str) -> Resp {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "POST /token HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    // The write itself may be reset once the server has refused and closed.
+    let _ = stream.write_all(req.as_bytes()).await;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no response at all: {text:?}"));
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().expect("status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status code in {status_line:?}"));
+    Resp {
+        status,
+        headers: lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+            .collect(),
+        body: body.to_string(),
+    }
 }
