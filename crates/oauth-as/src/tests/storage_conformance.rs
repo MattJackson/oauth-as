@@ -160,6 +160,54 @@ fn the_fixtures_carry_the_fields_the_round_trip_checks_exist_for() {
     assert_eq!(normalize_user_code(&grant.user_code), "WDJBMJHT");
 }
 
+/// The fields whose fixture value used to BE the default, which is the one way a round-trip check
+/// can be present and still see nothing: a store that drops the field reads back exactly what a
+/// store that keeps it does. Pinned here rather than trusted, because
+/// `sample_authorization_details` parses a literal and a parse failure would silently produce the
+/// empty default again.
+#[test]
+fn the_fixtures_carry_no_default_value_a_dropped_field_could_hide_behind() {
+    #[cfg(feature = "rar")]
+    {
+        assert!(
+            !sample_authorization_details().is_empty(),
+            "an empty AuthorizationDetails is the default, so the round-trip checks could not \
+             tell a store that drops RFC 9396 details from one that keeps them"
+        );
+        assert!(!sample_token("at", "client", None)
+            .authorization_details
+            .is_empty());
+        assert!(!sample_refresh("rt", "client", "fam")
+            .authorization_details
+            .is_empty());
+        assert!(!sample_authorization_code("code")
+            .authorization_details
+            .is_empty());
+        #[cfg(feature = "par")]
+        assert!(sample_pushed_request("urn:x")
+            .authorization_details
+            .is_some());
+    }
+    #[cfg(feature = "consent")]
+    {
+        // Both members, not just the presence of the record: a store that persists `auth_time` and
+        // drops `acr` satisfies RFC 9470 `max_age` and silently fails every `acr_values` request.
+        let auth = sample_authentication().expect("the fixture reports an authentication");
+        assert!(auth.acr.is_some());
+        assert!(sample_token("at", "client", None).authentication.is_some());
+        assert!(sample_refresh("rt", "client", "fam")
+            .authentication
+            .is_some());
+        assert!(sample_authorization_code("code").authentication.is_some());
+        assert!(sample_consent("c", "subject").authentication.is_some());
+    }
+    #[cfg(feature = "mtls")]
+    {
+        assert!(sample_token("at", "client", None).x5t_s256.is_some());
+        assert!(sample_refresh("rt", "client", "fam").x5t_s256.is_some());
+    }
+}
+
 /// A host is invited to filter or waive by check name, so the names have to be a complete and
 /// duplicate-free list or a waiver could silently cover more than the host meant.
 #[test]

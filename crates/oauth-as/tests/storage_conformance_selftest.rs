@@ -97,6 +97,72 @@ struct Faults {
     /// `put_token` persists every column except the RFC 9449 `jkt` binding.
     #[cfg(feature = "dpop")]
     drops_jkt: bool,
+    /// The same drop on the REFRESH record, which is a separate column in a separate table and so
+    /// a separate mistake. It is the worse of the two: the refresh record's `jkt` is what the next
+    /// rotation copies onto the token it mints, so losing it unbinds every token the chain will
+    /// ever produce, not one.
+    #[cfg(feature = "dpop")]
+    drops_jkt_on_refresh_records: bool,
+    /// `put_token` persists every column except the RFC 8705 section 3.1 `x5t#S256` binding. The
+    /// mTLS half of `drops_jkt`, and identical in consequence: a certificate-bound token becomes a
+    /// bearer token, silently, and an introspecting resource server sees no `cnf` at all rather
+    /// than an error.
+    #[cfg(feature = "mtls")]
+    drops_x5t_s256_on_tokens: bool,
+    /// The same drop on the refresh record. Same reasoning as `drops_jkt_on_refresh_records`.
+    #[cfg(feature = "mtls")]
+    drops_x5t_s256_on_refresh_records: bool,
+    /// `put_token` persists every column except the RFC 9396 `authorization_details`. The token
+    /// then describes a narrower authorization than the resource owner approved, and a resource
+    /// server that reads it falls back to the coarse `scope` string RAR exists to stop relying on.
+    #[cfg(feature = "rar")]
+    drops_authorization_details_on_tokens: bool,
+    /// The same drop on the refresh record, which is what RFC 9396 section 6 narrowing is measured
+    /// against on the next rotation: a chain with no details refuses, or silently loses, the rich
+    /// authorization every refreshed token should have carried.
+    #[cfg(feature = "rar")]
+    drops_authorization_details_on_refresh_records: bool,
+    /// The same drop on the authorization code, which is the record of what was actually approved.
+    #[cfg(feature = "rar")]
+    drops_authorization_details_on_codes: bool,
+    /// The same drop on the pushed request. RFC 9101 section 6.3 has the authorization endpoint
+    /// use ONLY the pushed parameters, so this is a parameter the client was told at push time was
+    /// acceptable and then did not get.
+    #[cfg(all(feature = "rar", feature = "par"))]
+    drops_authorization_details_on_pushed_requests: bool,
+    /// `put_pushed_authorization_request` persists every column except the RFC 7636 section 4.3
+    /// `code_challenge`. A silent PKCE downgrade on the one request shape whose entire purpose was
+    /// to keep the challenge out of the browser.
+    #[cfg(feature = "par")]
+    drops_the_pushed_code_challenge: bool,
+    /// `put_token` persists every column except the RFC 9470 authentication report, so every token
+    /// reads back as though no step-up ever happened.
+    #[cfg(feature = "consent")]
+    drops_the_authentication_on_tokens: bool,
+    /// The same drop on the refresh record, which is what stops a client defeating a `max_age` by
+    /// refreshing.
+    #[cfg(feature = "consent")]
+    drops_the_authentication_on_refresh_records: bool,
+    /// The same drop on the authorization code, so the token minted from it reports no `acr` and
+    /// no `auth_time` however the host authenticated the user.
+    #[cfg(feature = "consent")]
+    drops_the_authentication_on_codes: bool,
+    /// The same drop on the consent record, which is the authentication the consent was granted
+    /// under and the thing a later step-up decision is measured against.
+    #[cfg(feature = "consent")]
+    drops_the_authentication_on_consents: bool,
+    /// `take_refresh_token` PANICS. Not a defect a host writes on purpose, and that is the point:
+    /// an index out of bounds, an `unwrap` on a row a migration did not create, a panicking
+    /// deserializer. Under `with_spawn` the panic unwinds inside the host's runtime where the
+    /// harness cannot see it, so what the harness must NOT do is wait forever for a racer that is
+    /// never coming back.
+    ///
+    /// `take_refresh_token` specifically because the harness calls it from NOWHERE but the racers
+    /// (every other read of a refresh record goes through `get_refresh_token`). A panic in
+    /// `take_device_grant` would also fire inside the harness's own task, in the swap and
+    /// user-code checks, and would abort the run instead of exercising the spawned path this fault
+    /// exists to test.
+    the_refresh_take_panics: bool,
     /// `claim_replay_id` implemented as look-then-insert, with the suspension point a shared store
     /// has between the two. The RFC 7523 / RFC 9449 half of the same defect.
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
@@ -166,6 +232,79 @@ impl NaiveStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+// The field-drop faults, gathered per record kind rather than written inline in each `put_*`.
+//
+// One function per record because a dropped column is one column of one table: a fault that
+// dropped the same field from every record at once would fire several round-trip checks together
+// and could not tell a store that lost the token's copy from one that lost the refresh record's,
+// which are separate migrations and separate mistakes.
+//
+// `unused_mut` is allowed rather than worked around: with none of the optional features compiled
+// in there is nothing here to drop, and the alternative (a cfg on the binding itself) would say
+// less about why.
+impl NaiveStore {
+    #[allow(unused_mut, unused_variables)]
+    fn maybe_drop_token_fields(&self, mut token: IssuedToken) -> IssuedToken {
+        #[cfg(feature = "dpop")]
+        if self.faults.drops_jkt {
+            token.jkt = None;
+        }
+        #[cfg(feature = "mtls")]
+        if self.faults.drops_x5t_s256_on_tokens {
+            token.x5t_s256 = None;
+        }
+        #[cfg(feature = "rar")]
+        if self.faults.drops_authorization_details_on_tokens {
+            token.authorization_details = oauth_as::AuthorizationDetails::none();
+        }
+        #[cfg(feature = "consent")]
+        if self.faults.drops_the_authentication_on_tokens {
+            token.authentication = None;
+        }
+        token
+    }
+
+    #[allow(unused_mut, unused_variables)]
+    fn maybe_drop_refresh_fields(&self, mut record: RefreshTokenRecord) -> RefreshTokenRecord {
+        if self.faults.drops_family_id {
+            record.family_id = String::new();
+        }
+        #[cfg(feature = "dpop")]
+        if self.faults.drops_jkt_on_refresh_records {
+            record.jkt = None;
+        }
+        #[cfg(feature = "mtls")]
+        if self.faults.drops_x5t_s256_on_refresh_records {
+            record.x5t_s256 = None;
+        }
+        #[cfg(feature = "rar")]
+        if self.faults.drops_authorization_details_on_refresh_records {
+            record.authorization_details = oauth_as::AuthorizationDetails::none();
+        }
+        #[cfg(feature = "consent")]
+        if self.faults.drops_the_authentication_on_refresh_records {
+            record.authentication = None;
+        }
+        record
+    }
+
+    #[allow(unused_mut, unused_variables)]
+    fn maybe_drop_code_fields(
+        &self,
+        mut record: AuthorizationCodeRecord,
+    ) -> AuthorizationCodeRecord {
+        #[cfg(feature = "rar")]
+        if self.faults.drops_authorization_details_on_codes {
+            record.authorization_details = oauth_as::AuthorizationDetails::none();
+        }
+        #[cfg(feature = "consent")]
+        if self.faults.drops_the_authentication_on_codes {
+            record.authentication = None;
+        }
+        record
     }
 }
 
@@ -356,15 +495,24 @@ impl Storage for NaiveStore {
         &self,
         record: AuthorizationCodeRecord,
     ) -> Result<(), StorageError> {
+        let record = self.maybe_drop_code_fields(record);
         self.lock().codes.insert(record.code.clone(), record);
         Ok(())
     }
 
     #[cfg(feature = "par")]
+    #[allow(unused_mut)]
     async fn put_pushed_authorization_request(
         &self,
-        record: oauth_as::par::PushedAuthorizationRequest,
+        mut record: oauth_as::par::PushedAuthorizationRequest,
     ) -> Result<(), StorageError> {
+        if self.faults.drops_the_pushed_code_challenge {
+            record.code_challenge = None;
+        }
+        #[cfg(feature = "rar")]
+        if self.faults.drops_authorization_details_on_pushed_requests {
+            record.authorization_details = None;
+        }
         self.lock()
             .pushed
             .insert(record.request_uri.clone(), record);
@@ -406,14 +554,7 @@ impl Storage for NaiveStore {
     }
 
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
-        #[cfg(feature = "dpop")]
-        let token = {
-            let mut token = token;
-            if self.faults.drops_jkt {
-                token.jkt = None;
-            }
-            token
-        };
+        let token = self.maybe_drop_token_fields(token);
         self.lock()
             .tokens
             .insert(token.access_token.clone(), std::sync::Arc::new(token));
@@ -435,10 +576,8 @@ impl Storage for NaiveStore {
         Ok(())
     }
 
-    async fn put_refresh_token(&self, mut record: RefreshTokenRecord) -> Result<(), StorageError> {
-        if self.faults.drops_family_id {
-            record.family_id = String::new();
-        }
+    async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {
+        let record = self.maybe_drop_refresh_fields(record);
         self.lock()
             .refresh
             .insert(record.refresh_token.clone(), std::sync::Arc::new(record));
@@ -456,6 +595,14 @@ impl Storage for NaiveStore {
         &self,
         refresh_token: &str,
     ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+        // Every racer is already past the harness's rendezvous gate by the time it calls in, so
+        // this panics with all N racers in flight, which is the situation the latch has to
+        // survive: each of them has to release its count on the way out or the harness parks
+        // forever waiting for tasks that are already dead.
+        assert!(
+            !self.faults.the_refresh_take_panics,
+            "this store's take_refresh_token panics, which is what the fault is"
+        );
         if self.faults.read_then_delete {
             let record = self.lock().refresh.get(refresh_token).cloned();
             round_trip_to_the_store().await;
@@ -492,7 +639,10 @@ impl Storage for NaiveStore {
     }
 
     #[cfg(feature = "consent")]
-    async fn put_consent(&self, record: oauth_as::ConsentRecord) -> Result<(), StorageError> {
+    async fn put_consent(&self, mut record: oauth_as::ConsentRecord) -> Result<(), StorageError> {
+        if self.faults.drops_the_authentication_on_consents {
+            record.authentication = None;
+        }
         self.lock()
             .consents
             .insert(record.consent_id.to_string(), std::sync::Arc::new(record));
@@ -1138,6 +1288,35 @@ async fn every_violation_names_a_published_check() {
         normalizes_user_codes: true,
         #[cfg(feature = "dpop")]
         drops_jkt: true,
+        #[cfg(feature = "dpop")]
+        drops_jkt_on_refresh_records: true,
+        #[cfg(feature = "mtls")]
+        drops_x5t_s256_on_tokens: true,
+        #[cfg(feature = "mtls")]
+        drops_x5t_s256_on_refresh_records: true,
+        #[cfg(feature = "rar")]
+        drops_authorization_details_on_tokens: true,
+        #[cfg(feature = "rar")]
+        drops_authorization_details_on_refresh_records: true,
+        #[cfg(feature = "rar")]
+        drops_authorization_details_on_codes: true,
+        #[cfg(all(feature = "rar", feature = "par"))]
+        drops_authorization_details_on_pushed_requests: true,
+        #[cfg(feature = "par")]
+        drops_the_pushed_code_challenge: true,
+        #[cfg(feature = "consent")]
+        drops_the_authentication_on_tokens: true,
+        #[cfg(feature = "consent")]
+        drops_the_authentication_on_refresh_records: true,
+        #[cfg(feature = "consent")]
+        drops_the_authentication_on_codes: true,
+        #[cfg(feature = "consent")]
+        drops_the_authentication_on_consents: true,
+        // NOT set. It is mutually exclusive with `read_then_delete` above, which it would panic
+        // before ever reaching, and this test is about the vocabulary of the check names rather
+        // than about the spawned path;
+        // `a_racer_that_panics_is_reported_rather_than_hanging_the_harness` owns that.
+        the_refresh_take_panics: false,
         #[cfg(any(feature = "client_assertion", feature = "dpop"))]
         look_then_insert_claim: true,
         // Mutually exclusive with `look_then_insert_claim`, which returns first.
@@ -1483,5 +1662,322 @@ async fn a_read_then_delete_pushed_request_take_is_caught() {
         checks_that_fired(&violations).contains(&"atomic_take/take_pushed_authorization_request"),
         "the PAR handle must be held to the same atomicity as the other take_* operations: \
          {violations:#?}"
+    );
+}
+
+// ---------------------------------------- the fields a fixture's DEFAULT value used to hide
+//
+// A round-trip check can only see a dropped field if the fixture's value for it differs from what
+// a store that dropped it returns. Four fields failed that: the RFC 8705 `x5t#S256` binding (never
+// compared at all), the RFC 9396 `authorization_details` (compared nowhere, and empty in every
+// fixture), the RFC 9470 authentication report (`None` everywhere), and every field of the pushed
+// request (raced, never round-tripped). Each fault below drops exactly one field from exactly one
+// record kind, and each names the ONE check it must drive.
+
+/// The mTLS half of `a_store_that_silently_drops_the_dpop_binding_is_caught`. RFC 8705 section 3.1
+/// binds the token to the certificate the client presented; a store that loses the thumbprint
+/// hands back a token with no `cnf` at all, which an introspecting resource server reads as an
+/// ordinary bearer token rather than as an error. Nothing anywhere fails.
+#[cfg(feature = "mtls")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_mtls_binding_from_a_token_is_caught() {
+    let violations = run_against(Faults {
+        drops_x5t_s256_on_tokens: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/token"],
+        "{violations:#?}"
+    );
+    let detail = detail_of(&violations, "round_trip/token");
+    assert!(
+        detail.contains("x5t_s256") && detail.contains("did not survive the round trip"),
+        "the violation must name the field that was dropped: {detail}"
+    );
+}
+
+/// The same drop on the refresh record, which is the worse of the two: this is the binding the
+/// next rotation copies onto the token it mints, so losing it here unbinds every token the chain
+/// will ever produce.
+#[cfg(feature = "mtls")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_mtls_binding_from_a_refresh_record_is_caught() {
+    let violations = run_against(Faults {
+        drops_x5t_s256_on_refresh_records: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/refresh_token"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "round_trip/refresh_token").contains("x5t_s256"),
+        "the violation must name the field that was dropped"
+    );
+}
+
+/// The DPoP binding on the REFRESH record. `drops_jkt` above proved the check on the access token
+/// could fire; the refresh record's copy is a different column in a different table and had never
+/// been watched fail.
+#[cfg(feature = "dpop")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_dpop_binding_from_a_refresh_record_is_caught() {
+    let violations = run_against(Faults {
+        drops_jkt_on_refresh_records: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/refresh_token"],
+        "{violations:#?}"
+    );
+    assert!(detail_of(&violations, "round_trip/refresh_token").contains("jkt"));
+}
+
+/// RFC 9396 `authorization_details` dropped from the access token. This crate has itself shipped
+/// this defect twice on feature-gated paths, so a host's store having it is not hypothetical, and
+/// the fixture's details were the EMPTY default until now, which meant a store that dropped them
+/// round-tripped indistinguishably from one that kept them.
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn a_store_that_silently_drops_rich_authorization_details_from_a_token_is_caught() {
+    let violations = run_against(Faults {
+        drops_authorization_details_on_tokens: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/token"],
+        "{violations:#?}"
+    );
+    let detail = detail_of(&violations, "round_trip/token");
+    assert!(
+        detail.contains("authorization_details") && detail.contains("conformance-fixture"),
+        "the violation must name the field AND print what was stored, or a host cannot tell a \
+         dropped column from a reordered one: {detail}"
+    );
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn a_store_that_silently_drops_rich_authorization_details_from_a_refresh_record_is_caught() {
+    let violations = run_against(Faults {
+        drops_authorization_details_on_refresh_records: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/refresh_token"],
+        "{violations:#?}"
+    );
+    assert!(detail_of(&violations, "round_trip/refresh_token").contains("authorization_details"));
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn a_store_that_silently_drops_rich_authorization_details_from_a_code_is_caught() {
+    let violations = run_against(Faults {
+        drops_authorization_details_on_codes: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/authorization_code"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "round_trip/authorization_code").contains("authorization_details")
+    );
+}
+
+/// RFC 9470 step-up state dropped from an access token. The token then reports no `acr` and no
+/// `auth_time` at introspection however strongly the host authenticated the user, so a resource
+/// server that challenged for step-up gets an answer that looks like the challenge was ignored.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_authentication_report_from_a_token_is_caught() {
+    let violations = run_against(Faults {
+        drops_the_authentication_on_tokens: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/token"],
+        "{violations:#?}"
+    );
+    assert!(detail_of(&violations, "round_trip/token").contains("authentication"));
+}
+
+/// The same drop on the refresh record. That copy is what stops a client defeating an RFC 9470
+/// `max_age` simply by refreshing, so losing it turns every refresh into a fresh login that never
+/// happened.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_authentication_report_from_a_refresh_record_is_caught() {
+    let violations = run_against(Faults {
+        drops_the_authentication_on_refresh_records: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/refresh_token"],
+        "{violations:#?}"
+    );
+    assert!(detail_of(&violations, "round_trip/refresh_token").contains("authentication"));
+}
+
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_authentication_report_from_a_code_is_caught() {
+    let violations = run_against(Faults {
+        drops_the_authentication_on_codes: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/authorization_code"],
+        "{violations:#?}"
+    );
+    assert!(detail_of(&violations, "round_trip/authorization_code").contains("authentication"));
+}
+
+/// The same drop on the CONSENT record. `round_trip/consent` compares the whole record, so the
+/// check was already capable of seeing this; what it could not see was a fixture whose
+/// `authentication` was `None`, because `None` is what a store that drops the column returns.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_authentication_report_from_a_consent_is_caught() {
+    let violations = run_against(Faults {
+        drops_the_authentication_on_consents: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/consent"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "round_trip/consent").contains("differs from the one stored"),
+        "the consent check compares the whole record, and must say so"
+    );
+}
+
+/// The pushed request was the ONE record kind this harness raced and never round-tripped, so a
+/// store could drop any column of it and be certified clean. `code_challenge` is the one that
+/// matters most: losing it is a silent RFC 7636 downgrade on the request shape whose entire
+/// purpose was to keep the challenge out of the browser.
+#[cfg(feature = "par")]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_pushed_code_challenge_is_caught() {
+    let violations = run_against(Faults {
+        drops_the_pushed_code_challenge: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/pushed_authorization_request"],
+        "{violations:#?}"
+    );
+    let detail = detail_of(&violations, "round_trip/pushed_authorization_request");
+    assert!(
+        detail.contains("code_challenge") && detail.contains("did not survive the round trip"),
+        "the violation must name the field that was dropped: {detail}"
+    );
+}
+
+/// The RAR half of the same hole. RFC 9101 section 6.3 has the authorization endpoint use ONLY the
+/// pushed parameters, so a detail validated at push time and then dropped is a parameter the
+/// client was told was acceptable and then silently did not get.
+#[cfg(all(feature = "par", feature = "rar"))]
+#[tokio::test]
+async fn a_store_that_silently_drops_the_pushed_authorization_details_is_caught() {
+    let violations = run_against(Faults {
+        drops_authorization_details_on_pushed_requests: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/pushed_authorization_request"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "round_trip/pushed_authorization_request")
+            .contains("authorization_details")
+    );
+}
+
+// ---------------------------------------------------- a racer that never comes back
+
+/// A store whose call PANICS under concurrency must produce a REPORT, not a hung test run.
+///
+/// In spawned mode the racer's panic unwinds inside the host's runtime, where the harness cannot
+/// see it; what the harness owns is the latch it waits on, and a racer that never reaches the
+/// bottom of its task never released it. The result was that the harness parked forever, so a host
+/// whose store panics under concurrency got a test run that hung: the worst diagnostic available,
+/// because it names nothing and looks like the harness is broken rather than the store.
+///
+/// `atomic_take/take_refresh_token` necessarily goes with it and is asserted by name so the two
+/// stay distinguishable: with every racer dead, nobody received the record, and the record is
+/// still sitting in the store afterwards. That is a true statement about this store, and it is not
+/// the statement this test exists for.
+#[tokio::test]
+async fn a_racer_that_panics_is_reported_rather_than_hanging_the_harness() {
+    let violations = StorageConformance::new(|| async {
+        NaiveStore::new(Faults {
+            the_refresh_take_panics: true,
+            ..Faults::default()
+        })
+    })
+    .with_spawn(|task| {
+        tokio::spawn(task);
+    })
+    .racers(4)
+    .run()
+    .await;
+
+    let fired = checks_that_fired(&violations);
+    assert!(
+        fired.contains(&"harness/racer_panicked"),
+        "a racer that never finished must be reported: {violations:#?}"
+    );
+    assert!(
+        fired.contains(&"atomic_take/take_refresh_token"),
+        "and the take it was making is still a take nobody completed: {fired:?}"
+    );
+    let detail = detail_of(&violations, "harness/racer_panicked");
+    assert!(
+        detail.contains("4 of 4 racers never finished"),
+        "the report must say how many racers were lost, so a host can tell one panicking call \
+         from a store that panics on every call: {detail}"
+    );
+    assert!(
+        detail.contains("panicked"),
+        "and it must name the likely cause rather than leaving a host to guess: {detail}"
     );
 }
