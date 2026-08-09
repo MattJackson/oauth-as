@@ -88,3 +88,27 @@ fn an_empty_list_becomes_an_omitted_member_rather_than_an_empty_array() {
         Some(vec!["a".to_string()])
     );
 }
+
+/// `well_known_path` sizes its buffer in advance, and the hint is EXACT: the document location is
+/// the suffix followed by the resource's path and nothing else, so the string ends up precisely
+/// full. A hint that is too small reallocates for a value whose length was already known; one that
+/// is too large asks for bytes that are never written. Neither is visible in the returned path,
+/// which is why the capacity is asserted rather than only the text.
+#[test]
+fn the_well_known_path_is_built_in_one_exactly_sized_allocation() {
+    for resource in [
+        "https://rs.example",
+        "https://rs.example/api",
+        "https://rs.example/api/v2",
+        "https://rs.example/?tenant=1",
+    ] {
+        let path = well_known_path(resource);
+        let exact = PROTECTED_RESOURCE_WELL_KNOWN_PATH.len() + resource_path(resource).len();
+        assert_eq!(path.len(), exact, "{resource}");
+        assert_eq!(
+            path.capacity(),
+            exact,
+            "the hint for {resource} must be exactly the suffix plus the resource path"
+        );
+    }
+}
