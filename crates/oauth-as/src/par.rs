@@ -372,10 +372,21 @@ pub struct RegisteredRequestObjectKey {
     ///
     /// ONE CONSEQUENCE, stated because it is a real change rather than a refactor: the "is this
     /// point actually on P-256" check no longer happens at REGISTRATION, because this crate no
-    /// longer contains an elliptic curve. It happens in the installed verifier, per request, and it
-    /// still fails closed. What the constructors below still catch at registration time is every
-    /// encoding mistake (a trimmed coordinate, a wrong length, non-base64url), which is what a host
-    /// actually gets wrong when it copies a JWK out of its client table.
+    /// longer contains an elliptic curve. It moved into the installed verifier, per request, where
+    /// [`crate::jwt::Es256Verifier`] states it as a MUST and names what it is for (an
+    /// invalid-curve attack is what a missing on-curve check buys). What the constructors below
+    /// still catch at registration time is every encoding mistake (a trimmed coordinate, a wrong
+    /// length, non-base64url), which is what a host actually gets wrong when it copies a JWK out
+    /// of its client table.
+    ///
+    /// WHO ESTABLISHES IT, precisely, because "it still fails closed" is a claim and claims in
+    /// this crate are meant to be checkable. For the built-in `jwt-p256` backend it is
+    /// established: `p256`'s `from_sec1_bytes` rejects a point that is not on the curve, so an
+    /// off-curve coordinate pair cannot verify anything. For a HOST verifier it is the host's
+    /// contract to meet and nothing in this crate checks it: [`crate::signer_conformance`] does
+    /// not currently present an off-curve key, so a green run there does not cover this clause.
+    /// A host whose backend hands raw coordinates to a library that skips point validation should
+    /// test that clause itself until the harness carries it.
     key: crate::jwt::PublicJwk,
 }
 
