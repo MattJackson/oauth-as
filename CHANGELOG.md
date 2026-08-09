@@ -68,6 +68,38 @@ consistently: an absent consent resolver refuses, an absent registration policy 
   exposure rules: one published a `pub String` a caller could also forge, the other kept it
   entirely. Both are readable and neither is forgeable now.
 
+### Changed (BREAKING): the storage seam stopped copying what the caller only reads
+
+Measured with the counting allocator against `MemoryStorage`, not asserted. The whole point of a
+`get_*` is that the caller reads; handing back an owned clone charged every read for a copy nobody
+mutated.
+
+- **`Storage::get_client`, `get_token` and `get_refresh_token` return `Arc<T>`**, as do
+  `get_consent`, `find_consent` and `consents_for_subject` under the `consent` feature. Every
+  `take_*` and `claim_replay_id` still returns an OWNED value, deliberately: those hand over a
+  record the caller is about to be the only owner of, and single-use redemption is the one place
+  where sharing would be a bug rather than a saving. `AuthorizationServer::introspect`,
+  `remembered_consent` and `consents_for_subject` follow their storage methods.
+
+  RFC 7662 introspection went from 18 allocations to 4. That is the number that mattered most:
+  this crate's default access token is opaque, so a resource server introspects on every protected
+  request it serves.
+
+  `get_device_grant` and `find_device_grant_by_user_code` were tried and REVERTED. The device poll
+  mutates what it read (`last_poll_at`, and `interval` on a too-fast poll) and writes it back, so an
+  `Arc` only moves the clone from the read to the mutation and adds one: measured net +1 on the
+  hottest path in the crate.
+
+  Migration for a host's `Storage` impl: wrap the returned record in `Arc::new`. A database-backed
+  store pays one allocation on a path that has already done I/O.
+- **`ErrorResponse` and `RegistrationErrorResponse` hold `Cow<'static, str>`**, not `String`, and
+  `with_description` / `RegistrationErrorResponse::new` take `impl Into<Cow<'static, str>>`, which
+  is source-compatible with both `&'static str` and `String`. `ErrorResponse` gains `with_uri`.
+  Nearly every description this crate emits is a literal, and each one was being copied onto the
+  heap to be handed straight back out. A refused token request now allocates ZERO times end to end,
+  down from one. The struct is 56 bytes before and after: `Option<Cow<'static, str>>` and
+  `Option<String>` are both 24.
+
 ### Added
 
 - `impl std::error::Error for StepUpFailure`. It was the only error-shaped type in the crate
