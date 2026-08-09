@@ -138,7 +138,7 @@ fuzz_target!(|request: Request| {
     };
 
     let is_head = request.method == "HEAD";
-    let routed = fixture.paths.iter().any(|p| *p == request.path)
+    let routed = fixture.paths.contains(&request.path)
         // The RFC 7592 s3 client-management route is `{register}/{client_id}`, a prefix match, so
         // "is this path routed" cannot be a set membership test alone.
         || fixture

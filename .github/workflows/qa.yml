@@ -70,7 +70,13 @@
 #        attributes, no OpenAPI definition, and no git tags. The authors say it in their own RAID
 #        2022 paper: "As a result, OAuch is not fully automated." Last commit 2026-06-13, so
 #        nothing has changed. Do not re-research this without new evidence.
-#     7. No independent, CI-runnable RFC 8414 JSON Schema or metadata-validator tool (distinct
+#     7. A SHORT bounded libFuzzer run over the parsers (the `fuzz` job below, and fuzz/ in the
+#        tree). It is not a conformance check and it is not a soak: its job is to prove the fuzz
+#        targets still build and still run, and to catch an invariant that a committed RFC-vector
+#        seed already violates. The targets assert INVARIANTS (the RFC 9396 bounds, the scope
+#        round trip, the RFC 6749 s5.2 charset on every error body, "no generated credential
+#        authenticates"), so a red here is a wrong ANSWER and not merely a crash.
+#     8. No independent, CI-runnable RFC 8414 JSON Schema or metadata-validator tool (distinct
 #        from an OAuth/OIDC mock server, which tests the opposite direction) could be confirmed
 #        to exist as of 2026-08-08. If one surfaces later, wire it in following the same pinning
 #        discipline as every other job in this file.
@@ -338,6 +344,91 @@ jobs:
         run: cargo publish --dry-run --locked -p oauth-as
       - name: package file list (review before any real publish)
         run: cargo package --list --locked -p oauth-as
+
+  # A SHORT fuzz run, and deliberately not a soak.
+  #
+  # WHAT THIS JOB IS FOR, in order of importance:
+  #   1. Proving the targets still COMPILE and still RUN. A fuzz target that no longer builds is
+  #      worse than no fuzz target, because the directory still looks like coverage. `fuzz` is a
+  #      workspace member so lint-and-test already catches a compile break on stable; this job is
+  #      what catches a break that only shows up under the nightly sanitizer build, and it is the
+  #      only thing that proves a target does not abort on its own seed corpus.
+  #   2. Catching a SHALLOW regression: an invariant that a committed seed already violates, or
+  #      one reachable within a minute of mutation from those seeds.
+  # It is NOT a search for deep bugs. A minute per target finds what a minute finds, and claiming
+  # more from it would be the kind of "fuzzing passed" statement this repository does not make.
+  # A real hunt is `cargo +nightly fuzz run <target>` on a workstation, unbounded.
+  #
+  # A HARD GATE, not reporting-only. Unlike the mutation job below, a failure here is a crash or
+  # a violated invariant on input the fuzzer actually produced: a defect, reproducible from the
+  # artifact the run leaves behind, and not a judgement call about test strength.
+  #
+  # NIGHTLY, and that is contained. cargo-fuzz requires it, and nothing about this job touches
+  # the library's MSRV: the `msrv` job above is scoped to `-p oauth-as` precisely so that a
+  # member with a newer toolchain requirement cannot dictate the library's floor, and this member
+  # adds no dependency to the published crate (it is a CONSUMER of it, exactly like a host).
+  fuzz:
+    name: fuzz targets (short bounded run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # FLOATING nightly, and the trade is worth naming. A dated nightly would make this job's
+      # red always mean "a target broke" rather than sometimes "the compiler moved"; a floating
+      # one means the sanitizer instrumentation is always the current one, and it means nobody
+      # has to remember to bump a pin that will otherwise rot until the toolchain is unavailable.
+      # If this job starts going red for compiler reasons rather than target reasons, pin it.
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # THE ROT CHECK, and the reason it is a step of its own rather than something the workspace
+      # gate does for free. fuzz/ is EXCLUDED from the root workspace (see the root Cargo.toml for
+      # the measurement that forced that), so `cargo clippy --workspace --all-targets` does not
+      # see it. This is the replacement, and it is not weaker: it is the same lint at the same
+      # severity, on the same push, and it runs BEFORE the fuzzing so a signature that moved under
+      # a target is reported as a lint failure rather than as a confusing build error inside
+      # cargo-fuzz.
+      - name: fmt and clippy the fuzz targets (they must not rot)
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+      - name: run each target for a fixed budget
+        env:
+          # Wall-clock seconds per target. Eleven targets, so about seven minutes of fuzzing plus
+          # the build. `-max_total_time` rather than `-runs` on purpose: the per-iteration cost
+          # differs by two orders of magnitude between `scope_parse` and `par_request_object`
+          # (which verifies an ECDSA signature every iteration), so a fixed run count would give
+          # the cheap targets a tiny budget and the expensive ones an unbounded one.
+          FUZZ_SECONDS: 40
+        run: |
+          set -euo pipefail
+          # The output corpus goes to a scratch directory and the COMMITTED seeds are passed as a
+          # read-only extra input. Writing into fuzz/corpus/ would leave the working tree dirty
+          # and would grow the repository with machine-generated inputs nobody reviewed.
+          out="$RUNNER_TEMP/fuzz-corpus"
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            mkdir -p "$out/$target"
+            cargo +nightly fuzz run "$target" "$out/$target" "fuzz/corpus/$target" -- \
+              -dict=fuzz/dictionaries/oauth.dict \
+              -max_total_time="$FUZZ_SECONDS" \
+              -max_len=8192 \
+              -rss_limit_mb=4096 \
+              -print_final_stats=1
+            echo "::endgroup::"
+          done
+      # A crash leaves a reproducer in fuzz/artifacts/<target>/. It is the whole value of a red
+      # here: without it the failure is a log line, and with it it is a test case.
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   # Reporting job, not a hard gate, by explicit house instruction: mutation runs are slow and
   # this is scoped to crates/oauth-as (the published library) rather than the whole workspace

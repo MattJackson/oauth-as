@@ -11,13 +11,37 @@ members = [
     # manifest even optionally, and implementing the trait from OUTSIDE is what proves the seam is
     # usable through the public API alone. Not published; see its own README.
     "crates/oauth-as-postgres",
-    # The libFuzzer targets. A member rather than the excluded sub-workspace `cargo fuzz init`
-    # writes by default, so that `cargo clippy --workspace --all-targets` is what tells us a
-    # target stopped compiling after a signature moved. A fuzz target that no longer builds is
-    # worse than none, because the directory still looks like coverage. Never published, and
-    # nothing in crates/oauth-as depends on it: it is a CONSUMER of the public API.
-    "fuzz",
 ]
+
+# fuzz/ IS EXCLUDED, and the reason is FEATURE UNIFICATION rather than taste. Read this before
+# moving it into `members`, because it was tried there first and it does not work today.
+#
+# The fuzz targets exist to attack the parsers behind the optional features (`par`, `jar`, `dpop`,
+# `client_assertion`, `rar`, `http`, `jwt`, `mtls`), so the fuzz manifest has to turn those on.
+# Under resolver 2, a feature any workspace member asks for is enabled for EVERY member's build of
+# that package in the same `cargo build --workspace` invocation. So making fuzz/ a member silently
+# turns those features on for `crates/oauth-as-postgres` and for `crates/oauth-as`'s own test
+# targets, and MEASURED, on 2026-08-08, that breaks the workspace gate in two places:
+#
+#   1. `crates/oauth-as-postgres` does not implement `Storage::put_pushed_authorization_request`,
+#      `take_pushed_authorization_request` or `claim_replay_id`. Those trait items only exist when
+#      `par` / `dpop` / `client_assertion` are on, so the crate has never been compiled against
+#      them. That is a REAL GAP in the Postgres store, not an artifact of fuzzing: a host that
+#      enables PAR or DPoP cannot use it. It is recorded here rather than papered over.
+#   2. `crates/oauth-as/tests/http_par_jar_routing.rs` is gated
+#      `#![cfg(all(feature = "http", feature = "par"))]` but calls `axum::Router` and
+#      `axum::serve`, which need the separate `axum` feature. `http` + `par` without `axum` is a
+#      legal combination that nothing had ever built, so the under-gating was invisible.
+#
+# Neither is a defect in the fuzz targets and neither is this workstream's to fix, so fuzz/ carries
+# its own `[workspace]` table and resolves independently. `cargo package --list -p oauth-as` is
+# unaffected either way; nothing in crates/oauth-as depends on it, in any configuration.
+#
+# ROT PROTECTION, which is what membership was wanted for, is kept and is not weaker for being a
+# separate invocation: .github/workflows/qa.yml's `fuzz` job runs `cargo fmt --check` and
+# `cargo clippy --all-targets -- -D warnings` against fuzz/Cargo.toml before it runs anything, so
+# a target that stops compiling after a signature moves is still a RED, on every push to qa.
+exclude = ["fuzz"]
 
 # COMPILE SETTINGS, and an honest note about their reach.
 #

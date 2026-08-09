@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (C) 2026 Matthew Jackson
 
-# The fuzzing workspace member. NEVER PUBLISHED, and nothing in crates/oauth-as depends on it:
-# it is a consumer of the library's PUBLIC API, exactly like a host would be, so adding a target
-# here can never change what a consumer of `oauth-as` compiles or links.
+# The fuzz targets. NEVER PUBLISHED, and nothing in crates/oauth-as depends on it: this is a
+# CONSUMER of the library's public API, exactly like a host would be, so adding a target here can
+# never change what a consumer of `oauth-as` compiles or links.
 #
-# WHY A WORKSPACE MEMBER AT ALL, when `cargo fuzz init` writes an EXCLUDED sub-workspace by
-# default. An excluded crate is invisible to `cargo clippy --workspace --all-targets`, which is
-# precisely the gate that would otherwise tell us a fuzz target stopped compiling after a
-# signature moved. A fuzz target that no longer builds is worse than no fuzz target, because the
-# directory still looks like coverage. Membership is what keeps that honest.
+# ITS OWN WORKSPACE, deliberately. The root manifest carries the full argument (see the
+# `exclude = ["fuzz"]` block there); the short version is that this crate must enable `par`,
+# `jar`, `dpop`, `client_assertion` and the rest in order to fuzz the parsers behind them, and
+# under resolver 2 a member's features are unified into every other member's build. Membership
+# therefore turned those features on for `oauth-as-postgres` and for `oauth-as`'s own test
+# targets and broke both. Excluded, this manifest resolves alone and cannot reach them.
 #
-# The COST of membership is that the stable-toolchain gate compiles libfuzzer-sys (a C++ build)
-# on every cold cache. That is paid once per cache generation and is the price of the check above.
+# The rot protection membership was wanted for is kept as an explicit `cargo clippy --all-targets
+# -- -D warnings` against THIS manifest, in the `fuzz` job of .github/workflows/qa.yml.
 [package]
 name = "oauth-as-fuzz"
 version = "0.0.0"
@@ -26,6 +27,10 @@ rust-version = "1.75"
 
 [package.metadata]
 cargo-fuzz = true
+
+# An empty table, which is what makes this an independent workspace root rather than a member of
+# the one above it. See the header of this file and `exclude = ["fuzz"]` in the root manifest.
+[workspace]
 
 [dependencies]
 libfuzzer-sys = "0.4"
