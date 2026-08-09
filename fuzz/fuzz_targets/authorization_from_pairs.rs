@@ -84,9 +84,8 @@ fn first<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fuzz_target!(|pairs: Pairs| {
     let pairs = pairs.0;
-    let request = AuthorizationRequest::from_pairs(
-        pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-    );
+    let request =
+        AuthorizationRequest::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
     // 1, 2 and 4 together: `Option<&str>` equality covers presence, choice of occurrence, and
     // byte-for-byte identity in one comparison, and there is no way to satisfy it by accident.

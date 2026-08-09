@@ -51,9 +51,8 @@ fuzz_target!(|data: &[u8]| {
             "an accepted scope token contains the RFC 6749 s3.3 separator: {s:?}"
         );
         assert!(
-            s.bytes().all(|b| b == 0x21
-                || (0x23..=0x5B).contains(&b)
-                || (0x5D..=0x7E).contains(&b)),
+            s.bytes()
+                .all(|b| b == 0x21 || (0x23..=0x5B).contains(&b) || (0x5D..=0x7E).contains(&b)),
             "an accepted scope token is outside the RFC 6749 s3.3 charset: {s:?}"
         );
     }

@@ -150,7 +150,11 @@ fn build(input: &Input) -> String {
         ("redirect_uri", &input.redirect_uri, REDIRECT_URI),
         ("scope", &input.scope, "read"),
         ("code_challenge", &input.code_challenge, RFC7636_CHALLENGE),
-        ("code_challenge_method", &input.code_challenge_method, "S256"),
+        (
+            "code_challenge_method",
+            &input.code_challenge_method,
+            "S256",
+        ),
         ("iss", &input.iss, JAR_ID),
         ("aud", &input.aud, ISSUER),
     ] {
@@ -167,9 +171,7 @@ fn build(input: &Input) -> String {
         Signing::Registered => {
             jws_signed(request_object_key(), header.as_bytes(), payload.as_bytes())
         }
-        Signing::Unsigned => {
-            jws_with_signature(header.as_bytes(), payload.as_bytes(), Vec::new())
-        }
+        Signing::Unsigned => jws_with_signature(header.as_bytes(), payload.as_bytes(), Vec::new()),
         Signing::Wrong(bytes) => {
             jws_with_signature(header.as_bytes(), payload.as_bytes(), bytes.to_vec())
         }
@@ -180,8 +182,8 @@ fuzz_target!(|input: Input| {
     let object = build(&input);
     let presented = input.presented_client_id.as_str();
 
-    let outcome = runtime()
-        .block_on(server().validate_signed_authorization_request(presented, &object));
+    let outcome =
+        runtime().block_on(server().validate_signed_authorization_request(presented, &object));
 
     let validated = match outcome {
         Ok(validated) => validated,

@@ -101,7 +101,11 @@ fn build(input: &Input) -> String {
     );
     header.insert(
         "typ".into(),
-        input.typ.clone().unwrap_or_else(|| "dpop+jwt".into()).into(),
+        input
+            .typ
+            .clone()
+            .unwrap_or_else(|| "dpop+jwt".into())
+            .into(),
     );
     match &input.key {
         HeaderKey::Matching => {
@@ -125,8 +129,8 @@ fn build(input: &Input) -> String {
                 serde_json::json!({
                     "kty": "EC",
                     "crv": "P-384",
-                    "x": public.x,
-                    "y": public.y,
+                    "x": public.x(),
+                    "y": public.y(),
                 }),
             );
         }
@@ -193,19 +197,21 @@ fuzz_target!(|input: Input| {
 
     let proof = build(&input);
 
-    let outcome = runtime().block_on(server().token_with_context(
-        TokenRequest::ClientCredentials {
-            client_id: oauth_as::ClientId::new(CONFIDENTIAL_ID),
-            client_secret: input
-                .present_secret
-                .then(|| CONFIDENTIAL_SECRET.to_string()),
-            scope: None,
-        },
-        TokenRequestContext {
-            dpop_proof: Some(&proof),
-            ..Default::default()
-        },
-    ));
+    let outcome = runtime().block_on(
+        server().token_with_context(
+            TokenRequest::ClientCredentials {
+                client_id: oauth_as::ClientId::new(CONFIDENTIAL_ID),
+                client_secret: input
+                    .present_secret
+                    .then(|| CONFIDENTIAL_SECRET.to_string()),
+                scope: None,
+            },
+            TokenRequestContext {
+                dpop_proof: Some(&proof),
+                ..Default::default()
+            },
+        ),
+    );
 
     let Ok(token) = outcome else {
         return;

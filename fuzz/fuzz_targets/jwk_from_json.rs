@@ -67,7 +67,10 @@ impl<'a> Arbitrary<'a> for Input {
         if u.arbitrary()? {
             object.insert(
                 "kty".into(),
-                Value::String(u.choose(&["EC", "RSA", "oct", "OKP", "ec", ""])?.to_string()),
+                Value::String(
+                    u.choose(&["EC", "RSA", "oct", "OKP", "ec", ""])?
+                        .to_string(),
+                ),
             );
         }
         if u.arbitrary()? {
@@ -144,12 +147,13 @@ fuzz_target!(|input: Input| {
     );
 
     // 2.
-    assert_eq!(jwk.kty, "EC", "an accepted JWK has a non-EC kty: {value}");
+    assert_eq!(jwk.kty(), "EC", "an accepted JWK has a non-EC kty: {value}");
     assert_eq!(
-        jwk.crv, "P-256",
+        jwk.crv(),
+        "P-256",
         "an accepted JWK has a non-P-256 crv: {value}"
     );
-    for (name, coord) in [("x", &jwk.x), ("y", &jwk.y)] {
+    for (name, coord) in [("x", jwk.x()), ("y", jwk.y())] {
         let decoded = URL_SAFE_NO_PAD
             .decode(coord.as_bytes())
             .unwrap_or_else(|e| panic!("accepted {name} is not unpadded base64url ({e}): {coord}"));

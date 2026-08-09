@@ -188,7 +188,11 @@ pub fn server() -> &'static std::sync::Arc<AuthorizationServer<MemoryStorage, Sy
                     },
                     vec![GrantType::ClientCredentials],
                 ),
-                client(JAR_ID, ClientAuth::Public, vec![GrantType::AuthorizationCode]),
+                client(
+                    JAR_ID,
+                    ClientAuth::Public,
+                    vec![GrantType::AuthorizationCode],
+                ),
             ] {
                 server
                     .register_client(c)

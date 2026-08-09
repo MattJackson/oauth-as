@@ -117,7 +117,9 @@ fuzz_target!(|request: Request| {
         true => request.path.clone(),
         false => format!("{}?{}", request.path, request.query),
     };
-    let mut builder = http::Request::builder().method(request.method.as_str()).uri(&uri);
+    let mut builder = http::Request::builder()
+        .method(request.method.as_str())
+        .uri(&uri);
     for (name, value) in &request.headers {
         // A name or value an `http::HeaderMap` will not hold is one no HTTP server would deliver
         // either: `HeaderValue` rejects the control bytes that RFC 9110 s5.5 excludes from a field

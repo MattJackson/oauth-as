@@ -183,8 +183,8 @@ fn build(input: &Input) -> (String, bool) {
             // The "key" an algorithm-confusion attacker uses: the PUBLIC coordinates, which are
             // published in the JWKS and in every proof the client ever sent.
             let jwk = key.to_public_jwk();
-            let mut mac_key = URL_SAFE_NO_PAD.decode(&jwk.x).unwrap_or_default();
-            mac_key.extend(URL_SAFE_NO_PAD.decode(&jwk.y).unwrap_or_default());
+            let mut mac_key = URL_SAFE_NO_PAD.decode(jwk.x()).unwrap_or_default();
+            mac_key.extend(URL_SAFE_NO_PAD.decode(jwk.y()).unwrap_or_default());
             let unsigned = jws_with_signature(header.as_bytes(), payload.as_bytes(), Vec::new());
             let signing_input = unsigned.trim_end_matches('.');
             let mac = hmac_sha256(&mac_key, signing_input.as_bytes());
