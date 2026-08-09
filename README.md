@@ -60,7 +60,7 @@ See [ROADMAP.md](ROADMAP.md) for what is coming and, more usefully, what is miss
 
 ## Features
 
-Thirteen features. The default set is **empty**, and stays that way.
+Fourteen features. The default set is **empty**, and stays that way.
 
 | Feature | Adds | Implies | Cost in dependencies |
 | ------- | ---- | ------- | -------------------- |
@@ -68,6 +68,7 @@ Thirteen features. The default set is **empty**, and stays that way.
 | `http` | An HTTP service over the server: `http::Request` in, `http::Response` out, **no web framework and no async runtime** | | `http`, `http-body`, `bytes` |
 | `axum` | `impl From<AuthorizationService> for axum::Router`, plus the runtime to bind a listener with. About thirty lines, and the whole of this crate's exposure to a pre-1.0 framework | `http` | `axum` 0.8, `tokio` |
 | `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document | | `p256` |
+| `jwt-pkcs8` | `EcdsaP256Key::from_pkcs8_der` / `to_pkcs8_der`, for a host whose key arrives as DER rather than as a raw scalar | `jwt` | one crate, `pkcs8`; `der`, `spki` and `const_oid` are already in a `jwt` tree via `sec1` |
 | `client_assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
 | `dpop` | RFC 9449 sender-constrained tokens | `jwt` | none of its own |
 | `jar` | RFC 9101 signed request objects | `jwt` | none of its own |
@@ -79,7 +80,7 @@ Thirteen features. The default set is **empty**, and stays that way.
 | `resource-metadata` | The RFC 9728 document type, for a host that also runs a resource server | | none |
 | `test-util` | A runnable `Storage` conformance harness for hosts to run against their own store | | none |
 
-Nine of the thirteen add no dependency at all: they are serde shapes and comparisons over what is
+Ten of the fourteen add no dependency at all: they are serde shapes and comparisons over what is
 already there. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
 whose major has never moved, so they can appear in this crate's public signatures without making a
 framework upgrade in your tree a breaking change here. If you want a `Router`, turn on `axum` as
@@ -93,10 +94,70 @@ each item naming the feature that turns it on.
 
 ## Cost
 
-Measured, not asserted:
+Measured, not asserted. Run it yourself: **`scripts/size-report.sh`**.
 
-- **113 KiB** of linked binary for the whole protocol surface, with LTO and stripping, every entry
-  point reachable so nothing is dead stripped.
+### Linked size
+
+What a host's binary grows by when it adds this crate and **uses** it. Each number is the
+difference between two linked binaries, one with the crate and one without, built identically.
+
+| You enable | It costs | Into a host that already has serde_json, http, bytes and sha2 |
+| ---------- | -------- | ------------------------------------------------------------ |
+| *(default)* the protocol core | **195 KiB** | 182 KiB |
+| `jwt` | 259 KiB | 240 KiB |
+| `http` | 388 KiB | not measured |
+| `http` + `jwt` | 451 KiB | 378 KiB |
+| `axum` (with a tokio runtime and a bound listener) | 600 KiB | not measured |
+| everything, all fourteen features | 1103 KiB | 1022 KiB |
+
+What each optional feature adds on top of the core:
+
+| Feature | Adds | Feature | Adds |
+| ------- | ---- | ------- | ---- |
+| `mtls` | 6 KiB | `jwt` | 64 KiB |
+| `resource-metadata` | 7 KiB | `rar` | 95 KiB |
+| `token-exchange` | 8 KiB | `test-util` | 141 KiB |
+| `par` | 17 KiB | `http` | 193 KiB |
+| `consent` | 24 KiB | `axum` | 405 KiB (212 of it over `http`, and nearly all of that is tokio) |
+
+and on top of `jwt`: `dpop` 46 KiB, `jar` 49 KiB, `client_assertion` 49 KiB, `jwt-pkcs8` 30 KiB.
+
+**Read the caveats, because they change what the numbers mean.**
+
+- **Platform and profile:** `aarch64-apple-darwin`, `rustc 1.97.0`, `lto = "fat"`,
+  `codegen-units = 1`, `opt-level = 3`, `panic = "unwind"`. Code size is a property of the target's
+  instruction encoding, so an x86-64 figure is a different figure. **Nothing in this repository's
+  `[profile.release]` reaches you**: cargo honors profiles only for the workspace being built, so
+  you compile this crate with YOUR profile and get YOUR numbers. A build without LTO will be
+  larger, in some rows considerably.
+- **"Uses" is doing real work in that sentence.** With LTO the linker deletes whatever nothing
+  calls, so a feature you switch on and never touch costs close to nothing. Every row above was
+  measured with the surface actually driven: all four grants end to end, the authorization
+  endpoint, introspection, revocation, dynamic registration, and for `http` a request dispatched to
+  every route. `scripts/size-probe/src/` is the definition of what was exercised, per row.
+- **The rows include a host's own calling code**, because something has to call the library and
+  under fat LTO the two are inlined together and cannot be separated. About 48 KiB of the default
+  row is attributed to the probe's driver by `cargo bloat`, much of which is inlined library code.
+  Treat every row as an upper bound.
+- **`AuthorizationServer<S, C>` is monomorphized per (`Storage`, `Clock`) pair.** Measured: a
+  second instantiation of the default surface costs **53 KiB**, about 27% of the row again. One
+  pair is the normal case and every row above is one pair. That is the price of a storage seam that
+  is allocation-free and devirtualized rather than a `dyn Storage` with an indirect call on every
+  storage operation, and it is the trade this crate chose deliberately.
+- **Sharing helps less than the dependency list suggests.** Adding this crate to a host that
+  already links and uses serde_json, http, bytes and sha2 recovers only about 7% of the default
+  row. serde and serde_json are generic: their machinery instantiated for your types is different
+  machine code from the same machinery instantiated for ours, and only the non-generic core is
+  actually shared.
+- The `.rlib` is megabytes and is **not** a cost. It is crate metadata plus generic bodies nobody
+  instantiates. Do not use it to judge this or any other crate.
+
+**CI fails the build when any of `default`, `jwt`, `http`, `http,jwt`, `axum` or `--all-features`
+grows past a recorded budget**, and the budgets carry their reasoning next to them in
+`scripts/size-report.sh`. When one is blown, the design gets fixed, not the number.
+
+### Allocations
+
 - **Zero allocations** when an uninstalled hook is invoked, pinned by a counting allocator.
 - Allocation counts and type sizes on the hot paths are gated in CI. Those gates have caught three
   real regressions, including a 2 KB per-request allocation caused by crossing tokio's 2048 byte

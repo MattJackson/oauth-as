@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (C) 2026 Matthew Jackson
+
+# The SIZE PROBE. Not published, not a workspace member, and not something a consumer ever sees.
+#
+# WHY IT IS ITS OWN WORKSPACE, like fuzz/: this crate turns oauth-as features ON. Under resolver 2
+# a feature any workspace member asks for is enabled for every member's build of that package in
+# one `cargo build --workspace`, so making this a member would silently turn `http`, `jwt` and the
+# rest on for crates/oauth-as-postgres and for the test targets. The root Cargo.toml records the
+# same reasoning for fuzz/.
+#
+# WHY IT EXISTS AT ALL: an .rlib size is not a cost. It carries metadata and un-instantiated
+# generic bodies that no consumer links. The only honest measurement of what this crate costs is
+# the delta between a linked binary that USES it and a matched binary that does not, which is what
+# scripts/size-report.sh builds out of this crate.
+[workspace]
+
+[package]
+name = "size-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "size-probe"
+path = "src/main.rs"
+
+[dependencies]
+# The crate under measurement. OPTIONAL so the same binary, built with `--no-default-features`,
+# is the matched BASELINE: same toolchain, same profile, same std, same main, minus this crate.
+oauth-as = { path = "../../crates/oauth-as", default-features = false, optional = true }
+
+# The "host already has the deps" case. A real host that embeds an authorization server almost
+# certainly already parses JSON and speaks the `http` vocabulary, so the marginal cost of adding
+# oauth-as to THAT binary is a different (and smaller) number from the standalone delta. These are
+# the four shared crates: serde_json (with serde), http, bytes, sha2. Exercised in
+# src/hostdeps.rs, because a dependency the linker deletes is not a dependency the host has.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+http = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+# The axum ADAPTER's counterparty. A host that turns oauth-as's `axum` feature on necessarily has
+# axum in its own tree (that is what the feature is for), so the probe must too in order to name
+# `axum::Router`. Same version and the same default-features = false as crates/oauth-as declares,
+# so cargo unifies them rather than building two.
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
+# The runtime a host must have to call `axum::serve`. Declared here with exactly the feature set
+# crates/oauth-as asks for, so cargo unifies rather than building two tokios. Without this the
+# `axum` row would measure the adapter alone and report tokio at under a kilobyte, because LTO
+# deletes a runtime nothing enters.
+tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
+
+[features]
+default = []
+# The crate under measurement, exercised through its default (feature-free) surface.
+#
+# `dep:serde_json` comes along because a host that gets an RFC 8414 metadata document out of this
+# crate has to serialize it, and without the `http` feature that is the host's own call. It is
+# oauth-as's own dependency either way, so no crate enters the tree that was not already there.
+lib = ["dep:oauth-as", "dep:serde_json", "dep:serde"]
+# The shared-dependency host simulation. Independent of `lib`: the marginal measurement is
+# (hostdeps + lib) minus (hostdeps).
+hostdeps = ["dep:serde", "dep:serde_json", "dep:http", "dep:bytes", "dep:sha2"]
+
+# ONE PROBE FEATURE PER oauth-as FEATURE. They exist because a cargo feature of a DEPENDENCY is
+# not a `cfg` in the dependent crate: the probe cannot write `#[cfg(feature = "oauth-as/jwt")]`,
+# so each oauth-as feature gets a mirror here that both turns it on and gates the code that
+# exercises it. Naming is `f-<feature>` so the mirror is never mistaken for a capability of the
+# probe itself.
+f-http = ["lib", "dep:http", "oauth-as/http"]
+f-axum = ["lib", "f-http", "dep:axum", "dep:tokio", "oauth-as/axum"]
+f-jwt = ["lib", "oauth-as/jwt"]
+f-jwt-pkcs8 = ["lib", "f-jwt", "oauth-as/jwt-pkcs8"]
+# The SAME crate feature, with the probe's exercise of it left OFF. It exists to answer one
+# question the crate's own manifest asserts an answer to: what does compiling `jwt-pkcs8` in and
+# never calling it cost? Under `lto = "fat"` the answer turns out to be nothing, which is not what
+# a reader of the manifest would guess.
+f-jwt-pkcs8-unused = ["lib", "f-jwt", "oauth-as/jwt-pkcs8"]
+f-mtls = ["lib", "oauth-as/mtls"]
+f-par = ["lib", "oauth-as/par"]
+f-jar = ["lib", "f-jwt", "oauth-as/jar"]
+f-rar = ["lib", "oauth-as/rar"]
+f-dpop = ["lib", "f-jwt", "oauth-as/dpop"]
+f-client_assertion = ["lib", "f-jwt", "oauth-as/client_assertion"]
+f-consent = ["lib", "oauth-as/consent"]
+f-token-exchange = ["lib", "oauth-as/token-exchange"]
+f-resource-metadata = ["lib", "oauth-as/resource-metadata"]
+f-test-util = ["lib", "oauth-as/test-util"]
+
+# The profile the report is measured under, and the reasoning for each line.
+#
+# It is NOT this repository's [profile.release]: a consumer compiles oauth-as with THEIR profile
+# and nothing in our root Cargo.toml reaches them. This is the profile a size-conscious host would
+# plausibly pick, chosen so the measurement is a fair upper bound on what the crate contributes
+# rather than a flattering one.
+[profile.release]
+lto = "fat"          # cross-crate inlining AND dead code elimination, which is what makes an
+                     # un-exercised feature cost close to nothing (see the script's header)
+codegen-units = 1    # no cross-unit duplication to confuse the attribution
+opt-level = 3
+# panic = "unwind" is the DEFAULT and is left alone deliberately. Setting `abort` would delete the
+# landing pads and unwind tables this crate's code generates, which a real host (which is entitled
+# to catch a panic at its request boundary, per the note in the root Cargo.toml) still pays for.
+# Measuring with abort would understate the cost.
+# `strip` is NOT set here: scripts/size-report.sh needs symbols to attribute, and it measures
+# SECTION sizes rather than the file size, so symbol tables do not enter the number.

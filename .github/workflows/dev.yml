@@ -110,3 +110,41 @@ jobs:
         run: scripts/oauth-conformance.sh --selftest
       - name: live black-box conformance
         run: scripts/oauth-conformance.sh --check
+
+  # LINKED SIZE, gated rather than asserted, in the same spirit as tests/allocation.rs.
+  #
+  # WHAT IT MEASURES: scripts/size-report.sh links scripts/size-probe twice per feature set, once
+  # with oauth-as and once without, and compares byte-exact SECTION sizes. The probe EXERCISES
+  # every surface it measures, because `lto = "fat"` deletes anything nothing calls and a probe
+  # that merely enables a feature measures it at close to zero. The script's header has the whole
+  # method and the reasoning for every budget.
+  #
+  # WHY macOS AND NOT ubuntu, which is what every other job here runs on: code size is a property
+  # of the target's instruction encoding, so a budget measured on arm64 does not describe x86-64.
+  # The recorded budgets were measured on aarch64-apple-darwin, and the script REFUSES to run
+  # `--check` on a platform it has no budgets for rather than passing vacuously. Running it
+  # anywhere else would need a second set of budgets measured there, which is a real option and
+  # not what was done. It is a separate job, so it costs the rest of this gate no wall clock.
+  #
+  # THE HOUSE RULE, and it is the point of having this at all: when a change blows a budget, the
+  # CHANGE gets fixed. Raising a number here is allowed only with what bought it written down
+  # beside it, in scripts/size-report.sh.
+  size:
+    name: linked size budgets
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The probe is its own workspace (see scripts/size-probe/Cargo.toml on why), and its
+          # per-configuration target directories live under target/size-report. Neither is what
+          # this action caches by default, and without both every run is a cold fat-LTO link of
+          # nine binaries.
+          workspaces: |
+            .
+            scripts/size-probe
+          cache-directories: target/size-report
+      - name: linked size within budget
+        run: scripts/size-report.sh --check
