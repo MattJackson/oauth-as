@@ -53,7 +53,10 @@ tokio = { version = "1", features = ["rt"] }
 [dependencies.oauth-as]
 path = "../crates/oauth-as"
 default-features = false
-features = ["http", "jwt", "rar", "par", "jar", "dpop", "client_assertion", "mtls"]
+# `jwt-p256` rather than `jwt`: every one of these targets has to PRODUCE the credential it then
+# corrupts, and since the ES256 seam landed `jwt` is the trait surface and carries no curve. A
+# fuzzer that cannot sign cannot reach the verifier it exists to fuzz.
+features = ["http", "jwt-p256", "rar", "par", "jar", "dpop", "client_assertion", "mtls"]
 
 # The shared fixtures (the server under test, the JWS builders, the RFC charset predicates). A
 # `lib` rather than an `#[path]` include in each target, so there is ONE definition of "the
