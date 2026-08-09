@@ -5,12 +5,41 @@
 //! Compiled ONLY under the off-by-default `jwt` feature; with the feature off this module does not
 //! exist and the crate's dependency set is unchanged.
 //!
-//! # Why this is hand-rolled
+//! # Verification: the three rules, and they are the whole of the trust boundary
 //!
-//! (As of the `client_assertion` and `dpop` features this module also VERIFIES: see the
-//! VERIFICATION banner in the second half of this file, which is where the rules for handling a
-//! JWS somebody else made are written down. The argument below is about the SIGNING half and is
-//! unchanged by it; the verifier is likewise a few hundred lines rather than a framework.)
+//! This module SIGNS in its first half and VERIFIES in its second, and the two jobs are not
+//! symmetric. The module doc used to be able to say this crate "never parses a JWT it did not
+//! make"; the `client_assertion` and `dpop` features ended that. An RFC 7523 client assertion and
+//! an RFC 9449 DPoP proof are both JWTs a CLIENT made, so [`CompactJws::parse`], [`PublicJwk`] and
+//! [`verify_es256`] are handling attacker-controlled input, and anyone verifying against them
+//! needs these three rules rather than a pointer at the source.
+//!
+//! They are the same three rules every published JWS confusion attack has been aimed at:
+//!
+//! 1. THE KEY IS CHOSEN BY THE VERIFIER, never by the token. A caller passes the key it already
+//!    decided to trust (a registered client's JWK, a registered client's secret); nothing here
+//!    resolves a key out of the header on its own authority, and there is no `jku`, `x5u` or `kid`
+//!    lookup. DPoP is the one apparent exception and is not really one: its key comes from the
+//!    proof, but the proof only ever proves possession of THAT key, and it is the `cnf.jkt`
+//!    binding, not this module, that decides whether the key means anything (see the `dpop`
+//!    module).
+//! 2. THE ALGORITHM IS CHOSEN BY THE VERIFIER, never by the token. [`verify_es256`] and
+//!    [`verify_hs256`] are separate functions taking separate key types, so there is no value of
+//!    `alg` a caller can be made to route an HMAC verification at a public key it already
+//!    published. `none` is not implemented at all: no code path here accepts an unsigned JWS. A
+//!    caller still has to check that the `alg` it was handed is the one the REGISTRATION expects,
+//!    which is why the `client_assertion` module's `AssertionKeys` holds one algorithm, not a
+//!    set.
+//! 3. NOTHING IS DECODED TWICE. The signature is verified over the EXACT received bytes of
+//!    `header.payload` ([`CompactJws::signing_input`] borrows them), never over a re-serialization
+//!    of the parsed claims, so a payload that serializes differently than it arrived cannot verify
+//!    under one reading and be interpreted under another.
+//!
+//! A JWK presented to this module is also refused outright if it carries any PRIVATE or symmetric
+//! member (`d`, the RSA CRT parameters, `k`): RFC 9449 section 4.3 makes that a requirement, and
+//! [`PublicJwk::from_json`] is the only route into the type, including through `serde`.
+//!
+//! # Why this is hand-rolled
 //!
 //! This crate ISSUES exactly one token shape. A general
 //! JOSE library brings a parser, a validation policy engine and a key-format zoo that an issuer
@@ -535,29 +564,10 @@ mod tests;
 // =============================================================================================
 // VERIFICATION.
 //
-// Everything above this line SIGNS. Everything below it VERIFIES, which is a different and much
-// more dangerous job, because the input is attacker controlled: the module doc above used to say
-// this crate "never parses a JWT it did not make", and as of the `client_assertion` and `dpop`
-// features that is no longer true. RFC 7523 client assertions and RFC 9449 DPoP proofs are both
-// JWTs a CLIENT made, so what follows is a trust boundary.
-//
-// The rules that boundary is built on, and they are the same three rules every published JWS
-// confusion attack has been aimed at:
-//
-//  1. The KEY is chosen by the verifier, never by the token. A caller passes the key it already
-//     decided to trust (a registered client's JWK, a registered client's secret); nothing here
-//     resolves a key out of the header on its own authority. DPoP is the one apparent exception
-//     and is not really one: its key comes from the proof, but the proof only ever proves
-//     possession of THAT key, and it is the `cnf.jkt` binding, not this file, that decides whether
-//     that key means anything (see src/dpop.rs).
-//  2. The ALGORITHM is chosen by the verifier, never by the token. `verify_es256` and
-//     `verify_hs256` are separate functions taking separate key types, so there is no value of
-//     `alg` that can make an HMAC verification run against a public key. `none` is not implemented
-//     at all: there is no code path here that accepts an unsigned JWS.
-//  3. Nothing is decoded twice. The signature is verified over the EXACT received bytes of
-//     `header.payload` (`CompactJws::signing_input` borrows them), never over a re-serialization
-//     of the parsed claims, so a payload that serializes differently than it arrived cannot verify
-//     under one reading and be interpreted under another.
+// Everything above this line SIGNS; everything below it VERIFIES, which is a different and much
+// more dangerous job because the input is attacker controlled. The three rules that boundary is
+// built on are in this module's `//!` docs, where a reader on docs.rs can see them without
+// opening this file; they are not repeated here so that there is only one copy to keep true.
 // =============================================================================================
 
 /// A JWS could not be parsed, or did not verify.
@@ -602,19 +612,27 @@ const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "
 ///
 /// Deserialization goes through [`PublicJwk::from_json`], including through `serde`, so there is no
 /// route into this type that skips the private-parameter rejection.
+///
+/// The FIELDS ARE SEALED, which is what makes the sentence above true. They were public through
+/// 0.9, and a struct literal was exactly such a route: an `AssertionKeys::PublicKeys` built by hand
+/// could carry a `kty` this crate never verifies, or coordinates of any width, and
+/// [`PublicJwk::thumbprint`] would then hand back a `cnf.jkt` over it. Verification revalidates and
+/// so fails closed, but a thumbprint is a value a host WRITES DOWN, and a token bound to a key
+/// nobody can present is a token nobody can use. Read them with the accessors; build them with
+/// [`PublicJwk::from_json`] or [`PublicJwk::from_coordinates`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublicJwk {
     /// Key type; only `EC` is accepted.
-    pub kty: String,
+    kty: String,
     /// Curve; only `P-256` is accepted.
-    pub crv: String,
+    crv: String,
     /// Base64url (unpadded) x coordinate, exactly 32 bytes decoded.
-    pub x: String,
+    x: String,
     /// Base64url (unpadded) y coordinate, exactly 32 bytes decoded.
-    pub y: String,
+    y: String,
     /// The optional key identifier (RFC 7517 section 4.5).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kid: Option<String>,
+    kid: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for PublicJwk {
@@ -685,6 +703,68 @@ impl PublicJwk {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         })
+    }
+
+    /// One P-256 public key from its two RFC 7518 section 6.2.1.2 coordinates, exactly as they
+    /// appear in a JWK: base64url, unpadded, 32 bytes each.
+    ///
+    /// The constructor for a host that holds the coordinates rather than a JSON document, and the
+    /// reason the sealed fields cost nobody anything. `kty` and `crv` are not arguments because
+    /// there is exactly one pair this crate verifies with, so admitting others would only admit a
+    /// key that cannot be used. The same width check [`PublicJwk::from_json`] performs runs here:
+    /// a constructor that skipped it would be the hole the fields were sealed to close.
+    pub fn from_coordinates(x: &str, y: &str) -> Result<Self, VerifyError> {
+        let coordinate = |b64: &str| -> Result<(), VerifyError> {
+            match URL_SAFE_NO_PAD.decode(b64) {
+                Ok(bytes) if bytes.len() == 32 => Ok(()),
+                _ => Err(VerifyError::new(
+                    "a P-256 coordinate is exactly 32 base64url-encoded bytes",
+                )),
+            }
+        };
+        coordinate(x)?;
+        coordinate(y)?;
+        Ok(PublicJwk {
+            kty: "EC".to_string(),
+            crv: "P-256".to_string(),
+            x: x.to_string(),
+            y: y.to_string(),
+            kid: None,
+        })
+    }
+
+    /// Name this key, with the RFC 7517 section 4.5 `kid` a client publishes it under.
+    ///
+    /// Deliberately NOT part of the thumbprint: see [`PublicJwk::thumbprint`] on why relabelling a
+    /// key must not change what a token is bound to.
+    pub fn with_kid(mut self, kid: &str) -> Self {
+        self.kid = Some(kid.to_string());
+        self
+    }
+
+    /// Key type. Always `EC`: nothing else parses.
+    pub fn kty(&self) -> &str {
+        &self.kty
+    }
+
+    /// Curve. Always `P-256`: nothing else parses.
+    pub fn crv(&self) -> &str {
+        &self.crv
+    }
+
+    /// The base64url x coordinate.
+    pub fn x(&self) -> &str {
+        &self.x
+    }
+
+    /// The base64url y coordinate.
+    pub fn y(&self) -> &str {
+        &self.y
+    }
+
+    /// The RFC 7517 section 4.5 `kid`, if the key carries one.
+    pub fn kid(&self) -> Option<&str> {
+        self.kid.as_deref()
     }
 
     /// The RFC 7638 section 3 JWK Thumbprint of this key: SHA-256, base64url without padding.
