@@ -179,6 +179,11 @@ pub const CHECKS: &[&str] = &[
     ATOMIC_CLAIM_REPLAY_ID,
     CLAIM_REPLAY_ID_REFUSES_SECOND,
     SWEEP_RECLAIMS_REPLAY_IDS,
+    ATOMIC_TAKE_PUSHED_REQUEST,
+    ROUND_TRIP_CONSENT,
+    REVOKE_CONSENT_CASCADES,
+    REVOKE_CONSENT_SPARES_OTHERS,
+    REVOKE_CONSENT_COUNT,
 ];
 
 const HARNESS_RACE_SETUP: &str = "harness/race_setup";
@@ -208,6 +213,11 @@ const DELETE_TOKEN_IDEMPOTENT: &str = "delete_token/idempotent";
 const ATOMIC_CLAIM_REPLAY_ID: &str = "atomic_claim/claim_replay_id";
 const CLAIM_REPLAY_ID_REFUSES_SECOND: &str = "claim_replay_id/refuses_a_second_claim";
 const SWEEP_RECLAIMS_REPLAY_IDS: &str = "sweep_expired/reclaims_replay_ids";
+const ATOMIC_TAKE_PUSHED_REQUEST: &str = "atomic_take/take_pushed_authorization_request";
+const ROUND_TRIP_CONSENT: &str = "round_trip/consent";
+const REVOKE_CONSENT_CASCADES: &str = "revoke_consent/cascades";
+const REVOKE_CONSENT_SPARES_OTHERS: &str = "revoke_consent/spares_other_subjects";
+const REVOKE_CONSENT_COUNT: &str = "revoke_consent/count";
 
 /// A racer handed to the host's runtime by [`StorageConformance::with_spawn`].
 ///
@@ -298,6 +308,10 @@ where
         self.delete_token(&mut report).await;
         #[cfg(any(feature = "client_assertion", feature = "dpop"))]
         self.claim_replay_id(&mut report).await;
+        #[cfg(feature = "par")]
+        self.atomic_take_pushed_request(&mut report).await;
+        #[cfg(feature = "consent")]
+        self.consent(&mut report).await;
         report.violations
     }
 
@@ -770,6 +784,294 @@ where
                 report.fail(
                     ATOMIC_TAKE_AUTHORIZATION_CODE,
                     "a second take_authorization_code returned the record again",
+                );
+            }
+        }
+    }
+
+    /// RFC 9126 section 4 makes a `request_uri` single use, and
+    /// `take_pushed_authorization_request` is the ONLY thing enforcing it. Same defect shape as
+    /// the other `take_*` operations: a store that reads then deletes lets two concurrent
+    /// `/authorize` hits on one handle both resolve, so one pushed request authorizes twice.
+    ///
+    /// Worth checking separately rather than assuming a store that got the other three right got
+    /// this one right too: this method arrived with the PAR feature, later than the rest, which is
+    /// exactly the shape of thing a host adds in a hurry against an existing trait impl.
+    #[cfg(feature = "par")]
+    async fn atomic_take_pushed_request(&self, report: &mut Report) {
+        let store = self.store().await;
+        let record = sample_pushed_request("urn:ietf:params:oauth:request_uri:race");
+        if report
+            .ok(
+                ATOMIC_TAKE_PUSHED_REQUEST,
+                "put_pushed_authorization_request",
+                store.put_pushed_authorization_request(record).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                Box::pin(async move {
+                    gate.wait().await;
+                    store
+                        .take_pushed_authorization_request("urn:ietf:params:oauth:request_uri:race")
+                        .await
+                })
+            })
+            .await;
+        self.judge_race(
+            report,
+            ATOMIC_TAKE_PUSHED_REQUEST,
+            "pushed authorization request",
+            results,
+        );
+
+        if let Some(again) = report.ok(
+            ATOMIC_TAKE_PUSHED_REQUEST,
+            "take_pushed_authorization_request after take",
+            store
+                .take_pushed_authorization_request("urn:ietf:params:oauth:request_uri:race")
+                .await,
+        ) {
+            if again.is_some() {
+                report.fail(
+                    ATOMIC_TAKE_PUSHED_REQUEST,
+                    "a second take_pushed_authorization_request returned the handle again",
+                );
+            }
+        }
+    }
+
+    /// Consent round trip, and the withdrawal cascade.
+    ///
+    /// The cascade is the one worth the most care in this whole harness. Withdrawal is what a user
+    /// is told stops an application acting for them, so a store that removes the consent row and
+    /// leaves the credentials alive has told the user something false, and nothing anywhere
+    /// reports it: the endpoint answered 200, the row is gone, and the tokens keep working. That
+    /// is strictly worse than a withdrawal that visibly fails.
+    ///
+    /// So this seeds one of every record kind the contract enumerates for the consent being
+    /// withdrawn, AND one of each for a DIFFERENT subject of the same client, then requires the
+    /// first set gone, the second set untouched, and the count to match. A store that revokes too
+    /// much fails here just as a store that revokes too little does; over-revoking would log a
+    /// different user out of an application they never withdrew.
+    #[cfg(feature = "consent")]
+    async fn consent(&self, report: &mut Report) {
+        let store = self.store().await;
+
+        let mine = sample_consent("consent-mine", "subject-conformance");
+        let theirs = sample_consent("consent-theirs", "subject-other");
+        if report
+            .ok(
+                ROUND_TRIP_CONSENT,
+                "put_consent",
+                store.put_consent(mine.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if report
+            .ok(
+                ROUND_TRIP_CONSENT,
+                "put_consent (second subject)",
+                store.put_consent(theirs.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // Round trip by id, and by the (client, subject) lookup the remembered-consent path uses.
+        // A store whose index disagrees with what it stored answers one and not the other.
+        if let Some(Some(back)) = report.ok(
+            ROUND_TRIP_CONSENT,
+            "get_consent",
+            store.get_consent("consent-mine").await,
+        ) {
+            if back != mine {
+                report.fail(
+                    ROUND_TRIP_CONSENT,
+                    "get_consent returned a record that differs from the one stored",
+                );
+            }
+        } else {
+            report.fail(ROUND_TRIP_CONSENT, "get_consent did not return the record");
+        }
+        if let Some(found) = report.ok(
+            ROUND_TRIP_CONSENT,
+            "find_consent",
+            store
+                .find_consent(&ClientId::new("client-conformance"), "subject-conformance")
+                .await,
+        ) {
+            match found {
+                Some(f) if f.consent_id == mine.consent_id => {}
+                Some(_) => report.fail(
+                    ROUND_TRIP_CONSENT,
+                    "find_consent returned a different consent than the one for that subject",
+                ),
+                None => report.fail(
+                    ROUND_TRIP_CONSENT,
+                    "find_consent did not find a consent that get_consent can read",
+                ),
+            }
+        }
+
+        // Everything the withdrawal must reach, for the consent being withdrawn and for a
+        // bystander subject of the SAME client.
+        // The subject has to be overridden on every record, not just the device grant: the shared
+        // sample builders all carry one subject, and a "different subject" fixture that is
+        // secretly the same subject would make the spares-others check pass for the wrong reason.
+        let seed = |subject: &str, tag: &str| {
+            let mut token = sample_token(&format!("at-{tag}"), "client-conformance", Some(tag));
+            token.subject = Some(subject.to_string());
+            let mut refresh = sample_refresh(&format!("rt-{tag}"), "client-conformance", tag);
+            refresh.subject = Some(subject.to_string());
+            let mut code = sample_authorization_code(&format!("code-{tag}"));
+            code.subject = subject.to_string();
+            (
+                token,
+                refresh,
+                code,
+                sample_approved_device_grant(&format!("dc-{tag}"), &format!("UC{tag}"), subject),
+            )
+        };
+        let (at_mine, rt_mine, code_mine, grant_mine) = seed("subject-conformance", "mine");
+        let (at_theirs, rt_theirs, code_theirs, grant_theirs) = seed("subject-other", "theirs");
+        for (t, r, c, g) in [
+            (&at_mine, &rt_mine, &code_mine, &grant_mine),
+            (&at_theirs, &rt_theirs, &code_theirs, &grant_theirs),
+        ] {
+            if report
+                .ok(
+                    REVOKE_CONSENT_CASCADES,
+                    "seeding the records a withdrawal must reach",
+                    store.put_token(t.clone()).await,
+                )
+                .is_none()
+            {
+                return;
+            }
+            let _ = store.put_refresh_token(r.clone()).await;
+            let _ = store.put_authorization_code(c.clone()).await;
+            let _ = store.put_device_grant(g.clone()).await;
+        }
+
+        let removed = match report.ok(
+            REVOKE_CONSENT_CASCADES,
+            "revoke_consent",
+            store.revoke_consent("consent-mine").await,
+        ) {
+            Some(n) => n,
+            None => return,
+        };
+
+        // The four the contract enumerates, plus the consent row itself.
+        for (what, gone) in [
+            (
+                "the access token",
+                matches!(store.get_token(&at_mine.access_token).await, Ok(None)),
+            ),
+            (
+                "the refresh record",
+                matches!(
+                    store.get_refresh_token(&rt_mine.refresh_token).await,
+                    Ok(None)
+                ),
+            ),
+            (
+                "the unredeemed authorization code",
+                matches!(
+                    store.take_authorization_code(&code_mine.code).await,
+                    Ok(None)
+                ),
+            ),
+            (
+                "the approved device grant",
+                matches!(
+                    store.get_device_grant(&grant_mine.device_code).await,
+                    Ok(None)
+                ),
+            ),
+            (
+                "the consent record",
+                matches!(store.get_consent("consent-mine").await, Ok(None)),
+            ),
+        ] {
+            if !gone {
+                report.fail(
+                    REVOKE_CONSENT_CASCADES,
+                    &format!(
+                        "revoke_consent left {what} alive, so the user was told this application \
+                         was stopped and it was not"
+                    ),
+                );
+            }
+        }
+
+        // And nothing belonging to the other subject moved.
+        for (what, alive) in [
+            (
+                "access token",
+                matches!(store.get_token(&at_theirs.access_token).await, Ok(Some(_))),
+            ),
+            (
+                "refresh record",
+                matches!(
+                    store.get_refresh_token(&rt_theirs.refresh_token).await,
+                    Ok(Some(_))
+                ),
+            ),
+            (
+                "device grant",
+                matches!(
+                    store.get_device_grant(&grant_theirs.device_code).await,
+                    Ok(Some(_))
+                ),
+            ),
+            (
+                "consent record",
+                matches!(store.get_consent("consent-theirs").await, Ok(Some(_))),
+            ),
+        ] {
+            if !alive {
+                report.fail(
+                    REVOKE_CONSENT_SPARES_OTHERS,
+                    &format!(
+                        "revoke_consent removed another subject's {what}, logging out a user who \
+                         withdrew nothing"
+                    ),
+                );
+            }
+        }
+
+        // FOUR: the trait doc is explicit that the consent record itself is not counted, so this
+        // is the four credentials. The count is what an operator investigating an incident reads,
+        // so a store that reports a number it did not remove is lying to the one person who needs
+        // the truth.
+        if removed != 4 {
+            report.fail(
+                REVOKE_CONSENT_COUNT,
+                &format!(
+                    "revoke_consent removed 4 credentials but reported {removed} (the consent \
+                     record itself is not counted)"
+                ),
+            );
+        }
+
+        if let Some(second) = report.ok(
+            REVOKE_CONSENT_COUNT,
+            "revoke_consent (second call)",
+            store.revoke_consent("consent-mine").await,
+        ) {
+            if second != 0 {
+                report.fail(
+                    REVOKE_CONSENT_COUNT,
+                    &format!("withdrawing an already-withdrawn consent reported {second}, not 0"),
                 );
             }
         }
@@ -1956,6 +2258,62 @@ fn sample_device_grant(device_code: &str, user_code: &str) -> DeviceGrant {
         expires_at: at(600),
         interval: Duration::from_secs(7),
         last_poll_at: Some(at_before(5)),
+    }
+}
+
+/// An APPROVED device grant for `subject`. Approved rather than pending on purpose: the consent
+/// cascade must reach a grant the user already approved but whose device has not polled yet,
+/// which is precisely the window where a withdrawal that misses it hands out a token AFTER the
+/// user withdrew. A pending grant is not part of any consent and must survive.
+#[cfg(feature = "consent")]
+fn sample_approved_device_grant(device_code: &str, user_code: &str, subject: &str) -> DeviceGrant {
+    DeviceGrant {
+        state: DeviceGrantState::Approved {
+            subject: subject.to_string(),
+        },
+        ..sample_device_grant(device_code, user_code)
+    }
+}
+
+/// A consent for `subject`, with a scope and a resource so `covers` has something to answer about
+/// and a round trip has something to lose.
+#[cfg(feature = "consent")]
+fn sample_consent(consent_id: &str, subject: &str) -> crate::consent::ConsentRecord {
+    crate::consent::ConsentRecord {
+        consent_id: consent_id.into(),
+        client_id: ClientId::new("client-conformance"),
+        subject: subject.into(),
+        scope: scopes("read write"),
+        resource: vec!["https://rs-one.example/".to_string()],
+        granted_at: at_before(60),
+        authentication: None,
+    }
+}
+
+/// A pushed authorization request, complete enough that a store dropping a field on the way
+/// through is visible rather than plausible.
+#[cfg(feature = "par")]
+fn sample_pushed_request(request_uri: &str) -> crate::par::PushedAuthorizationRequest {
+    crate::par::PushedAuthorizationRequest {
+        request_uri: request_uri.to_string(),
+        client_id: ClientId::new("client-conformance"),
+        response_type: Some("code".to_string()),
+        redirect_uri: Some("https://app.example/cb".to_string()),
+        scope: Some("read write".to_string()),
+        state: Some("state-conformance".to_string()),
+        code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string()),
+        code_challenge_method: Some("S256".to_string()),
+        resource: vec!["https://rs-one.example/".to_string()],
+        #[cfg(feature = "rar")]
+        authorization_details: None,
+        // RFC 9470 s4. Populated rather than `None` for this fixture's stated reason: a store that
+        // drops one of them on the way through has disabled step-up for every PAR request, and the
+        // point of this record is that such a drop is visible.
+        #[cfg(feature = "consent")]
+        acr_values: Some("urn:acr:phr".to_string()),
+        #[cfg(feature = "consent")]
+        max_age: Some("300".to_string()),
+        expires_at: at(60),
     }
 }
 

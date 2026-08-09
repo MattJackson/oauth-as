@@ -64,6 +64,14 @@ struct Faults {
     /// has between the two. The RFC 7523 / RFC 9449 half of the same defect.
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
     look_then_insert_claim: bool,
+    /// `revoke_consent` removes the consent row and returns a count, and leaves every credential
+    /// it was supposed to take with it. The user is told the application was stopped; it was not.
+    #[cfg(feature = "consent")]
+    withdrawal_leaves_credentials: bool,
+    /// `revoke_consent` removes every record of the CLIENT rather than of the (client, subject)
+    /// pair, so withdrawing one user's consent logs out every other user of that application.
+    #[cfg(feature = "consent")]
+    withdrawal_takes_other_subjects: bool,
 }
 
 #[derive(Default)]
@@ -399,16 +407,56 @@ impl Storage for NaiveStore {
             Some(c) => c,
             None => return Ok(0),
         };
-        let client_id = &consent.client_id;
-        let subject: &str = consent.subject.as_ref();
-        let before = g.tokens.len() + g.refresh.len() + g.codes.len();
+        if self.faults.withdrawal_leaves_credentials {
+            // The row is gone and a plausible count is returned, so the endpoint answers 200 and
+            // the audit log records a withdrawal. Everything it was meant to revoke still works.
+            return Ok(5);
+        }
+        if self.faults.withdrawal_takes_other_subjects {
+            let client_id = consent.client_id.clone();
+            let before = g.tokens.len() + g.refresh.len() + g.codes.len() + g.device_by_code.len();
+            g.tokens.retain(|_, t| t.client_id != client_id);
+            g.refresh.retain(|_, r| r.client_id != client_id);
+            g.codes.retain(|_, c| c.client_id != client_id);
+            g.device_by_code.retain(|_, d| d.client_id != client_id);
+            let after = g.tokens.len() + g.refresh.len() + g.codes.len() + g.device_by_code.len();
+            return Ok((before - after) as u64 + 1);
+        }
+        let client_id = consent.client_id.clone();
+        let subject: String = consent.subject.to_string();
+        let before = g.tokens.len() + g.refresh.len() + g.codes.len() + g.device_by_code.len();
         g.tokens
-            .retain(|_, t| !(&t.client_id == client_id && t.subject.as_deref() == Some(subject)));
+            .retain(|_, t| !(t.client_id == client_id && t.subject.as_deref() == Some(&*subject)));
         g.refresh
-            .retain(|_, r| !(&r.client_id == client_id && r.subject.as_deref() == Some(subject)));
+            .retain(|_, r| !(r.client_id == client_id && r.subject.as_deref() == Some(&*subject)));
         g.codes
-            .retain(|_, c| !(&c.client_id == client_id && c.subject == subject));
-        let after = g.tokens.len() + g.refresh.len() + g.codes.len();
+            .retain(|_, c| !(c.client_id == client_id && c.subject == subject));
+        // APPROVED device grants for that subject, and their index entries. A grant the user has
+        // approved but the device has not polled yet mints a token seconds after the user said
+        // stop, so leaving it is the withdrawal failing in the window that matters most. PENDING
+        // grants stay: nobody consented to those, so there is nothing there to withdraw.
+        //
+        // This arm was missing until the harness grew a check for it, which is the whole argument
+        // for the check existing.
+        let doomed: Vec<String> = g
+            .device_by_code
+            .iter()
+            .filter(|(_, d)| {
+                d.client_id == client_id
+                    && matches!(
+                        &d.state,
+                        oauth_as::DeviceGrantState::Approved { subject: s } if *s == subject
+                    )
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for device_code in doomed {
+            if let Some(grant) = g.device_by_code.remove(&device_code) {
+                let normalized = oauth_as::device::normalize_user_code(&grant.user_code);
+                g.user_code_index.remove(&normalized);
+            }
+        }
+        let after = g.tokens.len() + g.refresh.len() + g.codes.len() + g.device_by_code.len();
         Ok((before - after) as u64)
     }
 
@@ -571,9 +619,11 @@ async fn read_then_delete_takes_are_caught_on_all_three_single_use_records() {
         vec![
             "atomic_take/take_authorization_code",
             "atomic_take/take_device_grant",
+            #[cfg(feature = "par")]
+            "atomic_take/take_pushed_authorization_request",
             "atomic_take/take_refresh_token",
         ],
-        "a read-then-delete store must fail exactly the three atomicity checks and nothing else: \
+        "a read-then-delete store must fail exactly the atomicity checks and nothing else: \
          {violations:#?}"
     );
     for check in checks_that_fired(&violations) {
@@ -606,6 +656,8 @@ async fn read_then_delete_is_caught_with_the_racers_on_the_runtime_too() {
         vec![
             "atomic_take/take_authorization_code",
             "atomic_take/take_device_grant",
+            #[cfg(feature = "par")]
+            "atomic_take/take_pushed_authorization_request",
             "atomic_take/take_refresh_token",
         ],
         "{violations:#?}"
@@ -870,6 +922,13 @@ async fn every_violation_names_a_published_check() {
         drops_jkt: true,
         #[cfg(any(feature = "client_assertion", feature = "dpop"))]
         look_then_insert_claim: true,
+        // Only one of the two withdrawal faults can be set at a time: they are mutually exclusive
+        // branches of the same method, and the "leaves credentials" one returns before the other
+        // is reachable. Under-revoking is the worse of the two, so it is the one exercised here.
+        #[cfg(feature = "consent")]
+        withdrawal_leaves_credentials: true,
+        #[cfg(feature = "consent")]
+        withdrawal_takes_other_subjects: false,
     })
     .await;
 
@@ -892,4 +951,65 @@ async fn every_violation_names_a_published_check() {
         let shown = violation.to_string();
         assert!(shown.contains(violation.check) && shown.contains(&violation.detail));
     }
+}
+
+/// A withdrawal that removes the consent row, reports a plausible count, and leaves every
+/// credential alive. This is the worst failure mode the consent feature has: the endpoint answers
+/// 200, the record is gone, the audit log records a withdrawal, and the application the user just
+/// revoked keeps working. Nothing anywhere reports it, which is why the harness has to.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_withdrawal_that_leaves_credentials_alive_is_caught() {
+    let violations = run_against(Faults {
+        withdrawal_leaves_credentials: true,
+        ..Faults::default()
+    })
+    .await;
+
+    let fired = checks_that_fired(&violations);
+    assert!(
+        fired.contains(&"revoke_consent/cascades"),
+        "a withdrawal that revoked nothing must be caught: {violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "revoke_consent/cascades").contains("was not"),
+        "the violation must say what the user was told versus what happened"
+    );
+}
+
+/// The opposite fault, which is just as real and easier to write by accident: a withdrawal keyed
+/// on the CLIENT rather than the (client, subject) pair. One user withdrawing consent logs out
+/// every other user of that application, and the count still looks right.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_withdrawal_that_takes_other_subjects_with_it_is_caught() {
+    let violations = run_against(Faults {
+        withdrawal_takes_other_subjects: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert!(
+        checks_that_fired(&violations).contains(&"revoke_consent/spares_other_subjects"),
+        "over-revoking must be caught, not just under-revoking: {violations:#?}"
+    );
+}
+
+/// The RFC 9126 s4 half of the read-then-delete defect. `take_pushed_authorization_request` is the
+/// only thing making a `request_uri` single use, so a store that reads then deletes lets two
+/// concurrent authorization requests resolve the same pushed request.
+#[cfg(feature = "par")]
+#[tokio::test]
+async fn a_read_then_delete_pushed_request_take_is_caught() {
+    let violations = run_against(Faults {
+        read_then_delete: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert!(
+        checks_that_fired(&violations).contains(&"atomic_take/take_pushed_authorization_request"),
+        "the PAR handle must be held to the same atomicity as the other take_* operations: \
+         {violations:#?}"
+    );
 }
