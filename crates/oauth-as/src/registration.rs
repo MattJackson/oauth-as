@@ -753,7 +753,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         client_id: &ClientId,
         registration_access_token: &str,
-    ) -> Result<(Client, DynamicRegistration), RegistrationFailure> {
+    ) -> Result<(std::sync::Arc<Client>, DynamicRegistration), RegistrationFailure> {
         let config = self.registration_config()?;
         if !config.management_enabled {
             return Err(RegistrationFailure::Disabled);

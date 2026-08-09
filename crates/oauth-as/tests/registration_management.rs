@@ -253,7 +253,7 @@ async fn the_registration_access_token_is_not_stored_in_plaintext() {
         .encoded()
         .is_empty());
     // The serialized record is what a host actually persists.
-    let json = serde_json::to_string(&stored).unwrap();
+    let json = serde_json::to_string(&*stored).unwrap();
     assert!(
         !json.contains(&token),
         "the persisted client carries the registration access token in plaintext"

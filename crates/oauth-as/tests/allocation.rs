@@ -108,6 +108,10 @@ fn zero_cost_efficiency_gates() {
             refresh_rotation_hot_path_allocation_bound,
         ),
         (
+            "introspection_hot_path_allocation_bound",
+            introspection_hot_path_allocation_bound,
+        ),
+        (
             "metadata_serialization_allocation_bound",
             metadata_serialization_allocation_bound,
         ),
@@ -386,24 +390,36 @@ fn device_authorization_hot_path_allocation_bound() {
     });
     let auth = auth.unwrap();
     assert!(!auth.device_code.is_empty());
-    // Observed 26 allocs / 2383 bytes on a warm single-client store. Bound leaves roughly 50%
-    // margin over the observed count so ordinary HashMap growth jitter cannot make this flaky,
-    // while still catching, say, an accidental second random_hex draw or an extra full-Client clone.
+    // Observed 19 allocs / 1795 bytes on a warm single-client store, on every feature set.
+    // It was 26 / 2383 through 0.9.0: `Storage::get_client` returning an owned `Client` deep
+    // copied the registration on every authenticated call, and returning `Arc<Client>` took
+    // SEVEN allocations off this path (this fixture's client has no redirect URIs and no name;
+    // a fuller registration saved more).
+    //
+    // Bound leaves roughly 35% margin over the observed count so ordinary HashMap growth jitter
+    // cannot make this flaky, while still catching, say, an accidental second random_hex draw or
+    // a reintroduced full-Client clone.
     assert!(
-        d.allocs <= 42,
+        d.allocs <= 26,
         "device_authorization allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 4096,
+        d.bytes <= 2560,
         "device_authorization allocation bytes regressed: {d:?}"
     );
 }
 
 /// RFC 8628 section 3.5: one poll that lands on `authorization_pending` (the grant exists, is
-/// unexpired, is not yet approved). Dominated by `MemoryStorage::get_client` and
-/// `get_device_grant`/`put_device_grant` each cloning a full owned record (client auth, grant
-/// types, redirect URIs, scope set; device code, user code, scope) out of and back into the mutexed
-/// maps, since the trait hands back owned values rather than references.
+/// unexpired, is not yet approved). This is the CHEAPEST call on the token plane, which is what
+/// makes it the honest place to see what a request pays before it does any work of its own.
+///
+/// What is left after the `Arc<Client>` read is `get_device_grant`/`put_device_grant`, which still
+/// clone a full owned record (device code, user code, scope) out of and back into the mutexed map.
+/// That one is DELIBERATELY not an `Arc` read: the poll MUTATES what it read (`last_poll_at`, and
+/// `interval` on a too-fast poll) and writes it back, so an `Arc` would force the clone at the
+/// mutation instead of at the read and then add one more allocation to re-wrap it. Measured, not
+/// assumed: `get_device_grant` costs 5 allocations, `DeviceGrant::clone` costs the same 5, and
+/// `Arc::new` of that clone costs 6. Moving a cost is not removing it.
 fn device_token_pending_poll_hot_path_allocation_bound() {
     let rt = current_thread_runtime();
     let (srv, device_code) = rt.block_on(async {
@@ -428,13 +444,14 @@ fn device_token_pending_poll_hot_path_allocation_bound() {
         result.unwrap_err().error,
         oauth_as::ErrorCode::AuthorizationPending
     );
-    // Observed 17 allocs / 1171 bytes; same ~50% margin rationale as the authorization test above.
+    // Observed 11 allocs / 591 bytes on default features, 12 / 759 with every feature on. It was
+    // 18 / 1179 (19 all-features) through 0.9.0, and `get_client` alone was 7 of them.
     assert!(
-        d.allocs <= 28,
+        d.allocs <= 17,
         "device_token(authorization_pending) allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 2048,
+        d.bytes <= 1280,
         "device_token(authorization_pending) allocation bytes regressed: {d:?}"
     );
 }
@@ -453,10 +470,10 @@ fn code_test_client() -> Client {
 }
 
 /// RFC 6749 section 4.1.3 with RFC 7636 verification: redeeming a live authorization code.
-/// Dominated by `authenticate_client` cloning the full `Client`, the atomic `take` returning an
-/// owned `AuthorizationCodeRecord`, `issue()` minting TWO fresh 32-byte random strings (access
-/// token, refresh token) and persisting both, and the code being put back in `Consumed` state
-/// (which clones the freshly minted access/refresh token strings a second time to record them).
+/// Dominated by the atomic `take` returning an owned `AuthorizationCodeRecord`, `issue()` minting
+/// TWO fresh 32-byte random strings (access token, refresh token) and persisting both, and the
+/// code being put back in `Consumed` state (which clones the freshly minted access/refresh token
+/// strings a second time to record them). `authenticate_client` no longer clones the `Client`.
 fn authorization_code_redemption_hot_path_allocation_bound() {
     let rt = current_thread_runtime();
     let verifier = support::RFC7636_VERIFIER;
@@ -500,20 +517,30 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
     });
     let token = token.unwrap();
     assert!(token.refresh_token.is_some());
-    // Observed 42 allocs / 3552 bytes; same margin rationale.
+    // Observed 39 allocs / 3041 bytes on default features, 40 / 3417 with every feature on. It
+    // was 46 / 4608 (47 all-features) through 0.9.0.
+    //
+    // The net is nine fewer, and it is a NET rather than a straight subtraction: the `Arc<Client>`
+    // read took nine off, and `put_token` plus `put_refresh_token` each added ONE back, because
+    // `MemoryStorage` now wraps the record it is handed. That is the deliberate side of the trade
+    // recorded on `introspection_hot_path_allocation_bound`: one allocation on the write, seven
+    // off every read of the same record afterwards, and with opaque tokens (this crate's default)
+    // a token is read far more often than it is issued.
     assert!(
-        d.allocs <= 65,
+        d.allocs <= 52,
         "authorization_code redemption allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 6144,
+        d.bytes <= 4608,
         "authorization_code redemption allocation bytes regressed: {d:?}"
     );
 }
 
 /// RFC 6749 section 6 with OAuth 2.1 single-use rotation. Dominated the same way as code
-/// redemption: a full `Client` clone to authenticate, the atomic `take` of the old refresh record,
-/// minting a fresh access token AND a fresh rotated refresh token, and persisting both.
+/// redemption: the atomic `take` of the old refresh record, minting a fresh access token AND a
+/// fresh rotated refresh token, and persisting both plus the SPENT record that makes reuse
+/// detectable. Those three writes are why this path pays three of `MemoryStorage`'s new `Arc`
+/// wraps where redemption pays two.
 fn refresh_rotation_hot_path_allocation_bound() {
     let rt = current_thread_runtime();
     let verifier = support::RFC7636_VERIFIER;
@@ -566,14 +593,81 @@ fn refresh_rotation_hot_path_allocation_bound() {
     });
     let result = result.unwrap();
     assert!(result.refresh_token.is_some());
-    // Observed 34 allocs / 2076 bytes; same margin rationale.
+    // Observed 33 allocs / 2725 bytes on default features, 34 / 3157 with every feature on. It
+    // was 39 / 2796 (40 all-features) through 0.9.0.
     assert!(
-        d.allocs <= 55,
+        d.allocs <= 44,
         "refresh rotation allocation count regressed: {d:?}"
     );
     assert!(
-        d.bytes <= 4096,
+        d.bytes <= 3840,
         "refresh rotation allocation bytes regressed: {d:?}"
+    );
+}
+
+fn confidential_test_client() -> Client {
+    Client {
+        client_id: ClientId::new("confidential-app"),
+        auth: ClientAuth::ConfidentialSecret {
+            secret: "s3cret".to_string(),
+        },
+        grant_types: vec![GrantType::ClientCredentials],
+        redirect_uris: vec![],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    }
+}
+
+/// RFC 7662 introspection of a live access token by its owner.
+///
+/// This gate exists because introspection is the read that DECIDES whether `Storage::get_token`
+/// should hand back an `Arc`. With opaque tokens, which are this crate's default, a resource
+/// server introspects on every protected request it serves, so this path runs far more often than
+/// issuance does; `get_token` returning an owned [`IssuedToken`] cost 7 allocations per call
+/// (measured in isolation against `MemoryStorage`) purely to copy a record nobody was going to
+/// modify. That is the whole of what the `Arc` removes here, and the one allocation it adds back
+/// on `put_token` is charged to the redemption and rotation gates above, where it is visible.
+fn introspection_hot_path_allocation_bound() {
+    let rt = current_thread_runtime();
+    let (srv, token) = rt.block_on(async {
+        let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+        let srv = AuthorizationServer::new(cfg, MemoryStorage::new());
+        srv.register_client(confidential_test_client())
+            .await
+            .unwrap();
+        let issued = srv
+            .token(TokenRequest::ClientCredentials {
+                client_id: ClientId::new("confidential-app"),
+                client_secret: Some("s3cret".to_string()),
+                scope: None,
+            })
+            .await
+            .unwrap();
+        (srv, issued.access_token)
+    });
+
+    let (response, d) = measure(|| {
+        rt.block_on(srv.introspection_response(
+            &ClientId::new("confidential-app"),
+            Some("s3cret"),
+            &token,
+        ))
+    });
+    assert!(response.unwrap().active, "the token must introspect active");
+    // Observed 4 allocs / 58 bytes, on every feature set: the RFC 7662 response document's own
+    // owned strings, and NOTHING for either record read, since `get_client` and `get_token` are
+    // both pointer clones now. It was 18 before them: the same four, plus 7 for the `Client` deep
+    // copy and 7 for the `IssuedToken` deep copy, both measured in isolation against
+    // `MemoryStorage`.
+    assert!(
+        d.allocs <= 8,
+        "introspection allocation count regressed: {d:?}"
+    );
+    assert!(
+        d.bytes <= 256,
+        "introspection allocation bytes regressed: {d:?}"
     );
 }
 
@@ -702,8 +796,12 @@ fn core_public_types_stay_within_their_size_budget() {
 /// from being a gate that only fires after the damage is done is the OBSERVED figures recorded
 /// here, which a reviewer can compare against a failing run's reported size:
 ///
-/// - default features: 1416 bytes
-/// - `--all-features`: 1824 bytes
+/// - default features: 1080 bytes
+/// - `--all-features`: 1344 bytes
+///
+/// Both SHRANK when `Storage`'s read paths began returning `Arc`: an owned `Client`, `IssuedToken`
+/// or `RefreshTokenRecord` held across an await point is that many bytes of the generator frame,
+/// and a pointer is eight.
 ///
 /// `AuthorizationCode` is the variant measured because it is the widest arm of [`TokenRequest`]
 /// and the deepest call chain behind it, so it is the arm that sets the high-water mark.

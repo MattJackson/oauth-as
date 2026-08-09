@@ -307,7 +307,10 @@ impl FaultStorage {
 }
 
 impl Storage for FaultStorage {
-    async fn get_client(&self, client_id: &ClientId) -> Result<Option<Client>, StorageError> {
+    async fn get_client(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<std::sync::Arc<Client>>, StorageError> {
         self.inner.get_client(client_id).await
     }
 
@@ -387,7 +390,10 @@ impl Storage for FaultStorage {
         self.inner.put_token(token).await
     }
 
-    async fn get_token(&self, access_token: &str) -> Result<Option<IssuedToken>, StorageError> {
+    async fn get_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<std::sync::Arc<IssuedToken>>, StorageError> {
         self.record("get_token");
         self.inner.get_token(access_token).await
     }
@@ -406,7 +412,7 @@ impl Storage for FaultStorage {
     async fn get_refresh_token(
         &self,
         refresh_token: &str,
-    ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<RefreshTokenRecord>>, StorageError> {
         self.record("get_refresh_token");
         self.inner.get_refresh_token(refresh_token).await
     }
@@ -434,7 +440,7 @@ impl Storage for FaultStorage {
     async fn get_consent(
         &self,
         consent_id: &str,
-    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<oauth_as::ConsentRecord>>, StorageError> {
         self.inner.get_consent(consent_id).await
     }
 
@@ -443,7 +449,7 @@ impl Storage for FaultStorage {
         &self,
         client_id: &ClientId,
         subject: &str,
-    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<oauth_as::ConsentRecord>>, StorageError> {
         self.inner.find_consent(client_id, subject).await
     }
 
@@ -451,7 +457,7 @@ impl Storage for FaultStorage {
     async fn consents_for_subject(
         &self,
         subject: &str,
-    ) -> Result<Vec<oauth_as::ConsentRecord>, StorageError> {
+    ) -> Result<Vec<std::sync::Arc<oauth_as::ConsentRecord>>, StorageError> {
         self.inner.consents_for_subject(subject).await
     }
 

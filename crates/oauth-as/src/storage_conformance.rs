@@ -892,7 +892,7 @@ where
             "get_consent",
             store.get_consent("consent-mine").await,
         ) {
-            if back != mine {
+            if *back != mine {
                 report.fail(
                     ROUND_TRIP_CONSENT,
                     "get_consent returned a record that differs from the one stored",

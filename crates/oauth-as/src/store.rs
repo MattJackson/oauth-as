@@ -206,10 +206,16 @@ pub trait Storage: Send + Sync {
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Look up an access token (introspection).
+    ///
+    /// `Arc` for the same reason [`Storage::get_client`] is: the record is only READ here, and
+    /// with opaque tokens this is the read a resource server makes on every protected request,
+    /// which makes it the hottest read in the crate after `get_client`. MEASURED against
+    /// [`MemoryStorage`]: 7 allocations per call when it handed back an owned [`IssuedToken`],
+    /// none now.
     fn get_token(
         &self,
         access_token: &str,
-    ) -> impl Future<Output = Result<Option<IssuedToken>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Arc<IssuedToken>>, StorageError>> + Send;
 
     /// Remove an access token. Idempotent: removing a token that is already gone is success, as
     /// RFC 7009 section 2.2 requires of revocation.
@@ -232,10 +238,15 @@ pub trait Storage: Send + Sync {
     /// a mismatch is a destructive operation on a credential the caller was never entitled to
     /// touch, and if the restoring write fails, the victim's chain is gone for good while the
     /// endpoint still answers 200.
+    ///
+    /// `Arc`, and note the contrast with [`Storage::take_refresh_token`] directly below: this one
+    /// asks a question about a record that stays put, so a shared pointer answers it, while the
+    /// take REMOVES the record and must hand back an owned value because "exactly one caller got
+    /// it" is the whole of what rotation rests on. MEASURED: 7 allocations per call before.
     fn get_refresh_token(
         &self,
         refresh_token: &str,
-    ) -> impl Future<Output = Result<Option<RefreshTokenRecord>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Arc<RefreshTokenRecord>>, StorageError>> + Send;
 
     /// Atomically remove and return a refresh token record. This is what makes rotation single
     /// use: under concurrent refresh exactly one caller wins and every other presentation of the
@@ -284,7 +295,7 @@ pub trait Storage: Send + Sync {
     fn get_consent(
         &self,
         consent_id: &str,
-    ) -> impl Future<Output = Result<Option<crate::consent::ConsentRecord>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Arc<crate::consent::ConsentRecord>>, StorageError>> + Send;
 
     /// The live consent for one (client, subject) pair, if there is one.
     ///
@@ -296,7 +307,7 @@ pub trait Storage: Send + Sync {
         &self,
         client_id: &ClientId,
         subject: &str,
-    ) -> impl Future<Output = Result<Option<crate::consent::ConsentRecord>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Arc<crate::consent::ConsentRecord>>, StorageError>> + Send;
 
     /// Every consent one resource owner has granted, so a host can show a user what they have
     /// approved. Order is not specified; a host that wants one sorts what it gets back.
@@ -304,7 +315,7 @@ pub trait Storage: Send + Sync {
     fn consents_for_subject(
         &self,
         subject: &str,
-    ) -> impl Future<Output = Result<Vec<crate::consent::ConsentRecord>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Vec<Arc<crate::consent::ConsentRecord>>, StorageError>> + Send;
 
     /// WITHDRAW a consent: remove the record AND everything issued under it, returning how many
     /// records were removed (the consent record itself is not counted).
@@ -453,12 +464,17 @@ struct MemoryInner {
     codes: HashMap<String, AuthorizationCodeRecord>,
     #[cfg(feature = "par")]
     pushed: HashMap<String, crate::par::PushedAuthorizationRequest>,
-    tokens: HashMap<String, IssuedToken>,
-    refresh: HashMap<String, RefreshTokenRecord>,
+    /// `Arc` so that `get_token` (introspection, once per protected resource request when tokens
+    /// are opaque) is a pointer clone. MEASURED: 7 allocations per read before, one on the write.
+    tokens: HashMap<String, Arc<IssuedToken>>,
+    /// `Arc` for the same reason as `tokens`; `take_refresh_token` unwraps it back to an owned
+    /// record, which costs nothing when the store is the only holder, and clones when a reader is
+    /// still looking at the snapshot it was handed.
+    refresh: HashMap<String, Arc<RefreshTokenRecord>>,
     /// Consent records by `consent_id`. Present only under the `consent` feature, so a
     /// default build's store is byte for byte the store it was before.
     #[cfg(feature = "consent")]
-    consents: HashMap<String, crate::consent::ConsentRecord>,
+    consents: HashMap<String, Arc<crate::consent::ConsentRecord>>,
     /// Claimed RFC 7523 / RFC 9449 single-use identifiers, mapped to when they may be reclaimed.
     /// Present only under the features that produce them, so a default build's store is byte for
     /// byte the store it was before.
@@ -632,11 +648,19 @@ impl Storage for MemoryStorage {
     }
 
     async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
-        self.lock().tokens.insert(token.access_token.clone(), token);
+        // The `Arc` costs ONE allocation here, on issuance, and saves seven on every introspection
+        // of the token afterwards. A token is issued once and introspected once per protected
+        // request it is presented with, so the trade is measured in the direction that pays.
+        self.lock()
+            .tokens
+            .insert(token.access_token.clone(), Arc::new(token));
         Ok(())
     }
 
-    async fn get_token(&self, access_token: &str) -> Result<Option<IssuedToken>, StorageError> {
+    async fn get_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<Arc<IssuedToken>>, StorageError> {
         Ok(self.lock().tokens.get(access_token).cloned())
     }
 
@@ -648,14 +672,14 @@ impl Storage for MemoryStorage {
     async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {
         self.lock()
             .refresh
-            .insert(record.refresh_token.clone(), record);
+            .insert(record.refresh_token.clone(), Arc::new(record));
         Ok(())
     }
 
     async fn get_refresh_token(
         &self,
         refresh_token: &str,
-    ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+    ) -> Result<Option<Arc<RefreshTokenRecord>>, StorageError> {
         Ok(self.lock().refresh.get(refresh_token).cloned())
     }
 
@@ -663,7 +687,15 @@ impl Storage for MemoryStorage {
         &self,
         refresh_token: &str,
     ) -> Result<Option<RefreshTokenRecord>, StorageError> {
-        Ok(self.lock().refresh.remove(refresh_token))
+        // Owned, because this is the rotation primitive: the record is GONE from the store and
+        // "exactly one caller got it" has to be what the type says. `try_unwrap` reclaims the
+        // record in place when nothing else is holding the snapshot, which is the ordinary case,
+        // and falls back to a clone when a concurrent reader is still looking at it.
+        Ok(self
+            .lock()
+            .refresh
+            .remove(refresh_token)
+            .map(|a| Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())))
     }
 
     async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
@@ -681,7 +713,7 @@ impl Storage for MemoryStorage {
     async fn put_consent(&self, record: crate::consent::ConsentRecord) -> Result<(), StorageError> {
         self.lock()
             .consents
-            .insert(record.consent_id.to_string(), record);
+            .insert(record.consent_id.to_string(), Arc::new(record));
         Ok(())
     }
 
@@ -689,7 +721,7 @@ impl Storage for MemoryStorage {
     async fn get_consent(
         &self,
         consent_id: &str,
-    ) -> Result<Option<crate::consent::ConsentRecord>, StorageError> {
+    ) -> Result<Option<Arc<crate::consent::ConsentRecord>>, StorageError> {
         Ok(self.lock().consents.get(consent_id).cloned())
     }
 
@@ -698,7 +730,7 @@ impl Storage for MemoryStorage {
         &self,
         client_id: &ClientId,
         subject: &str,
-    ) -> Result<Option<crate::consent::ConsentRecord>, StorageError> {
+    ) -> Result<Option<Arc<crate::consent::ConsentRecord>>, StorageError> {
         // A scan, honestly, for a map with no secondary index; a host with a real database indexes
         // the pair, and the trait doc says so because this one IS on the authorization path.
         Ok(self
@@ -713,7 +745,7 @@ impl Storage for MemoryStorage {
     async fn consents_for_subject(
         &self,
         subject: &str,
-    ) -> Result<Vec<crate::consent::ConsentRecord>, StorageError> {
+    ) -> Result<Vec<Arc<crate::consent::ConsentRecord>>, StorageError> {
         Ok(self
             .lock()
             .consents

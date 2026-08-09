@@ -76,14 +76,14 @@ struct Faults {
 
 #[derive(Default)]
 struct Inner {
-    clients: HashMap<String, Client>,
+    clients: HashMap<String, std::sync::Arc<Client>>,
     device_by_code: HashMap<String, DeviceGrant>,
     user_code_index: HashMap<String, String>,
     codes: HashMap<String, AuthorizationCodeRecord>,
-    tokens: HashMap<String, IssuedToken>,
-    refresh: HashMap<String, RefreshTokenRecord>,
+    tokens: HashMap<String, std::sync::Arc<IssuedToken>>,
+    refresh: HashMap<String, std::sync::Arc<RefreshTokenRecord>>,
     #[cfg(feature = "consent")]
-    consents: HashMap<String, oauth_as::ConsentRecord>,
+    consents: HashMap<String, std::sync::Arc<oauth_as::ConsentRecord>>,
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
     replay_ids: HashMap<String, SystemTime>,
     #[cfg(feature = "par")]
@@ -131,14 +131,18 @@ async fn round_trip_to_the_store() {
 }
 
 impl Storage for NaiveStore {
-    async fn get_client(&self, client_id: &ClientId) -> Result<Option<Client>, StorageError> {
+    async fn get_client(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<std::sync::Arc<Client>>, StorageError> {
         Ok(self.lock().clients.get(client_id.as_str()).cloned())
     }
 
     async fn put_client(&self, client: Client) -> Result<(), StorageError> {
-        self.lock()
-            .clients
-            .insert(client.client_id.as_str().to_string(), client);
+        self.lock().clients.insert(
+            client.client_id.as_str().to_string(),
+            std::sync::Arc::new(client),
+        );
         Ok(())
     }
 
@@ -294,11 +298,16 @@ impl Storage for NaiveStore {
             }
             token
         };
-        self.lock().tokens.insert(token.access_token.clone(), token);
+        self.lock()
+            .tokens
+            .insert(token.access_token.clone(), std::sync::Arc::new(token));
         Ok(())
     }
 
-    async fn get_token(&self, access_token: &str) -> Result<Option<IssuedToken>, StorageError> {
+    async fn get_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<std::sync::Arc<IssuedToken>>, StorageError> {
         Ok(self.lock().tokens.get(access_token).cloned())
     }
 
@@ -316,14 +325,14 @@ impl Storage for NaiveStore {
         }
         self.lock()
             .refresh
-            .insert(record.refresh_token.clone(), record);
+            .insert(record.refresh_token.clone(), std::sync::Arc::new(record));
         Ok(())
     }
 
     async fn get_refresh_token(
         &self,
         refresh_token: &str,
-    ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<RefreshTokenRecord>>, StorageError> {
         Ok(self.lock().refresh.get(refresh_token).cloned())
     }
 
@@ -337,9 +346,13 @@ impl Storage for NaiveStore {
             if record.is_some() {
                 self.lock().refresh.remove(refresh_token);
             }
-            return Ok(record);
+            return Ok(record.map(|a| (*a).clone()));
         }
-        Ok(self.lock().refresh.remove(refresh_token))
+        Ok(self
+            .lock()
+            .refresh
+            .remove(refresh_token)
+            .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())))
     }
 
     async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
@@ -360,7 +373,7 @@ impl Storage for NaiveStore {
     async fn put_consent(&self, record: oauth_as::ConsentRecord) -> Result<(), StorageError> {
         self.lock()
             .consents
-            .insert(record.consent_id.to_string(), record);
+            .insert(record.consent_id.to_string(), std::sync::Arc::new(record));
         Ok(())
     }
 
@@ -368,7 +381,7 @@ impl Storage for NaiveStore {
     async fn get_consent(
         &self,
         consent_id: &str,
-    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<oauth_as::ConsentRecord>>, StorageError> {
         Ok(self.lock().consents.get(consent_id).cloned())
     }
 
@@ -377,7 +390,7 @@ impl Storage for NaiveStore {
         &self,
         client_id: &ClientId,
         subject: &str,
-    ) -> Result<Option<oauth_as::ConsentRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<oauth_as::ConsentRecord>>, StorageError> {
         Ok(self
             .lock()
             .consents
@@ -390,7 +403,7 @@ impl Storage for NaiveStore {
     async fn consents_for_subject(
         &self,
         subject: &str,
-    ) -> Result<Vec<oauth_as::ConsentRecord>, StorageError> {
+    ) -> Result<Vec<std::sync::Arc<oauth_as::ConsentRecord>>, StorageError> {
         Ok(self
             .lock()
             .consents

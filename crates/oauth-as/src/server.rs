@@ -1255,7 +1255,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         client_id: &ClientId,
         cred: &ClientCredential<'_>,
-    ) -> Result<Client, ErrorResponse> {
+    ) -> Result<std::sync::Arc<Client>, ErrorResponse> {
         let attempt = Attempt::ClientAuthentication {
             client_id: client_id.as_str(),
         };
@@ -2229,7 +2229,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `ValidatedAuthorizationRequest::set_authorization_details`.
         #[allow(unused_mut)]
         let mut validated = ValidatedAuthorizationRequest::new(
-            client.client_id,
+            // Cloned rather than moved: `client` is an `Arc<Client>` shared with the store since
+            // `Storage::get_client` stopped deep-copying the registration, so the id has to be
+            // copied out. One allocation on the AUTHORIZATION endpoint, against the eight the
+            // shared read saved on it.
+            client.client_id.clone(),
             redirect_uri,
             scope,
             state,
@@ -2422,7 +2426,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 if let Ok(Some(rec)) = self.store.get_refresh_token(rt).await {
                     let _ = self.store.revoke_token_family(&rec.family_id).await;
                     revoked_family = true;
-                    revoked_family_id = Some(rec.family_id);
+                    // Cloned out of the shared snapshot `get_refresh_token` handed back. One
+                    // allocation, on the detected-compromise path only, against the seven that
+                    // read now costs nothing on the paths that run per request.
+                    revoked_family_id = Some(rec.family_id.clone());
                 }
             }
             if !revoked_family {
@@ -3109,7 +3116,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     pub async fn introspect(
         &self,
         access_token: &str,
-    ) -> Result<Option<IssuedToken>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<IssuedToken>>, StorageError> {
         Ok(self
             .store
             .get_token(access_token)
@@ -3243,8 +3250,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         authentication: Option<crate::consent::Authentication>,
     ) -> Result<crate::consent::ConsentRecord, StorageError> {
         let now = self.clock.now();
+        // CLONED out of the shared snapshot, because this is the one consent path that MUTATES
+        // what it read (`extend` below widens the grant in place). An `Arc` cannot be widened
+        // while the store still holds it, so the clone the read used to make happens here
+        // instead: the cost moved, it did not go away. It is paid once per host consent
+        // decision, against the read being free on the authorization endpoint, which runs per
+        // request. See `remembered_consent`.
         let mut record = match self.store.find_consent(client_id, subject).await? {
-            Some(existing) => existing,
+            Some(existing) => (*existing).clone(),
             None => crate::consent::ConsentRecord {
                 // 16 bytes of OS randomness, hex encoded, the same shape as every other opaque
                 // identifier this server mints. It is not a credential (see the field's own docs),
@@ -3283,7 +3296,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         client_id: &ClientId,
         subject: &str,
-    ) -> Result<Option<crate::consent::ConsentRecord>, StorageError> {
+    ) -> Result<Option<std::sync::Arc<crate::consent::ConsentRecord>>, StorageError> {
         self.store.find_consent(client_id, subject).await
     }
 
@@ -3294,7 +3307,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     pub async fn consents_for_subject(
         &self,
         subject: &str,
-    ) -> Result<Vec<crate::consent::ConsentRecord>, StorageError> {
+    ) -> Result<Vec<std::sync::Arc<crate::consent::ConsentRecord>>, StorageError> {
         self.store.consents_for_subject(subject).await
     }
 
