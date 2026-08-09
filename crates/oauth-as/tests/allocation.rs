@@ -979,12 +979,24 @@ fn core_public_types_stay_within_their_size_budget() {
 /// from being a gate that only fires after the damage is done is the OBSERVED figures recorded
 /// here, which a reviewer can compare against a failing run's reported size:
 ///
-/// - default features: 1080 bytes
-/// - `--all-features`: 1344 bytes
+/// The observed figures are DELIBERATELY NOT WRITTEN HERE. They were, twice, and both times they
+/// drifted: the recorded pair went stale first when `Storage`'s read paths began returning `Arc`
+/// and again when the ES256 signing seam split `wire_access_token`. A number in a comment that
+/// nothing re-measures is a claim, and this file exists to replace claims with measurements.
 ///
-/// Both SHRANK when `Storage`'s read paths began returning `Arc`: an owned `Client`, `IssuedToken`
-/// or `RefreshTokenRecord` held across an await point is that many bytes of the generator frame,
-/// and a pointer is eight.
+/// The reliable channel is the assertion below, which PRINTS the real size on failure. To see it
+/// deliberately, drop the bound and run the test:
+///
+/// ```text
+/// cargo test -p oauth-as --test allocation token_future_stays
+/// cargo test -p oauth-as --all-features --test allocation token_future_stays
+/// ```
+///
+/// What is worth recording, because it is a PROPERTY rather than a number: the size SHRANK when
+/// `Storage`'s reads began returning `Arc` (an owned `Client`, `IssuedToken` or
+/// `RefreshTokenRecord` held across an await is its full width in the generator frame; a pointer is
+/// eight), and it did NOT grow when signing became async, because `wire_access_token` was split so
+/// that only a `&JwtConfig` and a `String` live across the await.
 ///
 /// `AuthorizationCode` is the variant measured because it is the widest arm of [`TokenRequest`]
 /// and the deepest call chain behind it, so it is the arm that sets the high-water mark.
