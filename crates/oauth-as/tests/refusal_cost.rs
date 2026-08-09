@@ -45,6 +45,14 @@ fn refusal_cost_gates() {
             "token_exchange_token_type_refusal_bound",
             token_exchange_token_type_refusal_bound,
         ),
+        (
+            "unknown_grant_type_refusal_is_not_sized_by_the_caller",
+            unknown_grant_type_refusal_is_not_sized_by_the_caller,
+        ),
+        (
+            "unknown_token_type_refusal_is_not_sized_by_the_caller",
+            unknown_token_type_refusal_is_not_sized_by_the_caller,
+        ),
         ("jwt_signing_bound", jwt_signing_bound),
         (
             "redirectable_authorization_refusal_bound",
@@ -208,15 +216,203 @@ fn token_exchange_token_type_refusal_bound() {
 
     let (response, d) = measure(|| rt.block_on(service.handle(request)));
     assert_eq!(response.status(), 400);
-    // Observed 10 allocations / 4549 bytes, against 11 / 4633 before the description stopped
-    // being formatted. The allocation bound is EXACT (the one removed is the whole claim); the
-    // byte bound carries a little room because most of those bytes are the response buffer the
-    // `http` crate hands back, not this crate's.
-    check("token exchange token-type refusal", d, (10, 4800));
+    // Observed 9 allocations / 4523 bytes. It was 11 / 4633 before the description stopped being
+    // formatted, 10 / 4549 after that and before `TokenTypeIdentifier::parse` stopped `FromStr`
+    // copying the caller's value onto the heap to carry it into an error this endpoint discards.
+    // The allocation bound is EXACT (each one removed is the whole of its claim); the byte bound
+    // carries a little room because most of those bytes are the response buffer the `http` crate
+    // hands back, not this crate's.
+    //
+    // This gate is the one whose fixture was TOO SMALL to see the second of those two: its
+    // `urn:example:not-registered` is 27 bytes, so the copy it was buying cost 27 bytes and hid
+    // inside the byte bound's slack. `unknown_token_type_refusal_is_not_sized_by_the_caller`
+    // below is the gate that can see it.
+    check("token exchange token-type refusal", d, (9, 4800));
 }
 
 #[cfg(not(all(feature = "http", feature = "token-exchange")))]
 fn token_exchange_token_type_refusal_bound() {}
+
+// ------------------------------------------------- refusals the CALLER sizes, not the server
+//
+// The two gates below exist because the gates above them could not see the defect they were meant
+// to bound. Both used a SHORT fixture value (`urn:example:not-registered`, 27 bytes), so a refusal
+// that copied that value onto the heap cost 27 bytes and vanished into the byte budget's slack.
+// The value is attacker-supplied and the caps allow it to be nearly the whole body
+// (`MAX_BODY_BYTES` is 64 KiB and `MAX_FORM_PARAMETERS` is 64, so one parameter can be 60 KiB of
+// junk), and both parameters are resolved BEFORE the presented client credential is checked. A
+// fixture too small to see caller-controlled cost is a fixture that certifies its absence.
+//
+// The measurement is a DIFFERENCE rather than an absolute bound, because one caller-sized cost on
+// this path is honest and unavoidable: `collect_body` buffers the request body once, which is what
+// reading a form body IS, and `MAX_BODY_BYTES` is the thing that bounds it. Everything past that
+// one buffer is work the parser bought on the attacker's behalf. So the claim these gates pin is:
+// growing a parameter by N bytes grows the endpoint's allocator traffic by N bytes ONCE, and does
+// not change the allocation COUNT at all.
+
+/// How much junk one parameter carries. Comfortably inside `MAX_BODY_BYTES` (64 KiB) so the
+/// request is ACCEPTED and reaches the parse, which is the point: a body refused for size never
+/// gets to buy anything.
+#[cfg(feature = "http")]
+const CALLER_SIZED: usize = 60 * 1024;
+
+/// Post `body` to the token endpoint and measure the whole refusal, expecting `status`.
+#[cfg(feature = "http")]
+fn measure_token_post<S, C>(
+    rt: &tokio::runtime::Runtime,
+    service: &oauth_as::AuthorizationService<S, C>,
+    mut body: String,
+    status: u16,
+) -> Delta
+where
+    S: oauth_as::Storage,
+    C: oauth_as::Clock,
+{
+    // SHRUNK first, and this is not tidiness: `collect_body` hands the collected `Vec` to
+    // `Bytes::from`, which calls `into_boxed_slice`, which REALLOCATES when capacity exceeds
+    // length. A body built by `format!` carries geometric slack and one built by `to_string`
+    // does not, so without this the fixture's own construction decided whether the endpoint
+    // reallocated, and the allocation COUNT below would be measuring the test rather than the
+    // server. Measured: it is exactly this that made two identical 33-byte requests report 7 and
+    // 8 allocations.
+    body.shrink_to_fit();
+    // Built OUTSIDE the window: the request is the caller's cost, not the endpoint's. That is what
+    // lets these gates charge a 60 KiB parameter to the server at all.
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://as.example/token")
+        .header(
+            http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
+        .expect("a well formed request");
+    let (response, d) = measure(|| rt.block_on(service.handle(request)));
+    assert_eq!(
+        response.status(),
+        status,
+        "unexpected status for the fixture"
+    );
+    d
+}
+
+/// Assert that a refusal grew by no more than the ONE body buffer that reading the request
+/// requires, and that its allocation COUNT did not move at all.
+#[cfg(feature = "http")]
+fn assert_only_the_body_grew(name: &str, short: Delta, long: Delta, grew_by: usize) {
+    assert_eq!(
+        long.allocs, short.allocs,
+        "{name}: a longer parameter must not buy the endpoint an EXTRA allocation. \
+         short {short:?}, long {long:?}"
+    );
+    let extra = long.bytes.saturating_sub(short.bytes);
+    // 512 bytes of slack covers the body buffer's own rounding and the handful of small strings
+    // whose CONTENTS, not sizes, differ between the two requests. It is two orders of magnitude
+    // below the 60 KiB a second copy costs, so it cannot hide one.
+    assert!(
+        extra <= grew_by + 512,
+        "{name}: growing the parameter by {grew_by} bytes grew the refusal by {extra} bytes, \
+         which is more than the single body buffer that reading the request requires. \
+         short {short:?}, long {long:?}"
+    );
+    println!(
+        "{name}: +{extra} bytes for a +{grew_by} byte parameter, {} allocs either way",
+        long.allocs
+    );
+}
+
+/// RFC 6749 s5.2 `unsupported_grant_type`, sized by the caller.
+///
+/// `token_handler` resolves `grant_type` BEFORE client authentication, deliberately (its own
+/// comment says so), and then deliberately does NOT echo the value: the `Err` arm is
+/// `map_err(|_| ...)`. So the `String` that `FromStr` allocated for the rejection was allocated,
+/// copied into, and dropped unread, at whatever rate an unauthenticated caller can open sockets.
+#[cfg(feature = "http")]
+fn unknown_grant_type_refusal_is_not_sized_by_the_caller() {
+    use oauth_as::{AuthorizationServer, MemoryStorage, ServerConfig, ServiceBuilder};
+
+    let rt = current_thread_runtime();
+    let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    let server = std::sync::Arc::new(AuthorizationServer::new(cfg, MemoryStorage::new()));
+    let service = ServiceBuilder::new(server)
+        .build()
+        .expect("the fixture service must build");
+
+    let short = "grant_type=password&client_id=svc".to_string();
+    let long = format!("grant_type={}&client_id=svc", "A".repeat(CALLER_SIZED));
+    let grew_by = long.len() - short.len();
+
+    // WARM the runtime and the router outside every window, for the reason `jwt_signing_bound`
+    // does: tokio's first `block_on` allocates a thread-local parker of its own, and the first
+    // couple of trips through this endpoint settle one further one-time allocation of their own.
+    // Measured: from the third identical request onward the count is stable, and it is stable at
+    // the SAME value for every body size, which is the property the assertion below relies on.
+    for _ in 0..3 {
+        let _ = measure_token_post(&rt, &service, short.clone(), 400);
+    }
+
+    let short_cost = measure_token_post(&rt, &service, short, 400);
+    let long_cost = measure_token_post(&rt, &service, long, 400);
+    assert_only_the_body_grew("unsupported_grant_type", short_cost, long_cost, grew_by);
+}
+
+#[cfg(not(feature = "http"))]
+fn unknown_grant_type_refusal_is_not_sized_by_the_caller() {}
+
+/// RFC 8693 s3, the same defect one seam along, and the one whose refusal STRING was already
+/// fixed: the description stopped being `format!`ed, but the `String` allocated UNDER it by
+/// `FromStr` was missed. `token_exchange_response` resolves `subject_token_type` before the
+/// exchange is attempted, so before the presented client credential has been checked.
+///
+/// Note what the measurement corrects about the original finding: the handler resolves three
+/// `*_token_type` parameters, but it RETURNS on the first failure, so one request buys ONE
+/// discarded copy and not three. One is the whole of the defect; three would have been a different
+/// number, and asserting it without measuring would be the sort of claim this file replaces.
+#[cfg(all(feature = "http", feature = "token-exchange"))]
+fn unknown_token_type_refusal_is_not_sized_by_the_caller() {
+    use oauth_as::{
+        AuthorizationServer, Client, ClientAuth, ClientId, GrantType, MemoryStorage, ScopeSet,
+        ServerConfig, ServiceBuilder,
+    };
+
+    let rt = current_thread_runtime();
+    let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    let server = std::sync::Arc::new(AuthorizationServer::new(cfg, MemoryStorage::new()));
+    rt.block_on(server.register_client(Client {
+        client_id: ClientId::new("svc"),
+        auth: ClientAuth::ConfidentialSecretHash {
+            hash: oauth_as::SecretHash::sha256("svc-secret"),
+        },
+        grant_types: vec![GrantType::TokenExchange],
+        redirect_uris: vec![],
+        allowed_scopes: ScopeSet::parse("read").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    }))
+    .expect("the fixture client must register");
+    let service = ServiceBuilder::new(server)
+        .build()
+        .expect("the fixture service must build");
+
+    let prefix = "grant_type=urn:ietf:params:oauth:grant-type:token-exchange\
+                  &client_id=svc&client_secret=svc-secret\
+                  &subject_token=whatever&subject_token_type=";
+    let short = format!("{prefix}urn:example:not-registered");
+    let long = format!("{prefix}{}", "A".repeat(CALLER_SIZED));
+    let grew_by = long.len() - short.len();
+
+    for _ in 0..3 {
+        let _ = measure_token_post(&rt, &service, short.clone(), 400);
+    }
+
+    let short_cost = measure_token_post(&rt, &service, short, 400);
+    let long_cost = measure_token_post(&rt, &service, long, 400);
+    assert_only_the_body_grew("subject_token_type", short_cost, long_cost, grew_by);
+}
+
+#[cfg(not(all(feature = "http", feature = "token-exchange")))]
+fn unknown_token_type_refusal_is_not_sized_by_the_caller() {}
 
 // ------------------------------------------------------------------------- RFC 9068 signing
 
@@ -242,7 +438,11 @@ fn jwt_signing_bound() {
         scope: Some("read".to_string()),
         #[cfg(feature = "rar")]
         authorization_details: Default::default(),
-        #[cfg(feature = "mtls")]
+        // The cfg MATCHES THE FIELD's, which is `any(dpop, mtls)` (see `AccessTokenClaims`), and
+        // not `mtls` alone: `cnf` carries the RFC 9449 s6 DPoP thumbprint as well as the RFC 8705
+        // s3.1 certificate one. Gated on `mtls` alone, this file did not compile at all in a
+        // `dpop`-without-`mtls` build.
+        #[cfg(any(feature = "dpop", feature = "mtls"))]
         cnf: None,
     };
     // `sign_access_token` is async since the `Es256Signer` seam landed (the signing key may live

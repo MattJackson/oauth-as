@@ -128,7 +128,7 @@ use crate::error::{ErrorCode, ErrorResponse};
 use crate::events::Event;
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
-use crate::server::{AuthorizationServer, Bound, Clock};
+use crate::server::{AuthorizationServer, Bound, ClientCredential, Clock};
 use crate::store::{Storage, StorageError};
 
 /// The largest number of RFC 8693 section 2.1.1 `audience` values one exchange may carry.
@@ -182,6 +182,35 @@ pub enum TokenTypeIdentifier {
 }
 
 impl TokenTypeIdentifier {
+    /// Resolve a wire `*_token_type` value WITHOUT allocating, returning `None` for anything RFC
+    /// 8693 section 3 does not register.
+    ///
+    /// This is the parse the HTTP surface uses, for the reason [`crate::grant::GrantType::parse`]
+    /// exists: [`FromStr`]'s error carries the caller's value, and the router deliberately does not
+    /// echo it (RFC 6749 s5.2 restricts `error_description` to a charset an attacker-supplied URN
+    /// need not respect), so the copy was allocated and dropped unread. The refusal STRING here was
+    /// already made a `&'static str` for exactly this rule; the allocation underneath it was
+    /// missed, and it is the worse one, because the caller chooses its SIZE and this refusal
+    /// happens before the presented client credential has been checked.
+    ///
+    /// [`FromStr`] is unchanged and still carries the value, for the host-side callers that want
+    /// to report which URN they got wrong.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "urn:ietf:params:oauth:token-type:access_token" => {
+                Some(TokenTypeIdentifier::AccessToken)
+            }
+            "urn:ietf:params:oauth:token-type:refresh_token" => {
+                Some(TokenTypeIdentifier::RefreshToken)
+            }
+            "urn:ietf:params:oauth:token-type:id_token" => Some(TokenTypeIdentifier::IdToken),
+            "urn:ietf:params:oauth:token-type:saml1" => Some(TokenTypeIdentifier::Saml1),
+            "urn:ietf:params:oauth:token-type:saml2" => Some(TokenTypeIdentifier::Saml2),
+            "urn:ietf:params:oauth:token-type:jwt" => Some(TokenTypeIdentifier::Jwt),
+            _ => None,
+        }
+    }
+
     /// The registered URN, verbatim.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -233,17 +262,7 @@ impl FromStr for TokenTypeIdentifier {
     type Err = UnknownTokenTypeIdentifier;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "urn:ietf:params:oauth:token-type:access_token" => Ok(TokenTypeIdentifier::AccessToken),
-            "urn:ietf:params:oauth:token-type:refresh_token" => {
-                Ok(TokenTypeIdentifier::RefreshToken)
-            }
-            "urn:ietf:params:oauth:token-type:id_token" => Ok(TokenTypeIdentifier::IdToken),
-            "urn:ietf:params:oauth:token-type:saml1" => Ok(TokenTypeIdentifier::Saml1),
-            "urn:ietf:params:oauth:token-type:saml2" => Ok(TokenTypeIdentifier::Saml2),
-            "urn:ietf:params:oauth:token-type:jwt" => Ok(TokenTypeIdentifier::Jwt),
-            other => Err(UnknownTokenTypeIdentifier(other.to_string())),
-        }
+        TokenTypeIdentifier::parse(s).ok_or_else(|| UnknownTokenTypeIdentifier(s.to_string()))
     }
 }
 
@@ -298,9 +317,23 @@ pub struct TokenExchangeRequest<'a> {
     /// The client performing the exchange. It is authenticated, and it is the client the issued
     /// token belongs to.
     pub client_id: &'a ClientId,
-    /// Its secret. `None` cannot succeed: see [`TokenExchange::exchange_token`] on why a public
-    /// client may not use this grant.
+    /// Its secret, for a client registered for `client_secret_basic` or `client_secret_post`.
+    /// A confidential credential of SOME kind is required: see [`TokenExchange::exchange_token`]
+    /// on why a public client may not use this grant.
     pub client_secret: Option<&'a str>,
+    /// RFC 7521 section 4.2 `client_assertion_type`, for a client registered for
+    /// `private_key_jwt` or `client_secret_jwt`.
+    ///
+    /// This field and the one below exist because RFC 8693 section 2.1 authenticates the client
+    /// "as described in Section 2.3 of [RFC6749]", which is a reference to every method the server
+    /// offers and not to shared secrets alone. Carrying only `client_secret` meant a confidential
+    /// client registered for assertion authentication was answered `invalid_client` on a grant the
+    /// RFC 8414 document advertises to it: the credential it presented had nowhere to travel.
+    #[cfg(feature = "client_assertion")]
+    pub client_assertion_type: Option<&'a str>,
+    /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.
+    #[cfg(feature = "client_assertion")]
+    pub client_assertion: Option<&'a str>,
     /// REQUIRED (section 2.1). The token representing the party on whose behalf the request is
     /// made.
     pub subject_token: &'a str,
@@ -350,6 +383,10 @@ impl<'a> TokenExchangeRequest<'a> {
         TokenExchangeRequest {
             client_id,
             client_secret: None,
+            #[cfg(feature = "client_assertion")]
+            client_assertion_type: None,
+            #[cfg(feature = "client_assertion")]
+            client_assertion: None,
             subject_token,
             subject_token_type,
             actor_token: None,
@@ -371,10 +408,17 @@ impl fmt::Debug for TokenExchangeRequest<'_> {
         fn redact_opt<T>(value: &Option<T>) -> Option<&'static str> {
             value.as_ref().map(|_| "[redacted]")
         }
-        f.debug_struct("TokenExchangeRequest")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &redact_opt(&self.client_secret))
-            .field("subject_token", &"[redacted]")
+        let mut out = f.debug_struct("TokenExchangeRequest");
+        out.field("client_id", &self.client_id)
+            .field("client_secret", &redact_opt(&self.client_secret));
+        // The assertion is a bearer credential for as long as it is unexpired (RFC 7523 s3), so it
+        // is redacted exactly as the secret is. The TYPE is printed, because it is not a
+        // credential (it is a fixed URN) and a mistyped one is the commonest way this
+        // authentication method fails.
+        #[cfg(feature = "client_assertion")]
+        out.field("client_assertion_type", &self.client_assertion_type)
+            .field("client_assertion", &redact_opt(&self.client_assertion));
+        out.field("subject_token", &"[redacted]")
             .field("subject_token_type", &self.subject_token_type)
             .field("actor_token", &redact_opt(&self.actor_token))
             .field("actor_token_type", &self.actor_token_type)
@@ -548,9 +592,37 @@ async fn exchange<S: Storage, C: Clock>(
 
     // 2. The client. See `TokenExchange::exchange_token` for why confidential only.
     // RFC 8693 s2.1 authenticates the client the same way every other grant does, so it goes
-    // through the same value. No RFC 9449 binding: this surface is not handed a proof, and a token
-    // that claimed a binding nobody proved would be worse than an honest bearer token.
-    let bound = Bound::secret(request.client_secret);
+    // through the same value, and it carries EVERY credential shape the request could have
+    // presented rather than the shared secret alone. Section 2.1 points at RFC 6749 s2.3, which is
+    // a reference to whatever methods the server offers; `Bound::secret` discarded an RFC 7523
+    // assertion, so a confidential client registered for `private_key_jwt` or `client_secret_jwt`
+    // was answered `invalid_client` on a grant this server's RFC 8414 document advertises to it.
+    //
+    // No RFC 9449 binding, and that is now ENFORCED rather than assumed: this surface is not
+    // handed a proof, so a token issued here cannot be bound, and the HTTP router refuses a
+    // token-exchange request that presented one rather than quietly issuing an unbound token. See
+    // this module's "A SENDER-CONSTRAINED subject token is REFUSED" section, which makes the same
+    // argument about the subject token and would contradict itself if the ISSUED token were
+    // silently downgraded.
+    let bound = Bound {
+        cred: ClientCredential {
+            client_secret: request.client_secret,
+            #[cfg(feature = "client_assertion")]
+            client_assertion_type: request.client_assertion_type,
+            #[cfg(feature = "client_assertion")]
+            client_assertion: request.client_assertion,
+            // RFC 8705 is deliberately NOT threaded through here. A certificate authenticates AND
+            // binds (section 3), and this surface has nowhere to record the binding, so accepting
+            // one would issue an unbound token to a client that proved possession of a key: the
+            // silent downgrade this module refuses everywhere else. An mTLS-only client is
+            // refused `invalid_client` here, which is loud and is the honest answer until the
+            // exchange can carry a binding.
+            #[cfg(feature = "mtls")]
+            certificate: None,
+        },
+        #[cfg(feature = "dpop")]
+        jkt: None,
+    };
     let client = server
         .authenticate_client(request.client_id, &bound.cred)
         .await?;

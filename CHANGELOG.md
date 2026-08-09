@@ -12,6 +12,65 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+### Fixed: an unauthenticated caller SIZED an allocation on two refusal paths
+
+`GrantType`'s and `TokenTypeIdentifier`'s `FromStr` errors each carry an owned copy of the value
+that failed to parse. The HTTP token endpoint resolves `grant_type` BEFORE client authentication
+(deliberately, so an unimplemented grant is answered `unsupported_grant_type`) and deliberately
+does NOT echo the value back, so that `String` was allocated, copied into and dropped unread on
+every refused request. `MAX_BODY_BYTES` is 64 KiB and `MAX_FORM_PARAMETERS` is 64, so one form
+parameter can be nearly the whole body: an unauthenticated caller posting
+`grant_type=<60 KiB of junk>` bought the server a 60 KiB malloc and memcpy per refusal, at
+whatever rate it could open sockets. RFC 8693's `subject_token_type` was the same defect one seam
+along, and it is the one whose refusal STRING had already been made a `&'static str` for exactly
+this rule; the allocation underneath it was missed.
+
+**New, additive:** `GrantType::parse(&str) -> Option<Self>` and
+`TokenTypeIdentifier::parse(&str) -> Option<Self>`, non-allocating, used by the HTTP surface and
+by RFC 7591 registration. `FromStr` is UNCHANGED on both types and still carries the value, for
+host-side callers parsing their own configuration where knowing which spelling was wrong is the
+point and where an attacker does not set the rate.
+
+Measured through `AuthorizationService::handle`, growing the parameter by 61,432 bytes: before,
+the refusal grew by 122,888 bytes and one extra allocation; after, by 61,456 bytes and no extra
+allocation, which is the single request-body buffer that reading a form body requires. The gates
+are `unknown_grant_type_refusal_is_not_sized_by_the_caller` and
+`unknown_token_type_refusal_is_not_sized_by_the_caller` in `tests/refusal_cost.rs`; the existing
+token-exchange gate there dropped from 10 allocations / 4,549 bytes to 9 / 4,523.
+
+### Fixed: RFC 8693 token exchange refused every assertion-authenticated client over HTTP
+
+The token-exchange arm of the HTTP token handler forwarded `client_secret` and nothing else. RFC
+8693 s2.1 authenticates the client "as described in Section 2.3 of [RFC6749]", which is a
+reference to every method the server offers, and an RFC 7523 credential arrives in
+`client_assertion`. A confidential client registered for `private_key_jwt` or `client_secret_jwt`
+was therefore answered `invalid_client` on a grant this server's RFC 8414 document advertises to
+it. This is the second half of a defect whose first half (the arm carrying `None` and refusing
+EVERY client) was repaired earlier; restoring the secret alone left the rest of it in place.
+
+`TokenExchangeRequest` gains `client_assertion_type` and `client_assertion` under the
+`client_assertion` feature, and `token_exchange::exchange` now builds a full `ClientCredential`
+rather than `Bound::secret`. Additive: existing hosts construct this type through
+`TokenExchangeRequest::new` and set fields, so nothing breaks. RFC 8705 is deliberately still not
+threaded through; see the comment at the construction site for why an mTLS-only client is refused
+rather than silently issued an unbound token.
+
+### Fixed: a DPoP proof sent with `grant_type=token-exchange` was silently ignored
+
+The token-exchange arm RETURNS from the token handler, and the RFC 9449 s4.3 `DPoP` header was
+read after the dispatch, so on that one grant the header was never looked at: no duplicate-header
+check, no proof verification, and an issued token with no `jkt`. A client that asked for a
+sender-constrained token got a bearer token and no way to find out. `crate::token_exchange`'s own
+module documentation argues at length that a silent sender-constraint downgrade is "the one answer
+that is definitely wrong", about the SUBJECT token, while the same module was issuing a silently
+unbound token to a DPoP client.
+
+The header is now resolved BEFORE the grant is dispatched, so the duplicate-header rule reaches
+every grant, and a token-exchange request that presents a proof is refused `invalid_dpop_proof`
+rather than served. Honouring the proof instead would need a `jkt` to travel on
+`TokenExchangeRequest` and `Bound`; refusing is the answer that cannot be mistaken for success.
+Attacks in `tests/token_exchange_wire_credentials.rs`.
+
 ### Fixed: `client_secret_jwt` required an ES256 backend it does not use
 
 RFC 7523 `client_secret_jwt` is an HS256 HMAC over the registered secret (RFC 7518 s3.2). It

@@ -42,6 +42,36 @@ pub enum GrantType {
 }
 
 impl GrantType {
+    /// Resolve a wire `grant_type` value WITHOUT allocating, returning `None` for anything this
+    /// server does not implement.
+    ///
+    /// This is the parse the HTTP surface uses, and it exists because [`FromStr`]'s error type
+    /// cannot be built without a heap copy of the caller's value. `grant_type` is resolved BEFORE
+    /// client authentication (deliberately, so an unimplemented grant is answered
+    /// `unsupported_grant_type` rather than with a client-auth error about a parameter it never
+    /// reached), and the router does NOT echo the value back: RFC 6749 s5.2 restricts
+    /// `error_description` to a charset an attacker-supplied value need not respect. So the
+    /// `String` [`UnknownGrantType`] carries was allocated, copied into and dropped unread on every
+    /// refused request. `MAX_BODY_BYTES` is 64 KiB and `MAX_FORM_PARAMETERS` is 64, so one
+    /// parameter can be nearly the whole body: an unauthenticated caller sized that allocation, and
+    /// a refusal is work the attacker buys.
+    ///
+    /// [`FromStr`] is kept unchanged, and still carries the value, because a HOST parsing its own
+    /// configuration or a registration document wants to know which spelling it got wrong. The two
+    /// differ in what they can afford, not in what they accept: `from_str` is this function plus
+    /// the copy.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "authorization_code" => Some(GrantType::AuthorizationCode),
+            "refresh_token" => Some(GrantType::RefreshToken),
+            "client_credentials" => Some(GrantType::ClientCredentials),
+            DEVICE_CODE_GRANT_URN => Some(GrantType::DeviceCode),
+            #[cfg(feature = "token-exchange")]
+            TOKEN_EXCHANGE_GRANT_URN => Some(GrantType::TokenExchange),
+            _ => None,
+        }
+    }
+
     /// The registered wire spelling.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -76,16 +106,11 @@ impl std::error::Error for UnknownGrantType {}
 impl FromStr for GrantType {
     type Err = UnknownGrantType;
 
+    /// The value IS carried here, and that is the difference from [`GrantType::parse`]: a host
+    /// calling `"...".parse()` on its own configuration is not a path an attacker sets the rate of,
+    /// and it is a path where knowing which spelling was wrong is the whole point of the error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "authorization_code" => Ok(GrantType::AuthorizationCode),
-            "refresh_token" => Ok(GrantType::RefreshToken),
-            "client_credentials" => Ok(GrantType::ClientCredentials),
-            DEVICE_CODE_GRANT_URN => Ok(GrantType::DeviceCode),
-            #[cfg(feature = "token-exchange")]
-            TOKEN_EXCHANGE_GRANT_URN => Ok(GrantType::TokenExchange),
-            other => Err(UnknownGrantType(other.to_string())),
-        }
+        GrantType::parse(s).ok_or_else(|| UnknownGrantType(s.to_string()))
     }
 }
 

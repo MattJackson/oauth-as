@@ -1785,12 +1785,17 @@ async fn token_handler<S: Storage, C: Clock>(
                 &state.challenge,
             )
         }
-        Some(value) => match value.parse::<GrantType>() {
-            Ok(g) => g,
+        // `GrantType::parse` and NOT `value.parse::<GrantType>()`: `FromStr`'s error carries an
+        // owned copy of the caller's value, and the arm below discards it unread. That copy was
+        // sized by an unauthenticated caller (one form parameter can be nearly the whole 64 KiB
+        // body), which made a refusal cost the server a 60 KiB malloc and memcpy at whatever rate
+        // the caller could open sockets. See `tests/refusal_cost.rs`.
+        Some(value) => match GrantType::parse(value) {
+            Some(g) => g,
             // The value is NOT echoed. RFC 6749 s5.2 restricts error_description to a charset
             // that excludes the double quote and backslash, and an attacker controls this string;
             // saying which grant was asked for is not worth having to sanitize it.
-            Err(_) => {
+            None => {
                 return error_response(
                     &ErrorResponse::new(ErrorCode::UnsupportedGrantType)
                         .with_description("this server does not implement the requested grant"),
@@ -1813,6 +1818,44 @@ async fn token_handler<S: Storage, C: Clock>(
     // travels together on the request CONTEXT, so there is one place a reader has to look to see
     // what the client presented, rather than one for secrets and another for everything else.
     let client_secret: Option<String> = None;
+
+    // RFC 9449 s4.3 (1): there must be exactly ONE `DPoP` header. Several is not a request this
+    // server may pick a favourite from: an intermediary that appended one, or a client that sent
+    // two, leaves it ambiguous which proof the client meant to bind the token to.
+    //
+    // RESOLVED HERE, before the grant is dispatched, and that placement is the fix for a silent
+    // downgrade rather than tidiness. The RFC 8693 arm below RETURNS, so while this block sat
+    // after the dispatch a `DPoP` header sent with `grant_type=token-exchange` was never read at
+    // all: no duplicate check, no proof verification, and an issued token with no `jkt`. A client
+    // that asked for a sender-constrained token got a bearer token and no way to find out.
+    #[cfg(feature = "dpop")]
+    let dpop_proof = {
+        let mut values = headers.get_all(crate::dpop::DPOP_HEADER).iter();
+        let first = values.next();
+        if values.next().is_some() {
+            return error_response(
+                &ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                    .with_description("more than one DPoP header (RFC 9449 s4.3)"),
+                via_header,
+                &state.challenge,
+            );
+        }
+        match first.map(|v| v.to_str()) {
+            None => None,
+            Some(Ok(value)) => Some(value),
+            // A header that is not visible ASCII cannot be a compact JWS, so this is a malformed
+            // proof rather than an absent one, and answering "absent" would silently downgrade a
+            // client that asked for a bound token to a bearer one.
+            Some(Err(_)) => {
+                return error_response(
+                    &ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                        .with_description("the DPoP header is not a compact JWS"),
+                    via_header,
+                    &state.challenge,
+                )
+            }
+        }
+    };
 
     let request = match grant {
         GrantType::AuthorizationCode => {
@@ -1874,59 +1917,38 @@ async fn token_handler<S: Storage, C: Clock>(
         // avoid.
         #[cfg(feature = "token-exchange")]
         GrantType::TokenExchange => {
-            // TAKEN off the resolved credentials rather than reusing the `client_secret` above,
-            // which is the `None` every other arm now carries because their credential travels on
-            // the request CONTEXT instead. RFC 8693 s2.1 authenticates the client exactly as the
-            // other grants do, and `TokenExchange::exchange_token` REFUSES a client that is not
-            // confidential, so passing that `None` through meant every exchange this router ever
-            // served was answered `invalid_client`: the grant was advertised in the RFC 8414
-            // document and unreachable over HTTP.
-            return token_exchange_response(
-                state,
-                &form,
-                client_id,
-                creds.client_secret.take(),
-                via_header,
-            )
-            .await;
+            // RFC 9449: this grant CANNOT bind the token it issues, so a presented proof is
+            // REFUSED rather than ignored. `TokenExchangeRequest` carries no proof and
+            // `crate::token_exchange` has nowhere to record a `jkt`, so honouring the header would
+            // mean issuing an unbound token to a client that asked for a bound one and telling it
+            // nothing: the silent downgrade that module argues against at length for the SUBJECT
+            // token, applied to the ISSUED token by the same module. Loud beats quiet, and the
+            // refusal is what an operator who turned DPoP on can actually see.
+            #[cfg(feature = "dpop")]
+            if dpop_proof.is_some() {
+                return error_response(
+                    &ErrorResponse::new(ErrorCode::InvalidDpopProof).with_description(
+                        "this server does not issue sender-constrained tokens through RFC 8693 \
+                         token exchange",
+                    ),
+                    via_header,
+                    &state.challenge,
+                );
+            }
+            // The WHOLE credential, not the secret alone. RFC 8693 s2.1 authenticates the client
+            // exactly as the other grants do, and `TokenExchange::exchange_token` REFUSES a client
+            // that is not confidential: forwarding only `client_secret` first made every exchange
+            // `invalid_client` (the `None` the other arms carry), and then, once the secret was
+            // restored, still refused every client registered for `private_key_jwt` or
+            // `client_secret_jwt`, whose credential arrives in `client_assertion`. Half a repair
+            // is what left the second half invisible.
+            return token_exchange_response(state, &form, client_id, &creds, via_header).await;
         }
     };
 
     // RFC 8707 s2: `resource` is a parameter of the token request itself, independent of
     // `grant_type`, so it is collected once here rather than inside each arm above.
     let resources = resource_indicators(&form);
-
-    // RFC 9449 s4.3 (1): there must be exactly ONE `DPoP` header. Several is not a request this
-    // server may pick a favourite from: an intermediary that appended one, or a client that sent
-    // two, leaves it ambiguous which proof the client meant to bind the token to.
-    #[cfg(feature = "dpop")]
-    let dpop_proof = {
-        let mut values = headers.get_all(crate::dpop::DPOP_HEADER).iter();
-        let first = values.next();
-        if values.next().is_some() {
-            return error_response(
-                &ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                    .with_description("more than one DPoP header (RFC 9449 s4.3)"),
-                via_header,
-                &state.challenge,
-            );
-        }
-        match first.map(|v| v.to_str()) {
-            None => None,
-            Some(Ok(value)) => Some(value),
-            // A header that is not visible ASCII cannot be a compact JWS, so this is a malformed
-            // proof rather than an absent one, and answering "absent" would silently downgrade a
-            // client that asked for a bound token to a bearer one.
-            Some(Err(_)) => {
-                return error_response(
-                    &ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                        .with_description("the DPoP header is not a compact JWS"),
-                    via_header,
-                    &state.challenge,
-                )
-            }
-        }
-    };
 
     let context = crate::server::TokenRequestContext {
         credential: creds.credential(),
@@ -1957,7 +1979,7 @@ async fn token_exchange_response<S: Storage, C: Clock>(
     state: &Inner<S, C>,
     form: &[Pair<'_>],
     client_id: ClientId,
-    client_secret: Option<String>,
+    creds: &Credentials,
     via_header: bool,
 ) -> Response {
     // The three refusals below, written out rather than built from the parameter's name. There
@@ -1979,9 +2001,12 @@ async fn token_exchange_response<S: Storage, C: Clock>(
         // The VALUE is not echoed, for the reason `grant_type` is not echoed above: RFC
         // 6749 s5.2 restricts error_description to a charset an attacker-supplied URN need
         // not respect, and naming the parameter is enough for the developer who sent it.
-        value
-            .parse()
-            .map_err(|_| ErrorResponse::new(ErrorCode::InvalidRequest).with_description(refusal))
+        //
+        // And because it is not echoed, the parse must not COPY it either: `FromStr` builds an
+        // `UnknownTokenTypeIdentifier` holding an owned, caller-sized `String` that this line then
+        // throws away. `TokenTypeIdentifier::parse` is the same match with no payload.
+        crate::token_exchange::TokenTypeIdentifier::parse(value)
+            .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidRequest).with_description(refusal))
     }
 
     let subject_token = match required(form, "subject_token") {
@@ -2025,7 +2050,14 @@ async fn token_exchange_response<S: Storage, C: Clock>(
 
     let request = crate::token_exchange::TokenExchangeRequest {
         client_id: &client_id,
-        client_secret: client_secret.as_deref(),
+        client_secret: creds.client_secret.as_deref(),
+        // RFC 7521 s4.2 / RFC 7523 s2.2, forwarded rather than dropped: without these two an
+        // assertion-authenticated confidential client cannot use this grant at all, and this is
+        // the endpoint that advertises it.
+        #[cfg(feature = "client_assertion")]
+        client_assertion_type: creds.client_assertion_type.as_deref(),
+        #[cfg(feature = "client_assertion")]
+        client_assertion: creds.client_assertion.as_deref(),
         subject_token,
         subject_token_type,
         actor_token,

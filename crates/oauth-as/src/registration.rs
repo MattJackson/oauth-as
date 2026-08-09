@@ -533,7 +533,11 @@ fn validate(
                     // An unknown grant type is refused rather than dropped: see the test in
                     // `src/tests/registration.rs`. `implicit` and `password` land here too, which is
                     // right, because OAuth 2.1 removes both.
-                    let grant: GrantType = value.parse().map_err(|_| {
+                    // `GrantType::parse` and not `value.parse()`: the refusal below discards the
+                    // value, and `FromStr`'s error would first copy the caller's string onto the
+                    // heap to carry it there. The registration document is caller-supplied text of
+                    // the caller's chosen length, same as `grant_type` at the token endpoint.
+                    let grant: GrantType = GrantType::parse(value).ok_or_else(|| {
                         RegistrationFailure::Invalid(RegistrationErrorResponse::new(
                             RegistrationErrorCode::InvalidClientMetadata,
                             "grant_types names a grant this server does not implement",
