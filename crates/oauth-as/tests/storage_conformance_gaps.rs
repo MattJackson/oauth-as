@@ -747,6 +747,14 @@ async fn a_store_that_cannot_write_a_record_is_not_judged_on_records_it_never_st
 /// This is the EXPORTED harness, so a false pass here does not mislead this repository, it
 /// certifies a stranger's broken store. A host whose `put_refresh_token` is failing needs to be
 /// told that, by name, not handed a green cascade.
+///
+/// Gated on `consent`, because `revoke_consent/cascades` is: without the feature the harness has no
+/// consent check to seed for, and there is nothing here to be wrong about.
+#[cfg(feature = "consent")]
+// Gated on `consent`: this asserts on `revoke_consent/cascades`, which only exists in a build that
+// has the feature. Ungated it passed only because nobody had run this file under a feature set that
+// omits consent, which is the same shape of blindness the rest of this file exists to close.
+#[cfg(feature = "consent")]
 #[tokio::test]
 async fn a_consent_fixture_that_did_not_persist_fails_the_cascade_check_by_name() {
     for which in [

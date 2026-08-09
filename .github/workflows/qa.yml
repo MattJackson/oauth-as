@@ -132,7 +132,7 @@ jobs:
   # Every feature combination is checked, because an optional dependency is perfectly capable of
   # raising the floor for the consumers who enable it while the default build stays fine.
   msrv:
-    name: MSRV (1.75) build and test
+    name: MSRV (1.75) build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -166,9 +166,15 @@ jobs:
       # verified by the full test suite on stable, in the fmt/clippy/test job above.
       - name: build on 1.75, default features
         run: cargo build -p oauth-as --locked
-      # The jwt feature holds the same floor: p256 and its tree build on 1.75.
+      # The jwt SURFACE, which since the signing seam landed carries no crypto dependency at all.
       - name: build on 1.75, jwt feature
         run: cargo build -p oauth-as --locked --features jwt
+      # The built-in ES256 BACKEND, which is where p256 and its tree actually enter. Building only
+      # `jwt` would no longer prove the floor for the crypto, because `jwt` no longer pulls any:
+      # that is exactly what the seam changed, and this job has to change with it or it silently
+      # stops checking the thing it was written to check.
+      - name: build on 1.75, jwt-p256 backend
+        run: cargo build -p oauth-as --locked --features jwt-p256
 
   # The `http` feature has its OWN, HIGHER floor, and it is reported separately rather than
   # averaged into one number. axum 0.8 declares rust-version 1.80, so no amount of care on our
