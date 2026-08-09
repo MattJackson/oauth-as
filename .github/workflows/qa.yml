@@ -408,6 +408,14 @@ jobs:
       # If this job starts going red for compiler reasons rather than target reasons, pin it.
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          # rustfmt and clippy are NOT in the minimal profile this action installs, and the rot
+          # check below runs both. It runs them against nightly rather than stable because this
+          # step makes nightly the default toolchain, so an unqualified `cargo fmt` resolves
+          # there: without these components the job dies on "'cargo-fmt' is not installed for the
+          # toolchain 'nightly'" before it has fuzzed anything, which is a red that says nothing
+          # about the targets.
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz
