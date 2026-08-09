@@ -221,6 +221,9 @@ pub type CsrfTokenHook = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>
 /// SCREEN, which means the first request renders HTML and a later one carries the answer. The
 /// resolver returns that page here and the router serves it unchanged, so interposing a consent
 /// UI never requires abandoning this router.
+/// `#[non_exhaustive]`: this type's shape already varies with the cargo features a host
+/// enables, so an exhaustive match on it was never portable between builds of this crate.
+#[non_exhaustive]
 pub enum ConsentDecision {
     /// The resource owner has agreed to this exact request. RFC 6749 s4.1.2: mint the code.
     Approve,
@@ -246,6 +249,9 @@ pub enum ConsentDecision {
 /// it. The request has already passed RFC 6749 s4.1.1 validation, so `client_id`, `redirect_uri`
 /// and `scope` are the VALIDATED values (the redirect URI is a registered one, the scope is
 /// inside the client's registration), not raw query text.
+/// `#[non_exhaustive]`: this type's shape already varies with the cargo features a host
+/// enables, so an exhaustive match on it was never portable between builds of this crate.
+#[non_exhaustive]
 pub struct ConsentRequest<'a> {
     /// The request's headers, so the host can find its own session.
     pub headers: &'a HeaderMap,
@@ -308,6 +314,9 @@ enum VerificationProtection {
 /// Why a router could not be built. Every variant is a host configuration mistake that would
 /// otherwise become a runtime 404 on an endpoint the metadata document promises.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`: this type's shape already varies with the cargo features a host
+/// enables, so an exhaustive match on it was never portable between builds of this crate.
+#[non_exhaustive]
 pub enum ServiceError {
     /// An advertised endpoint is not under the issuer, so this router cannot serve it. The host
     /// is either fronting a separate service or has a typo; either way, silently not routing it
