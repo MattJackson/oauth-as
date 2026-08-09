@@ -1005,7 +1005,7 @@ where
             if !gone {
                 report.fail(
                     REVOKE_CONSENT_CASCADES,
-                    &format!(
+                    format!(
                         "revoke_consent left {what} alive, so the user was told this application \
                          was stopped and it was not"
                     ),
@@ -1041,7 +1041,7 @@ where
             if !alive {
                 report.fail(
                     REVOKE_CONSENT_SPARES_OTHERS,
-                    &format!(
+                    format!(
                         "revoke_consent removed another subject's {what}, logging out a user who \
                          withdrew nothing"
                     ),
@@ -1056,7 +1056,7 @@ where
         if removed != 4 {
             report.fail(
                 REVOKE_CONSENT_COUNT,
-                &format!(
+                format!(
                     "revoke_consent removed 4 credentials but reported {removed} (the consent \
                      record itself is not counted)"
                 ),
@@ -1071,7 +1071,7 @@ where
             if second != 0 {
                 report.fail(
                     REVOKE_CONSENT_COUNT,
-                    &format!("withdrawing an already-withdrawn consent reported {second}, not 0"),
+                    format!("withdrawing an already-withdrawn consent reported {second}, not 0"),
                 );
             }
         }
