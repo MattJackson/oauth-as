@@ -128,10 +128,273 @@ The general rule this makes explicit, and it cuts both ways: a mutation run judg
 configuration it was built with. Any `#[cfg]`-selected alternative needs its own run, and a "miss"
 in a block the run did not compile is a statement about the run, not about the suite.
 
-## THE CURRENT RUN: a complete all-features sweep at `47418ff`
+## THE CURRENT RUN: a complete all-features sweep at `ce7c438`
 
-This supersedes everything below it. The runs below are kept because their REASONING is still
-sound and several of their equivalence arguments still hold, but their numbers are history.
+This supersedes everything below it, including the `47418ff` sweep that used to hold this
+position. The runs below are kept because their REASONING is still sound and several of their
+equivalence arguments still hold, but their numbers are history.
+
+```
+cargo mutants -p oauth-as --all-features --timeout 300 -j 16
+```
+
+on a 64 vCPU `c7i.16xlarge` spot instance in `us-east-1`, at commit `ce7c438`, with NOTHING
+excluded, from a `git archive HEAD` of the tree rather than a clone or a live checkout.
+
+**1550 mutants: 969 caught, 42 missed, 12 timeouts, 527 unviable.** 59.2 minutes of instance
+life, `i-021b6766473d189ef`, confirmed `terminated` with no volume left behind, at $0.913/hour
+spot plus 100 GB of gp3: **about $0.91**.
+
+One operational note worth carrying forward, because it cost a re-run. `cargo mutants` builds each
+mutant in a copy of the tree under `TMPDIR`, and on AL2023 `/tmp` is a tmpfs: at `-j 16` the copies
+filled RAM and the last three mutants died with `No space left on device` while the root volume
+still had 97 GB free. They were re-run with `TMPDIR` on the disk and are included in the totals
+above. Point `TMPDIR` at real storage before starting, not after.
+
+The numbers are trustworthy on the usual grounds. Baseline on that box was a 12 second build and a
+2 second test, so the 300 second timeout is a ~20x margin on the whole cycle, and 12 of 1550 (0.8%)
+timed out, all in the known non-terminating class: the `GateWait` poll-budget mutants, the
+rejection-sampling loops, and `percent_decode`'s `i += 1` becoming `i *= 1` so the index never
+passes `while i < bytes.len()`. `cargo mutants` counts a timeout as caught, because the suite does
+not pass, and that is the right answer for all 12.
+
+The unviable count moved a long way (527 against 237 at `47418ff`) and that is a statement about
+`cargo-mutants` 27.1.0 generating more candidates that do not compile, not about the crate.
+
+### What was done with the 42
+
+**26 killed by new tests, 7 argued as equivalent, 3 are a `cfg` artifact, 3 are not worth a test,
+and 3 mutate code that no longer exists.**
+
+| File | Missed | Killed | Equivalent | `cfg` | Not worth it | Code gone |
+| --- | --- | --- | --- | --- | --- | --- |
+| `src/jwt.rs` | 7 | 6 | 1 | 0 | 0 | 0 |
+| `src/par.rs` | 6 | 6 | 0 | 0 | 0 | 0 |
+| `src/http.rs` | 7 | 5 | 1 | 0 | 1 | 0 |
+| `src/rar.rs` | 4 | 4 | 0 | 0 | 0 | 0 |
+| `src/server.rs` | 4 | 2 | 2 | 0 | 0 | 0 |
+| `src/store.rs` | 4 | 1 | 0 | 0 | 0 | 3 |
+| `src/storage_conformance.rs` | 4 | 0 | 2 | 0 | 2 | 0 |
+| `src/metadata.rs` | 3 | 0 | 0 | 3 | 0 | 0 |
+| `src/token.rs` | 1 | 1 | 0 | 0 | 0 | 0 |
+| `src/token_exchange.rs` | 1 | 1 | 0 | 0 | 0 | 0 |
+| `src/scope.rs` | 1 | 0 | 1 | 0 | 0 | 0 |
+| **total** | **42** | **26** | **7** | **3** | **3** | **3** |
+
+The five new files, each naming the mutant it kills in the doc comment above every test:
+
+- `crates/oauth-as/tests/mutation_gaps_jwt_primitives.rs`
+- `crates/oauth-as/tests/mutation_gaps_request_object.rs`
+- `crates/oauth-as/tests/mutation_gaps_authorization_details.rs`
+- `crates/oauth-as/tests/mutation_gaps_http_credentials.rs`
+- `crates/oauth-as/tests/mutation_gaps_grant_carriers.rs`
+
+### THE DEFECT THIS PASS FOUND, and it is not a small one
+
+`http.rs`'s token handler resolves client credentials once and then sets
+`let client_secret: Option<String> = None;`, because every other grant now carries its credential
+on the request CONTEXT instead. The RFC 8693 arm was never updated: it passed that `None` straight
+into `token_exchange_response`, which passed it into `TokenExchangeRequest::client_secret`, and
+`TokenExchange::exchange_token` refuses any client that is not confidential.
+
+**RFC 8693 token exchange was therefore unreachable over the HTTP surface, for every client, under
+every authentication method, since commit `9c58142`.** The grant is advertised in the RFC 8414
+metadata document, and the answer to every request for it was `invalid_client`.
+
+Nothing saw it because the exchange suite drives the library API directly and had never posted a
+form at `/token`. `tests/mutation_gaps_http_credentials.rs::a_token_exchange_posted_as_a_form_
+reaches_the_grant` was written to kill the `k == "audience"` mutant, failed on the unmutated tree
+with `{"error":"invalid_client"}`, and the one-line fix (take the secret off the resolved
+credentials) is in the same commit. That is the whole argument for mutation testing in one
+paragraph: the mutant was a coverage nit, and looking for a test that could kill it found a dead
+grant.
+
+### The 26 that are killed, and what each mutation would have done to a caller
+
+**`src/jwt.rs`, `encoded_jose_header`, five mutants at one site.** The guard
+`c if (c as u32) < 0x20` escapes the control characters RFC 8259 s7 forbids raw inside a JSON
+string. Replaced with `false`, or narrowed to `== 0x20`, a `kid` carrying a control character is
+written unescaped and the protected header of EVERY access token this server signs stops being
+JSON. Replaced with `true`, or widened to `> 0x20`, an astral character reaches an escape that
+writes a single BMP `\u` sequence, producing four hex digits and a stray fifth: the `kid` a
+verifier reads back is a different string, naming no key in the JWKS. `<=` escapes the space,
+which parses but silently breaks the module's own commitment that the precomputation leaves the
+wire bytes unchanged. The `kid` is host-supplied and the crate's docs say it need not be ASCII, so
+none of this needs an attacker.
+
+**`src/jwt.rs`, `hmac_sha256`, `> 64` to `>= 64`.** RFC 2104 replaces a key LONGER than the block
+size by its digest; at exactly 64 bytes the key is used as it stands. `>=` picks the other rule, so
+`client_secret_jwt` breaks for every client whose secret is exactly 64 characters, which is what a
+32 byte secret printed as hex is. The existing assertion tests could not see it because they sign
+with this same function, so a wrong HMAC still verifies against itself. The new test uses vectors
+computed OUTSIDE this crate.
+
+**`src/par.rs`, the `aud` check, two mutants.** Deleting the `Value::Array(many)` arm refuses every
+request object whose `aud` is an array, which RFC 7519 s4.1.3 makes the GENERAL form and which most
+JWT libraries emit. Inverting `s == issuer` to `!=` is worse: it ACCEPTS an object addressed to
+another authorization server and REFUSES the one addressed here, which is the mix-up `aud` exists
+to stop.
+
+**`src/par.rs`, the `nbf` bound, three mutants.** RFC 7519 s4.1.5 makes `now == nbf` the first
+ACCEPTABLE instant. `<=` refuses a request object for the whole of the second it was minted in,
+which is an intermittent unreproducible refusal of a correct client. `==` accepts objects from the
+future. `>` refuses every object whose window has already opened and accepts only the ones whose
+has not.
+
+**`src/par.rs`, `RequestObjectKeyError::detail`.** Four distinct operator problems (mangled base64
+in `x`, in `y`, a coordinate at the wrong width, a point off the curve) collapse into one constant
+sentence, at the exact moment a deployment is trying to find out why its clients cannot use JAR.
+
+**`src/http.rs`, `bearer_token`, two mutants.** `< 7` narrowed to `== 7` removes the bound that
+keeps `raw[..7]` in range, so any Authorization header shorter than the scheme PANICS out of a
+library, into the host's request handler, from an unauthenticated header. `||` to `&&` accepts a
+header naming a different scheme and cuts seven bytes off the front of it: `Authorization: Basic
+aGVsbG8=` is presented to the host's RFC 7591 s5 registration policy as the bearer token
+`GVsbG8=`, which is both a wrong answer and a credential leaking into a callback documented never
+to see one.
+
+**`src/http.rs`, `credentials_where`, `||` to `&&`.** RFC 6749 s2.3 allows one client
+authentication method per request. Weakened, an RFC 7523 assertion presented alongside a `Basic`
+header is accepted, and the assertion wins: the request authenticates as the assertion's subject
+while every log and proxy in front of the server sees the Basic client id.
+
+**`src/http.rs`, `token_exchange_response`, `k == "audience"` to `!=`.** Every form parameter that
+is NOT `audience` becomes a requested audience, none of which the subject token granted, so every
+exchange is `invalid_target`. See the defect note above for why nothing was watching this handler
+at all.
+
+**`src/http.rs`, `authorize_handler`, `remember && issued.is_ok()` to `||`.** A plain `Approve`
+writes a consent record. `ConsentDecision::ApproveAndRemember`'s own documentation is the
+specification this breaks: the crate "will not remember a consent nobody asked it to remember".
+The next request from that client is handed a `remembered` consent, so a host that skips its prompt
+when one exists never asks again, and one approval silently becomes standing consent.
+
+**`src/rar.rs`, `MAX_AUTHORIZATION_DETAILS_DEPTH - 2`, two mutants.** `+` makes the member depth
+budget 10 and hands four levels of recursion margin back to an unauthenticated caller; `/` makes it
+4 and refuses documents inside the depth the crate publishes. Only a test AT the boundary sees
+either, which is why "deeply nested is refused" was not enough.
+
+**`src/rar.rs`, `iter` and `from_elements`.** These two are the whole of the host-side construction
+path RFC 9396 s7.1 invites. `from_elements` returning the default throws a host's enriched consent
+away and issues a token that authorizes nothing, with no error anywhere because an empty set is
+legal to issue; `iter` returning nothing makes every check a host writes over the details pass
+vacuously on a token that does carry them.
+
+**`src/server.rs`, `GrantedDetails::of_token`.** The exchanged token stops inheriting the subject
+token's `authorization_details`, so the downstream call the exchange existed for is refused, and a
+resource server that reads an absent list as "unconstrained" is handed the opposite of the truth.
+
+**`src/server.rs`, `GrantedDetails::is_empty` to `true`.** NOT dead code, despite the
+`#[allow(dead_code)]` on it: the device-code branch calls it to refuse `authorization_details` on a
+grant that never carried any (RFC 9396 s6). Constant `true` deletes that refusal, and the client is
+answered `200 OK` while believing it holds authority the user was never shown. The previous entry
+in this file suggested confirming this one by DELETING the method; that would have been wrong.
+
+**`src/token.rs`, `Confirmation::jkt`.** The constructor hands back a confirmation naming nothing,
+and `Confirmation::is_empty` then omits `cnf` entirely, so a host publishing a sender-constrained
+binding publishes a token that reads as an ordinary bearer token: the RFC 9449 s6.1 downgrade.
+
+**`src/token_exchange.rs`, the `audience` de-duplication.** `any(|t| t == audience)` inverted asks
+"is there any target that DIFFERS", which is true the moment one `resource` is present, so the
+`audience` is silently dropped. RFC 8693 s2.1.1 makes the two parameters two spellings of one
+request, and the client discovers the loss at the resource server as a rejection it cannot explain.
+
+**`src/store.rs:695`, `MemoryStorage::compare_and_swap_device_grant`, `!=` to `==`.** The branch
+that retires the OLD user-code index entry when a swap changes the user code stops firing, and
+fires instead when the code did not change (where the insert below puts it straight back). A user
+code is the credential a human types: leaving a superseded one live means the code from the first
+screen still resolves to the grant.
+
+### The 7 that are equivalent
+
+**`src/jwt.rs:934`, `x.len() != 32 || y.len() != 32` to `&&`, in `verify_es256`.** This is the one
+that was flagged as the stop-and-look, and the honest answer is that it cannot be reached.
+`PublicJwk`'s fields are PRIVATE, and both of its constructors (`from_json` and `from_coordinates`)
+already refuse a coordinate whose base64url does not decode to exactly 32 bytes. `verify_es256`
+re-decodes the same strings, so both lengths are always 32, and `false || false` and `false && false`
+are the same value. The check is retained as defence in depth and it earns its keep: if one length
+could ever be wrong, `&&` would let it through to a `copy_from_slice` that PANICS on a length
+mismatch, and a JWK arrives in a DPoP proof header, so that is an unauthenticated panic.
+
+That argument is only as good as the seal, so the seal is now pinned:
+`mutation_gaps_jwt_primitives.rs::a_jwk_coordinate_that_is_not_thirty_two_bytes_cannot_be_constructed`
+tries a short and a long coordinate in each position through both constructors. If a third
+constructor ever skips the width check, this entry is void and the mutant becomes a hole.
+
+**`src/http.rs:2174`, `raw.len() < 7` to `<= 7`, in `bearer_token`.** They differ only at
+`raw.len() == 7`, and at exactly 7 bytes the original falls through to `raw[7..]`, which is the
+empty string, which `(!token.is_empty()).then_some` turns into `None`. The mutant returns `None`
+directly. Same answer, for the only input that separates them, and 7 is always a char boundary
+when the string is 7 bytes long so there is no panic on either side either.
+
+**`src/server.rs:346` and `:361`, `GrantedAuthentication::from_code` and `::from_refresh`.** These
+are the `#[cfg(not(feature = "consent"))]` bodies, so an `--all-features` run does not compile
+them at all. They are also equivalent where they DO compile: without the feature the struct has no
+fields, so `GrantedAuthentication {}` and `Default::default()` are the same value written twice.
+The `consent` copies of both functions are caught, by `tests/step_up.rs`.
+
+**`src/scope.rs:65`, `ScopeSet::empty`.** Carried forward unchanged; the argument is at the top of
+this file.
+
+**`src/storage_conformance.rs:2217`, `at_before`, two mutants.** Carried forward unchanged; the
+argument is under "the four that are not worth a test" below.
+
+### The 3 that are a `cfg` artifact
+
+`src/metadata.rs:245`, the three `advertised_jwks_uri` mutants, all in the
+`#[cfg(not(feature = "jwt"))]` body. Carried forward unchanged: a default-features run judges
+these, and `src/tests/metadata.rs::without_the_jwt_feature_jwks_uri_is_whatever_the_host_declared`
+kills them there.
+
+### The 3 that are not worth a test
+
+**`src/http.rs:1409`, `separators + 1` to `separators * 1`, in `parse_pairs`.** The value is a
+`Vec::with_capacity` hint and nothing else: `bound` is never compared, returned or stored. What is
+lost is that a body with no `&` at all preallocates for zero pairs instead of one, so the first
+push reallocates, and the same is true one pair short for every other body. It cannot change any
+response, any error, or any stored record. Pinning it would mean asserting an exact allocation
+count against an internal with no contract, and `tests/allocation.rs`'s budgets are deliberately
+coarser than that.
+
+**`src/storage_conformance.rs:1207` and `:2056`.** Carried forward unchanged; the arguments are
+below.
+
+### The 3 whose code no longer exists
+
+`src/store.rs:203`, three mutants (`== ` to `!=`, and the match guard to `true` and to `false`),
+all inside the DEFAULT implementation of `Storage::compare_and_swap_device_grant`. Commit
+`6e38fb0` deleted that default outright, for a reason this file has already recorded: the shim's
+write went through `put_device_grant`, which is an insert-or-update, so it could resurrect a grant
+that had just been redeemed. There is no code left to mutate and nothing to kill. The REPLACEMENT
+is a required trait method with no body, and the reference implementation's own version of the same
+comparison is exercised by `mutation_gaps_grant_carriers.rs` and by
+`storage_conformance`'s three swap checks.
+
+### Proof that the 26 tests kill them, rather than merely pass
+
+Per mutant, by hand. Each mutation was applied to a pinned copy of the tree, the named test file
+was run, the failure was recorded, and the source was restored. Every one went red and named the
+intended test. Two of the twenty-six (`GrantedDetails::is_empty`, and the `store.rs` swap) plus the
+`Confirmation::jkt` and `token_exchange` pair were proven against a copy of the WORKING tree rather
+than of `HEAD`, because the tree moved under this work: see the caveat below.
+
+`bearer_token`'s `<=` was applied the same way and stayed GREEN, which is the evidence for its
+equivalence argument rather than a gap.
+
+### The caveat that matters most, stated plainly
+
+**The sweep is at `ce7c438` and the tree did not hold still.** Three other agents were editing and
+COMMITTING to this working tree throughout: `HEAD` moved from `ce7c438` to `faa2a4a` and then to
+`f8fc976` while the sweep ran and while these tests were being written, and there is a large
+uncommitted working set besides. Three of the 42 survivors were already moot by the time they were
+read (the deleted swap shim), which is the same snapshot hazard every entry in this file has
+warned about, arriving inside a single session this time.
+
+So this run does NOT certify the tree as it stands. It certifies `ce7c438`, and the tests written
+against it are green on the tree as it stands. Gate 4 still requires a run at the RELEASE commit
+that comes back with nothing new.
+
+
 
 ```
 cargo mutants -p oauth-as --all-features --timeout 300 -j 16
@@ -512,3 +775,39 @@ The gate is met when those are killed or argued here to the standard at the top 
 a fresh run at the release commit comes back with nothing else. Nothing about the work done in
 this pass licenses ticking it early: an 88% reduction in untriaged survivors in the highest-blast
 -radius modules is progress, and progress is not the criterion.
+
+SUPERSEDED by the `ce7c438` sweep at the top of this file, which found 1550 mutants where 1514 had
+been and 42 survivors where 93 had been. What this paragraph got RIGHT is that the four named
+stop-and-look sites deserved the attention: `bearer_token` turned out to hide an unauthenticated
+panic and a cross-scheme credential leak, the RFC 9101 time bounds turned out to refuse conforming
+clients at the boundary, `credentials_where` turned out to let two credentials through as one, and
+`verify_es256` turned out to be the one of the four that genuinely could not be reached.
+
+## THE POSITION TODAY, at `ce7c438`
+
+**GATE 4 IS STILL NOT MET, and this time the reason is narrow enough to state in one sentence: the
+sweep is complete and every one of its survivors is accounted for, but it was taken at `ce7c438`
+and the tree has moved three commits and one large uncommitted working set since.**
+
+What changed in this pass. The whole crate was swept again at `--all-features` with nothing
+excluded (1550 mutants, 42 survivors, 59 minutes, about $0.91). All 42 are triaged individually:
+26 killed by tests in five new files with per-mutant red-before-green evidence, 7 argued as
+equivalent with the reason, 3 recorded as a `cfg` artifact, 3 as not worth a test with what is
+lost, and 3 as mutations of code that has since been deleted. `jwt.rs:894 verify_es256`, the
+mutant the previous entry singled out as the worst possible survivor, is argued as equivalent with
+its premise pinned by a test rather than by assertion. And the search for a test that could kill
+one router mutant found a REAL DEFECT: RFC 8693 token exchange had been unreachable over the HTTP
+surface since commit `9c58142`.
+
+What has not changed. A mutation report is a snapshot and this one is already behind the tree it
+describes, by more than usual: three other agents committed to this repository while the sweep ran.
+Nothing written above measures the code they added. The bar at the top of this file has not moved
+either, and it says the gate is met when a run AT THE RELEASE COMMIT, over the feature set that
+ships, comes back with every survivor killed or recorded here. That run has not happened, because
+there is not yet a release commit to take it at.
+
+The honest shape of the remaining work is therefore small and specific: cut the release commit,
+re-run the same command against it, and expect the survivors to be the 16 argued above (7
+equivalent, 3 `cfg`, 3 not worth a test, and the 3 that will simply no longer exist) plus whatever
+the code written since `ce7c438` produces. If that run comes back clean against that expectation,
+the gate is met. It is not met before it.

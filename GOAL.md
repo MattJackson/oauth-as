@@ -79,29 +79,42 @@ the server's behaviour. No assertion was ever weakened to obtain green.
 ### Gate 4: the tests actually constrain the code
 - [x] `cargo mutants -p oauth-as` run to completion
 - [ ] Every surviving mutant is either killed by a new test, or recorded in writing as equivalent
-      with the reason. **NOT MET.** See MUTANTS.md for the full record.
+      with the reason. **NOT MET, but for a much narrower reason than before.** See MUTANTS.md for
+      the full record.
 
-      The measured surface is now the WHOLE crate, which is what every previous statement of this
-      gate was waiting for: `cargo mutants -p oauth-as --all-features --timeout 300 -j 16` at
-      commit `47418ff`, nothing excluded, gave **1514 mutants: 1173 caught, 93 missed, 237
-      unviable, 11 timeouts**.
+      Every survivor of the current sweep IS accounted for. `cargo mutants -p oauth-as
+      --all-features --timeout 300 -j 16` at commit `ce7c438`, on a 64 vCPU spot instance, nothing
+      excluded, gave **1550 mutants: 969 caught, 42 missed, 12 timeouts, 527 unviable** in 59
+      minutes for about $0.91.
 
-      Of the 93: **46 are killed by new tests, 4 are argued as equivalent or not worth a test, and
-      43 remain.** Six of the 43 were already argued in MUTANTS.md before this pass, so about 36
-      are genuinely open. The three modules the previous entry named as untriaged
-      (`storage_conformance.rs`, `store.rs`, `registration.rs`) are now fully accounted for: 39 of
-      their 43 survivors killed, 4 argued.
+      All 42 are triaged individually: **26 killed by new tests, 7 argued as equivalent, 3 recorded
+      as a `#[cfg]` artifact, 3 as not worth a test with what is lost, and 3 as mutations of code
+      that has since been deleted.** Each of the 26 was proven by applying its mutation by hand to
+      a pinned copy of the tree and watching the named test fail.
 
-      WHAT REMAINS, exactly: about 36 survivors, concentrated in `src/http.rs` (16), `src/par.rs`
-      (6) and `src/rar.rs` (4), with singles in `jwt.rs`, `consent.rs`, `dpop.rs`,
-      `client_assertion.rs`, `token.rs`, `token_exchange.rs` and `server.rs`. They are listed
-      individually in MUTANTS.md. Several are in code where a surviving mutant is a reason to stop
-      and look rather than to schedule: `jwt.rs:894 replace || with && in verify_es256`,
-      `http.rs:2068 bearer_token`, `http.rs:1536 credentials_where`, and the RFC 9101 request
-      object time bounds at `par.rs:997`.
+      The four sites the previous statement of this gate flagged as stop-and-look are resolved:
+      `bearer_token` was hiding an unauthenticated panic AND a cross-scheme credential leak into
+      the host's registration policy, `credentials_where` was one operator away from accepting two
+      client authentication methods as one, the RFC 9101 `nbf` bound was one character away from
+      refusing conforming clients for the second they mint a request object in, and
+      `verify_es256`'s `||` is the one of the four that genuinely cannot be reached, because
+      `PublicJwk`'s fields are private and both constructors already fix both coordinate widths.
+      That argument is only as good as its premise, so the premise is now pinned by a test.
 
-      The gate is met when those are killed or argued to the bar MUTANTS.md sets, and a fresh
-      run at the release commit comes back with nothing else.
+      The pass also found a REAL DEFECT, which is the strongest argument for the method this
+      project has yet produced: RFC 8693 token exchange had been **unreachable over the HTTP
+      surface for every client since commit `9c58142`**, because the token handler passed a
+      hardcoded `None` where the client secret should have gone and the exchange refuses any client
+      that is not confidential. The grant was advertised in the RFC 8414 document and answered
+      `invalid_client` every time. Nothing saw it because the exchange suite drives the library API
+      and had never posted a form; the test written to kill a router mutant failed on the
+      unmutated tree, and the fix is in the same commit.
+
+      WHAT REMAINS, exactly: the sweep is a SNAPSHOT at `ce7c438`, and three other agents committed
+      to this tree while it ran, so `HEAD` has moved and the code written since has never been
+      mutated. The gate is met when a run at the RELEASE COMMIT comes back with nothing beyond the
+      16 already argued in MUTANTS.md. That run cannot be taken until there is a release commit to
+      take it at.
 
 CHECK: the mutants report is clean or annotated. A surviving mutant is a hole in the suite, not a
 curiosity.

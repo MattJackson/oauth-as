@@ -1841,8 +1841,21 @@ async fn token_handler<S: Storage, C: Clock>(
         // avoid.
         #[cfg(feature = "token-exchange")]
         GrantType::TokenExchange => {
-            return token_exchange_response(state, &form, client_id, client_secret, via_header)
-                .await
+            // TAKEN off the resolved credentials rather than reusing the `client_secret` above,
+            // which is the `None` every other arm now carries because their credential travels on
+            // the request CONTEXT instead. RFC 8693 s2.1 authenticates the client exactly as the
+            // other grants do, and `TokenExchange::exchange_token` REFUSES a client that is not
+            // confidential, so passing that `None` through meant every exchange this router ever
+            // served was answered `invalid_client`: the grant was advertised in the RFC 8414
+            // document and unreachable over HTTP.
+            return token_exchange_response(
+                state,
+                &form,
+                client_id,
+                creds.client_secret.take(),
+                via_header,
+            )
+            .await;
         }
     };
 
