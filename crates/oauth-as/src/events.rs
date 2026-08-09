@@ -21,6 +21,12 @@
 //!   whether it failed; it does NOT know the caller, the IP, the session or the user, because it
 //!   never sees a request. So the library asks and reports, and the host counts and decides.
 //!
+//!   That reasoning explains why this is a SEAM. It never justified shipping the seam EMPTY, and
+//!   as of 0.9.0 the crate does not: [`crate::rate_limit::FixedWindowRateLimiter`] is a counter a
+//!   host installs in one line, with defaults derived from the section 5.1 arithmetic. It is a
+//!   floor rather than a ceiling (it is per process, so on a multi-node deployment the effective
+//!   limit is multiplied by the node count); its module docs say plainly what it cannot do.
+//!
 //! # Zero cost until enabled
 //!
 //! The crate doc promises a host that never turns something on pays nothing for it, and this
@@ -296,6 +302,11 @@ pub enum AttemptOutcome {
 /// RFC 8628 section 5.1 is explicit that the device user code's entropy is sufficient only in
 /// combination with rate limiting of user code entry, so for any deployment offering the device
 /// grant this is not optional in practice, only optional in the type system.
+///
+/// A HOST DOES NOT HAVE TO WRITE ONE. [`crate::rate_limit::FixedWindowRateLimiter`] is an
+/// implementation this crate ships, in memory, with no new dependency and with defaults derived
+/// from the section 5.1 arithmetic. Implement this trait yourself when you have something the
+/// library does not: a request IP, a session, a user, or a store shared across nodes.
 pub trait RateLimiter: Send + Sync {
     /// Decide whether `attempt` may proceed. Called BEFORE any credential is evaluated, so a
     /// `Deny` costs the attacker a lookup and tells them nothing.
@@ -414,6 +425,10 @@ impl Hooks {
     /// [`RateLimitDecision::Allow`]: a library with no notion of a caller has no business
     /// inventing a throttling policy, and failing closed here would break every host that has not
     /// yet written one.
+    ///
+    /// "Allow" is therefore the answer for a host that installed nothing, and RFC 8628 section 5.1
+    /// says that host is running an under-protected verification endpoint. Install
+    /// [`crate::rate_limit::FixedWindowRateLimiter`] if you have nothing better.
     pub fn check(&self, attempt: Attempt<'_>) -> RateLimitDecision {
         match &self.0 {
             Some(installed) => match &installed.rate_limiter {
