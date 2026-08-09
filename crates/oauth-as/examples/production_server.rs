@@ -464,8 +464,15 @@ fn consent_submit(state: &Arc<HostState>, headers: &HeaderMap, body: &[u8]) -> R
     // primitive, and one that borrows the authorization server's own reputation. Origin-relative
     // only, and `//host` is rejected because a browser reads that as an absolute URL with the
     // current scheme.
+    //
+    // THE BACKSLASH FORMS COUNT AS `//`. WHATWG URL 4.3 treats `\` as a path separator wherever
+    // `/` is one for a special scheme, so `/\host` and `\/host` are `//host` to every browser
+    // that implements it, which is all of them. A check that reads the two characters literally
+    // and only knows about `/` is a check that stops the spelling an attacker would not use.
     let return_to = form.get("return_to").cloned().unwrap_or_default();
-    if !return_to.starts_with('/') || return_to.starts_with("//") {
+    let separator = |b: Option<&u8>| matches!(b, Some(b'/') | Some(b'\\'));
+    let bytes = return_to.as_bytes();
+    if bytes.first() != Some(&b'/') || separator(bytes.get(1)) {
         return html(StatusCode::BAD_REQUEST, "<p>Bad request.</p>".to_string());
     }
 

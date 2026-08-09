@@ -953,6 +953,19 @@ fn challenge_is_well_formed(challenge: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
+/// The number of decimal digits `n` is written in, which is what `replay_key` has to reserve for
+/// its length prefix. `0` is one digit, and there is no case with none.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+fn decimal_width(n: usize) -> usize {
+    let mut width = 1;
+    let mut rest = n / 10;
+    while rest > 0 {
+        rest /= 10;
+        width += 1;
+    }
+    width
+}
+
 /// The storage key one single-use identifier is claimed under.
 ///
 /// NAMESPACED, and both halves matter. `kind` keeps an RFC 7523 assertion's `jti` from colliding
@@ -962,14 +975,42 @@ fn challenge_is_well_formed(challenge: &str) -> bool {
 /// without it, an attacker could spend a victim's future `jti` values in advance, which is a denial
 /// of service bought for the price of a refused request.
 ///
-/// One allocation per assertion or proof, on a path that only exists when the feature is on.
+/// # Why the length prefix, and why a separator alone was not enough
+///
+/// The encoding is `kind ":" LEN(owner) ":" owner jti`, and it is INJECTIVE, which is a stronger
+/// statement than "the parts are separated" and is the statement that matters:
+///
+/// - `kind` is one of this file's own two constants (`ca`, `dpop`), neither of which contains a
+///   colon, so the first colon ends it;
+/// - what follows is the decimal byte length of `owner`, digits only, so the next colon ends it;
+/// - that length says exactly where `owner` stops and `jti` starts, whatever either of them
+///   contains.
+///
+/// Every part is therefore recoverable from the key, so no two distinct `(kind, owner, jti)`
+/// triples can produce the same one.
+///
+/// The previous encoding, `kind:owner:jti`, was NOT injective, and the counterexample is ordinary
+/// rather than exotic. `ClientId::new` imposes no character restriction and URN-style client ids
+/// are common, so a client registered as `urn` presenting the `jti` `client:foo:42` produced
+/// `ca:urn:client:foo:42`, which is exactly what the client registered as `urn:client:foo` gets
+/// for its `jti` `42`. Whoever claimed it first denied it to the other, so one client could spend
+/// another's single-use slot and the victim's conforming assertion came back `invalid_client` as a
+/// replay of something nobody sent. `tests/replay_key_collision.rs` runs that attack.
+///
+/// One allocation per assertion or proof, on a path that only exists when the feature is on: the
+/// capacity below is exact, and `write!` into a `String` with room does not grow it.
 #[cfg(any(feature = "client_assertion", feature = "dpop"))]
 fn replay_key(kind: &str, owner: &str, jti: &str) -> String {
-    let mut key = String::with_capacity(kind.len() + owner.len() + jti.len() + 2);
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(
+        kind.len() + 1 + decimal_width(owner.len()) + 1 + owner.len() + jti.len(),
+    );
     key.push_str(kind);
     key.push(':');
-    key.push_str(owner);
+    // Infallible: `fmt::Write` for `String` cannot fail, and there is no error to handle.
+    let _ = write!(key, "{}", owner.len());
     key.push(':');
+    key.push_str(owner);
     key.push_str(jti);
     key
 }
@@ -1432,6 +1473,34 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self.config
     }
 
+    /// The RFC 8414 document THIS server would publish, which is the one a host should serve.
+    ///
+    /// Different from [`crate::metadata::AuthorizationServerMetadata::from_config`], and the
+    /// difference is the point: `from_config` sees the configuration and nothing else, while some
+    /// of what the document promises depends on a seam the host INSTALLED on the server. RFC 7523
+    /// `private_key_jwt` is the case that forced this. It is ES256, so it is honest exactly when
+    /// this server can check an ES256 signature, and that is a property of
+    /// [`AuthorizationServer::with_es256_verifier`] plus the `jwt-p256` feature, neither of which
+    /// a `&ServerConfig` can see. A method the document names and the token endpoint refuses
+    /// every time is not a defect a client can work around: it did what it was told.
+    ///
+    /// `from_config` therefore advertises only what the CONFIGURATION alone establishes, and this
+    /// adds back exactly what the installed seams establish. It is the direction that fails safe:
+    /// a host that ignores this method under-advertises rather than inviting clients to use a
+    /// method that cannot work. [`crate::http::ServiceBuilder::build`] uses this one.
+    pub fn metadata(&self) -> crate::metadata::AuthorizationServerMetadata {
+        #[allow(unused_mut)]
+        let mut meta = crate::metadata::AuthorizationServerMetadata::from_config(&self.config);
+        // Only the ES256-dependent members need adjusting, and only in a build that could verify
+        // at all: the `cfg` is exactly the set `es256_verifier` is gated on, because those three
+        // features are the three that advertise something an ES256 signature check has to back.
+        #[cfg(any(feature = "client_assertion", feature = "jar", feature = "dpop"))]
+        if self.es256_verifier().is_some() {
+            meta.es256_verification_is_available();
+        }
+        meta
+    }
+
     /// This server's issuer identifier, in the ONE spelling it publishes.
     ///
     /// RFC 9207 section 2.4 has the client compare the `iss` authorization response parameter
@@ -1788,13 +1857,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
         // RFC 7523 section 3 (3) admits either the token endpoint URL or, by long-established
         // practice (OpenID Connect Core section 9), the issuer identifier.
-        // No ES256 backend means this credential cannot be checked, and an unchecked credential
-        // has authenticated nobody. RFC 6749 s5.2 `invalid_client`, the same answer every other
-        // failed client authentication gets, because telling the caller WHICH way it failed is how
-        // a verifier becomes a client-id oracle.
-        let verifier = self.es256_verifier().ok_or_else(refused)?;
+        //
+        // The verifier is resolved and PASSED ALONG rather than required here, because only one of
+        // the two methods needs one. `private_key_jwt` is ES256 and `verify_assertion` refuses it
+        // on a `None` (an unchecked credential has authenticated nobody). `client_secret_jwt` is
+        // an HS256 HMAC over the registered secret and touches no curve at all, so requiring a
+        // backend on that path refused a valid credential for a reason no RFC gives. Which one
+        // this registration is, is `client.auth`'s to say, and `AssertionKeys` is what says it.
         let verified = verify_assertion(
-            verifier,
+            self.es256_verifier(),
             keys,
             assertion,
             client.client_id.as_str(),

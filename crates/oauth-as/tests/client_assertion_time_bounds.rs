@@ -69,7 +69,7 @@ fn an_exp_of_u64_max_is_refused_rather_than_panicking() {
 
     assert_eq!(
         verify_assertion(
-            VERIFIER,
+            Some(VERIFIER),
             &keys(&key),
             &assertion,
             CLIENT_ID,
@@ -100,7 +100,7 @@ fn an_nbf_or_iat_of_u64_max_is_refused_rather_than_panicking() {
 
         assert_eq!(
             verify_assertion(
-                VERIFIER,
+                Some(VERIFIER),
                 &keys(&key),
                 &assertion,
                 CLIENT_ID,

@@ -206,20 +206,52 @@ fn c13_token_request_debug_still_names_the_grant() {
 /// its shape is not observable through either endpoint: any injective function of the three parts
 /// gives the same accept/refuse answers. So the shape is pinned here, directly.
 ///
-/// The separator matters. Without it, `("ca", "ab", "c")` and `("ca", "a", "bc")` are the same key,
-/// so one client could spend a `jti` belonging to another client whose id is a prefix of its own.
-/// That is precisely the collision the namespacing exists to prevent.
+/// INJECTIVITY is the property, and a separator alone did not buy it: `jti` and the client id are
+/// both caller-chosen and neither is restricted to a charset that excludes the separator. The
+/// length prefix is what makes the split unambiguous whatever they contain. See `replay_key` for
+/// the argument, and `tests/replay_key_collision.rs` for the attack the old encoding admitted.
 #[cfg(any(feature = "client_assertion", feature = "dpop"))]
 #[test]
 fn a_replay_key_separates_its_three_parts() {
-    assert_eq!(replay_key("ca", "client-1", "jti-1"), "ca:client-1:jti-1");
-    assert_eq!(replay_key("dpop", "thumb", "jti-1"), "dpop:thumb:jti-1");
+    assert_eq!(replay_key("ca", "client-1", "jti-1"), "ca:8:client-1jti-1");
+    assert_eq!(replay_key("dpop", "thumb", "jti-1"), "dpop:5:thumbjti-1");
     // The two mechanisms never share a key even when the owner and the `jti` are identical: a
     // captured DPoP proof's `jti` must not be spendable as a client assertion's, or the two replay
     // caches would lock each other out.
     assert_ne!(replay_key("ca", "x", "j"), replay_key("dpop", "x", "j"));
-    // Prefix collision, stated as the assertion it is.
+    // The prefix collision the old encoding was already asserted against.
     assert_ne!(replay_key("ca", "ab", "c"), replay_key("ca", "a", "bc"));
+    // The one it was NOT: a separator inside the caller's own values. Both of these produced
+    // `ca:urn:client:foo:42` before the length prefix.
+    assert_ne!(
+        replay_key("ca", "urn", "client:foo:42"),
+        replay_key("ca", "urn:client:foo", "42")
+    );
+    // The same shape one part along, for a `jti` that ends where the next field begins.
+    assert_ne!(
+        replay_key("dpop", "thumb", ":x"),
+        replay_key("dpop", "thumb:", "x")
+    );
+}
+
+/// The decimal width the capacity arithmetic depends on. Off by one here is a reallocation on
+/// every DPoP-carrying token request, which is exactly what the exactness test below would catch,
+/// so this pins the boundaries it would otherwise only catch by accident.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[test]
+fn the_decimal_width_is_the_number_of_digits() {
+    for (n, width) in [
+        (0usize, 1usize),
+        (1, 1),
+        (9, 1),
+        (10, 2),
+        (99, 2),
+        (100, 3),
+        (999, 3),
+        (1000, 4),
+    ] {
+        assert_eq!(decimal_width(n), width, "{n}");
+    }
 }
 
 /// The capacity hint is EXACT, so building a replay key is one allocation with no slack.
@@ -239,11 +271,12 @@ fn a_replay_key_is_built_in_exactly_one_correctly_sized_allocation() {
         ("ca", "", ""),
     ] {
         let key = replay_key(kind, owner, jti);
-        let exact = kind.len() + owner.len() + jti.len() + 2;
+        let exact = kind.len() + owner.len() + jti.len() + 2 + decimal_width(owner.len());
         assert_eq!(
             key.len(),
             exact,
-            "the two separators are the whole of the difference between the parts and the key"
+            "the two separators and the length prefix are the whole of the difference between \
+             the parts and the key"
         );
         assert_eq!(
             key.capacity(),

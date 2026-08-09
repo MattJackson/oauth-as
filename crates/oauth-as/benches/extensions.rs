@@ -248,11 +248,11 @@ fn main() {
             hmac_sha256(SECRET.as_bytes(), input.as_bytes()).to_vec()
         });
         assert!(
-            verify_assertion(VERIFIER, &hs_keys, &hs, CLIENT, &audiences, now).is_ok(),
+            verify_assertion(Some(VERIFIER), &hs_keys, &hs, CLIENT, &audiences, now).is_ok(),
             "the HS256 fixture must verify"
         );
         b.bench_fast("client_secret_jwt_hs256_verify", || {
-            verify_assertion(VERIFIER, &hs_keys, &hs, CLIENT, &audiences, now)
+            verify_assertion(Some(VERIFIER), &hs_keys, &hs, CLIENT, &audiences, now)
         });
 
         // private_key_jwt: ES256, asymmetric, and the reason a deployment whose policy forbids
@@ -266,11 +266,11 @@ fn main() {
             key.sign_signing_input(input).unwrap()
         });
         assert!(
-            verify_assertion(VERIFIER, &es_keys, &es, CLIENT, &audiences, now).is_ok(),
+            verify_assertion(Some(VERIFIER), &es_keys, &es, CLIENT, &audiences, now).is_ok(),
             "the ES256 fixture must verify"
         );
         b.bench_fast("private_key_jwt_es256_verify", || {
-            verify_assertion(VERIFIER, &es_keys, &es, CLIENT, &audiences, now)
+            verify_assertion(Some(VERIFIER), &es_keys, &es, CLIENT, &audiences, now)
         });
     }
 

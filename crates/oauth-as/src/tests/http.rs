@@ -254,6 +254,29 @@ fn the_issuer_origin_drops_the_path() {
     );
 }
 
+/// The origin is derived by SEARCHING for the path separator rather than by subtracting a trimmed
+/// length from an untrimmed string, and this is the input that tells the two apart: each trailing
+/// slash the trim removes shifts a subtracted index one byte further into the issuer, and with a
+/// two-byte character in the path the index lands inside it, where slicing a `str` panics.
+///
+/// NOT reachable through [`ServiceBuilder::build`] today, because `from_config` trims the issuer
+/// before this ever sees it, and a trimmed issuer has no trailing slash to shift anything. It is
+/// asserted anyway because "safe as long as one caller keeps trimming first" is a property no
+/// reader of this function can see, and the panic-free form costs nothing.
+#[test]
+fn the_issuer_origin_does_not_slice_inside_a_character() {
+    assert_eq!(
+        issuer_origin("https://as.example/\u{e9}//"),
+        "https://as.example"
+    );
+    assert_eq!(
+        issuer_origin("https://as.example:8443/\u{1f600}/x///"),
+        "https://as.example:8443"
+    );
+    // A trailing slash with no path at all, which is the case that already worked.
+    assert_eq!(issuer_origin("https://as.example//"), "https://as.example");
+}
+
 #[test]
 fn the_verification_page_escapes_what_it_echoes() {
     let html = verification_page("\"><script>alert(1)</script>", None, None, None);

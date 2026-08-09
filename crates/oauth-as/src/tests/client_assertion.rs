@@ -83,7 +83,7 @@ fn key_pair() -> (EcdsaP256Key, AssertionKeys) {
 }
 
 fn verify(keys: &AssertionKeys, assertion: &str) -> Result<VerifiedAssertion, AssertionFailure> {
-    verify_assertion(VERIFIER, keys, assertion, CLIENT, &audiences(), now())
+    verify_assertion(Some(VERIFIER), keys, assertion, CLIENT, &audiences(), now())
 }
 
 fn base64_url(bytes: &[u8]) -> String {

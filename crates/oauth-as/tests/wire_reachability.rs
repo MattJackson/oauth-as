@@ -629,12 +629,18 @@ async fn prove_auth_method(fx: &Fixture, method: &str) {
                 .await
                 .access_token("RFC 7523 private_key_jwt over HTTP");
         }
-        // A build with `client_assertion` but no ES256 BACKEND advertises the method and has no
-        // way to produce a signature to prove it with, because signing is what `jwt-p256`
-        // installs. Recorded rather than passed over in silence: this is the one advertised value
-        // whose proof is unavailable for a reason that is the build, not the server.
+        // A build with `client_assertion` and no ES256 BACKEND cannot check an ES256 signature, so
+        // it refuses every `private_key_jwt` assertion, so it must not name the method. This arm
+        // used to be empty, which recorded the gap honestly but left the advertisement unchecked;
+        // it is a panic now because the document is derived from the server's installed seams
+        // (`AuthorizationServer::metadata`) and this is the build where that has to be true. The
+        // fixture installs no verifier, so reaching this arm means the document is inviting
+        // clients to use a method that is refused every time.
         #[cfg(all(feature = "client_assertion", not(feature = "jwt-p256")))]
-        oauth_as::client_assertion::PRIVATE_KEY_JWT => {}
+        oauth_as::client_assertion::PRIVATE_KEY_JWT => panic!(
+            "this build has no ES256 backend and no host verifier is installed, so every ES256 \
+             assertion is refused. The RFC 8414 document must not advertise private_key_jwt here."
+        ),
         #[cfg(feature = "client_assertion")]
         oauth_as::client_assertion::CLIENT_SECRET_JWT => {
             assertion_token(&fx.service, CLIENT_SECRET_JWT_CLIENT, &client_secret_jwt())
@@ -1174,11 +1180,98 @@ fn assertion_claims(client_id: &str, jti: &str) -> Value {
 
 #[cfg(feature = "client_assertion")]
 fn client_secret_jwt() -> String {
+    client_secret_jwt_with_jti("wire-cs-1")
+}
+
+/// The same, with the caller's own `jti`. RFC 7523 s3 makes it single use, so a test that
+/// authenticates twice needs two of them; reusing one would be refused as the replay it is.
+#[cfg(feature = "client_assertion")]
+fn client_secret_jwt_with_jti(jti: &str) -> String {
     oauth_as::jwt::compact_jws(
         br#"{"alg":"HS256","typ":"JWT"}"#,
-        &serde_json::to_vec(&assertion_claims(CLIENT_SECRET_JWT_CLIENT, "wire-cs-1"))
+        &serde_json::to_vec(&assertion_claims(CLIENT_SECRET_JWT_CLIENT, jti))
             .expect("serializable claims"),
         |input| oauth_as::jwt::hmac_sha256(SECRET.as_bytes(), input.as_bytes()).to_vec(),
+    )
+}
+
+/// RFC 7009 s2.1 AND RFC 7662 s2.1 for a client whose credential is an ASSERTION.
+///
+/// The token endpoint is not the only endpoint that authenticates a client, and this is the test
+/// that says so over the wire. Every protected endpoint in this router resolves a credential the
+/// same way, and each one has to PASS it on; revocation dropped it and forwarded only
+/// `client_secret`, which for an assertion-authenticated client is `None`, so a `private_key_jwt`
+/// or `client_secret_jwt` client could never revoke anything through this service. That is the
+/// same defect, in the same shape and from the same cause, as the RFC 8693 token exchange one
+/// this whole file was written in reaction to: an arm that was not updated when credentials moved
+/// onto the request context, invisible because the revocation suite drives the library API.
+///
+/// Both endpoints are asserted together on purpose: one authenticates and the other does too, and
+/// a fix that reached only the endpoint somebody happened to test is how the first one survived.
+#[cfg(feature = "client_assertion")]
+#[tokio::test]
+async fn an_assertion_authenticated_client_may_introspect_and_revoke_over_http() {
+    let fx = fixture().await;
+    let access = assertion_token(
+        &fx.service,
+        CLIENT_SECRET_JWT_CLIENT,
+        &client_secret_jwt_with_jti("wire-cs-revoke-issue"),
+    )
+    .await
+    .access_token("RFC 7523 client_secret_jwt over HTTP");
+
+    let live = post_form(
+        &fx.service,
+        "/introspect",
+        assertion_form(
+            &format!("token={access}"),
+            &client_secret_jwt_with_jti("wire-cs-revoke-introspect"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        live.json().get("active").and_then(|v| v.as_bool()),
+        Some(true),
+        "RFC 7662 s2.2: an assertion authenticates at the introspection endpoint too: {}",
+        live.body
+    );
+
+    let revoked = post_form(
+        &fx.service,
+        "/revoke",
+        assertion_form(
+            &format!("token={access}&token_type_hint=access_token"),
+            &client_secret_jwt_with_jti("wire-cs-revoke-revoke"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        revoked.status,
+        http::StatusCode::OK,
+        "RFC 7009 s2.2: {}",
+        revoked.body
+    );
+    // The 200 proves nothing on its own (s2.2 answers 200 to an unknown token as well), so the
+    // token is read back through the library. This is the assertion that was failing: the request
+    // was refused with `invalid_client` and the token stayed live.
+    assert!(
+        fx.server
+            .introspect(&access)
+            .await
+            .expect("the store answers")
+            .is_none(),
+        "an assertion-authenticated client's revocation must actually revoke"
+    );
+}
+
+/// One form body carrying the RFC 7521 s4.2 assertion parameters plus whatever the endpoint's own
+/// parameters are.
+#[cfg(feature = "client_assertion")]
+fn assertion_form(endpoint_parameters: &str, assertion: &str) -> String {
+    format!(
+        "{endpoint_parameters}&client_id={CLIENT_SECRET_JWT_CLIENT}\
+         &client_assertion_type={}&client_assertion={assertion}",
+        urlencode(oauth_as::client_assertion::CLIENT_ASSERTION_TYPE)
     )
 }
 

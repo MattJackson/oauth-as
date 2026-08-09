@@ -34,7 +34,7 @@
 //!
 //! # What it serves
 //!
-//! Exactly the endpoints [`AuthorizationServerMetadata`] advertises, at exactly the paths it
+//! Exactly the endpoints [`crate::metadata::AuthorizationServerMetadata`] advertises, at exactly the paths it
 //! advertises them, plus the RFC 8628 `verification_uri`. The paths are DERIVED from the metadata
 //! document rather than hard-coded, because an advertised endpoint that 404s is a lie a client
 //! cannot recover from: if a host overrides `token_endpoint`, the route moves with it or
@@ -77,10 +77,9 @@
 //! # What this service CANNOT do, and a host must not advertise through it
 //!
 //! RFC 8705 mutual-TLS client authentication. A build with the `mtls` feature advertises
-//! `tls_client_auth` and `self_signed_tls_client_auth` in
-//! [`AuthorizationServerMetadata::token_endpoint_auth_methods_supported`], and a client that reads
-//! them and authenticates that way THROUGH THIS SERVICE is refused with `invalid_client`, every
-//! time. That is not an oversight: this module is handed an already-parsed request, it never
+//! `tls_client_auth` and `self_signed_tls_client_auth` in the RFC 8414 document's
+//! `token_endpoint_auth_methods_supported`, and a client that reads them and authenticates that
+//! way THROUGH THIS SERVICE is refused with `invalid_client`, every time. That is not an oversight: this module is handed an already-parsed request, it never
 //! terminates TLS and never sees the connection, so there is no certificate here that anybody
 //! verified. Reading one out of a proxy header would trust that header on every deployment's
 //! behalf rather than on the one host that knows whether its terminator can be trusted; the
@@ -108,7 +107,7 @@ use crate::device::{normalize_user_code, DeviceGrant, DeviceGrantState};
 use crate::error::{ErrorCode, ErrorResponse};
 use crate::events::{Attempt, AttemptOutcome, RateLimitDecision};
 use crate::grant::GrantType;
-use crate::metadata::{well_known_path, AuthorizationServerMetadata};
+use crate::metadata::well_known_path;
 use crate::scope::ScopeSet;
 use crate::server::{AuthorizationServer, Clock, DeviceApprovalError, TokenRequest, UserApproval};
 use crate::store::Storage;
@@ -571,7 +570,11 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
     /// [`ServiceError`] when the configuration advertises something this service cannot serve.
     pub fn build(self) -> Result<AuthorizationService<S, C>, ServiceError> {
         let config = self.server.config();
-        let meta = AuthorizationServerMetadata::from_config(config);
+        // The SERVER's document, not the configuration's: what this service can honour depends on
+        // the seams the host installed on the server as well as on the configuration, and RFC 7523
+        // `private_key_jwt` is the case that separates the two. See
+        // [`crate::AuthorizationServer::metadata`].
+        let meta = self.server.metadata();
         // `from_config` trims the issuer, and derives every default endpoint from that trimmed
         // form, so the prefix relation below holds for an unconfigured host by construction.
         let issuer = meta.issuer.clone();
@@ -811,11 +814,24 @@ fn endpoint_path(issuer: &str, endpoint: &'static str, url: &str) -> Result<Stri
 
 /// The issuer's `scheme://authority`, which is what an `Origin` header carries (RFC 6454 s6.1:
 /// scheme, host, and port, with no path).
+///
+/// SEARCHED for, rather than computed by subtraction. Subtracting the length of [`crate::metadata::issuer_path`] from the
+/// issuer would put the split point wherever a trailing slash the path trimmed used to be, so an
+/// issuer with both a non-ASCII path and a trailing slash split inside a character and PANICKED:
+/// `https://as.example/\u{e9}//` landed on the second byte of the two-byte character. Searching
+/// for the separator can only ever land on a boundary, whatever the issuer contains. The one
+/// caller passes an issuer already trimmed by `from_config`, so nothing reachable produced that
+/// panic, but "safe because one caller trims first" is not a property this function can state.
 fn issuer_origin(issuer: &str) -> &str {
-    let path = crate::metadata::issuer_path(issuer);
-    match path.is_empty() {
-        true => issuer.trim_end_matches('/'),
-        false => issuer[..issuer.len() - path.len()].trim_end_matches('/'),
+    // Past `://` when there is one, so a colon in the scheme cannot be read as a port and the
+    // first `/` found is the one that starts the path. `issuer_path` reads the same shape.
+    let authority_at = match issuer.find("://") {
+        Some(i) => i + 3,
+        None => 0,
+    };
+    match issuer[authority_at..].find('/') {
+        Some(i) => &issuer[..authority_at + i],
+        None => issuer,
     }
 }
 
@@ -2182,9 +2198,17 @@ async fn revoke_handler<S: Storage, C: Clock>(
     // nothing here it is unable to do.
     let hint = param(&form, "token_type_hint").and_then(|h| h.parse::<TokenTypeHint>().ok());
 
+    // The WHOLE credential, exactly as the other three protected endpoints in this module do.
+    // Forwarding only `client_secret` dropped every other way a client can authenticate: an RFC
+    // 7523 assertion arrives in `client_assertion`, not in `client_secret`, so an
+    // assertion-authenticated confidential client was refused `invalid_client` at this endpoint
+    // and could never revoke anything through this service. Same defect, same cause and same
+    // invisibility as the RFC 8693 one `tests/wire_reachability.rs` was written after: an arm not
+    // updated when credentials moved onto the request context, with a revocation suite that only
+    // ever drove the library API.
     match state
         .server
-        .revoke(&client_id, creds.client_secret.as_deref(), token, hint)
+        .revoke_with_credential(&client_id, &creds.credential(), token, hint)
         .await
     {
         Ok(()) => {

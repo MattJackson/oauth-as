@@ -297,13 +297,21 @@ impl AuthorizationServerMetadata {
                 .par
                 .as_ref()
                 .map(|par| par.require_pushed_authorization_requests),
-            #[cfg(feature = "jar")]
+            // Every algorithm on this list is ES256, so the list is honest only where an ES256
+            // signature can be checked. Without the built-in backend that is not something a
+            // `&ServerConfig` can answer, so the member is omitted here and
+            // `es256_verification_is_available` puts it back when the server resolves a verifier.
+            // `require_signed_request_object` below stays the signal that RFC 9101 is configured
+            // at all, which is what that method keys off.
+            #[cfg(all(feature = "jar", feature = "jwt-p256"))]
             request_object_signing_alg_values_supported: config.jar.as_ref().map(|_| {
                 crate::par::REQUEST_OBJECT_SIGNING_ALGS
                     .iter()
                     .map(|alg| alg.to_string())
                     .collect()
             }),
+            #[cfg(all(feature = "jar", not(feature = "jwt-p256")))]
+            request_object_signing_alg_values_supported: None,
             #[cfg(feature = "jar")]
             require_signed_request_object: config
                 .jar
@@ -325,11 +333,18 @@ impl AuthorizationServerMetadata {
                     // public clients, so omitting it would understate what it does.
                     "none".to_string(),
                 ];
-                // RFC 7523 s2.2, advertised exactly when this build can verify an assertion. The
-                // list and the verifier are derived from the same feature, so they cannot drift.
+                // RFC 7523 s2.2, and the two methods do NOT have the same requirements.
+                // `client_secret_jwt` is HS256 over the secret the registration already holds, so
+                // the feature alone makes it true. `private_key_jwt` is ES256, and since the
+                // signing seam landed a build can have this feature and no way to check an ES256
+                // signature at all (`client_assertion = ["jwt"]`, which does not pull `jwt-p256`),
+                // in which case every such assertion is refused. So it is advertised here only
+                // with the built-in backend, and `es256_verification_is_available` adds it when
+                // the host installed a verifier of its own.
                 #[cfg(feature = "client_assertion")]
                 {
                     methods.push(crate::client_assertion::CLIENT_SECRET_JWT.to_string());
+                    #[cfg(feature = "jwt-p256")]
                     methods.push(crate::client_assertion::PRIVATE_KEY_JWT.to_string());
                 }
                 // RFC 8705 s2.1.1 and s2.2.1 register these two, advertised exactly when this
@@ -344,22 +359,30 @@ impl AuthorizationServerMetadata {
                 }
                 methods
             },
-            #[cfg(feature = "client_assertion")]
+            // The same split, one member along: HS256 is checkable in every build with the
+            // feature, ES256 only where there is a backend to check it with.
+            #[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
             token_endpoint_auth_signing_alg_values_supported: Some(
                 crate::client_assertion::ASSERTION_SIGNING_ALGS
                     .iter()
                     .map(|a| a.to_string())
                     .collect(),
             ),
+            #[cfg(all(feature = "client_assertion", not(feature = "jwt-p256")))]
+            token_endpoint_auth_signing_alg_values_supported: Some(vec!["HS256".to_string()]),
             #[cfg(not(feature = "client_assertion"))]
             token_endpoint_auth_signing_alg_values_supported: None,
-            #[cfg(feature = "dpop")]
+            // RFC 9449 s5.1: a proof is an ES256 JWS this server VERIFIES, so with no backend
+            // there is no algorithm a client could send one under.
+            #[cfg(all(feature = "dpop", feature = "jwt-p256"))]
             dpop_signing_alg_values_supported: Some(
                 crate::dpop::DPOP_SIGNING_ALG_VALUES_SUPPORTED
                     .iter()
                     .map(|a| a.to_string())
                     .collect(),
             ),
+            #[cfg(all(feature = "dpop", not(feature = "jwt-p256")))]
+            dpop_signing_alg_values_supported: None,
             #[cfg(not(feature = "dpop"))]
             dpop_signing_alg_values_supported: None,
             code_challenge_methods_supported: vec!["S256".to_string()],
@@ -373,6 +396,58 @@ impl AuthorizationServerMetadata {
             authorization_response_iss_parameter_supported: true,
             #[cfg(feature = "mtls")]
             tls_client_certificate_bound_access_tokens: true,
+        }
+    }
+
+    /// Add back every advertisement that is honest only when an ES256 VERIFIER exists.
+    ///
+    /// [`AuthorizationServerMetadata::from_config`] cannot see one: `jwt-p256` compiles the
+    /// built-in backend in, and a host may install its own with
+    /// [`crate::AuthorizationServer::with_es256_verifier`], and neither is reachable from a
+    /// `&ServerConfig`. So `from_config` advertises the ES256-dependent members only when the
+    /// built-in backend is compiled in, and [`crate::AuthorizationServer::metadata`] calls this
+    /// when the server resolves a verifier.
+    ///
+    /// IDEMPOTENT, and it has to be: with `jwt-p256` on, `from_config` has already added all of
+    /// this, and a document that named `private_key_jwt` twice would be a defect of its own.
+    #[cfg(any(feature = "client_assertion", feature = "jar", feature = "dpop"))]
+    pub(crate) fn es256_verification_is_available(&mut self) {
+        #[cfg(feature = "client_assertion")]
+        {
+            let method = crate::client_assertion::PRIVATE_KEY_JWT.to_string();
+            if !self.token_endpoint_auth_methods_supported.contains(&method) {
+                self.token_endpoint_auth_methods_supported.push(method);
+            }
+            let algs = self
+                .token_endpoint_auth_signing_alg_values_supported
+                .get_or_insert_with(Vec::new);
+            if !algs.iter().any(|a| a == "ES256") {
+                algs.push("ES256".to_string());
+            }
+        }
+        #[cfg(feature = "jar")]
+        {
+            // Only for a server that HAS signed request objects enabled. `from_config` derives
+            // `require_signed_request_object` from `config.jar` and nothing else, so its presence
+            // is the one signal here for "RFC 9101 is configured" that does not depend on the
+            // very thing this method is adjusting.
+            if self.require_signed_request_object.is_some() {
+                self.request_object_signing_alg_values_supported = Some(
+                    crate::par::REQUEST_OBJECT_SIGNING_ALGS
+                        .iter()
+                        .map(|alg| alg.to_string())
+                        .collect(),
+                );
+            }
+        }
+        #[cfg(feature = "dpop")]
+        {
+            self.dpop_signing_alg_values_supported = Some(
+                crate::dpop::DPOP_SIGNING_ALG_VALUES_SUPPORTED
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            );
         }
     }
 }

@@ -316,16 +316,23 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 /// 3. Everything after that is the section 3 claim set, in the section's own order.
 ///
 /// `verifier` is the ES256 backend, the host's to choose after 0.9.0: enable `jwt-p256` for
-/// [`crate::jwt::P256Verifier`], or pass your own. It is a parameter and not an `Option` for the
-/// same reason as in [`crate::dpop::verify_proof`]: a caller holding no verifier must refuse the
-/// credential, not verify it leniently.
+/// [`crate::jwt::P256Verifier`], or pass your own.
+///
+/// It is an `Option`, and unlike [`crate::dpop::verify_proof`]'s it HAS to be, because only ONE of
+/// the two RFC 7523 methods involves a curve at all. `private_key_jwt` is ES256 and `None` refuses
+/// it, for that function's reason: a caller holding no verifier must refuse the credential rather
+/// than verify it leniently. `client_secret_jwt` is HS256 over the registered secret (RFC 7518
+/// section 3.2), and there is no elliptic curve on that path, no key for a verifier to check and
+/// nothing for a backend to contribute. Taking a verifier by value here made a build with
+/// `client_assertion` and no ES256 backend refuse a perfectly valid HMAC, which is a refusal no
+/// RFC asks for.
 ///
 /// PUBLIC because [`VerifiedAssertion`] and [`AssertionFailure`] are, and a type no consumer can
 /// obtain is a type that should not have been exported. It is also the other half of
 /// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
 /// while hiding the verification it exists to feed left the safe path out of reach.
 pub fn verify_assertion(
-    verifier: &dyn Es256Verifier,
+    verifier: Option<&dyn Es256Verifier>,
     keys: &AssertionKeys,
     assertion: &str,
     client_id: &str,
@@ -357,9 +364,18 @@ pub fn verify_assertion(
             &jws.signature,
         ),
         // Any ONE registered key is enough: see `AssertionKeys::PublicKeys` on rotation.
-        AssertionKeys::PublicKeys { keys } => keys
-            .iter()
-            .any(|key| verifier.verify(key, jws.signing_input.as_bytes(), &jws.signature)),
+        //
+        // No verifier means NO key matches, which lands on the same `BadSignature` an ES256
+        // assertion under a foreign key gets. Deliberately the same answer: the caller maps every
+        // failure to one bare `invalid_client` anyway (see `authenticate_by_assertion`), and a
+        // distinct "this deployment has no backend" outcome would be a fact about the server's
+        // configuration that an unauthenticated caller could read off the wire.
+        AssertionKeys::PublicKeys { keys } => match verifier {
+            Some(verifier) => keys
+                .iter()
+                .any(|key| verifier.verify(key, jws.signing_input.as_bytes(), &jws.signature)),
+            None => false,
+        },
     };
     if !signed {
         return Err(AssertionFailure::BadSignature);

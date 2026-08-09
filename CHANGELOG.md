@@ -12,6 +12,71 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+### Fixed: `client_secret_jwt` required an ES256 backend it does not use
+
+RFC 7523 `client_secret_jwt` is an HS256 HMAC over the registered secret (RFC 7518 s3.2). It
+involves no elliptic curve, no public key and no `Es256Verifier`. The ES256 signing seam
+nonetheless resolved a verifier UNCONDITIONALLY before looking at the registration, so a build of
+`--features client_assertion` (which pulls `jwt`, not `jwt-p256`) with no host verifier installed
+refused every valid HMAC assertion with `invalid_client`.
+
+`client_assertion::verify_assertion` now takes `Option<&dyn Es256Verifier>`, and only the
+`AssertionKeys::PublicKeys` (ES256) arm needs one: `None` there is a refusal, for the unchanged
+reason that a signature this server cannot check has authenticated nobody. **This is a breaking
+change to a public function's signature**, taken now because there is no consumer yet.
+
+### Fixed: the single-use replay key could collide across clients
+
+The RFC 7523 s3 and RFC 9449 s11.1 replay key was `kind:owner:jti` with an unescaped separator.
+`ClientId::new` imposes no character restriction and URN-style client ids are ordinary, so a
+client registered as `urn` presenting the `jti` `client:foo:42` produced exactly the key that the
+client registered as `urn:client:foo` produces for its `jti` `42`. Whoever claimed it first denied
+it to the other: one client could spend another's single-use slot, and the victim's conforming
+assertion was then refused as a replay of something nobody sent.
+
+The encoding is now `kind ":" LEN(owner) ":" owner jti`, which is INJECTIVE rather than merely
+separated: the length prefix says where the owner stops whatever either value contains, so every
+part is recoverable from the key and no two distinct triples can produce the same one. The attack
+is in `tests/replay_key_collision.rs`.
+
+### Fixed: the metadata document advertised `private_key_jwt` in builds that always refuse it
+
+After the signing seam, the `client_assertion` feature no longer guarantees an ES256 backend
+exists, so `private_key_jwt` could be advertised by a server that refuses every such assertion.
+The two RFC 7523 methods are now advertised on their own terms: `client_secret_jwt` whenever the
+feature is compiled in, because HS256 needs nothing else, and `private_key_jwt` exactly when this
+server can verify ES256. The same rule now covers `token_endpoint_auth_signing_alg_values_supported`
+(ES256 only with a backend), RFC 9101's `request_object_signing_alg_values_supported` and RFC
+9449's `dpop_signing_alg_values_supported`.
+
+Since a host-installed verifier is not visible to a `&ServerConfig`, there is a new
+`AuthorizationServer::metadata()` that derives the document from the server, including its
+installed seams; `AuthorizationServerMetadata::from_config` advertises only what the configuration
+alone establishes, which is the direction that fails safe. `oauth_as::http::ServiceBuilder::build`
+uses the new one.
+
+### Fixed: an assertion-authenticated client could not revoke a token over HTTP
+
+`oauth_as::http`'s revocation handler forwarded only `client_secret` and dropped the rest of the
+resolved credential, so an RFC 7523 client (whose credential arrives in `client_assertion`) was
+refused `invalid_client` at `/revoke` every time. Every other protected handler in that router
+already passed the whole credential. Same shape and same cause as the RFC 8693 defect below, and
+`tests/wire_reachability.rs` now covers revocation and introspection under an assertion.
+
+### Fixed: the origin derivation could slice inside a character
+
+`http::issuer_origin` computed a byte index by subtracting a trailing-slash-trimmed path length
+from the untrimmed issuer, so an issuer with both a non-ASCII path and a trailing slash split
+inside a character and panicked. Not reachable through `ServiceBuilder::build`, which passes an
+already-trimmed issuer, so this is hardening rather than a fixed outage; the origin is now found
+by searching for the path separator, which cannot land off a boundary.
+
+### Fixed: the consent example's open-redirect guard missed `/\`
+
+`examples/production_server.rs` rejected `//host` but accepted `/\host`, which WHATWG URL 4.3
+makes the same URL in every browser. The example is documented as the one to copy, so its guard is
+held to the rule its own comment states.
+
 ### Fixed: RFC 7009 revocation refused every public client, and RFC 8693 was unreachable over HTTP
 
 Two defects with one shape: a capability the RFC 8414 metadata document ADVERTISES, which no
