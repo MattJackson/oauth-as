@@ -384,6 +384,7 @@ pub trait Storage: Send + Sync {
     /// first. [`MemoryStorage`] treats a live entry as claimed regardless of its deadline and lets
     /// `sweep_expired` do the reclaiming, which is the conservative reading.
     #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "client_assertion", feature = "dpop"))))]
     fn claim_replay_id(
         &self,
         id: &str,
@@ -439,7 +440,8 @@ pub trait Storage: Send + Sync {
     /// - device grants with `expires_at <= now`
     /// - authorization codes with `expires_at <= now` (in either state)
     /// - access tokens with `expires_at <= now`
-    /// - claimed replay identifiers (see [`Storage::claim_replay_id`]) with `expires_at <= now`
+    /// - claimed replay identifiers (`claim_replay_id`, present only under the `client_assertion`
+    ///   or `dpop` features) with `expires_at <= now`
     /// - refresh records with `Some(expires_at) <= now`. A record with `expires_at: None` is a
     ///   chain with no absolute lifetime and is NOT dead; the server gives a spent record a
     ///   retention deadline precisely so this method can reclaim it.

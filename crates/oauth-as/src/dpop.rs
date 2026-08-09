@@ -163,7 +163,14 @@ pub fn htu_of(url: &str) -> &str {
 /// by requiring the signature to verify under the proof's OWN key: an attacker who captures a proof
 /// cannot substitute their key without invalidating the signature, and cannot re-sign without the
 /// private half.
-pub(crate) fn verify_proof(
+///
+/// PUBLIC because [`VerifiedProof`] and [`DpopFailure`] are, and a type with no reachable producer
+/// is a type a consumer can read about and never obtain. It is also the function a host needs
+/// directly: RFC 9449 section 7 has the RESOURCE server check a proof on every request, and a host
+/// whose resource server is in the same tree as its AS should not have to reimplement section 4.3
+/// to do it. Nothing is retained here, so claiming the returned `jti` (see
+/// [`crate::store::Storage::claim_replay_id`]) remains the caller's obligation either way.
+pub fn verify_proof(
     proof: &str,
     htm: &str,
     htu: &str,

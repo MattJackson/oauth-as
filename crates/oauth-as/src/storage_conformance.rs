@@ -4,6 +4,10 @@
 //! A RUNNABLE conformance harness for the [`Storage`] contract, behind the `test-util` cargo
 //! feature (off by default), for a HOST to run from its OWN test suite against its OWN store.
 //!
+//! Nothing here is re-exported at the crate root, on purpose: `Violation` and `CHECKS` are generic
+//! words that only mean something next to the thing they describe, and a host names this surface
+//! once, in a test.
+//!
 //! # Why this exists
 //!
 //! [`crate::store`] documents the contract in prose, and prose is the version of a contract that
@@ -274,8 +278,8 @@ impl<F> StorageConformance<F> {
         self
     }
 
-    /// How many callers race each `take_*`. Default [`DEFAULT_RACERS`]. Values below 2 are raised
-    /// to 2, since one racer cannot race.
+    /// How many callers race each `take_*`. Eight by default. Values below 2 are raised to 2,
+    /// since one racer cannot race.
     pub fn racers(mut self, racers: usize) -> Self {
         self.racers = racers.max(2);
         self

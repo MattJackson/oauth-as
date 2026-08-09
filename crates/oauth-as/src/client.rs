@@ -49,7 +49,8 @@ impl fmt::Display for ClientId {
 ///   is the RIGHT primitive for this particular job and the wrong one for a user password: a
 ///   client secret is high-entropy and host-generated, so there is no dictionary to run against
 ///   it, and the offline-guessing threat that makes a slow KDF necessary for human-chosen
-///   passwords does not exist here. See [`constant_time_eq`], which makes the same argument.
+///   passwords does not exist here. The comparison is constant time regardless, for the reason
+///   given on [`ClientAuth::verify_with`].
 /// - Anything else, built by [`SecretHash::custom`] and verified by a host-supplied
 ///   [`SecretVerifier`]. A host whose policy names argon2id, scrypt or bcrypt, or whose
 ///   verification happens in an HSM, keeps that dependency in its own tree where it belongs. A
@@ -164,8 +165,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// built-in scheme is always verified by this crate, so a permissive or buggy host verifier cannot
 /// weaken one.
 ///
-/// Implementations MUST compare in constant time with respect to the presented secret, for the
-/// reasons set out on [`constant_time_eq`]. Every serious password-hashing crate already does.
+/// Implementations MUST compare in constant time with respect to the presented secret: a
+/// comparison that returns early on the first differing byte leaks, through its own timing, how
+/// much of a guess was right, which turns an offline search into an online one an attacker can
+/// run a byte at a time. Every serious password-hashing crate already does this.
 pub trait SecretVerifier: Send + Sync {
     /// Whether `presented` is the secret behind `stored`.
     fn verify(&self, stored: &SecretHash, presented: &str) -> bool;
@@ -296,7 +299,8 @@ impl ClientAuth {
     /// Public clients accept `None` and reject any presented secret (presenting a secret for a
     /// secretless registration is a client mixup worth failing loud on). Confidential clients
     /// require the exact secret; the comparison is constant time regardless of the length of
-    /// either the registered or the presented secret (see [`constant_time_eq`]).
+    /// either the registered or the presented secret: an early-exit comparison would report,
+    /// through its own timing, how many leading bytes of a guess were right.
     ///
     /// ORDER OF PREFERENCE for a hashed registration: the crate's own scheme is checked by the
     /// crate, and only an unrecognised scheme is passed to `verifier`. That way installing a

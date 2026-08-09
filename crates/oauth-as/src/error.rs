@@ -19,21 +19,61 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     // RFC 6749 section 5.2 (token endpoint).
+    /// RFC 6749 section 5.2 `invalid_request`: the request is missing a required parameter,
+    /// repeats one, or is otherwise malformed. It says "you sent the wrong bytes", so a client
+    /// that retries the identical request cannot succeed.
     InvalidRequest,
+    /// RFC 6749 section 5.2 `invalid_client`: client authentication failed. Every reason collapses
+    /// into this one code deliberately, unknown client and wrong secret alike, because
+    /// distinguishing them tells an attacker which client ids exist. Carries HTTP 401 when the
+    /// client authenticated with a scheme that requires a `WWW-Authenticate` challenge.
     InvalidClient,
+    /// RFC 6749 section 5.2 `invalid_grant`: the authorization code, device code or refresh token
+    /// is invalid, expired, revoked, was issued to another client, or does not match the
+    /// redirect URI. Also the answer to a failed PKCE verification (RFC 7636 section 4.6), and to
+    /// a REPLAY, which additionally revokes the whole issued family.
     InvalidGrant,
+    /// RFC 6749 section 5.2 `unauthorized_client`: the client is authenticated but is not
+    /// registered for this grant type. Distinct from `invalid_client`, which is about identity,
+    /// and from `access_denied`, which is about the user.
     UnauthorizedClient,
+    /// RFC 6749 section 5.2 `unsupported_grant_type`: this server does not implement the requested
+    /// `grant_type` at all, as opposed to declining it for this client.
     UnsupportedGrantType,
+    /// RFC 6749 section 5.2 `invalid_scope`: the requested scope is unknown, malformed, or exceeds
+    /// what the grant being presented was issued with. A refresh that widens scope lands here
+    /// (section 6), because narrowing is allowed and widening never is.
     InvalidScope,
     // RFC 6749 section 4.1.2.1 (authorization endpoint; `access_denied` is also an RFC 8628
     // section 3.5 device-grant terminal code).
+    /// RFC 6749 section 4.1.2.1 `access_denied`: the resource owner, or this server's own policy,
+    /// refused the request. Also the RFC 8628 section 3.5 terminal answer for a device grant the
+    /// user rejected at the verification page.
     AccessDenied,
+    /// RFC 6749 section 4.1.2.1 `unsupported_response_type`: this server will not issue an
+    /// authorization code by this method. `response_type=token`, the implicit grant, is refused
+    /// with this code: OAuth 2.1 removes it.
     UnsupportedResponseType,
+    /// RFC 6749 section 4.1.2.1 `server_error`: the server hit a condition it could not recover
+    /// from and that is nobody's fault but its own. It is what a storage failure becomes, so it
+    /// never carries a detail that would describe the host's internals to a caller.
     ServerError,
+    /// RFC 6749 section 4.1.2.1 `temporarily_unavailable`: the server is overloaded or under
+    /// maintenance. Distinct from `server_error` because it tells the client that retrying LATER
+    /// is the right response, where `server_error` does not.
     TemporarilyUnavailable,
     // RFC 8628 section 3.5 (device access token request).
+    /// RFC 8628 section 3.5 `authorization_pending`: the device grant exists and the user has not
+    /// finished with it yet. The client keeps polling at the interval it was given. Not an error
+    /// in any useful sense: it is the normal answer for most of a device flow's life.
     AuthorizationPending,
+    /// RFC 8628 section 3.5 `slow_down`: the client polled faster than the interval it was given.
+    /// Emitting this obliges the server to increase that interval by 5 seconds, which this crate
+    /// does; a server that emitted the code without raising the interval would be asking the
+    /// client to guess by how much.
     SlowDown,
+    /// RFC 8628 section 3.5 `expired_token`: the `device_code` has passed its lifetime. Terminal.
+    /// The client must start a new device authorization request rather than keep polling.
     ExpiredToken,
     /// RFC 9396 section 5: the `authorization_details` parameter is unparseable, exceeds
     /// what this server will accept, names a `type` this server does not support, or asks

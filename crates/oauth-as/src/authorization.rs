@@ -13,7 +13,7 @@
 //! machine so the machine can answer it the way the RFC prescribes. Parsing into
 //! [`ValidatedAuthorizationRequest`] is what validation MEANS here, and only the validated form
 //! can mint a code. [`ValidatedAuthorizationRequest`] carries a private witness field so that,
-//! within this crate, [`ValidatedAuthorizationRequest::new`] is the only way to produce one; a
+//! within this crate, `ValidatedAuthorizationRequest::new` (private) is the only way to produce one; a
 //! host consuming this crate cannot construct one for itself. See that type's doc comment for
 //! exactly what is and is not proven by this.
 //!
@@ -213,7 +213,7 @@ pub(crate) fn is_valid_resource_indicator(value: &str) -> bool {
 /// `_sealed` field below: because it is not `pub`, no struct-literal expression written outside
 /// this module (that includes every downstream host, since this module is the only one with
 /// access to `Sealed`) can name every field of this struct, so a `ValidatedAuthorizationRequest`
-/// can only come from [`ValidatedAuthorizationRequest::new`], which only
+/// can only come from the crate-private `ValidatedAuthorizationRequest::new`, which only
 /// `AuthorizationServer::validate_authorization_request` (in `server.rs`, within this crate)
 /// calls. That is what "cannot be spelled" now actually means: not "the fields are private" (they
 /// are not), but "the value cannot be produced without going through validation first."
