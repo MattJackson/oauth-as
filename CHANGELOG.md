@@ -10,7 +10,47 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
-## [Unreleased]
+## [0.9.0] - 2026-08-09
+
+**This is the first release with an implementation in it.** It is an ALPHA, published so that a
+third party can build a real authorization server against it and report what breaks. It is not
+recommended for production, and the two defects below are the specific reasons why.
+
+### KNOWN DEFECTS in this release
+
+These are CONFIRMED, reproduced by tests, and NOT fixed in 0.9.0. They are written here because a
+third party finding a defect is a success of the method, and a third party finding that a CLAIM
+was false is not. Both are scheduled for 0.9.1.
+
+**1. Reuse detection does not contain a token minted during the signing window. (HIGH)**
+
+Refresh-token reuse detection and authorization-code replay detection both revoke a family, and
+both can be raced by an issuance that is already in flight. The window is the `await` inside ES256
+signing: the tombstone is written before the token is minted, the racing revocation removes the
+tombstone, and the in-flight issuance then completes and stores a LIVE access token that the
+revocation has already passed by. The result is that detecting the attack revokes nothing.
+
+The window is proportional to how long signing takes, so it is effectively closed for the built-in
+`jwt-p256` backend (local, microseconds) and OPEN for a host `Es256Signer` that makes a network
+call, which is exactly the KMS and HSM case the signing seam exists to serve. **If you implement
+`Es256Signer` against a remote signer, assume reuse detection is advisory in this release.**
+
+Reproduced by two tests, held back from the tree because they are red:
+`the access token minted during a detected-reuse window is live, so the revocation contained
+nothing` and `the access token minted during a detected code replay is live, so the replay revoked
+nothing`.
+
+The fix is a durable "this family is revoked" predicate that `put_token` and `put_refresh_token`
+consult, rather than a narrower window: a marker that a later write cannot resurrect. That is a
+breaking change to the `Storage` trait and it is why it is not in this release rather than rushed
+into it.
+
+**2. Mutation coverage is incomplete (`GOAL.md` gate 4 is OPEN).**
+
+`MUTANTS.md` names every surviving mutant individually rather than reporting a percentage. Read it
+before assuming a green test run means the tests would have caught a given change.
+
+### Everything else in 0.9.0
 
 ### Fixed: an unauthenticated caller SIZED an allocation on two refusal paths
 
@@ -924,7 +964,7 @@ loop, it was that nothing bounded `n`.
   host's: stop issuing for a client before deleting it, and delete a second time once in-flight
   requests have drained.
 
-## [0.9.0] - 2026-08-08 (release candidate; not yet published to crates.io)
+## [0.9.0-rc.1] - 2026-08-08 (development snapshot, superseded by 0.9.0 above)
 
 **0.9.0 adds no new protocol surface. It exists to prove the crate against the outside world**
 (`ROADMAP.md`), and the most valuable thing in it is an honest account of what could and could not

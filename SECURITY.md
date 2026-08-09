@@ -66,6 +66,15 @@ is):
   library and does not open sockets, terminate TLS, or count requests. RFC 8628 section 5.1 makes
   device user-code entropy adequate only in combination with rate limiting, and providing that is
   the host's job.
+- **Reuse detection does not contain a token minted during the signing window (0.9.0, HIGH).**
+  Refresh-token reuse and authorization-code replay both revoke a family, and both can be raced by
+  an issuance already in flight across the `await` inside ES256 signing: the revocation removes the
+  tombstone, then the in-flight issuance stores a live access token behind it. The window scales
+  with signing latency, so it is effectively closed for the built-in `jwt-p256` backend and OPEN
+  for a host `Es256Signer` that calls a remote KMS or HSM. This is CONFIRMED and reproduced; see
+  the known-defects section of `CHANGELOG.md` for the test names and the planned fix. Reported
+  already, so not a new finding, but an exploit that widens it or evades the planned fix is.
+
 - **The `Storage` trait's `take_*` operations must be genuinely atomic.** A host that implements
   them as read-then-delete on a multi-node deployment reintroduces double-spend. This is documented
   on the trait, and it is a host obligation.

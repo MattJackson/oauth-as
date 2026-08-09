@@ -17,6 +17,23 @@ the consent experience; the library owns the protocol.
 oauth-as = "0.9"
 ```
 
+## Alpha
+
+**0.9.0 is an alpha, published so it can be built against and reported on. It is not recommended
+for production yet.** Two things are true of this release and worth knowing before you adopt it:
+
+- **Reuse detection can be raced during token signing.** Detecting a stolen refresh token revokes
+  the family, but an issuance already in flight across the `await` inside ES256 signing can
+  complete behind the revocation and leave a live access token. The window scales with signing
+  latency: effectively closed for the built-in `jwt-p256` backend, **open if you implement
+  `Es256Signer` against a remote KMS or HSM**. Confirmed and reproduced; the fix needs a breaking
+  `Storage` change and lands in 0.9.1.
+- **Mutation coverage is incomplete.** `MUTANTS.md` names every surviving mutant individually
+  rather than quoting a percentage.
+
+The known-defects section of `CHANGELOG.md` has the detail, including the test names. The API is
+not frozen before 1.0.
+
 ## What it does
 
 | Capability | Spec | Notes |
@@ -24,7 +41,7 @@ oauth-as = "0.9"
 | Authorization code grant | RFC 6749 s4.1 | PKCE required, `S256` only, exact redirect URI matching |
 | PKCE | RFC 7636 | Verified against the appendix B vector |
 | Device authorization grant | RFC 8628 | Full state machine: pending, `slow_down`, expiry, denial, single use |
-| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, **reuse detection revokes the family** |
+| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, reuse detection revokes the family (with a [known gap](#alpha) under a remote signer) |
 | Client credentials | RFC 6749 s4.4 | Confidential clients only, no refresh token |
 | Server metadata | RFC 8414 | Derived from config, so an advertised endpoint is one that exists |
 | Token introspection | RFC 7662 | Unknown, expired and other clients' tokens all read `{"active": false}` |
