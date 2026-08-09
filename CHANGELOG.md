@@ -100,6 +100,34 @@ mutated.
   down from one. The struct is 56 bytes before and after: `Option<Cow<'static, str>>` and
   `Option<String>` are both 24.
 
+### Changed: two `Box::pin`s that had stopped paying for themselves
+
+Both were introduced with a measurement and both were RE-measured rather than trusted, which is the
+only reason either was found. Neither is an API change.
+
+- **The RFC 9449 DPoP proof check is no longer boxed.** `token_with_context` reached it through a
+  `Box::pin` so the proof-check state would stay out of the token future, which
+  `tests/allocation.rs` holds under tokio's 2048-byte debug boxing threshold. Measured both ways on
+  four feature sets, the future is byte for byte identical: 1136 under `dpop` alone, 1248 with
+  `rar`, 1280 with `mtls,consent,rar,par`, 1344 `--all-features`. The earlier restructuring of
+  `token_with_context` had already moved the high-water mark elsewhere, so the box was buying
+  nothing and costing one 168-byte allocation on EVERY token request under the feature, INCLUDING
+  every refusal, which is traffic an attacker sets the rate of. A refused token request now
+  allocates exactly zero on every feature set; `refused_token_request_allocation_bound` had been
+  carrying `dpop` as a named exception and no longer needs to.
+- **The RFC 7523 client-assertion check is no longer boxed**, for the same reason and with the same
+  kind of measurement: 1144 under `client_assertion` alone, 1256 with `rar`, 1344 with
+  `dpop,mtls,consent,rar,par` and `--all-features`, identical boxed and unboxed. What it was
+  costing is one allocation on every token request that presents an assertion, which for a
+  `private_key_jwt` deployment is every token request it makes. Measured on that path: 40
+  allocations to 38 `--all-features` (the second saving is the DPoP box above).
+
+`issue_boxed` was re-measured too and KEPT. Inlining it takes the `--all-features` token future from
+1344 to 1608, leaving 440 bytes of headroom against tokio's 2048 rather than 704, to save one
+allocation out of the 39 a code redemption already costs. This crate has crossed that threshold
+twice, once for 120 bytes and once for 344, and the failure mode on the other side is a 2 KB heap
+allocation on every token request. The trade is refused, with the number, in the function's docs.
+
 ### Added
 
 - `impl std::error::Error for StepUpFailure`. It was the only error-shaped type in the crate

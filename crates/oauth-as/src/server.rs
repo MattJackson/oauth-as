@@ -1402,14 +1402,23 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `jti` to spend so the request cannot be repeated.
         #[cfg(feature = "client_assertion")]
         if cred.client_assertion.is_some() {
-            // BOXED at the call site, and this is a measurement rather than a style. `authenticate_client`
-            // is inlined into all four grant helpers and so into the token future, which
-            // `tests/allocation.rs` holds under tokio's 2048-byte debug boxing threshold. Inlining
-            // the assertion state (a claim set, two owned Strings, a storage future) into every
-            // token request, including the overwhelming majority that carry no assertion, pushed it
-            // over: the gate caught it. One allocation, paid only on the path that actually
-            // presents an assertion.
-            return match Box::pin(self.authenticate_by_assertion(&client, cred)).await {
+            // NOT boxed, and that is a measurement rather than a style, in both directions.
+            //
+            // It WAS `Box::pin(..)` through 0.9.0: `authenticate_client` inlines into all four
+            // grant helpers and so into the token future, which `tests/allocation.rs` holds under
+            // tokio's 2048-byte debug boxing threshold, and inlining the assertion state (a claim
+            // set, two owned Strings, a storage future) once pushed it over. It no longer does.
+            // Measured both ways: 1144 under `client_assertion` alone, 1256 with `rar`, 1344 with
+            // `dpop,mtls,consent,rar,par` and with `--all-features`, IDENTICAL boxed and unboxed,
+            // because the token future's high-water mark moved elsewhere when the endpoint was
+            // restructured (see `token_with_context`).
+            //
+            // What the box was still costing is one allocation on every token request that
+            // presents an assertion, which for a `private_key_jwt` deployment is every token
+            // request it makes: precisely the deployments RFC 7523 exists for, and the ones FAPI
+            // 2.0 requires it of. `client_assertion_verification_bound` in
+            // `tests/allocation_paths.rs` pins the result.
+            return match self.authenticate_by_assertion(&client, cred).await {
                 Ok(()) => {
                     self.hooks.record(attempt, AttemptOutcome::Succeeded);
                     Ok(client)
@@ -1942,8 +1951,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             #[cfg(not(feature = "rar"))]
             let requested_details = GrantedDetails::default();
             // RFC 9449 s4.3, before anything else touches the store: see `verify_dpop`.
+            //
+            // NOT boxed, and that is a measurement. It was `Box::pin(..)` through 0.9.0, to keep
+            // the proof-check state out of the token future, and by then the restructuring
+            // recorded above (an `async move` block rather than an `async fn`, and matching
+            // `request` by reference) had already bought back more than the box was saving.
+            // Measured both ways on four feature sets, the future is byte for byte identical:
+            // 1136 under `dpop` alone, 1248 with `rar`, 1280 with `mtls,consent,rar,par`, 1344
+            // `--all-features`. So the box bought nothing and cost one 168-byte allocation on
+            // EVERY token request under this feature, including every refusal, which is traffic an
+            // attacker sets the rate of. `refused_token_request_allocation_bound` had been
+            // carrying that as a named exception; it now asserts zero on every feature set.
             #[cfg(feature = "dpop")]
-            let jkt = Box::pin(self.verify_dpop(context.dpop_proof)).await?;
+            let jkt = self.verify_dpop(context.dpop_proof).await?;
             // Matched by REFERENCE, and that is the second half of the same measurement the doc
             // comment above records. Moving the fields out of the enum does not free the enum's
             // own slot in the coroutine: `request` is an upvar, so its 120 bytes are reserved for
@@ -3030,6 +3050,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// So: one allocation, paid only when a token is actually issued, instead of one allocation the
     /// size of the entire token future paid on every request that reaches this endpoint. The
     /// allocation gates in `tests/allocation.rs` are what settled this, and they measure both.
+    ///
+    /// # RE-MEASURED after 0.9.0, and KEPT
+    ///
+    /// The two other `Box::pin`s on this path (the RFC 9449 proof check and the RFC 7523 assertion
+    /// check) were both removed at that point, because measuring them showed the future was byte
+    /// for byte identical with and without them: they had stopped buying anything. This one had
+    /// not. Inlined, the `--all-features` token future goes from 1344 bytes to 1608, leaving 440
+    /// bytes of headroom against tokio's 2048 rather than 704.
+    ///
+    /// That trade is REFUSED, and the number is why. What removing it would save is one allocation
+    /// per token ISSUED, out of the 39 a code redemption already costs. What it would spend is 264
+    /// bytes of the margin against a threshold this crate has crossed twice already, once for 120
+    /// bytes and once for 344; a future feature the size of `rar` would put it over, and the
+    /// failure mode on the other side of that line is a 2 KB heap allocation on every single token
+    /// request, refusals included. Two and a half percent off the issuance path is not worth
+    /// spending a third of the headroom that keeps the whole endpoint off tokio's slow path.
     #[allow(clippy::too_many_arguments)]
     fn issue_boxed<'a>(
         &'a self,

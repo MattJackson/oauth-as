@@ -738,21 +738,22 @@ fn refused_token_request_allocation_bound() {
         result.unwrap_err().error,
         oauth_as::ErrorCode::InvalidClient
     );
-    // ZERO on every feature set but one. It was 1 allocation of 49 bytes before
-    // `error_description` became a `Cow<'static, str>`: the whole of it was copying the string
-    // constant "client_credentials requires a confidential client" onto the heap so it could be
-    // owned by a response about to be serialized and dropped.
+    // ZERO, on EVERY feature set. It was 1 allocation of 49 bytes before `error_description`
+    // became a `Cow<'static, str>`: the whole of it was copying the string constant
+    // "client_credentials requires a confidential client" onto the heap so it could be owned by a
+    // response about to be serialized and dropped.
     //
-    // `dpop` is the exception, and the allocation is NOT the description. `token_with_context`
-    // reaches the RFC 9449 proof check through a `Box::pin` (168 bytes, measured), which is what
-    // keeps the token future under tokio's debug boxing threshold, and it is paid on every token
-    // request under that feature whether or not a proof was presented. It is called out here
-    // rather than budgeted silently: this is a REFUSAL gate, so a reader has to be able to tell
-    // an allocation the crate chose from one an attacker bought.
-    let dpop_boxed_proof_check = usize::from(cfg!(feature = "dpop"));
+    // Through 0.9.0 `dpop` was an EXCEPTION carried here rather than budgeted silently:
+    // `token_with_context` reached the RFC 9449 proof check through a `Box::pin` (168 bytes,
+    // measured) and paid it on every token request whether or not a proof was presented, so this
+    // gate asserted one allocation under that feature. The box is gone, because measuring it
+    // rather than trusting the comment showed it had stopped buying anything: the token future is
+    // byte for byte identical with and without it on four feature sets (1136 / 1248 / 1280 /
+    // 1344), the earlier restructuring of `token_with_context` having already moved the high-water
+    // mark elsewhere. An exception nobody re-measures is how a cost outlives its justification.
     assert_eq!(
-        d.allocs, dpop_boxed_proof_check,
-        "a refused token request must allocate NOTHING beyond the dpop proof check: {d:?}"
+        d.allocs, 0,
+        "a refused token request must allocate NOTHING, on every feature set: {d:?}"
     );
 
     // `deallocs` is deliberately not asserted: the `ClientId` the request was built with is moved
