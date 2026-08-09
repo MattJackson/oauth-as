@@ -92,6 +92,10 @@ been measuring the wrong thing about itself:
   of DER decoder is paid only by a host that actually calls it. What the split
   genuinely buys is one crate (`pkcs8` v0.10.2) off a `--features jwt` tree,
   which is the crate's stated dependency policy rather than a byte count.
+  (SUPERSEDED IN PART: the ES256 signing seam later took `p256` itself off a
+  `--features jwt` tree and put it behind `jwt-p256`, which `jwt-pkcs8` now
+  hangs off. The measurement above is unchanged and still describes what the
+  PKCS#8 split buys; the tree it buys it off is now `--features jwt-p256`.)
 - **Serialize-once under `jwt`: one real violation fixed, two corrected.** The
   JOSE header WAS re-serialized per token, and it is a function of the active
   key's `kid` and two constants; it is precomputed now, in `JwtConfig`, rebuilt
