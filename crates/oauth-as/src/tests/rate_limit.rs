@@ -352,11 +352,12 @@ fn a_zero_window_is_clamped_rather_than_dividing_by_zero() {
     assert_eq!(l.window_index(at(&l, Duration::ZERO)), 0);
     assert_eq!(l.window_index(at(&l, MIN_WINDOW)), 1);
 
-    // And a config built by field assignment (the struct's fields are public) rather than through
-    // the builder is clamped at USE, so the divide is safe whichever way the host got here.
-    let mut cfg = RateLimitConfig::default();
-    cfg.window = Duration::ZERO;
-    let l = limiter(cfg);
+    // And a config that set the field directly (they are all public) rather than going through the
+    // builder is clamped at USE, so the divide is safe whichever way the host got here.
+    let l = limiter(RateLimitConfig {
+        window: Duration::ZERO,
+        ..RateLimitConfig::default()
+    });
     assert_eq!(l.window_index(at(&l, MIN_WINDOW)), 1);
 }
 
