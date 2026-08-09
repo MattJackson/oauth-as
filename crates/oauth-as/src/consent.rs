@@ -172,9 +172,9 @@ impl ConsentRecord {
     /// Whether this record already covers a request for `scope` and `resource`.
     ///
     /// This is the whole of what "remembered consent" means in this crate, and it ANSWERS a
-    /// question rather than making a decision: see
-    /// [`crate::http::RouterBuilder::with_consent_resolver`]. Nothing in this crate approves an
-    /// authorization request on the strength of a `true` here.
+    /// question rather than making a decision: the `http` feature's
+    /// `ServiceBuilder::with_consent_resolver` is where the answer is turned into one. Nothing in
+    /// this crate approves an authorization request on the strength of a `true` here.
     ///
     /// Both halves are SUBSET tests against what was approved, never equality and never a widening:
     /// a request for less than was granted is covered, and a request for one token more is not.

@@ -3291,8 +3291,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The consent this user has already given this client, if any.
     ///
     /// This ANSWERS a question; it does not make a decision, and nothing in this crate approves an
-    /// authorization request on the strength of it. See
-    /// [`crate::http::RouterBuilder::with_consent_resolver`]: the library reports what it remembers
+    /// authorization request on the strength of it. See the `http` feature's
+    /// `ServiceBuilder::with_consent_resolver`: the library reports what it remembers
     /// and the host decides what that is worth, because "the user agreed to this once" and "the
     /// user agrees to this now" are different sentences and only the host can tell them apart.
     #[cfg(feature = "consent")]

@@ -223,7 +223,12 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 ///    an unauthenticated claim, even only to produce a better error message, is how a verifier ends
 ///    up telling an attacker which client ids exist.
 /// 3. Everything after that is the section 3 claim set, in the section's own order.
-pub(crate) fn verify_assertion(
+///
+/// PUBLIC because [`VerifiedAssertion`] and [`AssertionFailure`] are, and a type no consumer can
+/// obtain is a type that should not have been exported. It is also the other half of
+/// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
+/// while hiding the verification it exists to feed left the safe path out of reach.
+pub fn verify_assertion(
     keys: &AssertionKeys,
     assertion: &str,
     client_id: &str,
