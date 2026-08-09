@@ -227,6 +227,45 @@ in that window was answered `invalid_grant` and never counted as reuse either.
   briefly had was removed. `MemoryStorage` performs the whole operation under one lock, and
   `oauth-as-postgres` performs it as one conditional `UPDATE ... WHERE`.
 
+### Documented: three claims that had stopped being true
+
+- **`src/token.rs`'s module docs** said structured RFC 9068 access tokens were "a possible later
+  addition"; the `jwt` feature implements them. **`TokenResponse::token_type`** said "Always
+  `Bearer` from this server"; under `dpop` the server sets `DPoP`, because RFC 9449 s5 forbids
+  presenting a sender-constrained token as a bearer token. Both were stale docs on a published API,
+  which is the kind that gets believed.
+- **`src/rar.rs`'s module docs** said all three `authorization_details` bounds are applied "BEFORE
+  any structure is built". Only `MAX_AUTHORIZATION_DETAILS_BYTES` is; the element count and the
+  depth run on the already-parsed tree. The docs now say which runs where, and say why the order is
+  deliberate: checking the other two earlier would mean a second JSON scanner here that has to
+  agree with `serde_json` about strings and escapes, and a scanner that disagrees is a parser
+  differential, a worse class of bug than the one it would prevent.
+
+  The depth constant's own claim that "nothing here can be made to recurse until the stack runs
+  out" was resting on `serde_json`'s recursion limit near 128, which is a dependency's
+  implementation detail and not a contract. It now rests on this crate's own byte bound instead: 4096
+  bytes of raw JSON cannot express more than about 2047 levels, since a level costs at least a
+  byte, so the parse and the tree's recursive `Drop` are bounded whatever the parser was
+  configured to allow. `tests/cap_boundaries.rs` sends exactly that worst case.
+
+### Tested: the accepting side of three caps
+
+A bound tested only one PAST its limit is half tested. `>=` where `>` was meant refuses a request
+the constant says is legal, every assertion about the refusal still passes, and the defect surfaces
+as a client that cannot make a request the documentation permits. Most of this crate's caps already
+had an at-cap acceptance case; these did not, and both new ones were watched failing with the
+operator flipped:
+
+- `MAX_PROOF_BYTES`, with a real ES256 proof of exactly 4096 bytes (the padding is solved for, not
+  searched, because base64url without padding cannot reach every total length from one knob).
+- `MAX_RESOURCE_INDICATORS` at the TOKEN endpoint. The authorization endpoint's half already had
+  one, and both run through the same `validate_resources`, so an off-by-one would have broken both
+  while only one could see it.
+
+REJECTED from the same finding: `MAX_AUDIENCE_VALUES`, `MAX_CONSENT_RESOURCES`,
+`MAX_REGISTERED_REDIRECT_URIS` and `MAX_FORM_PARAMETERS` already have at-cap acceptance cases, as
+do all three `authorization_details` bounds.
+
 ### Fixed: two silent failures, one on the wire and one in the exported harness
 
 - **A pushed authorization request that cannot be restored is `server_error`, not

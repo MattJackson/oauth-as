@@ -28,13 +28,30 @@
 //!
 //! `authorization_details` arrives unauthenticated at the authorization endpoint, before any user
 //! interaction, in a parameter whose grammar is "some JSON". An AS that parses whatever it is sent
-//! is a denial of service with extra steps, so three limits are applied BEFORE any structure is
-//! built, and they are constants rather than configuration on purpose: a host cannot accidentally
-//! raise them, and nothing in RFC 9396 asks for values larger than these.
+//! is a denial of service with extra steps, so three limits are applied. They are constants rather
+//! than configuration on purpose: a host cannot accidentally raise them, and nothing in RFC 9396
+//! asks for values larger than these.
 //!
-//! - [`MAX_AUTHORIZATION_DETAILS_BYTES`], on the raw parameter, checked before the parser runs;
-//! - [`MAX_AUTHORIZATION_DETAILS_ELEMENTS`], on the array;
-//! - [`MAX_AUTHORIZATION_DETAILS_DEPTH`], on nesting inside an element.
+//! WHERE each one runs is stated precisely, because it decides what the limit actually buys:
+//!
+//! - [`MAX_AUTHORIZATION_DETAILS_BYTES`], on the RAW parameter, before `serde_json` is handed
+//!   anything. This is the only one that runs before a structure is built, and it is the one that
+//!   makes every cost below it finite, including the parser's own.
+//! - [`MAX_AUTHORIZATION_DETAILS_ELEMENTS`], on the PARSED array, and
+//! - [`MAX_AUTHORIZATION_DETAILS_DEPTH`], on nesting inside a parsed element.
+//!
+//! The last two run on an already-built tree. That is a deliberate choice and not an oversight:
+//! applying them earlier would mean a second JSON scanner, written here, that has to agree with
+//! `serde_json` about strings and escapes in order to count brackets correctly, and a second
+//! scanner that disagrees with the first is a parser differential, which is a worse class of bug
+//! than the one it would prevent. What makes it safe to let the parser run first is the byte bound
+//! above it, and the arithmetic is worth writing down: 4096 bytes of raw JSON cannot express more
+//! than about 2047 levels of nesting, since each level costs at least one byte, so the parser's
+//! recursion and the resulting tree's recursive `Drop` are both bounded at a few hundred kilobytes
+//! of stack whatever the input says. That argument depends on nothing but this crate's own
+//! constant. `serde_json` also refuses past its own limit near 128, which would refuse such input
+//! sooner, but that limit is a dependency's implementation detail rather than a contract and
+//! nothing here is allowed to rest on it.
 //!
 //! See each constant for the number and why it is that number.
 //!
@@ -78,10 +95,15 @@ pub const MAX_AUTHORIZATION_DETAILS_ELEMENTS: usize = 16;
 /// level 2.
 ///
 /// 8 leaves six levels inside an element, which is more than any published RFC 9396 type uses
-/// (appendix A's deepest is three). The reason for a bound at all is that every recursive walk in
-/// this module and in `serde_json`'s own `Drop` is bounded by it, so nothing here can be made to
-/// recurse until the stack runs out. `serde_json` has its own limit near 128; this is tighter, and
-/// tighter is the useful direction.
+/// (appendix A's deepest is three).
+///
+/// It is enforced on the PARSED tree, so it is not what keeps the parser off the stack: read the
+/// module docs for what does, which is [`MAX_AUTHORIZATION_DETAILS_BYTES`] and an argument that
+/// rests on this crate's own constant rather than on `serde_json`'s recursion limit. What this
+/// bound buys is that every recursive walk THIS module performs afterwards, over a value that will
+/// be stored on an authorization code, carried across a rotation, and compared element by element
+/// at every narrowing, is shallow by contract rather than by whatever the parser happened to
+/// accept.
 pub const MAX_AUTHORIZATION_DETAILS_DEPTH: usize = 8;
 
 /// The depth budget left for a member VALUE inside an element: the total, minus the array and the
@@ -380,8 +402,10 @@ impl AuthorizationDetails {
 
 /// The nesting depth of one JSON value: 1 for a scalar, 1 + the deepest child for a container.
 ///
-/// Recursive, and safely so: `serde_json`'s own parser refuses input nested past its recursion
-/// limit long before this runs, so the tree this walks is already bounded. The check exists to make
+/// Recursive, and safely so, but NOT because of `serde_json`'s recursion limit, which is a
+/// dependency's implementation detail. The tree this walks came from at most
+/// [`MAX_AUTHORIZATION_DETAILS_BYTES`] of raw JSON, and a level of nesting costs at least a byte,
+/// so it is at most about 2047 deep however the parser was configured. The check exists to make
 /// the bound THIS crate promises ([`MAX_AUTHORIZATION_DETAILS_DEPTH`]) an actual refusal rather
 /// than a comment.
 fn depth(value: &Value) -> usize {

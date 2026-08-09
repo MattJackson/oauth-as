@@ -2,9 +2,14 @@
 // Copyright (C) 2026 Matthew Jackson
 
 //! Token wire and storage shapes: the RFC 6749 section 5.1 success response, plus the records the
-//! server persists through [`crate::store::Storage`]. Access and refresh tokens here are OPAQUE
-//! random strings; structured (JWT) access tokens are a possible later addition and would slot in
-//! at issuance without changing these shapes.
+//! server persists through [`crate::store::Storage`].
+//!
+//! Access and refresh tokens are OPAQUE random strings by default. Under the `jwt` feature the
+//! WIRE access token becomes an RFC 9068 structured token and the opaque string becomes its `jti`;
+//! the shapes here are unchanged either way, which is the point. [`IssuedToken`] is persisted
+//! whichever form went out, keyed by whatever the client will actually present, so RFC 7662
+//! introspection and RFC 7009 revocation keep working and a revoked JWT is genuinely dead at this
+//! server rather than merely deprecated.
 
 use std::fmt;
 use std::time::SystemTime;
@@ -14,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use crate::client::ClientId;
 use crate::scope::ScopeSet;
 
-/// `token_type` values this server issues. Only `Bearer` (RFC 6750); the registered value is
-/// case-insensitive on the wire but conventionally spelled `Bearer`, which the rename pins.
+/// `token_type` values this server issues: `Bearer` (RFC 6750), and `DPoP` (RFC 9449 section 5)
+/// under the `dpop` feature when the request proved possession of a key. Both registered values
+/// are case-insensitive on the wire but conventionally spelled as the renames below pin them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenType {
     /// RFC 6750 bearer token.
@@ -37,9 +43,11 @@ pub enum TokenType {
 /// either to its logs.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenResponse {
-    /// The opaque access token.
+    /// The access token: an opaque random string, or an RFC 9068 JWT under the `jwt` feature.
     pub access_token: String,
-    /// Always `Bearer` from this server.
+    /// `Bearer` (RFC 6750), or `DPoP` (RFC 9449 s5) when the `dpop` feature is on and the token
+    /// request carried a proof, because a sender-constrained token MUST NOT be presented as a
+    /// bearer token.
     pub token_type: TokenType,
     /// Lifetime in seconds (RECOMMENDED by the RFC; this server always includes it).
     pub expires_in: u64,
