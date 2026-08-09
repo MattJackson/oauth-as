@@ -120,6 +120,12 @@ pub enum BearerMethod {
 /// REQUIRED), and the issuer identifier of at least one authorization server, without which the
 /// document tells a client nothing it can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`: this struct's field set VARIES WITH CARGO FEATURES, so a host that writes a
+/// full struct literal has a build that breaks the day anything in their dependency graph enables a
+/// feature they did not ask for. Construct with `new()` and assign the fields you want. This is the
+/// one attribute on this type that cannot be added after publication, because by then somebody's
+/// struct literal is in production.
+#[non_exhaustive]
 pub struct ProtectedResourceConfig {
     /// Section 2 `resource`: the resource identifier, an absolute URI with no fragment. This is
     /// the SAME string a client sends as an RFC 8707 `resource` indicator to get a token for this

@@ -71,6 +71,12 @@ impl Clock for SystemClock {
 /// Server configuration. [`ServerConfig::new`] fills RFC-shaped defaults; every field is public so
 /// hosts override what they need.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`: this struct's field set VARIES WITH CARGO FEATURES, so a host that writes a
+/// full struct literal has a build that breaks the day anything in their dependency graph enables a
+/// feature they did not ask for. Construct with `new()` and assign the fields you want. This is the
+/// one attribute on this type that cannot be added after publication, because by then somebody's
+/// struct literal is in production.
+#[non_exhaustive]
 pub struct ServerConfig {
     /// The issuer identifier (RFC 8414 `issuer`): the canonical `https` URL of this AS.
     ///

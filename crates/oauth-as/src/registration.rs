@@ -368,6 +368,12 @@ pub trait RegistrationPolicy: Send + Sync {
 /// Every bound below is a CEILING on what an anonymous, or merely policy-approved, registrant can
 /// obtain. The defaults are the narrow ones on purpose; see [`RegistrationConfig::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`: this struct's field set VARIES WITH CARGO FEATURES, so a host that writes a
+/// full struct literal has a build that breaks the day anything in their dependency graph enables a
+/// feature they did not ask for. Construct with `new()` and assign the fields you want. This is the
+/// one attribute on this type that cannot be added after publication, because by then somebody's
+/// struct literal is in production.
+#[non_exhaustive]
 pub struct RegistrationConfig {
     /// RFC 8414 section 2 `registration_endpoint`. `None` derives `{issuer}/register`.
     pub registration_endpoint: Option<String>,
