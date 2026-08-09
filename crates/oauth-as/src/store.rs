@@ -184,30 +184,38 @@ pub trait Storage: Send + Sync {
     ///
     /// `Ok(false)` for a `device_code` that is not present. A grant that has been redeemed or swept
     /// is gone, and a swap must never bring it back: reinstating a consumed grant would make a
-    /// single-use device code redeemable twice.
+    /// single-use device code redeemable twice. In particular the write MUST NOT be an
+    /// insert-or-update: `UPDATE ... WHERE` cannot create a row and is the shape to reach for,
+    /// whereas an upsert does not fail and does not no-op against a row that has just been
+    /// redeemed, it puts the grant back.
     ///
-    /// # The default implementation is a COMPATIBILITY SHIM, not a correct one
+    /// # THERE IS NO DEFAULT IMPLEMENTATION, deliberately
     ///
-    /// It is provided so that this method could be added without breaking every existing host
-    /// implementation, and it does the read-compare-write in three separate calls. That NARROWS the
-    /// window (the state it compares is re-read immediately before the write, rather than being
-    /// whatever the caller saw several storage round trips ago) but it does not close it. A host
-    /// running more than one process against a shared store SHOULD override it.
+    /// One was provided at first, doing the read, the comparison and the write as three separate
+    /// calls, on the reasoning that it NARROWED the window even though it could not close it. That
+    /// reasoning was wrong twice over, and the shim is gone.
+    ///
+    /// It was wrong about the window, because narrowing it was not the only thing the shim did. Its
+    /// write went through [`Storage::put_device_grant`], which is an INSERT-OR-UPDATE: a grant
+    /// redeemed by [`Storage::take_device_grant`] between the shim's read and the shim's write was
+    /// put BACK, so the shim did not merely fail to prevent a lost update, it manufactured a
+    /// single-use device code that could be redeemed twice. That is a worse defect than the one it
+    /// was written to mitigate.
+    ///
+    /// And it was wrong about the signal. A default implementation that is silently incorrect is
+    /// worse than no default at all, because the host who never reads this paragraph gets NOTHING:
+    /// their store compiles, their tests pass, and RFC 8628 section 3.3's first-decision-wins
+    /// guarantee is void in production. Requiring the method makes that a compile error naming the
+    /// method, which is the loudest and cheapest signal available, and it costs a host who has
+    /// already written the other four device-grant methods one more.
+    ///
+    /// [`crate::storage_conformance`] checks all three properties (a swap that must apply, a swap
+    /// that must be refused, and a swap that must not resurrect a redeemed grant). Run it.
     fn compare_and_swap_device_grant(
         &self,
         expected: &DeviceGrantState,
         updated: DeviceGrant,
-    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
-        async move {
-            match self.get_device_grant(&updated.device_code).await? {
-                Some(current) if current.state == *expected => {
-                    self.put_device_grant(updated).await?;
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        }
-    }
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
 
     /// Insert or replace an authorization code record, keyed by its code string.
     fn put_authorization_code(
@@ -667,15 +675,17 @@ impl Storage for MemoryStorage {
         Ok(grant)
     }
 
-    /// OVERRIDDEN rather than inherited, and that is the point of the override: the trait's default
-    /// does the compare and the write as separate calls, so it takes and releases this store's lock
-    /// twice and leaves exactly the window the method exists to close. Here the whole operation
-    /// happens under one guard, which is what a single-process host is entitled to expect from the
-    /// reference implementation.
+    /// The whole operation happens under ONE guard, which is what makes it a compare-and-swap
+    /// rather than a read followed by a hopeful write, and what a single-process host is entitled
+    /// to expect from the reference implementation.
     ///
-    /// The user-code index maintenance is deliberately NOT duplicated: this delegates to the same
-    /// insert path `put_device_grant` uses, so the two halves of the index contract documented on
-    /// that method cannot drift between the two writers.
+    /// Both halves of the user-code index contract documented on [`Storage::put_device_grant`] are
+    /// enforced here TOO, restated rather than delegated, because a `&mut` guard is already held
+    /// and calling the other method would deadlock. That duplication is a hazard worth naming: an
+    /// earlier version of this doc claimed the index maintenance was delegated and therefore could
+    /// not drift, and it had already drifted, because requirement (1), refusing a user code that is
+    /// live for a DIFFERENT device code, was simply absent. A swap could hand one user code to two
+    /// grants where a put would have refused. If either method changes, change both.
     async fn compare_and_swap_device_grant(
         &self,
         expected: &DeviceGrantState,
@@ -690,6 +700,18 @@ impl Storage for MemoryStorage {
             _ => return Ok(false),
         }
         let normalized = crate::device::normalize_user_code(&updated.user_code);
+        // Requirement (1), as `put_device_grant` applies it: RFC 8628 s6.1 makes the user code the
+        // credential a human types, so two live grants answering to one code is two devices
+        // sharing an identity. A REFUSAL rather than `Ok(false)`, because `Ok(false)` means "the
+        // state moved on", which the caller answers by giving up quietly; this is a store-level
+        // conflict the caller must hear about.
+        if let Some(owner) = g.user_code_index.get(&normalized) {
+            if owner != &updated.device_code {
+                return Err(StorageError::new(
+                    "user code is already indexed for a different device_code",
+                ));
+            }
+        }
         if let Some(previous) = g.device_by_code.get(&updated.device_code) {
             let previous_normalized = crate::device::normalize_user_code(&previous.user_code);
             if previous_normalized != normalized {

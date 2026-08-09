@@ -163,6 +163,9 @@ pub const CHECKS: &[&str] = &[
     ROUND_TRIP_TOKEN,
     ROUND_TRIP_REFRESH_TOKEN,
     ATOMIC_TAKE_DEVICE_GRANT,
+    SWAP_APPLIES_ON_MATCH,
+    SWAP_HONOURS_EXPECTED,
+    SWAP_NEVER_RESURRECTS,
     ATOMIC_TAKE_REFRESH_TOKEN,
     ATOMIC_TAKE_AUTHORIZATION_CODE,
     INDEX_RETIRES_OLD_USER_CODE,
@@ -197,6 +200,9 @@ const ROUND_TRIP_AUTHORIZATION_CODE: &str = "round_trip/authorization_code";
 const ROUND_TRIP_TOKEN: &str = "round_trip/token";
 const ROUND_TRIP_REFRESH_TOKEN: &str = "round_trip/refresh_token";
 const ATOMIC_TAKE_DEVICE_GRANT: &str = "atomic_take/take_device_grant";
+const SWAP_APPLIES_ON_MATCH: &str = "compare_and_swap_device_grant/applies_when_the_state_matches";
+const SWAP_HONOURS_EXPECTED: &str = "compare_and_swap_device_grant/honours_expected";
+const SWAP_NEVER_RESURRECTS: &str = "compare_and_swap_device_grant/never_resurrects";
 const ATOMIC_TAKE_REFRESH_TOKEN: &str = "atomic_take/take_refresh_token";
 const ATOMIC_TAKE_AUTHORIZATION_CODE: &str = "atomic_take/take_authorization_code";
 const INDEX_RETIRES_OLD_USER_CODE: &str = "user_code_index/retires_old_entry";
@@ -303,6 +309,7 @@ where
         self.round_trip_token(&mut report).await;
         self.round_trip_refresh_token(&mut report).await;
         self.atomic_take_device_grant(&mut report).await;
+        self.compare_and_swap_device_grant(&mut report).await;
         self.atomic_take_refresh_token(&mut report).await;
         self.atomic_take_authorization_code(&mut report).await;
         self.user_code_index(&mut report).await;
@@ -480,6 +487,192 @@ where
         );
         report.same(c, "name", &want.name, &got.name);
         report.same(c, "registration", &want.registration, &got.registration);
+    }
+
+    /// RFC 8628 section 3.3: the user's decision at the verification UI is FIRST-DECISION-WINS, and
+    /// `Storage::compare_and_swap_device_grant` is the only thing that makes it so. Three unrelated
+    /// actors write one device grant (the polling device, and the user approving or denying), so
+    /// without a real compare-and-swap the last writer wins by accident and a DENIAL a human
+    /// actually made is silently reverted to `Pending` by a poll that read the grant a moment
+    /// earlier.
+    ///
+    /// A store gets this wrong in two ways, and neither is visible to any other check here, because
+    /// both are perfectly ATOMIC. The first is dropping the comparison: `UPDATE ... SET payload =
+    /// $1 WHERE device_code = $2`, reporting `rows_affected > 0`, which is one statement, races
+    /// nothing, and reinstates exactly the lost update the method exists to prevent.
+    ///
+    /// The second is the one nobody thinks to test for, and it is worse: a read, a comparison, and
+    /// an INSERT-OR-UPDATE. `take_device_grant` is single-use redemption, so a grant redeemed
+    /// between that read and that write is gone; an upsert does not fail and does not no-op against
+    /// a row that is not there, it puts the grant BACK. An RFC 8628 device code that has already
+    /// been exchanged for a token becomes exchangeable a second time. The trait says a swap must
+    /// never bring a redeemed grant back; this is the check that holds a store to it.
+    async fn compare_and_swap_device_grant(&self, report: &mut Report) {
+        let store = self.store().await;
+        // Pending, because that is the state both the poll and the verification UI swap AGAINST.
+        let pending = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..sample_device_grant("dc-swap", "SWAP-AAAA")
+        };
+        if report
+            .ok(
+                SWAP_APPLIES_ON_MATCH,
+                "put_device_grant",
+                store.put_device_grant(pending.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // 1. The swap a correct store MUST apply: the state is the one the caller read.
+        let denied = DeviceGrant {
+            state: DeviceGrantState::Denied,
+            ..pending.clone()
+        };
+        let Some(applied) = report.ok(
+            SWAP_APPLIES_ON_MATCH,
+            "compare_and_swap_device_grant",
+            store
+                .compare_and_swap_device_grant(&DeviceGrantState::Pending, denied.clone())
+                .await,
+        ) else {
+            return;
+        };
+        if !applied {
+            report.fail(
+                SWAP_APPLIES_ON_MATCH,
+                "a swap whose expected state matched the stored state reported that it did not \
+                 apply; the user's decision at the verification UI would never be recorded",
+            );
+        }
+        match store.get_device_grant(&pending.device_code).await {
+            Ok(Some(got)) if got.state == DeviceGrantState::Denied => {}
+            Ok(other) => report.fail(
+                SWAP_APPLIES_ON_MATCH,
+                format!(
+                    "a swap that reported success did not change the stored state: read back \
+                     {:?}",
+                    other.map(|g| g.state)
+                ),
+            ),
+            Err(e) => report.fail(
+                SWAP_APPLIES_ON_MATCH,
+                format!("get_device_grant failed unexpectedly: {e}"),
+            ),
+        }
+
+        // 2. The swap a correct store MUST refuse. The stored state has moved on to `Denied`, so a
+        // poll still holding `Pending` from its own earlier read must not land. This is the whole
+        // of RFC 8628 section 3.3's first-decision-wins property, and a store that ignores
+        // `expected` passes every other check in this harness while failing it.
+        let repending = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..pending.clone()
+        };
+        let Some(applied) = report.ok(
+            SWAP_HONOURS_EXPECTED,
+            "compare_and_swap_device_grant",
+            store
+                .compare_and_swap_device_grant(&DeviceGrantState::Pending, repending)
+                .await,
+        ) else {
+            return;
+        };
+        if applied {
+            report.fail(
+                SWAP_HONOURS_EXPECTED,
+                "a swap whose expected state was STALE reported that it applied: the store is not \
+                 comparing `expected` against the stored state at all, so the user's decision is \
+                 reverted by whichever writer arrives last",
+            );
+        }
+        match store.get_device_grant(&pending.device_code).await {
+            Ok(Some(got)) if got.state == DeviceGrantState::Denied => {}
+            Ok(other) => report.fail(
+                SWAP_HONOURS_EXPECTED,
+                format!(
+                    "a swap with a stale `expected` overwrote the stored state: the user denied \
+                     this grant and it now reads {:?}",
+                    other.map(|g| g.state)
+                ),
+            ),
+            Err(e) => report.fail(
+                SWAP_HONOURS_EXPECTED,
+                format!("get_device_grant failed unexpectedly: {e}"),
+            ),
+        }
+
+        // 3. Resurrection. The grant is REDEEMED, exactly as `take_device_grant` leaves it after a
+        // successful token request, and a swap that was in flight when that happened now lands.
+        if report
+            .ok(
+                SWAP_NEVER_RESURRECTS,
+                "take_device_grant",
+                store.take_device_grant(&pending.device_code).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // Whether the index was ALREADY dirty before the swap ran. A store whose `take` leaves the
+        // user-code row behind has a different defect, which `user_code_index/cleared_by_take`
+        // owns; without this the swap check would report it a second time under its own name and a
+        // host would chase two bugs where there is one.
+        let index_already_dirty = matches!(
+            store
+                .find_device_grant_by_user_code(&normalize_user_code(&pending.user_code))
+                .await,
+            Ok(Some(_))
+        );
+        let Some(applied) = report.ok(
+            SWAP_NEVER_RESURRECTS,
+            "compare_and_swap_device_grant",
+            store
+                .compare_and_swap_device_grant(&DeviceGrantState::Denied, denied)
+                .await,
+        ) else {
+            return;
+        };
+        if applied {
+            report.fail(
+                SWAP_NEVER_RESURRECTS,
+                "a swap against a device_code that had already been redeemed reported that it \
+                 applied: `Ok(false)` is the only correct answer for a row that is not there",
+            );
+        }
+        match store.get_device_grant(&pending.device_code).await {
+            Ok(None) => {}
+            Ok(Some(_)) => report.fail(
+                SWAP_NEVER_RESURRECTS,
+                "a swap brought back a device grant that had been redeemed: the store is writing \
+                 through an insert-or-update, so an RFC 8628 single-use device code is now \
+                 redeemable a second time",
+            ),
+            Err(e) => report.fail(
+                SWAP_NEVER_RESURRECTS,
+                format!("get_device_grant failed unexpectedly: {e}"),
+            ),
+        }
+        // The user-code half of the same resurrection: a store keeping the index as its own row
+        // (the ordinary Redis or DynamoDB shape) can put the grant back THERE while the primary
+        // lookup stays clean, and the verification UI reads this path.
+        match store
+            .find_device_grant_by_user_code(&normalize_user_code(&pending.user_code))
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(_)) if index_already_dirty => {}
+            Ok(Some(_)) => report.fail(
+                SWAP_NEVER_RESURRECTS,
+                "a swap put a redeemed grant back into the user-code index: the code a human \
+                 typed resolves to a grant that has already been exchanged for a token",
+            ),
+            Err(e) => report.fail(
+                SWAP_NEVER_RESURRECTS,
+                format!("find_device_grant_by_user_code failed unexpectedly: {e}"),
+            ),
+        }
     }
 
     async fn round_trip_device_grant(&self, report: &mut Report) {

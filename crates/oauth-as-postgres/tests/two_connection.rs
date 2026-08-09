@@ -226,3 +226,197 @@ async fn the_naive_claim_is_caught_by_the_same_race() {
     );
     eprintln!("red proof: look-then-insert double-claimed in {double_claims}/{ROUNDS} rounds");
 }
+
+/// A `Pending` device grant, the state both the polling device and the verification UI swap
+/// against.
+fn pending_grant(device_code: &str, user_code: &str) -> oauth_as::DeviceGrant {
+    oauth_as::DeviceGrant {
+        device_code: device_code.to_string(),
+        user_code: user_code.to_string(),
+        client_id: ClientId::new("client-two-connection"),
+        scope: ScopeSet::parse("read").expect("a valid RFC 6749 s3.3 scope"),
+        state: oauth_as::DeviceGrantState::Pending,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        expires_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(2_000_000_000),
+        interval: std::time::Duration::from_secs(5),
+        last_poll_at: None,
+    }
+}
+
+/// One race over `compare_and_swap_device_grant`, returning how many callers were told their swap
+/// APPLIED. Both racers claim to have read `Pending`; one wants `Approved`, the other `Denied`.
+async fn race_swap(
+    a: &PostgresStorage,
+    b: &PostgresStorage,
+    device_code: &str,
+    user_code: &str,
+    atomic: bool,
+) -> usize {
+    let gate = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    let outcomes = [
+        oauth_as::DeviceGrantState::Approved {
+            subject: "subject-two-connection".to_string(),
+        },
+        oauth_as::DeviceGrantState::Denied,
+    ];
+    for (store, state) in [a.clone(), b.clone()].into_iter().zip(outcomes) {
+        let gate = Arc::clone(&gate);
+        let updated = oauth_as::DeviceGrant {
+            state,
+            ..pending_grant(device_code, user_code)
+        };
+        handles.push(tokio::spawn(async move {
+            gate.wait().await;
+            let expected = oauth_as::DeviceGrantState::Pending;
+            if atomic {
+                store
+                    .compare_and_swap_device_grant(&expected, updated)
+                    .await
+                    .expect("compare_and_swap_device_grant")
+            } else {
+                naive::compare_and_swap_device_grant_read_then_write(
+                    store.pool(),
+                    &expected,
+                    &updated,
+                )
+                .await
+                .expect("naive swap")
+            }
+        }));
+    }
+    let mut winners = 0;
+    for handle in handles {
+        if handle.await.expect("racer did not panic") {
+            winners += 1;
+        }
+    }
+    winners
+}
+
+/// RFC 8628 section 3.3 is FIRST-DECISION-WINS, and across two connections only the database can
+/// decide who was first. `UPDATE ... WHERE payload -> 'state' = $expected` does; a read followed
+/// by a write does not.
+///
+/// Two winners means both the approval and the denial were applied, so the record holds whichever
+/// arrived last and a user's answer was thrown away after the UI told them it was recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_and_swap_has_exactly_one_winner_across_two_connections() {
+    let (a, b) = two_connections("oauth_as_two_conn_swap").await;
+    for round in 0..ROUNDS {
+        let device_code = format!("dc-atomic-{round}");
+        let user_code = format!("SWAP-{round:04}");
+        a.put_device_grant(pending_grant(&device_code, &user_code))
+            .await
+            .expect("plant the device grant");
+        let winners = race_swap(&a, &b, &device_code, &user_code, true).await;
+        assert_eq!(
+            winners, 1,
+            "round {round}: the conditional UPDATE told {winners} callers their swap applied over \
+             two separate connections, so RFC 8628 s3.3 first-decision-wins does not hold"
+        );
+    }
+}
+
+/// THE RED PROOF for the test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_naive_swap_is_caught_by_the_same_race() {
+    let (a, b) = two_connections("oauth_as_two_conn_swap_naive").await;
+    let mut lost_updates = 0;
+    for round in 0..ROUNDS {
+        let device_code = format!("dc-naive-{round}");
+        let user_code = format!("NAIV-{round:04}");
+        a.put_device_grant(pending_grant(&device_code, &user_code))
+            .await
+            .expect("plant the device grant");
+        if race_swap(&a, &b, &device_code, &user_code, false).await > 1 {
+            lost_updates += 1;
+        }
+    }
+    assert!(
+        lost_updates > 0,
+        "the read-compare-write swap lost an update in 0 of {ROUNDS} rounds, so \
+         compare_and_swap_has_exactly_one_winner_across_two_connections is not detecting anything"
+    );
+    eprintln!("red proof: read-compare-write lost an update in {lost_updates}/{ROUNDS} rounds");
+}
+
+/// THE SECOND FAILURE MODE, and the one no race is needed to show: a swap that lands after the
+/// grant was REDEEMED must not put it back. `take_device_grant` is RFC 8628 single-use redemption,
+/// so a resurrected grant is a device code that can be exchanged for a token twice.
+///
+/// `UPDATE` cannot create a row, which is why the real implementation passes this by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swap_after_redemption_does_not_resurrect_the_grant() {
+    let (a, _b) = two_connections("oauth_as_two_conn_swap_gone").await;
+    let grant = pending_grant("dc-redeemed", "GONE-0001");
+    a.put_device_grant(grant.clone())
+        .await
+        .expect("plant the device grant");
+    a.take_device_grant(&grant.device_code)
+        .await
+        .expect("take_device_grant")
+        .expect("the planted grant is there to redeem");
+
+    let applied = a
+        .compare_and_swap_device_grant(
+            &oauth_as::DeviceGrantState::Pending,
+            oauth_as::DeviceGrant {
+                state: oauth_as::DeviceGrantState::Denied,
+                ..grant.clone()
+            },
+        )
+        .await
+        .expect("compare_and_swap_device_grant");
+    assert!(
+        !applied,
+        "a swap against a redeemed device_code reported that it applied"
+    );
+    assert!(
+        a.get_device_grant(&grant.device_code)
+            .await
+            .expect("get_device_grant")
+            .is_none(),
+        "the swap resurrected a device grant that had already been exchanged for a token"
+    );
+}
+
+/// THE RED PROOF for the test above: the read-compare-write shim, whose write is an upsert, brings
+/// the redeemed grant back every time. This is the defect the core trait's removed default body
+/// had, which is why it was removed rather than merely documented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_naive_swap_resurrects_the_redeemed_grant() {
+    let (a, _b) = two_connections("oauth_as_two_conn_swap_gone_naive").await;
+    let grant = pending_grant("dc-redeemed-naive", "GONV-0001");
+    a.put_device_grant(grant.clone())
+        .await
+        .expect("plant the device grant");
+    a.take_device_grant(&grant.device_code)
+        .await
+        .expect("take_device_grant")
+        .expect("the planted grant is there to redeem");
+
+    let applied = naive::compare_and_swap_device_grant_read_then_write(
+        a.pool(),
+        &oauth_as::DeviceGrantState::Pending,
+        &oauth_as::DeviceGrant {
+            state: oauth_as::DeviceGrantState::Denied,
+            ..grant.clone()
+        },
+    )
+    .await
+    .expect("naive swap");
+    assert!(
+        applied,
+        "the shim reports success against a row that is gone"
+    );
+    assert!(
+        a.get_device_grant(&grant.device_code)
+            .await
+            .expect("get_device_grant")
+            .is_some(),
+        "the read-compare-write shim did not resurrect the redeemed grant, so \
+         a_swap_after_redemption_does_not_resurrect_the_grant is not detecting anything"
+    );
+}

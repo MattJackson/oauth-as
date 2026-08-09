@@ -239,6 +239,16 @@ impl Storage for Faulty {
         self.inner.take_device_grant(device_code).await
     }
 
+    async fn compare_and_swap_device_grant(
+        &self,
+        expected: &oauth_as::DeviceGrantState,
+        updated: DeviceGrant,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .compare_and_swap_device_grant(expected, updated)
+            .await
+    }
+
     async fn put_authorization_code(
         &self,
         mut record: AuthorizationCodeRecord,

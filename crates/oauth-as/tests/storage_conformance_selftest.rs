@@ -49,6 +49,18 @@ struct Faults {
     /// its own copy of the grant (see `Inner::user_code_index`), so the code a human typed goes on
     /// resolving to a grant that has already been redeemed.
     index_outlives_the_taken_grant: bool,
+    /// `compare_and_swap_device_grant` ignores `expected` entirely and writes whenever the row is
+    /// there: the shape a host writes as an unconditional `UPDATE ... SET payload = $1 WHERE
+    /// device_code = $2` reporting `rows_affected > 0`. It is atomic, it compiles, it returns the
+    /// right TYPE, and it silently reinstates the first-decision-wins race the method exists to
+    /// close.
+    swap_ignores_expected: bool,
+    /// `compare_and_swap_device_grant` implemented as a read, a comparison, and an upsert, with no
+    /// check that the row is still there when the write lands. This is the WORSE half, because the
+    /// obvious mental model of a swap does not include it: a grant redeemed by `take_device_grant`
+    /// between the read and the write is put BACK, and a single-use RFC 8628 device code becomes
+    /// redeemable twice.
+    swap_resurrects_taken_grants: bool,
     /// `sweep_expired` reaps every record rather than the dead ones.
     sweep_removes_everything: bool,
     /// `sweep_expired` reaps NOTHING and reports zero: the opposite miss, and the one a host never
@@ -247,6 +259,48 @@ impl Storage for NaiveStore {
         g.user_code_index.insert(normalized, grant.clone());
         g.device_by_code.insert(grant.device_code.clone(), grant);
         Ok(())
+    }
+
+    async fn compare_and_swap_device_grant(
+        &self,
+        expected: &oauth_as::DeviceGrantState,
+        updated: DeviceGrant,
+    ) -> Result<bool, StorageError> {
+        // The round trip a shared store makes between the read and the write. Both faults below
+        // are only reachable BECAUSE of it, which is the whole point of modelling it.
+        if self.faults.swap_ignores_expected || self.faults.swap_resurrects_taken_grants {
+            round_trip_to_the_store().await;
+        }
+        let mut g = self.lock();
+        let present = g.device_by_code.contains_key(&updated.device_code);
+        let matches = g
+            .device_by_code
+            .get(&updated.device_code)
+            .map(|current| current.state == *expected)
+            .unwrap_or(false);
+        let write = if self.faults.swap_ignores_expected {
+            present
+        } else if self.faults.swap_resurrects_taken_grants {
+            // Absent reads as "nothing contradicted me", which is exactly what a shim over an
+            // insert-or-update does with a row that was redeemed while it was thinking.
+            matches || !present
+        } else {
+            matches
+        };
+        if !write {
+            return Ok(false);
+        }
+        let normalized = normalize_user_code(&updated.user_code);
+        if let Some(previous) = g.device_by_code.get(&updated.device_code) {
+            let previous_normalized = normalize_user_code(&previous.user_code);
+            if previous_normalized != normalized {
+                g.user_code_index.remove(&previous_normalized);
+            }
+        }
+        g.user_code_index.insert(normalized, updated.clone());
+        g.device_by_code
+            .insert(updated.device_code.clone(), updated);
+        Ok(true)
     }
 
     async fn get_device_grant(
@@ -765,6 +819,56 @@ async fn read_then_delete_is_caught_with_the_racers_on_the_runtime_too() {
     );
 }
 
+/// A swap that ignores `expected` is the whole of the first-decision-wins guarantee gone. It is
+/// atomic, so no `take_*` check can see it; only a check that asserts the COMPARISON happened can.
+#[tokio::test]
+async fn a_swap_that_ignores_the_expected_state_is_caught() {
+    let violations = run_against(Faults {
+        swap_ignores_expected: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["compare_and_swap_device_grant/honours_expected"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(
+            &violations,
+            "compare_and_swap_device_grant/honours_expected"
+        )
+        .contains("expected"),
+        "the violation must name the parameter that was ignored"
+    );
+}
+
+/// THE one nobody would think to test for. A shim over an insert-or-update reinstates a grant that
+/// was redeemed while it was thinking, so an RFC 8628 single-use device code is redeemable twice.
+#[tokio::test]
+async fn a_swap_that_resurrects_a_redeemed_grant_is_caught() {
+    let violations = run_against(Faults {
+        swap_resurrects_taken_grants: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["compare_and_swap_device_grant/never_resurrects"],
+        "{violations:#?}"
+    );
+    assert!(
+        detail_of(
+            &violations,
+            "compare_and_swap_device_grant/never_resurrects"
+        )
+        .contains("redeemed"),
+        "the violation must say the grant came back from the dead, not merely that a bool differed"
+    );
+}
+
 #[tokio::test]
 async fn a_user_code_index_that_overwrites_is_caught_on_both_halves() {
     let violations = run_against(Faults {
@@ -1020,6 +1124,9 @@ async fn every_violation_names_a_published_check() {
         // whichever branch runs.
         sweep_removes_nothing: false,
         sweep_errors_when_it_removed_nothing: false,
+        swap_ignores_expected: true,
+        // Mutually exclusive with the line above, which is evaluated first.
+        swap_resurrects_taken_grants: false,
         delete_client_leaves_credentials: true,
         delete_client_always_reports_true: true,
         family_revocation_spares_access_tokens: true,

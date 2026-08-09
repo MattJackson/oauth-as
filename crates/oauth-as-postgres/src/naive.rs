@@ -107,3 +107,71 @@ pub async fn claim_replay_id_read_then_write(
     .map_err(|e| error::db(OP, e))?;
     Ok(true)
 }
+
+/// The read-compare-write device grant swap: the defect at
+/// [`oauth_as::store::Storage::compare_and_swap_device_grant`], and it has TWO failure modes where
+/// the two functions above have one each.
+///
+/// The first is the ordinary lost update: two callers read `Pending`, both decide their swap
+/// applies, and the later write silently reverts the earlier one. RFC 8628 section 3.3's
+/// first-decision-wins guarantee is void, and the decision that gets thrown away is a human's.
+///
+/// The second is the one nobody thinks to test for, and it is the reason this helper writes
+/// through an INSERT ... ON CONFLICT rather than an UPDATE. `take_device_grant` is single-use
+/// redemption. A grant redeemed between the SELECT and the write is GONE, and an upsert does not
+/// fail and does not no-op against a row that is not there: it puts the grant BACK. A device code
+/// that has already been exchanged for a token becomes exchangeable a second time.
+///
+/// This is exactly the body the core trait used to provide as a default, which is why it was
+/// removed: the shim narrowed one window and opened a worse one, silently, for every host that
+/// never overrode it.
+pub async fn compare_and_swap_device_grant_read_then_write(
+    pool: &Pool<Postgres>,
+    expected: &oauth_as::DeviceGrantState,
+    updated: &oauth_as::DeviceGrant,
+) -> Result<bool, StorageError> {
+    const OP: &str = "naive compare_and_swap_device_grant";
+    // Round trip one: the comparison, on information that is stale the instant it arrives.
+    let row = sqlx::query("SELECT payload FROM oauth_as_device_grants WHERE device_code = $1")
+        .bind(&updated.device_code)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| error::db(OP, e))?;
+    if let Some(row) = row {
+        let raw: serde_json::Value = row.try_get("payload").map_err(|e| error::db(OP, e))?;
+        let current: oauth_as::DeviceGrant =
+            serde_json::from_value(raw).map_err(|_| error::payload(OP))?;
+        if current.state != *expected {
+            return Ok(false);
+        }
+    }
+    // Round trip two, and note there is no second look: the row may have been redeemed since, and
+    // this statement will happily create it again.
+    let payload = serde_json::to_value(updated).map_err(|_| error::encode(OP))?;
+    let approved_subject = match &updated.state {
+        oauth_as::DeviceGrantState::Approved { subject } => Some(subject.as_str()),
+        _ => None,
+    };
+    sqlx::query(
+        "INSERT INTO oauth_as_device_grants \
+             (device_code, user_code_normalized, client_id, approved_subject, \
+              expires_at_ns, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (device_code) DO UPDATE SET \
+             user_code_normalized = EXCLUDED.user_code_normalized, \
+             client_id            = EXCLUDED.client_id, \
+             approved_subject     = EXCLUDED.approved_subject, \
+             expires_at_ns        = EXCLUDED.expires_at_ns, \
+             payload              = EXCLUDED.payload",
+    )
+    .bind(&updated.device_code)
+    .bind(oauth_as::device::normalize_user_code(&updated.user_code))
+    .bind(updated.client_id.as_str())
+    .bind(approved_subject)
+    .bind(crate::to_nanos(updated.expires_at))
+    .bind(payload)
+    .execute(pool)
+    .await
+    .map_err(|e| error::db(OP, e))?;
+    Ok(true)
+}

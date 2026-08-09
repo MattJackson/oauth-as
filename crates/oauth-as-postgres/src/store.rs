@@ -305,6 +305,67 @@ impl Storage for PostgresStorage {
         payload_of(OP, row)
     }
 
+    /// ONE conditional statement, in the same spirit as the `DELETE ... RETURNING` above: the
+    /// database performs the comparison and the write together and decides the winner, so RFC 8628
+    /// section 3.3's first-decision-wins guarantee holds across as many AS processes as a
+    /// deployment runs. That is the whole reason this override exists: this store is BY DEFINITION
+    /// the shared, multi-process case, so it is exactly the deployment a read-compare-write cannot
+    /// serve.
+    ///
+    /// `UPDATE`, NOT `INSERT ... ON CONFLICT`, and that is load bearing rather than incidental. An
+    /// `UPDATE` cannot create a row. A grant redeemed by `take_device_grant` while this statement
+    /// was on its way therefore leaves nothing to update, `rows_affected` is 0, and the answer is
+    /// `Ok(false)`, which is what the trait requires: a swap must never bring a redeemed grant
+    /// back, because an RFC 8628 device code that has been exchanged for a token must not become
+    /// exchangeable a second time. DO NOT "helpfully" turn this into an upsert to share the shape
+    /// of `put_device_grant`; that would reinstate exactly that defect, silently, and no test that
+    /// runs on one node would notice.
+    ///
+    /// The comparison is against `payload -> 'state'` rather than a dedicated column. The state is
+    /// already in the payload, JSONB equality is structural, and adding a column would put the same
+    /// fact in two places with nothing keeping them equal.
+    async fn compare_and_swap_device_grant(
+        &self,
+        expected: &oauth_as::DeviceGrantState,
+        updated: DeviceGrant,
+    ) -> Result<bool, StorageError> {
+        const OP: &str = "compare_and_swap_device_grant";
+        let normalized = oauth_as::device::normalize_user_code(&updated.user_code);
+        let expected_json = encode(OP, expected)?;
+        let payload = encode(OP, &updated)?;
+        let result = sqlx::query(
+            "UPDATE oauth_as_device_grants SET \
+                 user_code_normalized = $2, \
+                 client_id            = $3, \
+                 approved_subject     = $4, \
+                 expires_at_ns        = $5, \
+                 payload              = $6 \
+             WHERE device_code = $1 AND payload -> 'state' = $7",
+        )
+        .bind(&updated.device_code)
+        .bind(&normalized)
+        .bind(updated.client_id.as_str())
+        .bind(approved_subject(&updated.state))
+        .bind(to_nanos(updated.expires_at))
+        .bind(payload)
+        .bind(expected_json)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(done) => Ok(done.rows_affected() > 0),
+            // The same refusal `put_device_grant` gives, for the same RFC 8628 s6.1 reason: this
+            // statement can move a grant onto a user code another live grant already holds, and
+            // the unique index is what stops two devices sharing one human-typed credential.
+            Err(e) if error::is_unique_violation(&e, "oauth_as_device_grants_user_code_key") => {
+                Err(StorageError::new(
+                    "oauth-as-postgres: user code is already indexed for a different device_code",
+                ))
+            }
+            Err(e) => Err(error::db(OP, e)),
+        }
+    }
+
     /// ATOMIC remove-and-return, RFC 8628 single-use redemption. One statement: the database
     /// decides which of N concurrent polls receives the grant, and the user-code index goes with
     /// it because the index is a column of the row being deleted.

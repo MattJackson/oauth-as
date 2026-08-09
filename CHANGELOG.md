@@ -223,12 +223,53 @@ in that window was answered `invalid_grant` and never counted as reuse either.
   answer it would have received had it arrived a moment later. Hosts that call these from a UI where
   two actions on one code are possible will now see `NotPending` where a write previously succeeded.
 - **`Storage::compare_and_swap_device_grant`**, the primitive the two items above rest on. It is a
-  PROVIDED method with a default implementation, so no existing `Storage` implementor has to change
-  anything to keep compiling. The default does the read, the comparison and the write as three
-  separate calls, which NARROWS the window without closing it; its docs say so plainly, and a host
-  running more than one process against a shared store should override it with
-  `UPDATE ... WHERE state = $expected` or the equivalent. `MemoryStorage` overrides it and performs
-  the whole operation under one lock.
+  REQUIRED method with NO default implementation; see the next section for why the default it
+  briefly had was removed. `MemoryStorage` performs the whole operation under one lock, and
+  `oauth-as-postgres` performs it as one conditional `UPDATE ... WHERE`.
+
+### Fixed (security): the compare-and-swap shim resurrected redeemed device grants
+
+`Storage::compare_and_swap_device_grant` shipped in this same unreleased cycle with a default body
+that did the read, the comparison and the write as three calls, documented as a compatibility shim
+that narrowed the race without closing it. That account was wrong in a way the docs did not cover,
+and three independent review lenses converged on it.
+
+The shim's write went through `put_device_grant`, which is an INSERT-OR-UPDATE. `take_device_grant`
+is RFC 8628 single-use redemption. A grant redeemed between the shim's read and the shim's write is
+GONE, and an upsert neither fails nor no-ops against a row that is not there: it puts the grant
+BACK. So the shim did not merely fail to prevent a lost update, it manufactured a device code that
+could be exchanged for a token TWICE, which is a worse defect than the one it mitigated, and it
+contradicted the method's own doc two paragraphs above it ("a swap must never bring it back").
+
+- **BREAKING: `Storage::compare_and_swap_device_grant` has no default implementation.** A default
+  that is silently incorrect is worse than none, because the host who never reads the doc gets no
+  signal at all: their store compiles, their tests pass, and the first-decision-wins guarantee is
+  void in production. Requiring the method makes that a compile error naming the method, which is
+  the loudest and cheapest signal available and costs a host who has already written the other four
+  device-grant methods exactly one more.
+- **`PostgresStorage` implements it**, as ONE conditional statement,
+  `UPDATE ... WHERE device_code = $1 AND payload -> 'state' = $7`, so the database performs the
+  comparison and the write together. It is an `UPDATE` and not an upsert deliberately: an `UPDATE`
+  cannot create a row, so a redeemed grant cannot be resurrected by construction. This is the one
+  shipped backend that is by definition shared and multi-process, so it was precisely the
+  deployment the shim could not serve, and it inherited the shim. `tests/two_connection.rs` proves
+  both properties against a real database, each with a permanent red proof against
+  `naive::compare_and_swap_device_grant_read_then_write`: the conditional update has exactly one
+  winner in 100/100 rounds where the shim loses an update in 100/100, and the shim resurrects a
+  redeemed grant where the update leaves it gone.
+- **The exported conformance harness now checks it**, which it did not: a host could implement the
+  swap as an unconditional `UPDATE ... WHERE device_code = $1`, or as Redis `GET` / compare /
+  `SET` with no `WATCH`, run `StorageConformance` as the docs instruct, get an empty violation
+  list and ship. Three new checks, all in `CHECKS`:
+  `compare_and_swap_device_grant/applies_when_the_state_matches`,
+  `compare_and_swap_device_grant/honours_expected` and
+  `compare_and_swap_device_grant/never_resurrects`. Both failure modes are perfectly ATOMIC, so no
+  `atomic_take/*` check could ever have seen them. `tests/storage_conformance_selftest.rs` plants
+  each fault and watches the harness go red on it.
+- **`MemoryStorage::compare_and_swap_device_grant` enforces the user-code uniqueness requirement**
+  that `put_device_grant` does. Its doc claimed the index maintenance was delegated to that method
+  and therefore could not drift; it was not delegated, and it had already drifted, so a swap could
+  hand one RFC 8628 s6.1 user code to two grants where a put would have refused.
 
 ### Performance: the entropy draw, where the allocation gates and the clock disagreed
 

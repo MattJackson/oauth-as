@@ -172,6 +172,13 @@ impl Storage for LookupFails {
     ) -> impl Future<Output = Result<Option<DeviceGrant>, StorageError>> + Send {
         self.0.take_device_grant(device_code)
     }
+    fn compare_and_swap_device_grant(
+        &self,
+        expected: &oauth_as::DeviceGrantState,
+        updated: DeviceGrant,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        self.0.compare_and_swap_device_grant(expected, updated)
+    }
     // RFC 9126 pushed authorization requests. Delegated like everything else here: the one
     // behaviour this fixture breaks is the user-code lookup, and a store that also lost its PAR
     // handles would be testing two failures at once.
