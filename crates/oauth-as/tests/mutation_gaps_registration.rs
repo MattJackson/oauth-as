@@ -51,9 +51,7 @@ fn registration_config() -> RegistrationConfig {
     cfg
 }
 
-fn server(
-    registration: RegistrationConfig,
-) -> AuthorizationServer<MemoryStorage, ManualClock> {
+fn server(registration: RegistrationConfig) -> AuthorizationServer<MemoryStorage, ManualClock> {
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     cfg.registration = Some(Box::new(registration));
     AuthorizationServer::with_clock(cfg, MemoryStorage::new(), ManualClock::at_epoch())
