@@ -803,7 +803,7 @@ impl<'a> Bound<'a> {
 /// entered code must be able to say so without that being a semver-major change for every host.
 /// Every other host-facing failure enum in this crate carries the same attribute
 /// ([`crate::registration::RegistrationFailure`], [`crate::events::ClientAuthFailure`],
-/// [`crate::consent::StepUpRequirement`]); this one was the exception, and there was no argument
+/// [`crate::consent::AuthenticationRequirement`]); this one was the exception, and there was no argument
 /// for the exception.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

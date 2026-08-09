@@ -98,6 +98,7 @@ struct Faults {
     repoints_the_index_then_refuses: bool,
     /// `find_consent` is indexed on the client alone, so it answers with whichever consent that
     /// client holds rather than the one belonging to the subject asked about.
+    #[cfg(feature = "consent")]
     find_consent_ignores_the_subject: bool,
     /// `take_refresh_token` reads, suspends, then deletes. The selftest's headline fault, needed
     /// here only as something for `check_storage` to find.

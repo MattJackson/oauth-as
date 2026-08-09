@@ -732,7 +732,9 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
 /// buffer the whole body before parsing, and they are reachable before the client is
 /// authenticated, so the ceiling on "how much memory can an anonymous request make this server
 /// hold" is set here.
-const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Public because it is a ceiling a host needs when sizing its own proxy or gateway limits, and
+/// because [`MAX_FORM_PARAMETERS`] documents itself in terms of it.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// The largest number of form or query parameters any endpoint this service serves will decode.
 ///

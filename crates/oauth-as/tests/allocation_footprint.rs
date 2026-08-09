@@ -472,15 +472,18 @@ const REFRESH_TOKEN_BUDGET: usize = 792
 
 /// Observed 573. `ConsentRecord` has no `#[cfg]` field of its own (the whole module is behind
 /// `consent`), so this is one number and not a sum.
+#[cfg(feature = "consent")]
 const CONSENT_RECORD_BUDGET: usize = 640;
 
 /// Observed 943 with `rar` and `consent` also on, which is the record's WIDEST shape: it is stored
 /// by value, and `rar` and `consent` add one `Option<String>` each (24 bytes of struct, 48 of
 /// resident heap apiece). With `par` alone the record is smaller and this bound is loose, which is
 /// the correct direction for an upper bound.
+#[cfg(feature = "par")]
 const PUSHED_REQUEST_BUDGET: usize = 1056;
 
 /// Observed 134, and it is the cheapest record in the store by a factor of five: a `String` key and
 /// a `SystemTime`, with no value struct at all. It is also the only one an attacker can grow
 /// without holding a grant, which is why it is worth pinning even though it is small.
+#[cfg(any(feature = "client_assertion", feature = "dpop"))]
 const REPLAY_ID_BUDGET: usize = 152;
