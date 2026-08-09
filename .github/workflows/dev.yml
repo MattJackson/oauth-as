@@ -37,3 +37,35 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: tests
         run: cargo test --workspace --locked
+      # ALL FEATURES TOO, and this is not belt and braces. Twelve of this crate's capabilities
+      # are behind off-by-default cargo features, so a default-features run exercises a minority
+      # of the code: at 0.9.0 that is roughly 320 tests against roughly 710. A regression in
+      # DPoP, mTLS, PAR, RAR, token exchange or consent would otherwise reach `qa` unnoticed,
+      # which defeats the point of having a fast gate at all.
+      - name: clippy (all features)
+        run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
+      - name: tests (all features)
+        run: cargo test -p oauth-as --locked --all-features
+
+  # The independent conformance harness, on EVERY push rather than only at `qa`.
+  #
+  # It was left out of the fast gate on the assumption it was slow. Measured: 13 seconds warm,
+  # and GitHub runs jobs in parallel, so it costs this gate no wall clock at all. Leaving the
+  # crate's central piece of evidence to a promotion branch meant a change could break the one
+  # thing an outsider is asked to judge this library by, and nobody would know until later.
+  #
+  # BOTH halves run, in this order, because a green from a gate nobody has watched go red is
+  # worth nothing: `--selftest` proves the suite fails against a deliberately nonconformant stub
+  # server, and only then does `--check` mean anything.
+  conformance:
+    name: independent conformance harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: gate self-test (must go RED against a nonconformant server)
+        run: scripts/oauth-conformance.sh --selftest
+      - name: live black-box conformance
+        run: scripts/oauth-conformance.sh --check
