@@ -15,7 +15,9 @@
 //! two per-operation costs, so the arithmetic can be done on numbers instead of on instinct.
 //!
 //! Run with `cargo bench -p oauth-as --all-features --bench extensions` to get every row. With no
-//! features it prints nothing and says so, rather than silently reporting an empty table.
+//! optional feature enabled every block below compiles out, so the target SAYS that in one line
+//! rather than exiting silently on an empty table: a bench that prints nothing is
+//! indistinguishable from a bench that failed to run.
 
 #[path = "harness/mod.rs"]
 mod harness;
@@ -112,7 +114,7 @@ fn main() {
     // ================================================================================ RFC 9449 DPoP
     #[cfg(feature = "dpop")]
     {
-        use oauth_as::dpop::verify_proof;
+        use oauth_as::dpop::{verify_proof, DpopFailure};
         use oauth_as::jwt::{compact_jws, EcdsaP256Key};
 
         const HTM: &str = "POST";
@@ -173,6 +175,23 @@ fn main() {
             sig[10] = if sig[10] == 'a' { 'b' } else { 'a' };
             format!("{head}.{}", sig.into_iter().collect::<String>())
         };
+        //
+        // Both refusals are PINNED TO THEIR REASON, for the same reason the happy path above is
+        // pinned to its success. A refusal fixture that starts failing EARLIER than intended
+        // (a `typ` this crate stops recognising, a size cap that now catches the fixture) still
+        // refuses, so the row still runs, and it silently reports the cost of a path nobody meant
+        // to measure. These two rows exist precisely to be compared against each other, so the
+        // one that must cost a full ES256 verify has to be the one that actually ran one.
+        assert_eq!(
+            verify_proof(malformed, HTM, HTU, now),
+            Err(DpopFailure::Malformed),
+            "this row must measure the PARSER refusing, before any curve arithmetic"
+        );
+        assert_eq!(
+            verify_proof(&wrong_signature, HTM, HTU, now),
+            Err(DpopFailure::BadSignature),
+            "this row must measure a COMPLETED ES256 verification that failed, not an earlier              refusal that skipped it"
+        );
         b.bench_fast("dpop_verify_proof_malformed", || {
             verify_proof(malformed, HTM, HTU, now)
         });
@@ -344,4 +363,13 @@ fn main() {
     }
 
     b.finish();
+    if b.measured_nothing() {
+        println!();
+        println!("== optional features ==");
+        println!(
+            "   nothing measured: every row in this target is behind an optional cargo feature \
+             and none is enabled."
+        );
+        println!("   cargo bench -p oauth-as --all-features --bench extensions");
+    }
 }

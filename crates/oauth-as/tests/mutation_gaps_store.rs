@@ -22,18 +22,12 @@
 
 mod support;
 
-#[cfg(any(
-    feature = "par",
-    feature = "consent",
-    feature = "client_assertion",
-    feature = "dpop"
-))]
+// Ungated: the RFC 8628 device-grant tests below need every one of these and are themselves
+// ungated, so a narrower gate here would only be a second place to get the feature set wrong.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(any(feature = "par", feature = "consent"))]
 use oauth_as::{ClientId, MemoryStorage, ScopeSet, Storage};
 
-#[cfg(any(feature = "par", feature = "consent"))]
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
@@ -136,7 +130,6 @@ async fn delete_client_takes_only_its_own_pushed_authorization_requests() {
 /// resolves, and that passes either way: `find_device_grant_by_user_code` walks the index into
 /// `device_by_code`, and the grant is gone from there, so a dangling entry resolves to `None`
 /// anyway. What is unchecked is the spared client's code, which is the direction that breaks.
-#[cfg(feature = "par")]
 #[tokio::test]
 async fn delete_client_keeps_the_user_code_index_of_the_grants_it_spared() {
     use oauth_as::{DeviceGrant, DeviceGrantState};

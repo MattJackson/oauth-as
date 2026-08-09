@@ -329,6 +329,15 @@ impl Bench {
 
     /// Look a measured row back up by name, for a bench target that wants to COMPARE two rows
     /// (the constant-time gate does this) rather than only print them.
+    /// Whether this run measured nothing at all.
+    ///
+    /// A `--list` run measures nothing by design, so it does not count: the question this answers
+    /// is "did the feature set leave this target with no work to do", which is a thing a target
+    /// should be able to SAY rather than leave a reader to infer from an absent table.
+    pub fn measured_nothing(&self) -> bool {
+        !self.list_only && self.rows.is_empty()
+    }
+
     pub fn row(&self, name: &str) -> Option<&Row> {
         self.rows.iter().find(|r| r.name == name)
     }
@@ -398,19 +407,30 @@ pub fn print_growth(
         "{:>10}  {:>12}  {:>14}  {:>10}  {:>10}",
         "n", "median", "ns/element", "n factor", "t factor"
     );
+    // `n == 0` is a legitimate row: several sweeps start there deliberately, because the row with
+    // no elements is the FIXED cost the other rows are measured on top of. What it is not is a
+    // divisor. Both columns that would divide by it print `-` instead of `inf`, which is the
+    // honest answer to "what did each of no elements cost".
     let mut prev: Option<(usize, f64)> = None;
     for (n, row) in found {
         let ns = row.median.as_secs_f64() * 1e9;
-        let per = ns / n as f64;
+        let per = if n == 0 {
+            String::from("-")
+        } else {
+            format!("{:.1}", ns / n as f64)
+        };
         let (nf, tf) = match prev {
             None => (String::from("-"), String::from("-")),
+            // The TIME ratio against a zero-element row is still meaningful (it is the fixed cost
+            // this row is measured against), so only the element ratio is withheld.
+            Some((0, pns)) => (String::from("-"), format!("{:.1}x", ns / pns)),
             Some((pn, pns)) => (
                 format!("{:.1}x", n as f64 / pn as f64),
                 format!("{:.1}x", ns / pns),
             ),
         };
         println!(
-            "{n:>10}  {:>12}  {per:>14.1}  {nf:>10}  {tf:>10}",
+            "{n:>10}  {:>12}  {per:>14}  {nf:>10}  {tf:>10}",
             fmt_dur(row.median)
         );
         prev = Some((n, ns));

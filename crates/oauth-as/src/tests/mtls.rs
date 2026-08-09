@@ -354,7 +354,7 @@ fn a_registration_reads_certificates_out_of_the_clients_jwks() {
 /// for a mutual-TLS registration, so even a build with this feature compiled OUT (where nothing
 /// exists to check a certificate) refuses the client rather than admitting it.
 #[test]
-fn no_secret_and_no_certificate_authenticates_a_mutual_tls_client() {
+fn no_secret_and_no_certificate_must_not_authenticate_a_mutual_tls_client() {
     let client = mtls_client(MtlsClientRegistration::TlsClientAuth(
         ExpectedSubject::SanDns("client.example.com".to_string()),
     ));

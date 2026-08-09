@@ -364,11 +364,51 @@ fn a_zero_window_is_clamped_rather_than_dividing_by_zero() {
 /// An [`Instant`] before the limiter's base cannot happen (they are monotonic) but the arithmetic
 /// saturates rather than panicking if one ever does, because a panic inside `check` would take the
 /// whole request down.
+///
+/// What is actually reachable here is the DIRECTION, not a panic: `Instant::duration_since` has
+/// saturated rather than panicked since Rust 1.60, so `now - self.base` cannot bring a request
+/// down today whatever it is spelled as. What can still go wrong is answering the wrong window.
+/// An absolute difference (`if now >= base { now - base } else { base - now }`, which is the
+/// plausible way to write this while thinking about the panic that used to exist) puts a pre-base
+/// instant in window three, and a limiter that jumps to a window it has no counters for hands out
+/// a fresh budget. So the assertion is that it lands in window ZERO, not merely that it returns.
+///
+/// The instant BEFORE `base` is the whole point, so it is constructed rather than hoped for: the
+/// base is moved forward past instants that already exist, which is the only way to hold one that
+/// precedes it without depending on how long the machine has been up. `Instant::now() - d` would
+/// be the obvious spelling and it is not usable here: it panics on a platform whose clock has not
+/// yet run for `d`, which would make this test's own fixture the flake.
 #[test]
 fn the_window_index_saturates_rather_than_panicking() {
-    let l = limiter(RateLimitConfig::default());
+    let mut l = limiter(RateLimitConfig::default());
     assert_eq!(l.window_index(l.base), 0);
     assert_eq!(l.window_index(at(&l, DEFAULT_WINDOW * 3)), 3);
+
+    let before_base = l.base;
+    l.base = before_base + DEFAULT_WINDOW * 3;
+    assert_eq!(
+        l.window_index(before_base),
+        0,
+        "an instant three windows BEFORE the base must land in window 0, not panic and not wrap \
+         to a far-future index that would hand out a fresh budget"
+    );
+    assert_eq!(
+        l.window_index(before_base + DEFAULT_WINDOW),
+        0,
+        "still before the base, so still window 0"
+    );
+
+    // And through the endpoint the host actually calls, since a panic there is the one that takes
+    // a request down with it.
+    assert_eq!(
+        l.check_at(Attempt::DeviceUserCodeEntry, before_base),
+        RateLimitDecision::Allow
+    );
+    l.record_at(
+        Attempt::DeviceUserCodeEntry,
+        AttemptOutcome::Failed,
+        before_base,
+    );
 }
 
 /// A poisoned mutex must not turn the limiter into a source of panics: a panic elsewhere in the

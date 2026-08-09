@@ -100,23 +100,93 @@ fn verify_builtin_refuses_a_scheme_it_does_not_implement() {
     assert!(!hash.verify_builtin("anything"));
 }
 
-/// The hashed comparison goes through [`constant_time_eq`], NOT through `==`. The property that
-/// matters is the one C9 was about: a length difference must not be observable, and the digest hex
-/// is fixed width so there is nothing length-dependent left. This pins the wiring, since a
-/// `self.encoded == computed` would pass every functional test in the suite and quietly reintroduce
-/// an early-exit comparison on a credential.
+/// The hashed path answers EXACTLY what `==` on the two digests would answer, at equal and
+/// unequal lengths, and never on a prefix.
+///
+/// # What this test does not claim
+///
+/// It does not claim the comparison is constant time, and it is worth being blunt about why: no
+/// `#[test]` in this suite can. A previous version of this test asserted that the literal text
+/// `constant_time_eq(` appeared in the source of [`SecretHash::verify_builtin`], which exercised
+/// no comparison at all: it would have passed for `constant_time_eq(a, b) || a == b` and failed on
+/// a rename that changed nothing. That is coverage reported rather than provided, so it is gone.
+///
+/// The constant-time claim rests where it can actually be supported: STRUCTURALLY on
+/// [`constant_time_eq`] itself (fixed-width fold, no early exit, lengths folded in), which
+/// `constant_time_eq_agrees_with_eq` below and `tests/constant_time.rs` pin functionally, and
+/// EMPIRICALLY on `benches/constant_time.rs`, which measures whether the position of the first
+/// differing byte is observable. What is left for this test is the functional half, asserted
+/// honestly: the answers themselves.
 #[test]
-fn the_hashed_path_compares_in_constant_time() {
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/client.rs"))
-        .expect("src/client.rs must be readable");
-    let start = source
-        .find("fn verify_builtin(")
-        .expect("verify_builtin must exist");
-    let body = &source[start..start + 400];
+fn the_hashed_path_answers_exactly_what_comparing_the_digests_would() {
+    const SECRET: &str = "a-high-entropy-registered-client-secret";
+    let hash = SecretHash::sha256(SECRET);
+
+    assert!(hash.verify_builtin(SECRET), "the registered secret");
+
+    // Equal length, one byte different: the case a comparison that stopped at the first difference
+    // would answer correctly and leak how far it got.
+    let mut near = SECRET.to_string();
+    near.replace_range(0..1, "b");
+    assert_ne!(near, SECRET, "the fixture must actually differ");
+    assert!(!hash.verify_builtin(&near), "differs at the first byte");
+    let mut near_end = SECRET.to_string();
+    near_end.replace_range(SECRET.len() - 1..SECRET.len(), "X");
+    assert!(!hash.verify_builtin(&near_end), "differs at the last byte");
+
+    // Different lengths, in both directions, including a presented secret that has the whole
+    // registered one as a prefix. C9 was a length-handling defect, so length is asserted rather
+    // than assumed.
+    assert!(!hash.verify_builtin(""), "the empty secret");
     assert!(
-        body.contains("constant_time_eq("),
-        "the hashed verification path must use constant_time_eq, not =="
+        !hash.verify_builtin(&SECRET[..SECRET.len() - 1]),
+        "a prefix"
     );
+    assert!(
+        !hash.verify_builtin(&format!("{SECRET}x")),
+        "an extension of the registered secret"
+    );
+    assert!(
+        !hash.verify_builtin(&format!("{SECRET}{}", "\0".repeat(65536))),
+        "the C9 padding: a length difference that only shows in bits above 15"
+    );
+    assert!(
+        SecretHash::sha256("").verify_builtin(""),
+        "an empty registered secret still verifies against itself"
+    );
+
+    // A STORED verifier that is a prefix of the right digest must not verify either: the digest is
+    // fixed width, so a truncated one can only come from corruption or from a comparison that
+    // stopped when one side ran out.
+    let full = SecretHash::sha256(SECRET).encoded().to_string();
+    let truncated = SecretHash::custom(SecretHash::SHA256_HEX, &full[..full.len() - 1]);
+    assert!(
+        !truncated.verify_builtin(SECRET),
+        "a truncated stored digest must not match the secret it is a prefix of"
+    );
+
+    // The full agreement property, swept: `verify_builtin` and comparing the two digests by hand
+    // must never disagree, whatever the shapes. The reference hex is written out here with
+    // `{:02x}` rather than by calling the crate's own `hex_lower`, so that a defect in the
+    // encoder cannot cancel itself out on both sides of this comparison.
+    fn reference_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    for registered in ["", "a", "hunter2", SECRET] {
+        let hash = SecretHash::sha256(registered);
+        assert_eq!(
+            hash.encoded(),
+            reference_hex(&Sha256::digest(registered.as_bytes())),
+            "the stored verifier is lower-case hex of the SHA-256 digest"
+        );
+        for presented in ["", "a", "A", "hunter2", "hunter20", SECRET, "\u{0}"] {
+            assert_eq!(
+                hash.verify_builtin(presented),
+                reference_hex(&Sha256::digest(presented.as_bytes())) == *hash.encoded(),
+                "verify_builtin({presented:?}) against a hash of {registered:?}"
+            );
+        }
+    }
 }
 
 /// A hashed registration is confidential, and a public one is not. Three endpoints

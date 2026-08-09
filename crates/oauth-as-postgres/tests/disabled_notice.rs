@@ -15,15 +15,17 @@
 
 #![cfg(not(feature = "pg-integration"))]
 
+/// The NAME is the whole notice, and it has to be: `cargo test` captures both `stdout` and
+/// `stderr` of a test that PASSES and discards them, so a `println!` or `eprintln!` here would be
+/// invisible in exactly the case this file exists for (the normal one, where the suite is green
+/// and nobody passed `--nocapture`). The one line that always reaches the terminal is
+/// `test <name> ... ok`, so everything that has to be read goes in the name.
+///
+/// The body stays empty for the same reason. A body that printed the longer form would look like
+/// the notice while being the half nobody sees, which is the failure this whole file is about.
+/// The longer form lives in the module docs above, where a reader who follows the name will find
+/// it, and in `scripts/postgres-conformance.sh`.
 #[test]
-fn postgres_atomicity_proof_did_not_run_use_scripts_postgres_conformance_sh() {
-    eprintln!(
-        "\n\
-         oauth-as-postgres: the conformance run and the two-connection atomicity proof were NOT\n\
-         executed. They need a real PostgreSQL and are behind `--features pg-integration`.\n\
-         Run scripts/postgres-conformance.sh (it starts a throwaway container), or:\n\
-         \n  \
-         OAUTH_AS_POSTGRES_TEST_URL=postgres://... \\\n    \
-         cargo test -p oauth-as-postgres --features pg-integration\n"
-    );
+fn skipped_postgres_atomicity_proof_run_scripts_postgres_conformance_sh_or_features_pg_integration()
+{
 }

@@ -161,25 +161,87 @@ fn an_unknown_grant_type_is_refused_rather_than_ignored() {
 }
 
 /// RFC 7591 s2: `token_endpoint_auth_method` defaults to `client_secret_basic`, and a value this
-/// server does not implement is `invalid_client_metadata`. The accepted set is exactly what the
-/// RFC 8414 `token_endpoint_auth_methods_supported` member advertises.
+/// server does not implement is `invalid_client_metadata`.
+///
+/// The containment that must hold is ONE WAY, and this test pins that direction rather than the
+/// equality an earlier version of this comment claimed. Everything dynamic registration ACCEPTS
+/// must appear in the RFC 8414 `token_endpoint_auth_methods_supported` member, because a
+/// registration recorded under a method the token endpoint does not offer is a client that can
+/// never authenticate. The reverse does not hold, and deliberately: see
+/// [`a_method_the_metadata_advertises_may_still_be_unregisterable`].
 #[test]
-fn the_token_endpoint_auth_method_must_be_one_this_server_advertises() {
+fn every_registerable_auth_method_is_one_the_metadata_advertises() {
     let registered = validate(&code_grant_metadata(), &config()).expect("valid");
     assert_eq!(registered.token_endpoint_auth_method, "client_secret_basic");
+
+    let advertised = crate::metadata::AuthorizationServerMetadata::from_config(&ServerConfig::new(
+        "https://as.example",
+        "https://as.example/device",
+    ))
+    .token_endpoint_auth_methods_supported;
 
     for method in ["none", "client_secret_basic", "client_secret_post"] {
         let mut m = code_grant_metadata();
         m.token_endpoint_auth_method = Some(method.to_string());
-        assert!(validate(&m, &config()).is_ok(), "{method} is advertised");
+        let accepted = validate(&m, &config()).expect("this server registers this method");
+        assert_eq!(accepted.token_endpoint_auth_method, method);
+        assert!(
+            advertised.iter().any(|m| m == method),
+            "registration accepts {method} but RFC 8414 \
+             token_endpoint_auth_methods_supported does not advertise it, so a client registered \
+             this way can never authenticate at the token endpoint"
+        );
     }
 
+    let mut m = code_grant_metadata();
+    m.token_endpoint_auth_method = Some("urn:example:invented".to_string());
+    assert_eq!(
+        error_code(validate(&m, &config()).unwrap_err()),
+        RegistrationErrorCode::InvalidClientMetadata
+    );
+}
+
+/// The other direction of the same question, pinned SEPARATELY because it is an asymmetry a reader
+/// will otherwise assume is a bug.
+///
+/// RFC 8414 s2's `token_endpoint_auth_methods_supported` describes the TOKEN ENDPOINT. Under
+/// `client_assertion` it advertises `private_key_jwt` and `client_secret_jwt`, and under `mtls`
+/// the two RFC 8705 methods, and all four of those are genuinely accepted there for a client the
+/// HOST provisioned out of band. None of the four can be reached through RFC 7591 dynamic
+/// registration, because a registration cannot carry what they need: [`ClientMetadata`] models no
+/// `jwks`/`jwks_uri` (RFC 7591 s2) and none of the RFC 8705 s2.1.1 subject parameters, and
+/// `client_secret_jwt` needs the secret in the CLEAR (see
+/// [`crate::client_assertion::AssertionKeys::ClientSecret`]) while registration keeps a one-way
+/// [`crate::client::SecretHash`] only. Accepting any of them here would mint the exact trap the
+/// redirect-URI rule above refuses to mint: a registration the token endpoint can never honour.
+///
+/// So the refusal is right and the advertisement is right. What is NOT right is the wording of the
+/// refusal, `"token_endpoint_auth_method is not one this server advertises"`, which under either
+/// feature is factually false and sends the registrant looking for a metadata document that says
+/// what they were just told it says.
+#[test]
+fn a_method_the_metadata_advertises_may_still_be_unregisterable() {
     let mut m = code_grant_metadata();
     m.token_endpoint_auth_method = Some("private_key_jwt".to_string());
     assert_eq!(
         error_code(validate(&m, &config()).unwrap_err()),
         RegistrationErrorCode::InvalidClientMetadata
     );
+
+    #[cfg(feature = "client_assertion")]
+    {
+        let advertised = crate::metadata::AuthorizationServerMetadata::from_config(
+            &ServerConfig::new("https://as.example", "https://as.example/device"),
+        )
+        .token_endpoint_auth_methods_supported;
+        assert!(
+            advertised
+                .iter()
+                .any(|m| m == crate::client_assertion::PRIVATE_KEY_JWT),
+            "this build verifies RFC 7523 assertions, so the token endpoint really does offer \
+             private_key_jwt even though registration cannot record the key it would need"
+        );
+    }
 }
 
 /// RFC 6749 s4.4 gives the client credentials grant to CONFIDENTIAL clients only, so registering

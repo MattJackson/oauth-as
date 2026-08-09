@@ -22,6 +22,15 @@
 //! deterministic scalar implementation. An attacker with a shared cache, hardware performance
 //! counters, or millions of samples over a network has better resolution than this file does.
 //!
+//! # What can FAIL this run
+//!
+//! The CONTROL group, and only the control group. See the comment at the bottom of `main`: the
+//! control asserts that a difference IS present, which noise cannot fake away, while the two real
+//! groups assert that one is ABSENT, which noise on a shared runner can fake at any time. So the
+//! real groups print their verdict for a human, and the control exits non-zero. The point of the
+//! control is that "no difference detected" from an instrument that cannot detect a difference is
+//! not a result, and this file must not report one as though it were.
+//!
 //! The real assurance is STRUCTURAL and it lives in `src/client.rs`: the comparison SHA-256-hashes
 //! both sides and then folds a fixed 32-byte XOR with no early exit, so the work is a function of
 //! the input LENGTHS and nothing else. This file's job is to catch the day somebody replaces that
@@ -50,17 +59,30 @@ fn differing_at(index: usize) -> String {
     String::from_utf8(bytes).expect("ASCII in, ASCII out")
 }
 
-/// Report on one group of rows that MUST be indistinguishable from each other.
+/// What one group of rows turned out to be.
+#[derive(PartialEq, Eq)]
+enum Verdict {
+    /// Fewer than two of the group's rows were measured, so there was nothing to compare. A
+    /// `--list` run and a run with a name filter both land here, which is why this is a case
+    /// rather than a failure.
+    NotMeasured,
+    /// The medians all fall inside this harness's own noise band.
+    Indistinguishable,
+    /// A row escaped the band.
+    Distinguishable,
+}
+
+/// Report on one group of rows, and say which way it came out.
 ///
 /// The threshold is derived from the harness's own measured spread rather than picked: the widest
 /// median-absolute-deviation among the rows in the group, tripled, is the band inside which this
 /// harness cannot tell two rows apart. A group whose medians all fall inside that band has told us
 /// nothing (correctly). A group that escapes it has told us something, and the something is a
 /// security finding.
-fn verdict(b: &harness::Bench, group: &str, names: &[&str]) {
+fn verdict(b: &harness::Bench, group: &str, names: &[&str], must_differ: bool) -> Verdict {
     let rows: Vec<&harness::Row> = names.iter().filter_map(|n| b.row(n)).collect();
     if rows.len() < 2 {
-        return;
+        return Verdict::NotMeasured;
     }
     let medians: Vec<f64> = rows.iter().map(|r| r.median.as_secs_f64()).collect();
     let lo = medians.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -85,16 +107,35 @@ fn verdict(b: &harness::Bench, group: &str, names: &[&str]) {
     }
     println!("   spread between fastest and slowest : {observed_pct:.2}%");
     println!("   this harness's own noise band (3x MAD): {band_pct:.2}%");
+    // The two outcomes mean OPPOSITE things depending on the group, so the line says which. A
+    // control that differs is the instrument working; a secret comparison that differs is an
+    // oracle.
     if observed_pct > band_pct.max(2.0) {
+        if must_differ {
+            println!(
+                "   VERDICT: distinguishable, as this group is built to be. Good: the probe \
+                      can report a difference."
+            );
+        } else {
+            println!(
+                "   VERDICT: DISTINGUISHABLE. Treat as a SECURITY finding, not a performance \
+                 note: the position of the first differing byte is observable in the response \
+                 time."
+            );
+        }
+        Verdict::Distinguishable
+    } else if must_differ {
         println!(
-            "   VERDICT: DISTINGUISHABLE. Treat as a SECURITY finding, not a performance note: \
-             the position of the first differing byte is observable in the response time."
+            "   VERDICT: NOT distinguishable, and this group was built to be. The probe is \
+                  not measuring what it thinks it is."
         );
+        Verdict::Indistinguishable
     } else {
         println!(
             "   VERDICT: not distinguishable at this resolution. This is not a proof of \
              constant time; see this file's module docs for what it is and is not."
         );
+        Verdict::Indistinguishable
     }
 }
 
@@ -182,6 +223,13 @@ fn main() {
 
     b.finish();
 
+    // The two REAL groups stay ADVISORY, and that is a deliberate asymmetry rather than a
+    // shortage of nerve. Asserting "these two medians are within a band" is asserting the ABSENCE
+    // of a timing difference, and absence is exactly what a shared CI runner cannot be trusted to
+    // report: one preempted round on a noisy neighbour turns a correct implementation red, and a
+    // gate that goes red for reasons unrelated to the code is a gate people learn to rerun. So a
+    // DISTINGUISHABLE verdict here is printed as the security finding it is, for a human to act
+    // on, and it does not fail the run.
     verdict(
         &b,
         "RFC 6749 s2.3.1 client secret (all guesses 32 bytes)",
@@ -191,6 +239,7 @@ fn main() {
             "client_secret_differs_at_byte_16",
             "client_secret_differs_at_byte_31",
         ],
+        false,
     );
     verdict(
         &b,
@@ -200,13 +249,35 @@ fn main() {
             "pkce_verifier_differs_in_last_char",
             "pkce_verifier_differs_in_first_char",
         ],
+        false,
     );
-    verdict(
+
+    // The CONTROL is the falsifiable half, and it is falsifiable for the opposite reason: it is
+    // built to show a LARGE difference (parsing one scope token against parsing seven), so the
+    // claim being made is the PRESENCE of a difference. Noise can only ever help that claim, so
+    // there is no flaky direction, and a control that has stopped being able to report a
+    // difference has taken the meaning out of every "not distinguishable" line above it. That is
+    // a broken instrument reporting a clean result, which is the one outcome this file exists to
+    // make impossible, so it FAILS THE RUN.
+    if verdict(
         &b,
         "CONTROL: a comparison that SHOULD differ (this probe must be able to say so)",
         &[
             "control_scope_parse_1_token",
             "control_scope_parse_7_tokens",
         ],
-    );
+        true,
+    ) == Verdict::Indistinguishable
+    {
+        println!();
+        println!(
+            "   CONTROL FAILED. This probe could not tell apart two operations whose costs differ \
+             several fold, so it cannot detect a timing oracle either, and every \
+             \"not distinguishable\" verdict printed above is VACUOUS. Do not read this run as \
+             evidence of anything. Likely causes: the control rows were optimized away, the \
+             machine is too noisy for the harness's own noise band, or the harness's timing is \
+             broken."
+        );
+        std::process::exit(1);
+    }
 }

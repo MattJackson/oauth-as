@@ -87,6 +87,9 @@ fn a_stored_handle_is_not_printed_by_debug() {
 #[cfg(feature = "par")]
 #[test]
 fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
+    #[cfg(feature = "rar")]
+    const RAR_DETAILS: &str = r#"[{"type":"payment_initiation","actions":["initiate"],"locations":["https://rs.example"]}]"#;
+
     let record = PushedAuthorizationRequest {
         request_uri: "urn:ietf:params:oauth:request_uri:abc".to_string(),
         client_id: ClientId::new("app"),
@@ -97,7 +100,7 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
         code_challenge: Some("challenge".to_string()),
         code_challenge_method: Some("S256".to_string()),
         #[cfg(feature = "rar")]
-        authorization_details: None,
+        authorization_details: Some(RAR_DETAILS.to_string()),
         #[cfg(feature = "consent")]
         acr_values: Some("urn:acr:phr urn:acr:mfa".to_string()),
         #[cfg(feature = "consent")]
@@ -119,7 +122,24 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
     assert_eq!(request.state.as_deref(), Some("opaque"));
     assert_eq!(request.code_challenge.as_deref(), Some("challenge"));
     assert_eq!(request.code_challenge_method.as_deref(), Some("S256"));
-    assert_eq!(request.resource.len(), 2);
+    assert_eq!(
+        request.resource,
+        vec![
+            "https://rs.example/a".to_string(),
+            "https://rs.example/b".to_string()
+        ],
+        "RFC 8707 s2 indicators are per-request, so both the count and the values have to survive"
+    );
+    // RFC 9396 s3: `authorization_details` is the request parameter that says WHAT the token may
+    // do, so dropping it across the join downgrades a fine-grained request to whatever `scope`
+    // alone means. This crate has already had RAR details silently dropped on one feature-gated
+    // path, which is why it is asserted here rather than assumed to ride along.
+    #[cfg(feature = "rar")]
+    assert_eq!(
+        request.authorization_details.as_deref(),
+        Some(RAR_DETAILS),
+        "the pushed authorization_details did not survive to the request the handle resolves to"
+    );
     // RFC 9470 s4. These two are the join's whole reason for existing as a test: they were absent
     // from this record entirely, so every pushed request resolved to a request asking for no
     // step-up, whatever the client had pushed.
