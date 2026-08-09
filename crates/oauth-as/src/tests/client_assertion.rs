@@ -542,3 +542,84 @@ fn a_jwk_with_a_trimmed_coordinate_is_refused() {
     value["x"] = json!("AAAA");
     assert!(PublicJwk::from_json(&value).is_err());
 }
+
+// -------------------------------------------------------------- the exact edges of each window
+//
+// Each of the three tests below sits ON a boundary that a comparison operator decides. A `>` that
+// becomes a `>=` (or the reverse) moves the boundary by one second in a direction no test above
+// notices, because every test above is at least a second clear of it. These are the tests that
+// notice.
+
+#[test]
+fn an_assertion_expiring_exactly_at_the_tracking_horizon_is_accepted() {
+    // The refusal above is for an `exp` FURTHER OUT than this server will remember a `jti` for.
+    // Exactly at the horizon is not further out: the whole lifetime is trackable, so refusing it
+    // would reject a client that had done precisely what the limit asks.
+    let mut c = claims();
+    c["exp"] = json!(secs(now() + MAX_ASSERTION_LIFETIME));
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+    let verified = verify(&secret_keys(), &assertion).expect("exp at the horizon is trackable");
+    assert_eq!(verified.expires_at, now() + MAX_ASSERTION_LIFETIME);
+}
+
+#[test]
+fn an_assertion_issued_exactly_at_the_skew_horizon_is_accepted() {
+    // RFC 7523 s3 (5) and (6): `nbf` and `iat` are checked with leeway, and the leeway is a
+    // tolerance rather than a strict inequality. A client whose clock is ahead by EXACTLY the
+    // leeway is inside what the deployment said it would tolerate.
+    for claim in ["iat", "nbf"] {
+        let mut c = claims();
+        c[claim] = json!(secs(now() + CLOCK_SKEW_LEEWAY));
+        let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+        assert!(
+            verify(&secret_keys(), &assertion).is_ok(),
+            "{claim} exactly at the skew horizon must be inside the tolerance"
+        );
+    }
+}
+
+// -------------------------------------------------------- the unverified lookup key, and its bar
+//
+// RFC 7521 section 4.2 makes `client_id` optional on a request carrying an assertion, so something
+// has to read `sub` BEFORE any signature has been checked in order to find the registration that
+// holds the key. `unverified_subject` is that something, and the whole safety argument for it is
+// that it returns the assertion's own `sub` verbatim and nothing else: a caller that received a
+// constant, or an empty string, would be looking up the wrong registration (or always the same
+// one) for every request, and the re-check in `verify_assertion` would then refuse every honest
+// client while an attacker's own registration is the one that gets found.
+
+#[test]
+fn the_unverified_subject_is_the_assertions_own_sub_verbatim() {
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &claims());
+    assert_eq!(unverified_subject(&assertion).as_deref(), Some(CLIENT));
+
+    // A DIFFERENT subject must read back differently, or the lookup is a constant wearing a
+    // parameter.
+    let mut other = claims();
+    other["sub"] = json!("some-other-client");
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &other);
+    assert_eq!(
+        unverified_subject(&assertion).as_deref(),
+        Some("some-other-client")
+    );
+}
+
+#[test]
+fn an_assertion_with_no_readable_subject_yields_no_lookup_key() {
+    // Nothing to look up is NOT the same as looking up the empty client id: a host that received
+    // `Some("")` here would go on to query its store for a client whose id is the empty string.
+    let mut c = claims();
+    c.as_object_mut().unwrap().remove("sub");
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+    assert_eq!(unverified_subject(&assertion), None);
+
+    // And a string that is not a JWS at all yields nothing rather than a guess.
+    assert_eq!(unverified_subject("not-a-jws"), None);
+    assert_eq!(unverified_subject(""), None);
+
+    // A non-string `sub` is not a subject either.
+    let mut c = claims();
+    c["sub"] = json!(7);
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+    assert_eq!(unverified_subject(&assertion), None);
+}

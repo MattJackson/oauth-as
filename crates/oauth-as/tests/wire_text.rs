@@ -420,3 +420,438 @@ fn authorization_error_redirect_location_carries_every_present_member() {
         "absent optional members must contribute no parameter at all"
     );
 }
+
+// ------------------------------------------------------------- the optional features' own text
+//
+// Everything below is behind a cargo feature, and every one of these `Display` and `Debug`
+// implementations was a surviving mutant in the first all-features mutation run: each could be
+// replaced with one that writes NOTHING and the suite still passed. They are grouped here rather
+// than scattered across the feature test files because what they have in common is the reason they
+// matter: an error whose text is empty is a host operator staring at a blank audit line while an
+// authentication is being refused for a reason nobody can now name.
+
+/// RFC 7523 section 3: every one of these refusals collapses to `invalid_client` on the wire, so
+/// the ONLY place the distinction survives is the host's audit channel, and that channel is this
+/// `Display`. An empty one turns a diagnosable `private_key_jwt` failure into a blank line.
+#[cfg(feature = "client_assertion")]
+#[test]
+fn client_assertion_failure_display_names_the_check_that_refused() {
+    use oauth_as::AssertionFailure;
+
+    for (failure, text) in [
+        (
+            AssertionFailure::Malformed,
+            "the client assertion is not a well formed JWT",
+        ),
+        (
+            AssertionFailure::AlgorithmMismatch,
+            "the client assertion alg is not the one this registration signs with",
+        ),
+        (
+            AssertionFailure::BadSignature,
+            "the client assertion signature did not verify",
+        ),
+        (
+            AssertionFailure::WrongPrincipal,
+            "the client assertion iss/sub is not this client",
+        ),
+        (
+            AssertionFailure::WrongAudience,
+            "the client assertion aud is not this server",
+        ),
+        (
+            AssertionFailure::Expired,
+            "the client assertion is expired or too long lived",
+        ),
+        (
+            AssertionFailure::NotYetValid,
+            "the client assertion is not yet valid",
+        ),
+        (
+            AssertionFailure::MissingJti,
+            "the client assertion carries no jti",
+        ),
+        (
+            AssertionFailure::Replayed,
+            "the client assertion jti has already been used",
+        ),
+    ] {
+        assert_eq!(format!("{failure}"), text);
+    }
+}
+
+/// RFC 7591 section 2 and RFC 8414 `token_endpoint_auth_methods_supported`: these two names are
+/// registered spellings that a metadata document advertises and a client matches on, so the
+/// accessor has to produce exactly them and has to tell the two variants apart.
+#[cfg(feature = "client_assertion")]
+#[test]
+fn assertion_keys_report_the_registered_auth_method_and_never_print_the_secret() {
+    use oauth_as::AssertionKeys;
+
+    let symmetric = AssertionKeys::ClientSecret {
+        secret: "s3cr3t-not-for-logs".to_string(),
+    };
+    let asymmetric = AssertionKeys::PublicKeys { keys: Vec::new() };
+
+    assert_eq!(
+        symmetric.token_endpoint_auth_method(),
+        "client_secret_jwt",
+        "RFC 7523 section 2.2 with a MAC is `client_secret_jwt` on the wire"
+    );
+    assert_eq!(
+        asymmetric.token_endpoint_auth_method(),
+        "private_key_jwt",
+        "RFC 7523 section 2.2 with a signature is `private_key_jwt` on the wire"
+    );
+
+    // The hand-written `Debug` exists to keep the shared secret out of a log; an empty one would
+    // hide the whole registration instead, which is the other way of being useless.
+    let printed = format!("{symmetric:?}");
+    assert_eq!(printed, "ClientSecret { secret: \"[redacted]\" }");
+    assert!(!printed.contains("s3cr3t-not-for-logs"));
+    assert_eq!(format!("{asymmetric:?}"), "PublicKeys { keys: [] }");
+}
+
+/// RFC 9449 section 4.3 lists the checks a proof must pass. Each refusal below is one of them, and
+/// the text is the only record of WHICH, since the wire answer is the same `invalid_dpop_proof`
+/// either way.
+#[cfg(feature = "dpop")]
+#[test]
+fn dpop_failure_display_names_the_check_that_refused() {
+    use oauth_as::DpopFailure;
+
+    for (failure, text) in [
+        (
+            DpopFailure::Malformed,
+            "the DPoP proof is not a well formed JWT",
+        ),
+        (DpopFailure::NotAProof, "the DPoP proof typ is not dpop+jwt"),
+        (
+            DpopFailure::UnsupportedAlgorithm,
+            "the DPoP proof alg is not supported",
+        ),
+        (
+            DpopFailure::BadProofKey,
+            "the DPoP proof jwk is missing or is not a public key",
+        ),
+        (
+            DpopFailure::BadSignature,
+            "the DPoP proof signature did not verify",
+        ),
+        (
+            DpopFailure::WrongMethod,
+            "the DPoP proof htm is not this request's method",
+        ),
+        (
+            DpopFailure::WrongUri,
+            "the DPoP proof htu is not this request's URI",
+        ),
+        (
+            DpopFailure::StaleProof,
+            "the DPoP proof iat is missing or outside the window",
+        ),
+        (DpopFailure::MissingJti, "the DPoP proof carries no jti"),
+        (
+            DpopFailure::Replayed,
+            "the DPoP proof jti has already been used",
+        ),
+    ] {
+        assert_eq!(format!("{failure}"), text);
+    }
+}
+
+/// RFC 9470 section 3: `description` is the `error_description` this failure puts ON THE WIRE, back
+/// to the client through the authorization response redirect, so an empty or wrong one is a
+/// protocol-visible defect rather than a log-only one. `Display` is the host-facing short form.
+#[cfg(feature = "consent")]
+#[test]
+fn step_up_failure_text_is_the_wire_description_and_the_short_form() {
+    use oauth_as::StepUpFailure;
+
+    for (failure, description, short) in [
+        (
+            StepUpFailure::NotReported,
+            "no user authentication was reported for this request",
+            "no authentication reported",
+        ),
+        (
+            StepUpFailure::Stale,
+            "the user authentication is older than the requested max_age",
+            "authentication older than max_age",
+        ),
+        (
+            StepUpFailure::AcrNotMet,
+            "the user authentication does not satisfy the requested acr_values",
+            "acr_values not satisfied",
+        ),
+    ] {
+        assert_eq!(failure.description(), description);
+        assert_eq!(format!("{failure}"), short);
+    }
+}
+
+/// RFC 8705 section 3.1: the `x5t#S256` wire form is base64url of the SHA-256 of the DER
+/// certificate, unpadded, 43 characters. `Display` IS that wire form, which is what an operator
+/// compares against a certificate fingerprint, so it has to round-trip the parser exactly.
+#[cfg(feature = "mtls")]
+#[test]
+fn certificate_thumbprint_display_is_the_rfc_8705_wire_form() {
+    use oauth_as::CertificateThumbprint;
+
+    // 32 zero bytes: a value with an unambiguous base64url spelling, so the assertion is about the
+    // encoding rather than about a fixture.
+    let wire = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let thumbprint = CertificateThumbprint::from_base64url(wire).expect("43 chars is 32 bytes");
+    assert_eq!(thumbprint.to_string(), wire);
+    assert_eq!(thumbprint.to_string(), thumbprint.to_base64url());
+    assert_eq!(thumbprint.as_bytes(), &[0u8; 32]);
+
+    // A second, DIFFERENT value, so `as_bytes` cannot be a constant: a fixed return there would
+    // make every certificate compare equal to every other, which is the whole binding gone.
+    let ones = CertificateThumbprint::from_base64url("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE")
+        .expect("43 chars is 32 bytes");
+    assert_eq!(ones.as_bytes(), &[1u8; 32]);
+    assert_ne!(thumbprint.as_bytes(), ones.as_bytes());
+}
+
+/// RFC 8705 sections 2.1.1, 2.1.2 and 3.1: every one of these is a REGISTRATION-time refusal, which
+/// is the one place this crate can tell an operator they have configured mutual-TLS wrongly before
+/// a client ever presents a certificate. An empty message there is a silent misconfiguration.
+#[cfg(feature = "mtls")]
+#[test]
+fn mtls_registration_error_display_says_what_the_operator_got_wrong() {
+    use oauth_as::MtlsRegistrationError;
+
+    for (error, text) in [
+        (
+            MtlsRegistrationError::NoSubjectValue,
+            "tls_client_auth requires one of the RFC 8705 s2.1.1 subject parameters",
+        ),
+        (
+            MtlsRegistrationError::MoreThanOneSubjectValue,
+            "RFC 8705 s2.1.2 permits exactly one tls_client_auth subject parameter",
+        ),
+        (
+            MtlsRegistrationError::EmptySubjectValue,
+            "a tls_client_auth subject parameter was empty, which no certificate can match",
+        ),
+        (
+            MtlsRegistrationError::MalformedJwks,
+            "the JWK Set could not be parsed",
+        ),
+        (
+            MtlsRegistrationError::NoCertificateInJwks,
+            "the JWK Set carries no x5c certificate to match against",
+        ),
+        (
+            MtlsRegistrationError::MalformedCertificate,
+            "the certificate is not DER or PEM-wrapped DER",
+        ),
+        (
+            MtlsRegistrationError::MalformedThumbprint,
+            "an x5t#S256 value is base64url of exactly 32 bytes",
+        ),
+    ] {
+        assert_eq!(format!("{error}"), text);
+    }
+}
+
+/// RFC 9101 section 6.2: a request object is verified against a key the CLIENT registered, so the
+/// only person who can fix a bad key is the operator reading this message at registration time.
+#[cfg(feature = "jar")]
+#[test]
+fn request_object_key_error_display_names_the_key_that_will_not_load() {
+    use oauth_as::RegisteredRequestObjectKey;
+
+    let thirty_two = "A".repeat(43);
+    let err = RegisteredRequestObjectKey::es256_from_jwk_coordinates(None, "!not base64!", "AA")
+        .expect_err("a non-base64url x is not a key");
+    assert_eq!(
+        err.to_string(),
+        "request object key error: x is not base64url"
+    );
+
+    let err = RegisteredRequestObjectKey::es256_from_jwk_coordinates(None, &thirty_two, "!!")
+        .expect_err("a non-base64url y is not a key");
+    assert_eq!(
+        err.to_string(),
+        "request object key error: y is not base64url"
+    );
+
+    let err = RegisteredRequestObjectKey::es256_from_sec1(None, &[4u8; 10])
+        .expect_err("ten bytes is not a P-256 point");
+    assert_eq!(
+        err.to_string(),
+        "request object key error: an uncompressed P-256 point is exactly 65 bytes"
+    );
+}
+
+/// RFC 7518 section 6.2.1.2 fixes BOTH P-256 coordinates at 32 bytes. The check is one condition
+/// per coordinate joined by `or`, and joining them by `and` instead would accept a key with exactly
+/// one wrong coordinate: this pins each coordinate's length independently of the other's.
+#[cfg(feature = "jar")]
+#[test]
+fn each_p256_coordinate_is_length_checked_on_its_own() {
+    use oauth_as::RegisteredRequestObjectKey;
+
+    let full = "A".repeat(43); // 32 bytes
+    let short = "A".repeat(42); // 31 bytes
+
+    for (x, y) in [
+        (short.as_str(), full.as_str()),
+        (full.as_str(), short.as_str()),
+        (short.as_str(), short.as_str()),
+    ] {
+        let err = RegisteredRequestObjectKey::es256_from_jwk_coordinates(None, x, y)
+            .expect_err("a coordinate that is not 32 bytes is not a key");
+        assert_eq!(
+            err.to_string(),
+            "request object key error: a P-256 coordinate is exactly 32 bytes"
+        );
+    }
+}
+
+/// RFC 7591 section 3.2.2: these three codes are a registry of their own, separate from RFC 6749
+/// section 5.2, and `Display` is what a host logs and what the error body carries.
+#[test]
+fn registration_error_text_is_the_registered_code_and_the_description() {
+    use oauth_as::{RegistrationErrorCode, RegistrationErrorResponse, RegistrationFailure};
+
+    for (code, wire) in [
+        (
+            RegistrationErrorCode::InvalidRedirectUri,
+            "invalid_redirect_uri",
+        ),
+        (
+            RegistrationErrorCode::InvalidClientMetadata,
+            "invalid_client_metadata",
+        ),
+        (
+            RegistrationErrorCode::InvalidSoftwareStatement,
+            "invalid_software_statement",
+        ),
+    ] {
+        assert_eq!(format!("{code}"), wire);
+        assert_eq!(code.as_str(), wire);
+    }
+
+    let described = RegistrationErrorResponse::new(
+        RegistrationErrorCode::InvalidRedirectUri,
+        "a redirect URI must not carry a fragment",
+    );
+    assert_eq!(
+        described.to_string(),
+        "invalid_redirect_uri: a redirect URI must not carry a fragment"
+    );
+
+    let bare = RegistrationErrorResponse {
+        error: RegistrationErrorCode::InvalidClientMetadata,
+        error_description: None,
+    };
+    assert_eq!(bare.to_string(), "invalid_client_metadata");
+
+    // And the failure enum that wraps it, including the two that carry no body at all.
+    assert_eq!(
+        RegistrationFailure::Disabled.to_string(),
+        "dynamic client registration is disabled"
+    );
+    assert_eq!(
+        RegistrationFailure::Unauthorized.to_string(),
+        "not authorized to register"
+    );
+    assert_eq!(
+        RegistrationFailure::Invalid(described).to_string(),
+        "invalid_redirect_uri: a redirect URI must not carry a fragment"
+    );
+    assert_eq!(
+        RegistrationFailure::Storage(StorageError::new("the database is gone")).to_string(),
+        "storage error: the database is gone"
+    );
+}
+
+/// RFC 7591 section 3.2.1 hands back a `client_secret` and RFC 7592 section 3 a
+/// `registration_access_token`. Both are bearer credentials, and this struct is what a host holds
+/// at exactly the moment it is most likely to debug-print one. The hand-written `Debug` keeps the
+/// SHAPE (a secret was issued) and drops the VALUE; an empty one would drop both.
+#[test]
+fn client_information_debug_redacts_both_credentials_and_keeps_the_shape() {
+    use oauth_as::{ClientInformation, ClientMetadata};
+
+    let issued = ClientInformation {
+        client_id: "c-1".to_string(),
+        client_secret: Some("secret-value-do-not-log".to_string()),
+        client_id_issued_at: Some(1_700_000_000),
+        client_secret_expires_at: Some(0),
+        registration_access_token: Some("rat-value-do-not-log".to_string()),
+        registration_client_uri: Some("https://as.example/register/c-1".to_string()),
+        metadata: ClientMetadata::default(),
+    };
+    let printed = format!("{issued:?}");
+    assert!(!printed.contains("secret-value-do-not-log"), "{printed}");
+    assert!(!printed.contains("rat-value-do-not-log"), "{printed}");
+    assert!(
+        printed.contains("client_secret: Some(\"[redacted]\")"),
+        "the Some/None distinction is registration shape, not a secret: {printed}"
+    );
+    assert!(
+        printed.contains("registration_access_token: Some(\"[redacted]\")"),
+        "{printed}"
+    );
+    assert!(printed.contains("client_id: \"c-1\""), "{printed}");
+    assert!(
+        printed.contains("client_id_issued_at: Some(1700000000)"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("registration_client_uri: Some(\"https://as.example/register/c-1\")"),
+        "the management URI is not a credential and stays readable: {printed}"
+    );
+
+    // A PUBLIC registration holds neither credential, and the redaction must say so rather than
+    // claiming a secret that does not exist.
+    let public = ClientInformation {
+        client_secret: None,
+        registration_access_token: None,
+        ..issued
+    };
+    let printed = format!("{public:?}");
+    assert!(printed.contains("client_secret: None"), "{printed}");
+    assert!(
+        printed.contains("registration_access_token: None"),
+        "{printed}"
+    );
+    assert!(!printed.contains("[redacted]"), "{printed}");
+}
+
+/// RFC 8693 section 3 registers the `*_token_type` identifiers. A value outside the registry is
+/// rejected, and the message has to name the value the deployment actually sent or the operator is
+/// debugging a typo they cannot see.
+#[cfg(feature = "token-exchange")]
+#[test]
+fn unknown_token_type_identifier_display_quotes_the_rejected_value() {
+    use oauth_as::TokenTypeIdentifier;
+
+    let err = "urn:example:not-registered"
+        .parse::<TokenTypeIdentifier>()
+        .expect_err("an unregistered identifier is not accepted");
+    assert_eq!(
+        err.to_string(),
+        "unknown token type identifier \"urn:example:not-registered\""
+    );
+}
+
+/// The JWS verification errors never name which check failed in a way a client could use to probe a
+/// key, but they do have to say SOMETHING: this is the host's only account of why a key it
+/// configured was refused.
+#[cfg(feature = "jwt")]
+#[test]
+fn jwk_verify_error_display_is_prefixed_and_carries_the_reason() {
+    use oauth_as::jwt::PublicJwk;
+
+    let err =
+        PublicJwk::from_json(&serde_json::Value::from(1u8)).expect_err("a number is not a JWK");
+    assert_eq!(
+        err.to_string(),
+        "JWS verification error: a JWK must be a JSON object"
+    );
+}

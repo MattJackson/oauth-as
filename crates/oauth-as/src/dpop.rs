@@ -213,9 +213,17 @@ pub(crate) fn verify_proof(
     // (10) `iat` within an acceptable window, in both directions. A proof from the future would
     // otherwise extend its own life past the window by however far ahead the client dares to
     // claim, which is the one bound this check exists to impose.
+    //
+    // The age bound is EXCLUSIVE, and the one character is load bearing. `replay_until` below is
+    // `iat + MAX_PROOF_AGE`, and `Storage::sweep_expired` drops a claimed `jti` when `now < exp`
+    // fails, so at `now == iat + MAX_PROOF_AGE` the `jti` is already forgotten. An inclusive check
+    // here would still ACCEPT the proof at that instant, against an empty replay cache: exactly
+    // one free replay of a captured proof, which is the whole thing the `jti` exists to refuse.
+    // The two predicates have to agree at the boundary, and the sweep's is the exclusive one.
+    // `client_assertion` has never had this gap because its acceptance was exclusive already.
     let iat = jws.claim_time("iat").ok_or(DpopFailure::StaleProof)?;
     let issued_at = UNIX_EPOCH + Duration::from_secs(iat);
-    if issued_at > now + CLOCK_SKEW_LEEWAY || issued_at + MAX_PROOF_AGE < now {
+    if issued_at > now + CLOCK_SKEW_LEEWAY || issued_at + MAX_PROOF_AGE <= now {
         return Err(DpopFailure::StaleProof);
     }
 

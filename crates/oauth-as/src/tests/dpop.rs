@@ -314,6 +314,60 @@ fn the_replay_deadline_is_exactly_the_window_this_proof_stays_acceptable_in() {
     }
 }
 
+#[test]
+fn a_proof_is_refused_at_the_exact_instant_its_jti_stops_being_remembered() {
+    // THE ATTACK, and it is one instant wide. `Storage::sweep_expired` drops a claimed `jti` when
+    // `now < expires_at` fails, so at `now == replay_until` the `jti` is FORGOTTEN. If the `iat`
+    // check is inclusive at that same instant, the proof is still ACCEPTED, and a captured proof
+    // whose original was spent five minutes ago verifies again against an empty cache: one free
+    // replay, reachable by anything that can see a header and wait.
+    //
+    // The two predicates must therefore agree at every instant, and the boundary is where they can
+    // disagree. The sweep's is exclusive (`now < exp`), so acceptance is exclusive too.
+    // `client_assertion` has never had this gap because its acceptance was exclusive already.
+    let key = EcdsaP256Key::generate("k");
+    let mut c = claims();
+    let iat = secs(now()) - MAX_PROOF_AGE.as_secs();
+    c["iat"] = json!(iat);
+    let proof = proof_with(&key, &header(&key), &c);
+    assert_eq!(
+        verify(&proof),
+        Err(DpopFailure::StaleProof),
+        "a proof is still acceptable at the instant its jti has already been swept"
+    );
+}
+
+#[test]
+fn no_proof_outlives_the_deadline_it_asked_to_be_remembered_until() {
+    // The invariant `VerifiedProof::replay_until` states, checked as a property rather than at one
+    // hand-picked age: for EVERY proof this verifier accepts, verifying the same proof again at its
+    // own `replay_until` must fail. Anything else is a window in which the cache has forgotten a
+    // proof the clock still takes.
+    let key = EcdsaP256Key::generate("k");
+    for age in [0u64, 1, 60, 299] {
+        let mut c = claims();
+        c["iat"] = json!(secs(now()) - age);
+        let proof = proof_with(&key, &header(&key), &c);
+        let verified = verify(&proof).unwrap();
+        assert_eq!(
+            verify_proof(&proof, HTM, HTU, verified.replay_until),
+            Err(DpopFailure::StaleProof),
+            "a proof issued {age}s ago is still accepted at its own replay_until"
+        );
+        // And it is accepted right up to there, so the window is closed rather than shortened.
+        assert!(
+            verify_proof(
+                &proof,
+                HTM,
+                HTU,
+                verified.replay_until - Duration::from_secs(1)
+            )
+            .is_ok(),
+            "a proof issued {age}s ago was refused before its window ran out"
+        );
+    }
+}
+
 // ------------------------------------------------------------------------------- the thumbprint
 
 #[test]
