@@ -325,7 +325,7 @@ pub struct TokenExchangeRequest<'a> {
     /// `private_key_jwt` or `client_secret_jwt`.
     ///
     /// This field and the one below exist because RFC 8693 section 2.1 authenticates the client
-    /// "as described in Section 2.3 of [RFC6749]", which is a reference to every method the server
+    /// "as described in Section 2.3 of \[RFC6749\]", which is a reference to every method the server
     /// offers and not to shared secrets alone. Carrying only `client_secret` meant a confidential
     /// client registered for assertion authentication was answered `invalid_client` on a grant the
     /// RFC 8414 document advertises to it: the credential it presented had nowhere to travel.
