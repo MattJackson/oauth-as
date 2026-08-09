@@ -805,3 +805,47 @@ async fn two_distinct_granted_elements_can_both_be_narrowed() {
         .await
         .expect("narrowing each of two distinct granted elements must still be allowed");
 }
+
+/// RFC 9396 s7: "the AS MUST also return the `authorization_details` as granted by the resource
+/// owner and assigned to the respective access token". The crate honoured s9.1 (the JWT claim) and
+/// s9.2 (introspection) but not the token response body itself.
+///
+/// It matters for the same reason RFC 6749 s3.3 has `scope` echoed when it differs from the
+/// request: s7.1 explicitly permits granted to differ from requested, so without this a client
+/// that asked for two details and was granted one has no way to find out, and goes on to call a
+/// resource server believing it can do something it cannot.
+#[tokio::test]
+async fn the_token_response_carries_the_granted_authorization_details() {
+    let srv = rar_server(ManualClock::at_epoch()).await;
+    let c = challenge();
+    let code = code_for(&srv, &c, Some(GRANTED)).await;
+
+    let issued = srv.token(redeem(&code)).await.expect("redeemed");
+
+    let body = serde_json::to_value(&issued).unwrap();
+    let details = body
+        .get("authorization_details")
+        .expect("RFC 9396 s7 makes this a MUST on a response to a request that carried details");
+    assert_eq!(
+        details,
+        &serde_json::from_str::<serde_json::Value>(GRANTED).unwrap(),
+        "the response must carry what was GRANTED, byte for byte"
+    );
+}
+
+/// The other half: a grant that carried no authorization details must emit exactly the body it
+/// emitted before this member existed. A `null`, or an empty array, would be a wire change for
+/// every deployment that does not use the feature.
+#[tokio::test]
+async fn a_grant_with_no_details_omits_the_member_entirely() {
+    let srv = rar_server(ManualClock::at_epoch()).await;
+    let c = challenge();
+    let code = code_for(&srv, &c, None).await;
+
+    let issued = srv.token(redeem(&code)).await.expect("redeemed");
+    let body = serde_json::to_value(&issued).unwrap();
+    assert!(
+        body.get("authorization_details").is_none(),
+        "an unused member must be omitted, not null and not [], got {body}"
+    );
+}

@@ -50,6 +50,20 @@ pub struct TokenResponse {
     /// satisfies the section 3.3 requirement to report a scope differing from the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The RFC 9396 authorization details as GRANTED, which section 7 makes a MUST for a response
+    /// to a request that carried them.
+    ///
+    /// It is a MUST for the same reason RFC 6749 section 3.3 has `scope` echoed when it differs
+    /// from the request: section 7.1 explicitly permits what was granted to differ from what was
+    /// asked for, because the host's consent screen may narrow or enrich it. Without this member a
+    /// client has no way to learn that what it holds is not what it requested, and would go on to
+    /// call a resource server believing it can do something it cannot.
+    ///
+    /// Omitted entirely when empty, so a deployment that never uses authorization details emits
+    /// exactly the body it emitted before this existed.
+    #[cfg(feature = "rar")]
+    #[serde(skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty")]
+    pub authorization_details: crate::rar::AuthorizationDetails,
 }
 
 /// Hand-written so neither `access_token` nor `refresh_token` ever prints. `refresh_token` keeps

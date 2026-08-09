@@ -95,6 +95,8 @@ fn c13_token_response_debug_redacts_both_tokens_and_keeps_option_shape_visible()
         expires_in: 3600,
         refresh_token: Some("rt-secret-value".into()),
         scope: Some("read write".into()),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
     };
     let printed = format!("{with_refresh:?}");
     assert!(
@@ -136,6 +138,8 @@ fn success_response_shape_is_rfc6749_5_1() {
         expires_in: 3600,
         refresh_token: Some("rt".into()),
         scope: Some("read write".into()),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
     };
     assert_eq!(
         serde_json::to_value(&full).unwrap(),
@@ -153,6 +157,8 @@ fn success_response_shape_is_rfc6749_5_1() {
         expires_in: 60,
         refresh_token: None,
         scope: None,
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
     };
     assert_eq!(
         serde_json::to_value(&minimal).unwrap(),

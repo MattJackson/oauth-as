@@ -3045,7 +3045,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // The chain remembers what it may narrow from on the next rotation.
                     resource,
                     #[cfg(feature = "rar")]
-                    authorization_details: details.into_details(),
+                    authorization_details: details.clone().into_details(),
                     expires_at,
                     // Present whenever a refresh token is: `issues_refresh` is what decided both.
                     family_id: family_id.unwrap_or_default(),
@@ -3088,6 +3088,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             expires_in: self.config.access_token_ttl.as_secs(),
             refresh_token,
             scope: (!scope.is_empty()).then(|| scope.to_string()),
+            // RFC 9396 s7: what was GRANTED, from the same value that reaches the stored record
+            // and the signed token, so the three cannot disagree about what this token authorizes.
+            #[cfg(feature = "rar")]
+            authorization_details: details.into_details(),
         })
     }
 
