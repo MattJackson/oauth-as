@@ -319,9 +319,25 @@ impl RequestObjectAlg {
 }
 
 /// A public key was not usable as a request object verification key. Carries no key material.
+///
+/// The payload is sealed and read through [`RequestObjectKeyError::detail`], matching
+/// [`crate::token_exchange::UnknownTokenTypeIdentifier`]: both are one-payload rejections, both
+/// are readable, and neither can be forged by a caller.
 #[cfg(feature = "jar")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestObjectKeyError(String);
+
+#[cfg(feature = "jar")]
+impl RequestObjectKeyError {
+    /// Why the key was refused, as a sentence.
+    ///
+    /// A `&'static`-shaped description of the CONDITION, never any part of the key: the variants
+    /// this type is built from name a decoding or a width failure, and the type's own docs commit
+    /// to carrying no key material.
+    pub fn detail(&self) -> &str {
+        &self.0
+    }
+}
 
 #[cfg(feature = "jar")]
 impl std::fmt::Display for RequestObjectKeyError {

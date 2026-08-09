@@ -7,6 +7,7 @@
 
 pub mod alloc;
 
+use oauth_as::server::UserApproval;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -203,7 +204,7 @@ pub async fn mint_code_token<S: Storage>(
         .await
         .expect("fixture authorization request must validate");
     let response = srv
-        .issue_authorization_code(&validated, subject)
+        .issue_authorization_code(UserApproval::granted(&validated, subject))
         .await
         .expect("fixture code issuance must succeed");
     srv.token(TokenRequest::AuthorizationCode {
@@ -249,7 +250,7 @@ pub async fn mint_code_token_keeping_code<S: Storage>(
         .await
         .expect("fixture authorization request must validate");
     let response = srv
-        .issue_authorization_code(&validated, subject)
+        .issue_authorization_code(UserApproval::granted(&validated, subject))
         .await
         .expect("fixture code issuance must succeed");
     let issued = srv

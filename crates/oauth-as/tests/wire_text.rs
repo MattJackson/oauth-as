@@ -486,10 +486,11 @@ fn client_assertion_failure_display_names_the_check_that_refused() {
 #[cfg(feature = "client_assertion")]
 #[test]
 fn assertion_keys_report_the_registered_auth_method_and_never_print_the_secret() {
+    use oauth_as::client_assertion::ClientSecretKey;
     use oauth_as::AssertionKeys;
 
     let symmetric = AssertionKeys::ClientSecret {
-        secret: "s3cr3t-not-for-logs".to_string(),
+        secret: ClientSecretKey::new("s3cr3t-not-for-logs-and-long-enough").unwrap(),
     };
     let asymmetric = AssertionKeys::PublicKeys { keys: Vec::new() };
 

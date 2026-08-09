@@ -11,6 +11,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::time::Duration;
 
 use oauth_as::{
@@ -72,7 +73,7 @@ async fn valid_request_issues_a_code_that_redeems_once() {
     assert_eq!(validated.code_challenge_method, CodeChallengeMethod::S256);
 
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .expect("issuing a code for a validated request");
     assert_eq!(
@@ -111,7 +112,7 @@ async fn success_redirect_url_encodes_parameters() {
 
     let validated = srv.validate_authorization_request(&req).await.unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
     let location = response.location(PUBLIC_REDIRECT);
@@ -138,7 +139,7 @@ async fn redirect_url_appends_to_an_existing_query() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -387,7 +388,7 @@ async fn wrong_verifier_is_invalid_grant() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -410,7 +411,7 @@ async fn missing_verifier_is_invalid_grant() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -439,7 +440,7 @@ async fn mismatched_redirect_uri_at_redemption_is_invalid_grant() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -471,7 +472,7 @@ async fn cross_client_redemption_is_invalid_grant() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -498,7 +499,7 @@ async fn expired_code_is_invalid_grant() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -534,7 +535,7 @@ async fn replayed_code_is_refused_and_revokes_what_it_minted() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -587,7 +588,7 @@ async fn a_third_presentation_is_still_refused() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 
@@ -616,7 +617,7 @@ async fn codes_are_unpredictable() {
             .await
             .unwrap();
         let r = srv
-            .issue_authorization_code(&validated, "user-1")
+            .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
             .await
             .unwrap();
         assert!(

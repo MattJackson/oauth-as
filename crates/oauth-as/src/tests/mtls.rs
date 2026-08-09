@@ -281,7 +281,7 @@ fn matching_is_case_sensitive() {
 #[test]
 fn a_self_signed_certificate_nobody_registered_does_not_authenticate() {
     let client = mtls_client(MtlsClientRegistration::SelfSignedTlsClientAuth(
-        RegisteredCertificates::from_der_certificates([CERT_A]),
+        RegisteredCertificates::from_der_certificates([CERT_A]).unwrap(),
     ));
     let forged = ClientCertificate::from_der(CERT_B);
     assert_eq!(
@@ -302,7 +302,7 @@ fn a_self_signed_certificate_nobody_registered_does_not_authenticate() {
 #[test]
 fn every_registered_self_signed_certificate_authenticates() {
     let client = mtls_client(MtlsClientRegistration::SelfSignedTlsClientAuth(
-        RegisteredCertificates::from_der_certificates([CERT_A, CERT_B]),
+        RegisteredCertificates::from_der_certificates([CERT_A, CERT_B]).unwrap(),
     ));
     for der in [CERT_A, CERT_B] {
         assert_eq!(
@@ -498,7 +498,7 @@ fn the_registered_method_names_are_the_rfc_8705_spellings() {
     );
     assert_eq!(
         MtlsClientRegistration::SelfSignedTlsClientAuth(
-            RegisteredCertificates::from_der_certificates([CERT_A])
+            RegisteredCertificates::from_der_certificates([CERT_A]).unwrap()
         )
         .method_name(),
         "self_signed_tls_client_auth"

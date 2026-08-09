@@ -41,6 +41,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -508,7 +509,7 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
         };
         let validated = srv.validate_authorization_request(&req).await.unwrap();
         let response = srv
-            .issue_authorization_code(&validated, "user-1")
+            .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
             .await
             .unwrap();
         (srv, response.code)
@@ -575,7 +576,7 @@ fn refresh_rotation_hot_path_allocation_bound() {
         };
         let validated = srv.validate_authorization_request(&req).await.unwrap();
         let response = srv
-            .issue_authorization_code(&validated, "user-1")
+            .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
             .await
             .unwrap();
         let token = srv

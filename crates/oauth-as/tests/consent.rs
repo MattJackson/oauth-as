@@ -27,6 +27,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -204,7 +205,7 @@ async fn withdrawal_kills_an_authorization_code_that_has_not_been_redeemed_yet()
     ]);
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
     let consent = srv

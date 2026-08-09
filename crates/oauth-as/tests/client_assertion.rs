@@ -13,7 +13,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use oauth_as::client_assertion::{AssertionKeys, CLIENT_ASSERTION_TYPE};
+use oauth_as::client_assertion::{AssertionKeys, ClientSecretKey, CLIENT_ASSERTION_TYPE};
 use oauth_as::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};
 use oauth_as::{
     AuthorizationServer, AuthorizationServerMetadata, Client, ClientAuth, ClientCredential,
@@ -129,7 +129,7 @@ async fn a_client_secret_jwt_client_gets_a_token_without_transmitting_its_secret
         "csjwt",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::ClientSecret {
-                secret: SECRET.to_string(),
+                secret: ClientSecretKey::new(SECRET).expect("fixture secret clears the floor"),
             },
         },
     ))
@@ -305,7 +305,7 @@ async fn a_client_registered_for_an_assertion_cannot_authenticate_with_a_secret(
         "keys-only",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::ClientSecret {
-                secret: SECRET.to_string(),
+                secret: ClientSecretKey::new(SECRET).expect("fixture secret clears the floor"),
             },
         },
     ))
@@ -426,7 +426,7 @@ async fn an_assertion_from_one_client_cannot_authenticate_another() {
             id,
             ClientAuth::ConfidentialAssertion {
                 keys: AssertionKeys::ClientSecret {
-                    secret: SECRET.to_string(),
+                    secret: ClientSecretKey::new(SECRET).expect("fixture secret clears the floor"),
                 },
             },
         ))

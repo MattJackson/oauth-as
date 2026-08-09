@@ -14,6 +14,7 @@
 //! suite that checks only introspection cannot see a `cnf` that never reached the JWT at all.
 #![cfg(feature = "dpop")]
 
+use oauth_as::server::UserApproval;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -368,7 +369,7 @@ async fn mint_refresh_token(
     };
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let code = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap()
         .code;
@@ -615,7 +616,7 @@ async fn a_signed_access_token_carries_both_bindings_when_the_client_holds_both(
         client_id: ClientId::new("app"),
         auth: ClientAuth::Mtls {
             registration: MtlsClientRegistration::SelfSignedTlsClientAuth(
-                RegisteredCertificates::from_der_certificates([DER]),
+                RegisteredCertificates::from_der_certificates([DER]).unwrap(),
             ),
         },
         grant_types: vec![GrantType::ClientCredentials],

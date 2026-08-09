@@ -138,8 +138,24 @@ impl fmt::Display for TokenTypeIdentifier {
 }
 
 /// The rejection for a `*_token_type` value that is not one RFC 8693 section 3 registers.
+///
+/// The payload is SEALED and read through [`UnknownTokenTypeIdentifier::identifier`], matching
+/// [`crate::par::RequestObjectKeyError`], which is the crate's other one-payload rejection type.
+/// The two disagreed: this one published its `String` as a tuple field, so a host could also
+/// CONSTRUCT one and hand it to code that reasonably assumed only this crate mints them. Readable
+/// and not forgeable is the rule both follow now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownTokenTypeIdentifier(pub String);
+pub struct UnknownTokenTypeIdentifier(String);
+
+impl UnknownTokenTypeIdentifier {
+    /// The unregistered identifier, exactly as it arrived.
+    ///
+    /// Echoing it back is safe and useful: it is a `*_token_type` URN out of the request, not a
+    /// token, and a host debugging an interoperability failure needs to see what the peer sent.
+    pub fn identifier(&self) -> &str {
+        &self.0
+    }
+}
 
 impl fmt::Display for UnknownTokenTypeIdentifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -250,14 +266,28 @@ pub struct TokenExchangeRequest<'a> {
 }
 
 impl<'a> TokenExchangeRequest<'a> {
-    /// The minimum request RFC 8693 section 2.1 admits: a client, and the subject token it is
-    /// exchanging. Everything else is optional and set on the returned value.
-    pub fn new(client_id: &'a ClientId, subject_token: &'a str) -> Self {
+    /// The minimum request RFC 8693 section 2.1 admits: a client, the subject token it is
+    /// exchanging, and WHAT THE CALLER SAYS THAT TOKEN IS. Everything else is optional and set on
+    /// the returned value.
+    ///
+    /// `subject_token_type` is an argument rather than a default because it is the parameter the
+    /// exchange refuses on (see [`TokenExchange::exchange_token`]): a caller that presents a refresh
+    /// token and labels it an access token is asking this server to check the string a different
+    /// way than it is going to, and refusing the mismatch is what stops the type parameter being
+    /// decorative. Section 2.1 makes it REQUIRED. Defaulting it here meant a host that assembled
+    /// the request in code, and forgot to copy the form field across, silently converted that
+    /// refusal into a pass, because the value the constructor invented is precisely the one value
+    /// that passes.
+    pub fn new(
+        client_id: &'a ClientId,
+        subject_token: &'a str,
+        subject_token_type: TokenTypeIdentifier,
+    ) -> Self {
         TokenExchangeRequest {
             client_id,
             client_secret: None,
             subject_token,
-            subject_token_type: TokenTypeIdentifier::AccessToken,
+            subject_token_type,
             actor_token: None,
             actor_token_type: None,
             resource: &[],

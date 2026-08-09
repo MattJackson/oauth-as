@@ -45,6 +45,91 @@ pub const CLIENT_SECRET_JWT: &str = "client_secret_jwt";
 /// The RFC 8414 `token_endpoint_auth_methods_supported` value for a public-key-signed assertion.
 pub const PRIVATE_KEY_JWT: &str = "private_key_jwt";
 
+/// The shortest `client_secret_jwt` key this crate will register: 22 characters.
+///
+/// NOT tuning, and the same reasoning as [`crate::server::MIN_USER_CODE_LENGTH`]: a parameter this
+/// weak is not a slower version of the feature, it is the feature not working. RFC 6749 section
+/// 10.10 requires a credential of this kind to carry at least 128 bits of entropy, and base64url,
+/// which is what a generated secret is nearly always spelled in, carries 6 bits per character, so
+/// 128 bits is `ceil(128 / 6)` = 22 characters.
+///
+/// The reason it matters MORE here than for `client_secret_basic` is that a `client_secret_jwt`
+/// assertion is an HMAC over public inputs: an attacker who observes ONE assertion (from a log, a
+/// proxy, a captured request) can grind candidate keys against it offline, at whatever rate their
+/// hardware allows, without ever touching this server again. There is no rate limit that reaches
+/// that, so the key length is the entire defence.
+///
+/// This is a LENGTH check and length only bounds entropy from above: 22 copies of the letter `a`
+/// clears it and carries none. A library cannot measure the entropy of a string it did not
+/// generate, and refusing the obviously-too-short case is the part that can be checked. Clamping,
+/// the answer [`crate::server::ServerConfig::user_code_length`] gives, is not available here: this
+/// crate cannot lengthen a secret the client already holds.
+pub const MIN_CLIENT_SECRET_JWT_KEY_LENGTH: usize = 22;
+
+/// A registered `client_secret_jwt` HMAC key that has cleared
+/// [`MIN_CLIENT_SECRET_JWT_KEY_LENGTH`].
+///
+/// A newtype with a private field rather than a bare `String` on the variant, because a private
+/// field is the only spelling Rust has for "this cannot be reached by a struct literal", and a
+/// floor a caller can skip by writing `AssertionKeys::ClientSecret { secret: "abc".into() }` is not
+/// a floor. Deserialization is routed through the same check for the same reason
+/// [`crate::jwt::PublicJwk`]'s is: a registration read back out of the host's store must be held to
+/// what the constructor holds a fresh one to, or the store becomes the way around it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ClientSecretKey(String);
+
+impl ClientSecretKey {
+    /// Register a secret, refusing one below the floor.
+    pub fn new(secret: impl Into<String>) -> Result<Self, WeakClientSecret> {
+        let secret = secret.into();
+        // Characters, not bytes: the floor is an argument about how many symbols of a generated
+        // alphabet the secret carries, and a multi-byte character contributes one of those.
+        if secret.chars().count() < MIN_CLIENT_SECRET_JWT_KEY_LENGTH {
+            return Err(WeakClientSecret);
+        }
+        Ok(ClientSecretKey(secret))
+    }
+
+    /// The key material, for the HMAC.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// Hand-written, for the reason [`AssertionKeys`]'s own is: this type exists to sit inside a
+/// registration that gets logged, and a derived one would print the key.
+impl fmt::Debug for ClientSecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"[redacted]\"")
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientSecretKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        ClientSecretKey::new(String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A `client_secret_jwt` key that does not clear [`MIN_CLIENT_SECRET_JWT_KEY_LENGTH`].
+///
+/// Carries NO payload: the whole of it is "too short", and a rejection that echoed the offending
+/// secret would write the credential into whatever log caught the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WeakClientSecret;
+
+impl fmt::Display for WeakClientSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a client_secret_jwt key must be at least {MIN_CLIENT_SECRET_JWT_KEY_LENGTH} \
+             characters (RFC 6749 s10.10, 128 bits at 6 bits per base64url character)"
+        )
+    }
+}
+
+impl std::error::Error for WeakClientSecret {}
+
 /// The `token_endpoint_auth_signing_alg_values_supported` this server advertises (RFC 8414
 /// section 2), which is exactly what [`AssertionKeys::signing_alg`] can return.
 pub const ASSERTION_SIGNING_ALGS: &[&str] = &["HS256", "ES256"];
@@ -85,7 +170,10 @@ pub enum AssertionKeys {
         /// The shared secret. Held in the clear because HMAC verification needs the key itself; a
         /// one-way [`crate::client::SecretHash`] cannot be used here, and pretending otherwise
         /// would be the kind of storage that looks safe and is not.
-        secret: String,
+        ///
+        /// A [`ClientSecretKey`] rather than a `String` so that the entropy floor cannot be walked
+        /// past by writing the variant out by hand.
+        secret: ClientSecretKey,
     },
     /// `private_key_jwt` (RFC 7523 section 2.2 with a digital signature): ECDSA P-256 under a key
     /// only the client holds. This is the variant to reach for.
@@ -252,6 +340,8 @@ pub fn verify_assertion(
 
     // (2) The signature, over the bytes that arrived.
     let signed = match keys {
+        // The entropy floor is enforced at registration and again on the way out of the host's
+        // store, so nothing here has to re-check it; see `ClientSecretKey`.
         AssertionKeys::ClientSecret { secret } => verify_hs256(
             secret.as_bytes(),
             jws.signing_input.as_bytes(),

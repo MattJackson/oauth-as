@@ -76,7 +76,11 @@ fn the_grant_type_urn_is_the_registered_one() {
 #[test]
 fn the_request_debug_prints_no_credential() {
     let client_id = ClientId::new("some-client");
-    let mut request = TokenExchangeRequest::new(&client_id, "SUBJECT-TOKEN-SECRET");
+    let mut request = TokenExchangeRequest::new(
+        &client_id,
+        "SUBJECT-TOKEN-SECRET",
+        TokenTypeIdentifier::AccessToken,
+    );
     request.client_secret = Some("CLIENT-SECRET-VALUE");
     request.actor_token = Some("ACTOR-TOKEN-SECRET");
     request.actor_token_type = Some(TokenTypeIdentifier::AccessToken);

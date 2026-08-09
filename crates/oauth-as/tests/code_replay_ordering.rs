@@ -17,6 +17,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use oauth_as::{ClientId, ErrorCode, Storage, TokenRequest};
 use support::{
     confidential_client, mint_code_token_keeping_code, public_client, server_with, ManualClock,
@@ -163,7 +164,7 @@ async fn a_wrong_client_presentation_leaves_an_unredeemed_code_usable() {
     };
     let validated = srv.validate_authorization_request(&req).await.unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 

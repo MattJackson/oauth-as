@@ -97,7 +97,13 @@ pub struct Authentication {
 }
 
 impl Authentication {
-    /// A report with no `acr`.
+    /// A report with no `acr`, for an authentication that happened at `auth_time`.
+    ///
+    /// `auth_time` is WHEN THE USER ACTUALLY LOGGED IN, not when this request arrived, and this
+    /// constructor is the place that distinction is lost or kept. Passing `SystemTime::now()` here
+    /// on every request makes every login look seconds old, which satisfies every `max_age` a
+    /// client can ask for and turns RFC 9470 step-up into decoration for that deployment. Nothing
+    /// downstream can detect it: see the module docs on which half of this boundary is the host's.
     pub fn at(auth_time: SystemTime) -> Self {
         Authentication {
             auth_time,
@@ -436,6 +442,12 @@ impl std::fmt::Display for StepUpFailure {
         })
     }
 }
+
+/// The other error-shaped types in this crate ([`crate::dpop::DpopFailure`],
+/// [`crate::client_assertion::AssertionFailure`], [`crate::mtls::MtlsRegistrationError`]) are all
+/// `std::error::Error`, and a host that puts one of them behind `?` or in a `Box<dyn Error>` has to
+/// be able to do the same with this one. `Display` above is the whole implementation.
+impl std::error::Error for StepUpFailure {}
 
 impl From<StepUpFailure> for ErrorResponse {
     fn from(failure: StepUpFailure) -> ErrorResponse {

@@ -82,10 +82,9 @@ async fn happy_path_pending_then_approved_then_single_use() {
     assert_eq!(auth.expires_in, 600);
     assert_eq!(auth.interval, 5);
     assert_eq!(auth.verification_uri, "https://as.example/device");
-    assert_eq!(
-        auth.verification_uri_complete.as_deref(),
-        Some(format!("https://as.example/device?user_code={}", auth.user_code).as_str())
-    );
+    // `verification_uri_complete` is OFF by default (RFC 8628 s5.4 remote phishing), so the
+    // default-config response omits it. `tests/device_flow_edges.rs` covers both settings.
+    assert_eq!(auth.verification_uri_complete, None);
     // User code shape: XXXX-XXXX over the section 6.1 example alphabet (20 consonants).
     let (a, b) = auth
         .user_code

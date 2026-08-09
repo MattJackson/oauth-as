@@ -15,6 +15,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::sync::Mutex;
 
 use oauth_as::{
@@ -375,7 +376,7 @@ async fn deleting_a_registration_invalidates_everything_it_was_issued() {
     };
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let issued = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
     let tokens = srv
@@ -393,7 +394,7 @@ async fn deleting_a_registration_invalidates_everything_it_was_issued() {
 
     // A second, still-outstanding authorization code, so the delete has one to reap.
     let outstanding = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap()
         .code;

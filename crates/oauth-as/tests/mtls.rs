@@ -15,6 +15,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::sync::{Arc, Mutex};
 
 use oauth_as::{
@@ -60,7 +61,7 @@ async fn issue_code<S: oauth_as::Storage>(
         max_age: None,
     };
     let validated = srv.validate_authorization_request(&request).await.unwrap();
-    srv.issue_authorization_code(&validated, "user-1")
+    srv.issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap()
         .code
@@ -97,7 +98,7 @@ fn self_signed_client() -> Client {
         client_id: ClientId::new("selfie"),
         auth: ClientAuth::Mtls {
             registration: MtlsClientRegistration::SelfSignedTlsClientAuth(
-                RegisteredCertificates::from_der_certificates([CLIENT_DER]),
+                RegisteredCertificates::from_der_certificates([CLIENT_DER]).unwrap(),
             ),
         },
         grant_types: vec![GrantType::ClientCredentials],

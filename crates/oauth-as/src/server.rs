@@ -172,7 +172,23 @@ pub struct ServerConfig {
     /// the default is 60 seconds, which is ample for a redirect round trip.
     pub authorization_code_ttl: Duration,
     /// Whether device authorization responses include `verification_uri_complete`
-    /// (`{verification_uri}?user_code={code}`).
+    /// (`{verification_uri}?user_code={code}`). `false` by default.
+    ///
+    /// RFC 8628 section 5.4 (Remote Phishing) is why this is a decision and not a convenience
+    /// setting. The attack is that an attacker starts a device grant for their OWN client and mails
+    /// the victim the link ("click here to finish setting up your TV"); the victim, already signed
+    /// in, lands on a page that needs one click, and the attacker collects the tokens. Section 5.4
+    /// names TYPING THE CODE as the friction that makes this hard, and this member is precisely the
+    /// removal of that friction: the code arrives pre-filled from a URL the user did not compose.
+    ///
+    /// OFF by default from 0.10.0, having been on. Section 3.3.1 makes the member OPTIONAL, so
+    /// omitting it is conformant and costs a deployment only the QR-code convenience, while
+    /// including it by default made every host that never read this paragraph pay for a capability
+    /// it did not ask for. That is the same posture the rest of this config takes:
+    /// [`ServerConfig::registration`] and the PAR and JAR blocks are all off until a host says
+    /// otherwise. A host that turns this ON should pair it with a verification page that names the
+    /// client and the scope and requires an affirmative action, which is what section 3.3 asks for
+    /// and what the `http` feature's page does.
     pub include_verification_uri_complete: bool,
     /// Device code and user code lifetime. Default 600 seconds.
     pub device_code_ttl: Duration,
@@ -185,8 +201,25 @@ pub struct ServerConfig {
     pub access_token_ttl: Duration,
     /// Whether user-approved grants also issue a refresh token. Default true.
     pub issue_refresh_tokens: bool,
-    /// Absolute refresh chain lifetime; `None` (the default) means no time expiry. Rotation
-    /// preserves the chain's original expiry rather than sliding it.
+    /// Absolute refresh chain lifetime. Rotation preserves the chain's original expiry rather than
+    /// sliding it, so this is a ceiling on the whole chain and not on one token.
+    ///
+    /// `None` (the default) means NO TIME EXPIRY AT ALL: a refresh chain established once lives
+    /// until something revokes it. `None` is the default because it is the pre-existing behaviour
+    /// and turning expiry on by default would sign every deployment's users out on an interval
+    /// nobody chose, so, exactly as with [`ServerConfig::allowed_resources`], `None` is a real risk
+    /// rather than a neutral one and the risk belongs here rather than in a changelog.
+    ///
+    /// What it costs: a refresh token exfiltrated once is a credential for the user's account
+    /// FOREVER, and rotation does not fix that. RFC 9700 section 4.14.2 reuse detection catches the
+    /// thief only if the legitimate client comes back and presents the token the thief already
+    /// spent; a thief who steals a chain the user has abandoned, or who simply rotates it faster
+    /// than the real client does, is never detected by anything and holds access indefinitely.
+    /// Setting this bounds that to a window, and OAuth 2.1 draft section 6.1 asks for either a
+    /// finite lifetime or rotation on the same grounds.
+    ///
+    /// A deployment whose users are humans, and whose refresh tokens sit on devices those humans
+    /// lose, should set this.
     pub refresh_token_ttl: Option<Duration>,
     /// How long a ROTATED (spent) refresh token is retained purely so that its reuse can be
     /// detected, when its chain has no absolute expiry of its own. Default 30 days.
@@ -270,6 +303,83 @@ impl GrantedAuthentication {
     }
 }
 
+/// A statement, by the HOST, that a resource owner saw one validated authorization request and
+/// agreed to it. The only thing [`AuthorizationServer::issue_authorization_code`] will mint from.
+///
+/// # Why this type exists
+///
+/// The `http` feature's `ServiceBuilder` REFUSES TO BUILD without a consent resolver, so a host on
+/// that path cannot reach code issuance without having written the word "approve". The direct API
+/// had no such step, and the direct API is the path this crate's DEFAULT BUILD invites: no HTTP
+/// surface, no listener, the host owning its own routes. `issue_authorization_code(&validated,
+/// "alice")` read like a lookup, compiled, passed the host's own tests, and shipped an
+/// authorization server that approved everything. The refusal existed on one of two supported
+/// adoption paths, which is the same as not existing.
+///
+/// # What it is, and what it is not
+///
+/// It is NOT a proof, and no type this crate could define would be one: this library has no user,
+/// no session and no screen, so "the user agreed" is a fact only the host holds. Nor is it weaker
+/// than the seam it mirrors. A host can wire `|_| ConsentDecision::Approve` into the `http` path
+/// just as it can call [`UserApproval::granted`] here, so what BOTH seams buy is the same and is
+/// the whole of what a library at this boundary can buy: the approval becomes a sentence the host
+/// WROTE rather than a default it inherited, and the host that never considered RFC 6749 section
+/// 10.12 gets a compile error naming it instead of a working forgery endpoint.
+///
+/// It also closes a bug class the two-argument form left open. The approval BORROWS the request it
+/// approves, so there is no second request parameter left to disagree with it: a host cannot prompt
+/// for one request and issue for another, approving a `read` and minting a `read write`.
+///
+/// # Allocation
+///
+/// A borrow plus the `subject` String, which is the same one allocation the old
+/// `subject: impl Into<String>` argument made on its way into the record. Nothing on the token path
+/// changes, and nothing here is on it.
+pub struct UserApproval<'a> {
+    request: &'a ValidatedAuthorizationRequest,
+    subject: String,
+}
+
+impl<'a> UserApproval<'a> {
+    /// The resource owner named by `subject` approved `request`.
+    ///
+    /// CALLING THIS IS AN ASSERTION. It says a real user was really asked about really this
+    /// request, in whatever the deployment's consent step is, and said yes. This crate cannot check
+    /// that and will not try; what it can do is refuse to mint anything until someone writes it.
+    ///
+    /// `subject` is the authenticated resource owner, in the host's own vocabulary for users, and
+    /// is what the issued code and every token it mints will carry.
+    pub fn granted(request: &'a ValidatedAuthorizationRequest, subject: impl Into<String>) -> Self {
+        UserApproval {
+            request,
+            subject: subject.into(),
+        }
+    }
+
+    /// The request this approves.
+    pub fn request(&self) -> &'a ValidatedAuthorizationRequest {
+        self.request
+    }
+
+    /// The resource owner who approved it.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+}
+
+/// Hand-written: `subject` is a user identifier, and this crate does not print those into whatever
+/// caught a `{:?}`. Which REQUEST is being approved stays visible, because that is the whole of
+/// what anybody debugging an issuance needs.
+impl fmt::Debug for UserApproval<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserApproval")
+            .field("client_id", &self.request.client_id)
+            .field("scope", &self.request.scope)
+            .field("subject", &"[redacted]")
+            .finish()
+    }
+}
+
 /// How many times user-code generation may redraw on a collision before giving up.
 ///
 /// A collision at the floor length is a roughly one-in-a-hundred-billion event per live grant, so
@@ -310,7 +420,8 @@ impl ServerConfig {
             #[cfg(feature = "jwt")]
             access_token_format: AccessTokenFormat::Opaque,
             authorization_code_ttl: Duration::from_secs(60),
-            include_verification_uri_complete: true,
+            // OFF. RFC 8628 s5.4 remote phishing: see the field's own docs.
+            include_verification_uri_complete: false,
             device_code_ttl: Duration::from_secs(600),
             poll_interval: Duration::from_secs(5),
             slow_down_increment: Duration::from_secs(5),
@@ -2255,15 +2366,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
     /// Mint an authorization code for a request the user has approved (RFC 6749 section 4.1.2).
     ///
-    /// `subject` is the authenticated resource owner. Taking a
-    /// [`ValidatedAuthorizationRequest`] rather than a raw request is deliberate: an unvalidated
-    /// request cannot reach code issuance, because it cannot be spelled.
+    /// RFC 6749 SECTION 10.12 IS THE REASON THIS TAKES A [`UserApproval`] AND NOT A SUBJECT.
+    /// Knowing WHO the user is does not establish that they agreed to anything. An authorization
+    /// endpoint that mints a code as soon as it can name the logged-in user issues one on any
+    /// cross-site top-level navigation that user's browser can be made to follow, which is exactly
+    /// the cross-site request forgery section 10.12 describes: the attacker's client, the victim's
+    /// session, a code delivered to the attacker's registered redirect URI. Nothing in this crate
+    /// can see a user, so nothing here can detect that; the only defence a library has is to
+    /// require the host to SAY that a resource owner approved this request, and to be unbuildable
+    /// without it.
+    ///
+    /// Taking a [`ValidatedAuthorizationRequest`] (through the approval) rather than a raw request
+    /// is deliberate for the same reason one level down: an unvalidated request cannot reach code
+    /// issuance, because it cannot be spelled.
     pub async fn issue_authorization_code(
         &self,
-        request: &ValidatedAuthorizationRequest,
-        subject: impl Into<String>,
+        approval: UserApproval<'_>,
     ) -> Result<AuthorizationResponse, AuthorizationError> {
-        self.issue_authorization_code_inner(request, subject, GrantedAuthentication::default())
+        self.issue_authorization_code_inner(approval, GrantedAuthentication::default())
             .await
     }
 
@@ -2281,15 +2401,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// by this point the redirect URI has been validated, and the client is both the party that
     /// asked the question and the party that has to decide whether to send the user back to log in.
     /// Nothing is minted and no consent is touched.
+    /// The approval means the same thing here as it does on
+    /// [`AuthorizationServer::issue_authorization_code`], and is required for the same RFC 6749
+    /// section 10.12 reason: a satisfied `acr_values` says the user authenticated STRONGLY, never
+    /// that they agreed.
     #[cfg(feature = "consent")]
     pub async fn issue_authorization_code_with_authentication(
         &self,
-        request: &ValidatedAuthorizationRequest,
-        subject: impl Into<String>,
+        approval: UserApproval<'_>,
         requirement: &crate::consent::AuthenticationRequirement,
         authentication: Option<&crate::consent::Authentication>,
     ) -> Result<AuthorizationResponse, AuthorizationError> {
         if let Err(failure) = requirement.satisfied_by(authentication, self.clock.now()) {
+            let request = approval.request();
             return Err(AuthorizationError::Redirect(AuthorizationErrorRedirect {
                 redirect_uri: request.redirect_uri.clone(),
                 error: failure.error_response(),
@@ -2298,8 +2422,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }));
         }
         self.issue_authorization_code_inner(
-            request,
-            subject,
+            approval,
             GrantedAuthentication {
                 authentication: authentication.cloned().map(Box::new),
             },
@@ -2310,12 +2433,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The issuance itself, shared by both entry points above so that they cannot drift.
     async fn issue_authorization_code_inner(
         &self,
-        request: &ValidatedAuthorizationRequest,
-        subject: impl Into<String>,
+        approval: UserApproval<'_>,
         authentication: GrantedAuthentication,
     ) -> Result<AuthorizationResponse, AuthorizationError> {
         #[cfg(not(feature = "consent"))]
         let _ = authentication;
+        // Destructured rather than borrowed through the approval: `subject` is MOVED into the
+        // record below, which is the same one allocation the previous `impl Into<String>` argument
+        // produced. The approval adds no allocation of its own; it is a borrow plus that String.
+        let UserApproval { request, subject } = approval;
         let now = self.clock.now();
         let code = random_hex(32);
         let record = AuthorizationCodeRecord {
@@ -2323,7 +2449,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             client_id: request.client_id.clone(),
             redirect_uri: request.redirect_uri.clone(),
             scope: request.scope.clone(),
-            subject: subject.into(),
+            subject,
             code_challenge: request.code_challenge.clone(),
             code_challenge_method: request.code_challenge_method,
             // RFC 8707 s2: what the token this code redeems into may be audience-restricted to.

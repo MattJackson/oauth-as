@@ -24,6 +24,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use oauth_as::{
     AuthorizationError, AuthorizationRequest, AuthorizationServer, Client, ClientAuth, ClientId,
     ErrorCode, GrantType, MemoryStorage, ScopeSet, ServerConfig, TokenRequest,
@@ -79,7 +80,7 @@ async fn a_requested_resource_becomes_the_token_audience() {
         .await
         .expect("a well formed resource must be accepted");
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
     let issued = srv
@@ -125,7 +126,7 @@ async fn several_resource_parameters_are_all_carried() {
 
     let validated = srv.validate_authorization_request(&req).await.unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
     let issued = srv
@@ -313,7 +314,7 @@ async fn code_for<S: oauth_as::Storage>(
         resources,
     );
     let validated = srv.validate_authorization_request(&req).await.unwrap();
-    srv.issue_authorization_code(&validated, "user-1")
+    srv.issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap()
         .code

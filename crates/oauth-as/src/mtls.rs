@@ -210,7 +210,12 @@ pub struct ClientCertificate<'a> {
 }
 
 impl<'a> ClientCertificate<'a> {
-    /// From the DER encoding of the verified certificate. The thumbprint (RFC 8705 section 3.1) is
+    /// From the DER encoding of the VERIFIED certificate: this crate cannot check the chain and
+    /// takes the bytes as an established fact, so read this module's trust boundary section before
+    /// choosing where they come from. Bytes off an unstripped `X-Client-Cert` header authenticate
+    /// nobody.
+    ///
+    /// The thumbprint (RFC 8705 section 3.1) is
     /// computed here, once, so no caller has to decide which bytes to hash or which base64 alphabet
     /// to use.
     ///
@@ -408,16 +413,28 @@ pub struct RegisteredCertificates(Vec<CertificateThumbprint>);
 
 impl RegisteredCertificates {
     /// From thumbprints already computed.
-    pub fn from_thumbprints(thumbprints: Vec<CertificateThumbprint>) -> Self {
-        RegisteredCertificates(thumbprints)
+    ///
+    /// An EMPTY list is refused, exactly as [`RegisteredCertificates::from_jwks`] refuses a key set
+    /// that yields no certificate, and for the identical reason: a registration with nothing to
+    /// compare against can never authenticate anybody, so it is a configuration mistake and not a
+    /// permissive setting. Accepting it here and refusing it there would have made the outcome of
+    /// one mistake depend on which constructor the host happened to reach for.
+    pub fn from_thumbprints(
+        thumbprints: Vec<CertificateThumbprint>,
+    ) -> Result<Self, MtlsRegistrationError> {
+        if thumbprints.is_empty() {
+            return Err(MtlsRegistrationError::NoCertificates);
+        }
+        Ok(RegisteredCertificates(thumbprints))
     }
 
-    /// From the DER encodings of the registered certificates.
-    pub fn from_der_certificates<'a, I>(certificates: I) -> Self
+    /// From the DER encodings of the registered certificates. An empty iterator is refused, for the
+    /// reason [`RegisteredCertificates::from_thumbprints`] gives.
+    pub fn from_der_certificates<'a, I>(certificates: I) -> Result<Self, MtlsRegistrationError>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        RegisteredCertificates(
+        RegisteredCertificates::from_thumbprints(
             certificates
                 .into_iter()
                 .map(CertificateThumbprint::from_der)
@@ -519,6 +536,13 @@ impl MtlsClientRegistration {
     }
 
     /// Whether `certificate` authenticates this client.
+    ///
+    /// This answer is only ever as good as the certificate handed in. READ this module's trust
+    /// boundary section: a `true` here means "the presented certificate matches what was
+    /// registered" and NOTHING about whether it was presented on a TLS connection whose handshake
+    /// proved possession of the private key. That part is the host's, it happened before this call,
+    /// and a [`ClientCertificate`] built from an unverified header makes this function return
+    /// whatever the caller wanted it to.
     pub fn accepts(&self, certificate: &ClientCertificate<'_>) -> bool {
         match self {
             MtlsClientRegistration::TlsClientAuth(expected) => certificate.satisfies(expected),
@@ -548,6 +572,8 @@ pub enum MtlsRegistrationError {
     MalformedJwks,
     /// A JWK Set that parsed but carries no certificate for this crate to match against.
     NoCertificateInJwks,
+    /// A certificate registration built from an empty list, which can never match anything.
+    NoCertificates,
     /// A certificate that is not the DER (or PEM-wrapped DER) this crate can hash.
     MalformedCertificate,
     /// An `x5t#S256` value that is not the base64url encoding of a 32 byte hash.
@@ -569,6 +595,9 @@ impl fmt::Display for MtlsRegistrationError {
             MtlsRegistrationError::MalformedJwks => "the JWK Set could not be parsed",
             MtlsRegistrationError::NoCertificateInJwks => {
                 "the JWK Set carries no x5c certificate to match against"
+            }
+            MtlsRegistrationError::NoCertificates => {
+                "a certificate registration must name at least one certificate"
             }
             MtlsRegistrationError::MalformedCertificate => {
                 "the certificate is not DER or PEM-wrapped DER"

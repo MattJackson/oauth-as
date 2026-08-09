@@ -12,7 +12,74 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed (BREAKING): types that made the wrong thing easy
+
+Every item here is an API-safety change, pre-1.0, and the crate's existing posture applied
+consistently: an absent consent resolver refuses, an absent registration policy refuses, and a
+`user_code_length` below the floor is clamped up rather than honoured.
+
+- **`AuthorizationServer::issue_authorization_code` now takes a `UserApproval`** rather than
+  `(&ValidatedAuthorizationRequest, subject)`, and so does
+  `issue_authorization_code_with_authentication`. RFC 6749 s10.12: knowing WHO the user is does not
+  establish that they agreed, and the direct API had no step that made a host say so. The `http`
+  feature's `ServiceBuilder` refuses to build without a consent resolver; the DIRECT path, which is
+  what this crate's default build (no HTTP surface at all) invites, had no equivalent, so a host
+  embedding the library got an auto-approving authorization server that compiled and passed its own
+  tests. `UserApproval::granted(&validated, subject)` is not a proof and cannot be, exactly as
+  `ConsentDecision::Approve` is not; what it is, is the same statement on both adoption paths, and
+  a compile error naming s10.12 for the host that never made it. It also borrows the request it
+  approves, so a host cannot prompt for one request and issue for another.
+
+  Migration: `srv.issue_authorization_code(&validated, subject)` becomes
+  `srv.issue_authorization_code(UserApproval::granted(&validated, subject))`.
+- **`ServerConfig::include_verification_uri_complete` now defaults to `false`.** A BEHAVIOUR
+  change: a default-configured device authorization response no longer carries the
+  `verification_uri_complete` deep link. RFC 8628 s5.4 (Remote Phishing) is the reason. The attack
+  is that an attacker starts a device grant for their own client and mails the victim the link;
+  s5.4 names typing the code as the friction that makes that hard, and this member is exactly its
+  removal. s3.3.1 makes the member OPTIONAL, so omitting it is conformant and costs a deployment
+  only the QR-code convenience, whereas including it by default charged every host that never read
+  the section for a capability it did not ask for. Set it back to `true` explicitly, and pair it
+  with a verification page that names the client and the scope and requires an affirmative action
+  (s3.3), which is what the `http` feature's page does.
+- **`TokenExchangeRequest::new` takes `subject_token_type` as a third argument** instead of
+  defaulting it to `TokenTypeIdentifier::AccessToken`. RFC 8693 s2.1 makes it REQUIRED, and the
+  exchange refuses on it; the default was precisely the one value that passes, so a host that built
+  the request in code and forgot to copy the form field turned that refusal into a pass.
+- **`PublicJwk`'s fields are sealed** behind `kty()`, `crv()`, `x()`, `y()` and `kid()`, with
+  `PublicJwk::from_coordinates` and `with_kid` as the constructors. The type documented that "there
+  is no route into this type that skips the private-parameter rejection", and a struct literal was
+  exactly that route: verification revalidates and fails closed, but `thumbprint()` would emit a
+  `cnf.jkt` over anything a host wrote.
+- **`AssertionKeys::ClientSecret` carries a `ClientSecretKey`**, not a `String`, and refuses a key
+  shorter than `MIN_CLIENT_SECRET_JWT_KEY_LENGTH` (22 characters) at construction AND at
+  deserialization. A `client_secret_jwt` assertion is an HMAC over public inputs, so an attacker
+  who observes one assertion can grind the key offline at their own pace with no rate limit that
+  reaches them; RFC 6749 s10.10 asks for 128 bits, which is 22 characters at base64url's 6 bits
+  each.
+- **`RegisteredCertificates::from_thumbprints` and `from_der_certificates` return
+  `Result<_, MtlsRegistrationError>`** and refuse an empty list, matching `from_jwks`, which already
+  refused the identical state. A registration with nothing to compare against can never
+  authenticate anybody, and which constructor a host reached for should not decide whether that is
+  a refusal or a live-but-useless registration. New variant:
+  `MtlsRegistrationError::NoCertificates`.
+- **`UnknownTokenTypeIdentifier`'s payload is sealed**, read through `identifier()`, and
+  `RequestObjectKeyError` gains `detail()`. The two one-payload rejection types had opposite
+  exposure rules: one published a `pub String` a caller could also forge, the other kept it
+  entirely. Both are readable and neither is forgeable now.
+
+### Added
+
+- `impl std::error::Error for StepUpFailure`. It was the only error-shaped type in the crate
+  without one.
+- `ServerConfig::refresh_token_ttl` and `ServerConfig::include_verification_uri_complete` document
+  the risk their defaults carry, matching what `allowed_resources` already did: `None` on a refresh
+  chain means a token exfiltrated once is a credential forever, and RFC 9700 s4.14.2 reuse
+  detection catches only the thief whose victim comes back.
+- Pointer sentences on the three items a host's fingers touch and whose one-line docs hid a
+  load-bearing caveat: `MtlsClientRegistration::accepts`, `ClientCertificate::from_der` (both back
+  to the `mtls` trust boundary section) and `Authentication::at` (do not stamp `auth_time` with
+  `now`).
 
 ## [0.9.0] - 2026-08-08 (release candidate; not yet published to crates.io)
 

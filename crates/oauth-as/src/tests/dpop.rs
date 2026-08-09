@@ -383,7 +383,10 @@ fn the_thumbprint_is_the_rfc_7638_construction_and_nothing_else() {
     let jwk = key.to_public_jwk();
     let canonical = format!(
         r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
-        jwk.crv, jwk.kty, jwk.x, jwk.y
+        jwk.crv(),
+        jwk.kty(),
+        jwk.x(),
+        jwk.y()
     );
     let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
     assert_eq!(jwk.thumbprint(), expected);
@@ -396,12 +399,15 @@ fn the_thumbprint_ignores_kid_and_any_other_optional_member() {
     // different `cnf.jkt` and a resource server would reject a token that is genuinely the
     // client's.
     let key = EcdsaP256Key::generate("kid-one");
-    let mut relabelled = key.to_public_jwk();
+    let relabelled = key.to_public_jwk();
     let original = relabelled.thumbprint();
-    relabelled.kid = Some("kid-two".into());
-    assert_eq!(relabelled.thumbprint(), original);
-    relabelled.kid = None;
-    assert_eq!(relabelled.thumbprint(), original);
+    assert_eq!(
+        relabelled.clone().with_kid("kid-two").thumbprint(),
+        original
+    );
+    let unnamed = PublicJwk::from_coordinates(relabelled.x(), relabelled.y())
+        .expect("the same point, with no kid at all");
+    assert_eq!(unnamed.thumbprint(), original);
 }
 
 #[test]

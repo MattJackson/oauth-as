@@ -18,6 +18,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use oauth_as::{
     AuthorizationError, AuthorizationRequest, AuthorizationServerMetadata, ErrorCode, ServerConfig,
 };
@@ -61,7 +62,7 @@ async fn the_success_redirect_carries_the_issuer_identifier() {
         .await
         .expect("a complete, valid request must validate");
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .expect("issuing a code for a validated request");
 
@@ -148,7 +149,7 @@ async fn the_iss_value_is_byte_identical_to_the_metadata_issuer() {
         .await
         .unwrap();
     let response = srv
-        .issue_authorization_code(&validated, "user-1")
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .unwrap();
 

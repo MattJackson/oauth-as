@@ -41,6 +41,7 @@ mod support;
 use oauth_as::rar::{
     AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES, MAX_AUTHORIZATION_DETAILS_ELEMENTS,
 };
+use oauth_as::server::UserApproval;
 use oauth_as::{
     AuthorizationError, AuthorizationRequest, AuthorizationServer, AuthorizationServerMetadata,
     Client, ClientAuth, ClientId, ErrorCode, GrantType, MemoryStorage, ScopeSet, ServerConfig,
@@ -127,7 +128,7 @@ async fn code_for(
         .validate_authorization_request(&req)
         .await
         .expect("a well formed authorization_details must be accepted");
-    srv.issue_authorization_code(&validated, "user-1")
+    srv.issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
         .expect("issuing the code")
         .code

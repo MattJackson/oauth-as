@@ -27,6 +27,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::{
@@ -84,8 +85,7 @@ async fn authorize(
         .await
         .expect("the request itself is well formed");
     srv.issue_authorization_code_with_authentication(
-        &validated,
-        "user-1",
+        UserApproval::granted(&validated, "user-1"),
         requirement,
         authentication,
     )

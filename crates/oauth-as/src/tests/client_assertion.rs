@@ -65,7 +65,7 @@ fn es256(key: &EcdsaP256Key, header: &serde_json::Value, claims: &serde_json::Va
 
 fn secret_keys() -> AssertionKeys {
     AssertionKeys::ClientSecret {
-        secret: SECRET.to_string(),
+        secret: ClientSecretKey::new(SECRET).expect("fixture secret clears the floor"),
     }
 }
 

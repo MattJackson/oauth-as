@@ -25,6 +25,7 @@
 
 mod support;
 
+use oauth_as::server::UserApproval;
 use std::time::Duration;
 
 use oauth_as::{
@@ -173,7 +174,7 @@ async fn subject_token<S: Storage>(
         .await
         .expect("fixture authorization request must validate");
     let response = srv
-        .issue_authorization_code(&validated, subject)
+        .issue_authorization_code(UserApproval::granted(&validated, subject))
         .await
         .expect("fixture code issuance must succeed");
     srv.token(TokenRequest::AuthorizationCode {
@@ -191,7 +192,8 @@ fn exchange_request<'a>(
     subject_token: &'a str,
     client_id: &'a ClientId,
 ) -> TokenExchangeRequest<'a> {
-    let mut req = TokenExchangeRequest::new(client_id, subject_token);
+    let mut req =
+        TokenExchangeRequest::new(client_id, subject_token, TokenTypeIdentifier::AccessToken);
     req.client_secret = Some(EXCHANGER_SECRET);
     req
 }
@@ -367,7 +369,11 @@ async fn an_exchange_cannot_exceed_the_exchanging_clients_own_registration() {
     )
     .await;
     let client_id = ClientId::new("read-only-exchanger");
-    let mut req = TokenExchangeRequest::new(&client_id, &subject.access_token);
+    let mut req = TokenExchangeRequest::new(
+        &client_id,
+        &subject.access_token,
+        TokenTypeIdentifier::AccessToken,
+    );
     req.client_secret = Some(READ_ONLY_SECRET);
 
     let error = srv
@@ -589,7 +595,11 @@ async fn a_public_client_cannot_exchange() {
     )
     .await;
     let client_id = ClientId::new("public-exchanger");
-    let req = TokenExchangeRequest::new(&client_id, &subject.access_token);
+    let req = TokenExchangeRequest::new(
+        &client_id,
+        &subject.access_token,
+        TokenTypeIdentifier::AccessToken,
+    );
     let error = srv.exchange_token(&req).await.expect_err(
         "a grant that converts one principal's authority into another's cannot rest on a name",
     );
@@ -612,7 +622,11 @@ async fn a_client_not_registered_for_the_grant_is_refused() {
     )
     .await;
     let client_id = ClientId::new("no-exchange");
-    let mut req = TokenExchangeRequest::new(&client_id, &subject.access_token);
+    let mut req = TokenExchangeRequest::new(
+        &client_id,
+        &subject.access_token,
+        TokenTypeIdentifier::AccessToken,
+    );
     req.client_secret = Some("no-exchange-secret-for-tests");
     let error = srv.exchange_token(&req).await.unwrap_err();
     assert_eq!(error.error, ErrorCode::UnauthorizedClient);
