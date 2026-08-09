@@ -32,6 +32,12 @@
 //! - `grant_types_supported` drives [`prove_grant`], whose `match` has a catch-all that PANICS.
 //! - `token_endpoint_auth_methods_supported` drives [`prove_auth_method`], likewise.
 //! - `response_types_supported` and `code_challenge_methods_supported`, likewise.
+//! - every member whose name ends in `_alg_values_supported` drives
+//!   [`every_advertised_signing_algorithm_can_be_performed_by_this_build`], likewise, and that one
+//!   is discovered by NAME rather than listed, so a new member of the family is swept with no
+//!   change here. It is the newest of these and it covers the family where the document became
+//!   able to lie: those lists were derived from cargo features, and since the ES256 seam a
+//!   feature no longer implies a backend that can perform the algorithm.
 //! - every member whose name ends in `_endpoint`, plus `jwks_uri`, is probed for a non-404, with
 //!   no per-endpoint list written down anywhere in this file.
 //!
@@ -759,6 +765,121 @@ async fn every_advertised_endpoint_is_routed() {
             "{label}: expected at least authorization, token, device, introspection and \
              revocation to be advertised, swept {probed}"
         );
+    }
+}
+
+/// EVERY `*_alg_values_supported` member the document publishes, swept the same structural way,
+/// against the one question those members exist to answer: can this server actually perform the
+/// algorithm it is naming?
+///
+/// # Why this member family needed its own sweep
+///
+/// The checklists above cover four of the document's capability lists (grant types, auth methods,
+/// response types, PKCE methods). The signing-algorithm lists were not among them, and they are
+/// the family where the advertisement became able to lie: they were each derived from FEATURE
+/// PRESENCE, and since the ES256 seam a feature no longer implies a backend. `client_assertion`
+/// compiles the `Es256Verifier` SEAM in; `jwt-p256` is what compiles an implementation of it, and
+/// a host may install its own instead. So a build could advertise ES256 with nothing anywhere in
+/// the process able to check an ES256 signature.
+///
+/// # The rule, and what makes it checkable rather than a restatement
+///
+/// Every algorithm named in any of these members is one of exactly two kinds:
+///
+/// - HS256 is symmetric (RFC 7518 s3.2). The key is the registered client secret, there is no
+///   curve on the path, and any build with the feature can perform it.
+/// - ES256 needs a VERIFIER (RFC 7518 s3.4). This fixture installs none, so the only way the
+///   process has one is the built-in `jwt-p256` backend.
+///
+/// The catch-all PANICS, which is the property that makes this sweep worth having: a third
+/// algorithm added to any of these lists, or a whole new `*_alg_values_supported` member added to
+/// the document, fails here on the next run rather than shipping as an unproven promise.
+///
+/// The advertisement is then tied back to something driven over the wire: an algorithm named in
+/// `token_endpoint_auth_signing_alg_values_supported` must have its RFC 7523 method named in
+/// `token_endpoint_auth_methods_supported` too, and every entry in THAT list is redeemed to a
+/// real `access_token` by `every_advertised_token_endpoint_auth_method_is_exercised_over_http`.
+/// Without that tie this test would only be comparing the document against a cfg.
+#[tokio::test]
+async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
+    // TRUE exactly when an ES256 signature can be checked in this process. No fixture in this
+    // file installs a host verifier, so the built-in backend is the only source of one.
+    let es256_is_checkable = cfg!(feature = "jwt-p256");
+
+    for (label, service) in service_variants().await {
+        let doc = metadata(&service).await;
+        let object = doc.as_object().expect("the document is a JSON object");
+        let methods = advertised(&doc, "token_endpoint_auth_methods_supported");
+        let mut swept = 0usize;
+
+        for (member, value) in object {
+            if !member.ends_with("_alg_values_supported") {
+                continue;
+            }
+            let algs = advertised(&doc, member);
+            assert!(
+                !algs.is_empty(),
+                "{label}: {member} is present and empty, which advertises a capability with no \
+                 algorithm a client could use: {value}"
+            );
+            for alg in &algs {
+                match alg.as_str() {
+                    "HS256" => {
+                        // RFC 7523 s2.2: the only member that may name HS256 is the token
+                        // endpoint's, and only because `client_secret_jwt` is an HMAC over the
+                        // registered secret. A DPoP proof or a request object signed HS256 would
+                        // be signed with a secret the CLIENT and this server share, which is not
+                        // proof of possession of anything (RFC 8725 s3.5).
+                        assert_eq!(
+                            member, "token_endpoint_auth_signing_alg_values_supported",
+                            "{label}: {member} names HS256, and a shared secret is not a \
+                             signature for that member's purpose"
+                        );
+                        assert!(
+                            methods.iter().any(|m| m == "client_secret_jwt"),
+                            "{label}: HS256 is advertised for client authentication but \
+                             client_secret_jwt is not among {methods:?}, so no client can use it"
+                        );
+                    }
+                    "ES256" => {
+                        assert!(
+                            es256_is_checkable,
+                            "{label}: {member} advertises ES256 and this build has no ES256 \
+                             backend and no installed host verifier, so every credential a \
+                             client signs under it is refused. This is the exact advertisement \
+                             that must be derived from the installed verifier and not from a \
+                             cargo feature."
+                        );
+                        if member == "token_endpoint_auth_signing_alg_values_supported" {
+                            assert!(
+                                methods.iter().any(|m| m == "private_key_jwt"),
+                                "{label}: ES256 is advertised for client authentication but \
+                                 private_key_jwt is not among {methods:?}"
+                            );
+                        }
+                    }
+                    other => panic!(
+                        "{label}: {member} advertises {other:?} and nothing here proves this \
+                         server can perform it. Adding an algorithm to an RFC 8414 list is a \
+                         promise to every client that reads the document, so it needs a proof \
+                         here, not just an entry there."
+                    ),
+                }
+            }
+            swept += 1;
+        }
+
+        // The converse, so the sweep cannot pass by finding nothing. `client_assertion` always
+        // produces `token_endpoint_auth_signing_alg_values_supported` (HS256 at minimum, because
+        // `client_secret_jwt` needs no backend), so in that build there is at least one member to
+        // sweep and a document that dropped the family entirely is caught.
+        #[cfg(feature = "client_assertion")]
+        assert!(
+            swept >= 1,
+            "{label}: this build has client_assertion, so the document must carry \
+             token_endpoint_auth_signing_alg_values_supported: {doc}"
+        );
+        let _ = swept;
     }
 }
 

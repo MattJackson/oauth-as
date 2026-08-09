@@ -409,7 +409,13 @@ fn a_router_refuses_to_publish_a_path_it_would_shadow() {
 /// server can reach, and an advertised `jwks_uri` this router cannot serve is the same lie as any
 /// other unroutable endpoint. Off-issuer is refused rather than silently unrouted because these
 /// bytes are produced by this server and nothing else can produce them.
-#[cfg(feature = "jwt")]
+///
+/// Gated on `jwt-p256` and NOT on `jwt`, because the fixture needs a signing KEY and since the
+/// ES256 seam `jwt` is the trait surface with no backend behind it: `EcdsaP256Key` only exists
+/// with the built-in backend compiled in. Under plain `jwt` this file did not compile at all,
+/// which is why `--features http,client_assertion` (client_assertion implies jwt, not jwt-p256)
+/// was a build nobody could run.
+#[cfg(feature = "jwt-p256")]
 #[test]
 fn a_jwks_uri_off_the_issuer_refuses_to_build() {
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
@@ -434,7 +440,9 @@ fn a_jwks_uri_off_the_issuer_refuses_to_build() {
 /// The key set shares the collision check every other route gets: a `jwks_uri` that lands on the
 /// token endpoint would shadow one of the two, and which one is an implementation detail no host
 /// should have to know.
-#[cfg(feature = "jwt")]
+///
+/// `jwt-p256` for the same reason as the test above: the fixture needs a real signing key.
+#[cfg(feature = "jwt-p256")]
 #[test]
 fn a_jwks_uri_colliding_with_another_endpoint_refuses_to_build() {
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
