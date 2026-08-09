@@ -3,6 +3,9 @@ target
 # cargo-mutants writes its report tree here. It is build output: large, machine
 # specific, and regenerated on every run.
 mutants.out
+# cargo-mutants rotates the previous run here rather than deleting it, so the
+# same reasoning applies to the rotated copy.
+mutants.out.old
 
 # Agent worktrees used for isolated parallel work.
 .claude/worktrees
