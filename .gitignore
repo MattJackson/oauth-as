@@ -6,3 +6,6 @@ mutants.out
 
 # Agent worktrees used for isolated parallel work.
 .claude/worktrees
+
+# Python bytecode from the integration patch scripts.
+__pycache__
