@@ -30,9 +30,16 @@ Three properties, in priority order. Where they conflict, the earlier one wins.
 3. **EFFICIENT.** Fast and small, with the claims gated in CI rather than asserted in prose. A
    consumer who does not enable a feature pays nothing for it, in dependencies, memory, or size.
 
-Non-goals for 0.1.0, stated so nobody has to guess: no OIDC, no dynamic client registration
-(RFC 7591), no DPoP, no PAR, no FAPI profile. These are defensible additions later and are
-deliberate omissions now.
+Non-goals for 0.1.0, stated so nobody had to guess: no OIDC, no dynamic client registration
+(RFC 7591), no DPoP, no PAR, no FAPI profile.
+
+UPDATE at 0.9.0: all of those except OIDC and a FAPI profile have since landed, on purpose, via
+the 0.2.0 to 0.8.0 releases in ROADMAP.md. **OIDC remains a non-goal** for the reason KICKOFF gives:
+the badge it would earn would be true and substantively misleading. A FAPI 2.0 run is now
+achievable and the remaining work is written down in
+`crates/oauth-as-conformance/EXTERNAL-TOOLING.md`, including a genuine spec conflict worth knowing
+about: FAPI 2.0 s5.3.2.1-9 forbids refresh token rotation, which OAuth 2.1 s6.1 and RFC 9700
+s4.14.2 are precisely why this crate does it.
 
 ## WHAT 100% MEANS
 
@@ -46,13 +53,13 @@ deliberate omissions now.
 - [x] RFC 8414 authorization server metadata
 - [x] RFC 7662 introspection
 - [x] RFC 7009 revocation
-- [ ] RFC 9068 JWT access tokens plus RFC 7517 JWKS, behind an off-by-default feature
+- [x] RFC 9068 JWT access tokens plus RFC 7517 JWKS, behind an off-by-default feature
 
 CHECK: every item above has a test file naming the RFC section it pins.
 
 ### Gate 2: an external process can talk to it
-- [ ] HTTP surface behind an off-by-default `http` feature, forcing no web framework on anyone
-- [ ] `crates/oauth-as/conformance-serve.sh` honouring the launch contract in
+- [x] HTTP surface behind an off-by-default `http` feature, forcing no web framework on anyone
+- [x] `crates/oauth-as/conformance-serve.sh` honouring the launch contract in
       `crates/oauth-as-conformance/src/lib.rs`
 
 CHECK: `scripts/oauth-conformance.sh --check` starts the AS and reaches its metadata document.
@@ -62,62 +69,70 @@ The harness was written by an author who could not see the library. That is the 
 the library's own tests were written by the library's author, so the judge is arms-length but the
 CHOICE OF WHAT TO TEST is not. The harness closes that gap.
 
-- [ ] `scripts/oauth-conformance.sh --selftest` passes (the gate is proven able to go RED first)
-- [ ] `scripts/oauth-conformance.sh --check` passes against the live AS
+- [x] `scripts/oauth-conformance.sh --selftest` passes (the gate is proven able to go RED first)
+- [x] `scripts/oauth-conformance.sh --check` passes against the live AS
 
 CHECK: both commands exit 0. Any defect the harness found is recorded in the commit that fixed it,
 with the RFC section that settled it and a note of WHICH SIDE changed, the harness's assumption or
 the server's behaviour. No assertion was ever weakened to obtain green.
 
 ### Gate 4: the tests actually constrain the code
-- [ ] `cargo mutants -p oauth-as` run to completion
+- [x] `cargo mutants -p oauth-as` run to completion
 - [ ] Every surviving mutant is either killed by a new test, or recorded in writing as equivalent
-      with the reason
+      with the reason. **NOT MET.** Every survivor on the measured surface is closed, but eight
+      modules (registration, resource_metadata, token_exchange, par, rar, dpop, mtls,
+      client_assertion) landed AFTER that run and have never been mutation tested. That is the
+      same position `http.rs` was in before this session. See MUTANTS.md.
 
 CHECK: the mutants report is clean or annotated. A surviving mutant is a hole in the suite, not a
 curiosity.
 
 ### Gate 5: efficiency is gated, not asserted
-- [ ] Allocation counts on the hot paths pinned by a zero-dependency counting allocator
-- [ ] Size bounds pinned for the core public types
-- [ ] Default feature set empty: no HTTP stack, no crypto beyond PKCE, in a default build
+- [x] Allocation counts on the hot paths pinned by a zero-dependency counting allocator
+- [x] Size bounds pinned for the core public types
+- [x] Default feature set empty: no HTTP stack, no crypto beyond PKCE, in a default build
 
 CHECK: `cargo tree -p oauth-as` on default features shows only serde, serde_json, getrandom, sha2,
 base64. The allocation tests pass, and each was proven able to fail.
 
 ### Gate 6: it builds where it claims to
-- [ ] MSRV is the TRUE floor, verified, not guessed. Measured as 1.75: 1.74 fails only on RPITIT
+- [x] MSRV is the TRUE floor, verified, not guessed. Measured as 1.75: 1.74 fails only on RPITIT
       in `store.rs`, 1.75 and 1.80 compile clean.
-- [ ] `Cargo.lock` in a format the floor toolchain can parse, so `--locked` is honest at the floor
-- [ ] Per-feature floors documented separately where an optional dependency raises them
+- [x] `Cargo.lock` in a format the floor toolchain can parse, so `--locked` is honest at the floor
+- [x] Per-feature floors documented separately where an optional dependency raises them
 
 CHECK: `cargo +1.75 test -p oauth-as --locked` passes.
 
 ### Gate 7: the promotion pipeline works
-- [ ] push to `dev` runs the fast gate: fmt, clippy, test
-- [ ] push to `qa` runs the full suite: MSRV, conformance selftest, live conformance check,
+- [x] push to `dev` runs the fast gate: fmt, clippy, test
+- [x] push to `qa` runs the full suite: MSRV, conformance selftest, live conformance check,
       third-party client drive, mutants, package dry run
-- [ ] `main` publishes only by explicit owner action, never automatically
+- [x] `main` publishes only by explicit owner action, never automatically
 
 CHECK: a real push to `dev` goes green, then a real push to `qa` goes green. Observed, not assumed.
 
 ### Gate 8: the claims are true
-- [ ] README states exactly what is proven and exactly what is not
-- [ ] No third-party verification is claimed that was not actually run. As of 2026-08-08 the only
-      independent judges are the vendored RFC vectors and the pinned `oauth2 = "=5.0.0"` client
-      drive. `authgent` was investigated and does NOT apply (see KICKOFF.md). OAuch has no
-      headless mode. There is no OAuth 2.1 certification programme in existence, so no
-      certification claim is possible for this or any other implementation.
-- [ ] KICKOFF.md corrected where research contradicted it
+- [x] README states exactly what is proven and exactly what is not
+- [x] No third-party verification is claimed that was not actually run. UPDATED as the position
+      changed during the work: the independent judges are now the vendored RFC vectors, TWO pinned
+      third-party clients in two languages (`oauth2 = "=5.0.0"` for Rust and
+      `golang.org/x/oauth2 v0.36.0` for Go), and the `authgent` scanner, which became applicable
+      once RFC 9728 landed and IS now run in CI with its findings recorded rather than silenced.
+      OAuch still has no headless mode and its authors say so. There is still no OAuth 2.1
+      certification programme in existence, so no certification claim is possible for this or any
+      other implementation, and none is made.
+- [x] KICKOFF.md corrected where research contradicted it
 
 CHECK: read the README against this list. Every claim maps to a command in this file.
 
 ### Gate 9: it is safe to publish
-- [ ] `cargo publish --dry-run --locked -p oauth-as` passes
-- [ ] `cargo package --list` read LINE BY LINE. The repo is public and so is the tarball: nothing
+- [x] `cargo publish --dry-run --locked -p oauth-as` passes
+- [x] `cargo package --list` read LINE BY LINE. The repo is public and so is the tarball: nothing
       private, nothing machine specific, no absolute paths
 - [ ] Adversarial security review completed, every finding either fixed or recorded with its
-      reasoning
+      reasoning. **PARTIALLY MET.** Two reviews run, all findings fixed (one critical, three high,
+      several medium and low). But mTLS, RAR and consent landed AFTER the second review and have
+      had none. The first two reviews each found serious defects on smaller surface.
 
 CHECK: the package list is in the release commit message or the PR body, so the review is
 auditable after the fact.
