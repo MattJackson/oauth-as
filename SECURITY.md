@@ -15,8 +15,9 @@ see.
 Please include, as far as you can:
 
 - the affected version or commit,
-- which crate feature set was enabled (the exact `features = [...]` list, since thirteen of them
-  exist and most of the wire surface is behind one),
+- which crate feature set was enabled (the exact `features = [...]` list, since the default set is
+  EMPTY and most of the wire surface is behind an optional feature, so a report that does not name
+  them may describe code the reader cannot even compile),
 - a concrete attack: the requests, the order they are sent in, and what the attacker ends up
   holding that they should not,
 - the RFC section you believe is violated, if one applies.
@@ -88,7 +89,10 @@ newest version rather than being backported.
 - An independently authored conformance harness, written by an author who could not see the
   library's source, drives the server as a black box.
 - The project runs adversarial security review, and mutation testing to check that the tests
-  actually constrain the code rather than merely accompanying it.
+  actually constrain the code rather than merely accompanying it. Mutation coverage is NOT yet
+  complete: `GOAL.md` gate 4 is open, and `MUTANTS.md` names every surviving mutant individually
+  rather than reporting a percentage. Read that file before assuming a green test run means the
+  tests would have caught a given change.
 
 None of that makes the crate correct. It makes the claims checkable, which is the most any project
 can honestly offer.

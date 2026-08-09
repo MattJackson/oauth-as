@@ -20,10 +20,12 @@ Implemented today: RFC 6749 (authorization code under the OAuth 2.1
 constraints, client credentials, refresh rotation with reuse detection),
 RFC 6750, RFC 7009, RFC 7517, RFC 7523, RFC 7591, RFC 7592, RFC 7636, RFC 7662,
 RFC 8414, RFC 8628, RFC 8693, RFC 8705, RFC 8707, RFC 9068, RFC 9101, RFC 9126,
-RFC 9207, RFC 9396, RFC 9449, RFC 9470, RFC 9728. Thirteen cargo features, all
-off by default; the default build is still five dependencies. Nine of the
-thirteen add no dependency at all, and the only one that raises the MSRV floor is
-`axum`, which is a thirty line adapter over the framework-free `http` feature
+RFC 9207, RFC 9396, RFC 9449, RFC 9470, RFC 9728. Fifteen cargo features, all off
+by default, and the default build declares four direct dependencies. MEASURED,
+because the previous numbers here had drifted: five of the fifteen (`par`,
+`consent`, `resource-metadata`, `token-exchange`, `test-util`) add NOTHING to a
+dependency tree, not even transitively. The only feature that raises the MSRV
+floor is `axum`, a thirty line adapter over the framework-free `http` feature
 rather than the HTTP surface itself.
 
 So the "gap by category" below is now largely CLOSED, with two deliberate
