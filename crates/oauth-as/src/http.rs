@@ -1649,7 +1649,7 @@ async fn token_handler<S: Storage, C: Clock>(
         },
     };
 
-    let mut creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
@@ -1722,7 +1722,7 @@ async fn token_handler<S: Storage, C: Clock>(
         // avoid.
         #[cfg(feature = "token-exchange")]
         GrantType::TokenExchange => {
-            return token_exchange_response(&state, &form, client_id, client_secret, via_header)
+            return token_exchange_response(state, &form, client_id, client_secret, via_header)
                 .await
         }
     };
@@ -1875,7 +1875,7 @@ async fn device_authorization_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
-    let mut creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
@@ -1915,7 +1915,7 @@ async fn pushed_authorization_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
-    let mut creds = match pushed_request_credentials(&headers, &form) {
+    let mut creds = match pushed_request_credentials(headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
@@ -1960,7 +1960,7 @@ async fn introspect_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
-    let mut creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
@@ -1992,7 +1992,7 @@ async fn revoke_handler<S: Storage, C: Clock>(
     let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
 
-    let mut creds = match credentials(&headers, &form) {
+    let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
         Err(e) => return error_response(&e, via_header, &state.challenge),
     };
@@ -2280,7 +2280,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
 ) -> Response {
     let pairs = parse_pairs(uri.query().unwrap_or_default());
 
-    let validated = match resolve_authorization_request(&state, &pairs).await {
+    let validated = match resolve_authorization_request(state, &pairs).await {
         Ok(v) => v,
         // RFC 6749 s4.1.2.1. `Direct` means the client or the redirect URI could not be
         // validated, so there is no address the server may safely send this to; it is rendered
@@ -2293,7 +2293,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
     };
 
     // The resource owner. Without one there is nobody whose consent a code could represent.
-    let subject = match state.subject(&headers) {
+    let subject = match state.subject(headers) {
         Some(s) => s,
         // Deliberately NOT an error redirect. `access_denied` at the client's redirect URI would
         // tell the client a user refused, when in truth no user was ever asked: this host has not
@@ -2322,13 +2322,13 @@ async fn authorize_handler<S: Storage, C: Clock>(
 
     let consent = match &state.consent {
         Some(resolver) => resolver(&ConsentRequest {
-            headers: &headers,
+            headers,
             subject: &subject,
             client_id: &validated.client_id,
             scope: &validated.scope,
             redirect_uri: &validated.redirect_uri,
             state: validated.state.as_deref(),
-            uri: &uri,
+            uri,
             #[cfg(feature = "consent")]
             // Deref through the shared `Arc<ConsentRecord>` the storage seam now returns: the
             // resolver borrows for the length of the call and never needs the handle.
@@ -2357,7 +2357,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
     // The host's report of how and when it authenticated this user, for RFC 9470 s4's parameters to
     // be enforced against. An unwired host reports `None`, which satisfies no requirement.
     #[cfg(feature = "consent")]
-    let authentication = state.authentication.as_ref().and_then(|f| f(&headers));
+    let authentication = state.authentication.as_ref().and_then(|f| f(headers));
     // The requirement comes off the RESOLVED request, not off `pairs`. For a PAR or JAR request the
     // query holds only `client_id` plus the handle or the object, so reading `pairs` here dropped
     // `acr_values` and `max_age` entirely and silently disabled step-up for both (RFC 9126 s4, RFC
@@ -2614,7 +2614,7 @@ async fn verification_page_handler<S: Storage, C: Clock>(
     // the client and the scope, with the approval still one deliberate click away.
     let pairs = parse_pairs(uri.query().unwrap_or_default());
     let prefill = param(&pairs, "user_code").unwrap_or_default();
-    render_verification(&state, &headers, prefill, StatusCode::OK, None).await
+    render_verification(state, headers, prefill, StatusCode::OK, None).await
 }
 
 /// The verification form's submission: the user has entered the code shown on their device.
@@ -2632,7 +2632,7 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
         );
     }
 
-    let text = String::from_utf8_lossy(&body);
+    let text = String::from_utf8_lossy(body);
     let form = parse_pairs(&text);
     let user_code = param(&form, "user_code").unwrap_or_default();
 
@@ -2640,7 +2640,7 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
     // explicitly disabled these is not browser-facing and is answering for that itself.
     let protected = !matches!(state.verification, VerificationProtection::Disabled);
     if protected {
-        if !same_origin(&headers, &state.origin) {
+        if !same_origin(headers, &state.origin) {
             return html_response(
                 StatusCode::FORBIDDEN,
                 verification_message("That request did not come from this site."),
@@ -2648,7 +2648,7 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
         }
         let expected =
             match &state.verification {
-                VerificationProtection::Tokens { consume, .. } => consume(&headers),
+                VerificationProtection::Tokens { consume, .. } => consume(headers),
                 // No CSRF seam: nothing to compare against, so nothing is approved. The GET above
                 // already refused to render a form, so this is the direct-POST path.
                 VerificationProtection::Unwired => return html_response(
@@ -2673,8 +2673,8 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
 
     if user_code.is_empty() {
         return render_verification(
-            &state,
-            &headers,
+            state,
+            headers,
             "",
             StatusCode::BAD_REQUEST,
             Some("Enter the code shown on your device."),
@@ -2691,12 +2691,12 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
     let denied = action == "deny";
     let approved = action == "approve" || !protected;
     if !denied && !approved {
-        return render_verification(&state, &headers, user_code, StatusCode::OK, None).await;
+        return render_verification(state, headers, user_code, StatusCode::OK, None).await;
     }
 
     // Approval binds the grant to a USER, so the same rule as the authorization endpoint applies:
     // without an authenticated resource owner there is nobody to bind it to.
-    let subject = match state.subject(&headers) {
+    let subject = match state.subject(headers) {
         Some(s) => s,
         None => {
             return html_response(
@@ -2742,7 +2742,7 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
             };
             // The CSRF token was consumed above, so this re-render mints a fresh one; without
             // that a mistyped code would leave the user with a form that can never be submitted.
-            render_verification(&state, &headers, user_code, status, Some(message)).await
+            render_verification(state, headers, user_code, status, Some(message)).await
         }
     }
 }

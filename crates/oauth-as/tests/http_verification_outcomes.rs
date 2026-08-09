@@ -211,7 +211,7 @@ impl Storage for LookupFails {
     fn get_token(
         &self,
         access_token: &str,
-    ) -> impl Future<Output = Result<Option<IssuedToken>, StorageError>> + Send {
+    ) -> impl Future<Output = Result<Option<Arc<IssuedToken>>, StorageError>> + Send {
         self.0.get_token(access_token)
     }
     fn delete_token(
@@ -229,7 +229,7 @@ impl Storage for LookupFails {
     fn get_refresh_token(
         &self,
         refresh_token: &str,
-    ) -> impl Future<Output = Result<Option<RefreshTokenRecord>, StorageError>> + Send {
+    ) -> impl Future<Output = Result<Option<Arc<RefreshTokenRecord>>, StorageError>> + Send {
         self.0.get_refresh_token(refresh_token)
     }
     fn take_refresh_token(
@@ -257,7 +257,8 @@ impl Storage for LookupFails {
     fn get_consent(
         &self,
         consent_id: &str,
-    ) -> impl Future<Output = Result<Option<oauth_as::ConsentRecord>, StorageError>> + Send {
+    ) -> impl Future<Output = Result<Option<Arc<oauth_as::ConsentRecord>>, StorageError>> + Send
+    {
         self.0.get_consent(consent_id)
     }
     #[cfg(feature = "consent")]
@@ -265,14 +266,15 @@ impl Storage for LookupFails {
         &self,
         client_id: &ClientId,
         subject: &str,
-    ) -> impl Future<Output = Result<Option<oauth_as::ConsentRecord>, StorageError>> + Send {
+    ) -> impl Future<Output = Result<Option<Arc<oauth_as::ConsentRecord>>, StorageError>> + Send
+    {
         self.0.find_consent(client_id, subject)
     }
     #[cfg(feature = "consent")]
     fn consents_for_subject(
         &self,
         subject: &str,
-    ) -> impl Future<Output = Result<Vec<oauth_as::ConsentRecord>, StorageError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Arc<oauth_as::ConsentRecord>>, StorageError>> + Send {
         self.0.consents_for_subject(subject)
     }
     #[cfg(feature = "consent")]

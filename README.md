@@ -47,7 +47,8 @@ Behind off-by-default features:
 | Rich authorization requests | RFC 9396 | `rar` |
 | Protected resource metadata | RFC 9728 | `resource-metadata` |
 | Consent records and step-up auth | RFC 9470 | `consent` |
-| An axum router over all of it | | `http` |
+| An HTTP service over all of it | | `http` |
+| An axum adapter for that service | | `axum` |
 | A `Storage` conformance harness for hosts | | `test-util` |
 
 Plus the seams a real deployment needs: an audit **event sink**, a **rate limiting** hook
@@ -64,7 +65,8 @@ The default feature set is **empty**, and stays that way.
 | Feature | Adds | Cost |
 | ------- | ---- | ---- |
 | *(default)* | The protocol core | `serde`, `serde_json`, `getrandom`, `sha2`, `base64` |
-| `http` | An axum router over the server | `axum`, `tokio` |
+| `http` | An HTTP service over the server | `http`, `http-body`, `bytes` |
+| `axum` | An `axum::Router` adapter for it | `axum`, `tokio` |
 | `jwt` | RFC 9068 signed access tokens and a JWKS | `p256` |
 
 A consumer who wants only the library gets no HTTP stack, no async runtime, and no signing code.
@@ -115,7 +117,8 @@ in CI with `--locked`:
 | ----------- | ----- | ------ |
 | default | **1.75** | this crate (RPITIT in `Storage`) |
 | `jwt` | **1.75** | `p256` builds there |
-| `http` | **1.80** | `axum` 0.8 declares it |
+| `http` | **1.75** | this crate; `http`, `http-body` and `bytes` are all lower |
+| `axum` | **1.80** | `axum` 0.8 declares it |
 
 1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower
 would mean `Box<dyn Future>` there, a heap allocation on every storage call, paid forever by every
