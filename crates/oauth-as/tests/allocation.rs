@@ -286,11 +286,7 @@ fn authorization_request_from_borrowed_pairs_allocates_nothing() {
     assert_eq!(req.client_id.as_deref(), Some("public-app"));
     assert_eq!(
         d,
-        Delta {
-            allocs: 0,
-            deallocs: 0,
-            bytes: 0
-        },
+        Delta::default(),
         "AuthorizationRequest::from_pairs on borrowed &str must not allocate at all, got {d:?}"
     );
 }
@@ -346,7 +342,8 @@ fn authorization_response_location_allocates_exactly_once_at_the_exact_size() {
         Delta {
             allocs: 1,
             deallocs: 0,
-            bytes: exact_len
+            bytes: exact_len,
+            freed: 0
         },
         "location() must allocate its buffer once, at exactly the size the output needs: {d:?}"
     );

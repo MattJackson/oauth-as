@@ -134,11 +134,7 @@ fn an_unconfigured_hook_allocates_nothing() {
     });
     assert_eq!(
         d,
-        Delta {
-            allocs: 0,
-            deallocs: 0,
-            bytes: 0
-        },
+        Delta::default(),
         "an unconfigured event hook must not allocate: {d:?}"
     );
 }

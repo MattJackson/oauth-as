@@ -29,6 +29,13 @@ pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static BYTES_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+/// Bytes handed BACK to the allocator. Counted separately from [`BYTES_ALLOCATED`] so that a
+/// measurement can report RESIDENT bytes (`bytes - freed`) as well as allocator traffic. Traffic is
+/// the right number for a hot path, where the question is how much work a request buys; resident is
+/// the right number for a stored record, where the question is what a live grant costs a deployment
+/// for as long as it exists. `tests/allocation_footprint.rs` needs the second one and nothing in
+/// the crate could report it before.
+static BYTES_FREED: AtomicUsize = AtomicUsize::new(0);
 
 /// Counts every call that passes through it and delegates the actual memory work to `System`. The
 /// counts are cumulative for the process's whole lifetime; callers read deltas via [`Snapshot`].
@@ -43,6 +50,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        BYTES_FREED.fetch_add(layout.size(), Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -58,6 +66,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
         // `Vec`/`String` growth actually costs a caller: one realloc, not an alloc plus a dealloc.
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
         BYTES_ALLOCATED.fetch_add(new_size, Ordering::Relaxed);
+        // The old block stops being resident, so a grow of 32 to 64 bytes leaves 64 resident and
+        // not 96. Without this the resident figure would count every intermediate buffer a `Vec`
+        // ever passed through.
+        BYTES_FREED.fetch_add(layout.size(), Ordering::Relaxed);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -68,6 +80,7 @@ pub struct Snapshot {
     alloc_calls: usize,
     dealloc_calls: usize,
     bytes_allocated: usize,
+    bytes_freed: usize,
 }
 
 /// The change in the counters between two snapshots (or across a measured closure).
@@ -79,6 +92,20 @@ pub struct Delta {
     pub deallocs: usize,
     /// Sum of requested bytes across the counted alloc-family calls.
     pub bytes: usize,
+    /// Sum of bytes returned to the allocator (`dealloc`, plus the old block of every `realloc`).
+    pub freed: usize,
+}
+
+impl Delta {
+    /// Bytes still held when the window closed: what a deployment's RSS actually carries, as
+    /// opposed to [`Delta::bytes`], which is the traffic a request generated on its way there.
+    ///
+    /// Saturating rather than wrapping because a window can legitimately end NEGATIVE (freeing
+    /// memory allocated before it opened), and a footprint measurement that reported
+    /// `usize::MAX - 3` for "it shrank" would be worse than useless.
+    pub fn resident(&self) -> usize {
+        self.bytes.saturating_sub(self.freed)
+    }
 }
 
 /// Read the counters now.
@@ -87,6 +114,7 @@ pub fn snapshot() -> Snapshot {
         alloc_calls: ALLOC_CALLS.load(Ordering::Relaxed),
         dealloc_calls: DEALLOC_CALLS.load(Ordering::Relaxed),
         bytes_allocated: BYTES_ALLOCATED.load(Ordering::Relaxed),
+        bytes_freed: BYTES_FREED.load(Ordering::Relaxed),
     }
 }
 
@@ -97,6 +125,7 @@ impl Snapshot {
             allocs: later.alloc_calls.saturating_sub(self.alloc_calls),
             deallocs: later.dealloc_calls.saturating_sub(self.dealloc_calls),
             bytes: later.bytes_allocated.saturating_sub(self.bytes_allocated),
+            freed: later.bytes_freed.saturating_sub(self.bytes_freed),
         }
     }
 }
