@@ -15,7 +15,8 @@ see.
 Please include, as far as you can:
 
 - the affected version or commit,
-- which crate feature set was enabled (`default`, `http`, `jwt`),
+- which crate feature set was enabled (the exact `features = [...]` list, since thirteen of them
+  exist and most of the wire surface is behind one),
 - a concrete attack: the requests, the order they are sent in, and what the attacker ends up
   holding that they should not,
 - the RFC section you believe is violated, if one applies.

@@ -60,17 +60,36 @@ See [ROADMAP.md](ROADMAP.md) for what is coming and, more usefully, what is miss
 
 ## Features
 
-The default feature set is **empty**, and stays that way.
+Thirteen features. The default set is **empty**, and stays that way.
 
-| Feature | Adds | Cost |
-| ------- | ---- | ---- |
-| *(default)* | The protocol core | `serde`, `serde_json`, `getrandom`, `sha2`, `base64` |
-| `http` | An HTTP service over the server | `http`, `http-body`, `bytes` |
-| `axum` | An `axum::Router` adapter for it | `axum`, `tokio` |
-| `jwt` | RFC 9068 signed access tokens and a JWKS | `p256` |
+| Feature | Adds | Implies | Cost in dependencies |
+| ------- | ---- | ------- | -------------------- |
+| *(default)* | The protocol core | | `serde`, `serde_json`, `getrandom`, `sha2`, `base64` |
+| `http` | An HTTP service over the server: `http::Request` in, `http::Response` out, **no web framework and no async runtime** | | `http`, `http-body`, `bytes` |
+| `axum` | `impl From<AuthorizationService> for axum::Router`, plus the runtime to bind a listener with. About thirty lines, and the whole of this crate's exposure to a pre-1.0 framework | `http` | `axum` 0.8, `tokio` |
+| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document | | `p256` |
+| `client_assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
+| `dpop` | RFC 9449 sender-constrained tokens | `jwt` | none of its own |
+| `jar` | RFC 9101 signed request objects | `jwt` | none of its own |
+| `mtls` | RFC 8705 mTLS client auth and certificate-bound tokens | | none |
+| `par` | RFC 9126 pushed authorization requests | | none |
+| `rar` | RFC 9396 rich authorization requests | | none |
+| `token-exchange` | RFC 8693 token exchange | | none |
+| `consent` | Consent records, withdrawal with a revocation cascade, RFC 9470 step-up | | none |
+| `resource-metadata` | The RFC 9728 document type, for a host that also runs a resource server | | none |
+| `test-util` | A runnable `Storage` conformance harness for hosts to run against their own store | | none |
+
+Nine of the thirteen add no dependency at all: they are serde shapes and comparisons over what is
+already there. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
+whose major has never moved, so they can appear in this crate's public signatures without making a
+framework upgrade in your tree a breaking change here. If you want a `Router`, turn on `axum` as
+well; if you are on a different axum major, leave it off and mount the service directly.
 
 A consumer who wants only the library gets no HTTP stack, no async runtime, and no signing code.
 That is the premise of the crate, not a configuration option.
+
+On [docs.rs](https://docs.rs/oauth-as) everything above is built and rendered, with a badge on
+each item naming the feature that turns it on.
 
 ## Cost
 
@@ -119,6 +138,10 @@ in CI with `--locked`:
 | `jwt` | **1.75** | `p256` builds there |
 | `http` | **1.75** | this crate; `http`, `http-body` and `bytes` are all lower |
 | `axum` | **1.80** | `axum` 0.8 declares it |
+
+`axum` is the only feature that raises the floor, and it raises it because a dependency it pulls
+in says so, not because of anything in this crate. The other nine features add no dependency, so
+they add no floor; `client_assertion`, `dpop` and `jar` inherit `jwt`'s.
 
 1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower
 would mean `Box<dyn Future>` there, a heap allocation on every storage call, paid forever by every

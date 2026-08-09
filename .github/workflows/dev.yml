@@ -37,7 +37,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: tests
         run: cargo test --workspace --locked
-      # ALL FEATURES TOO, and this is not belt and braces. Twelve of this crate's capabilities
+      # ALL FEATURES TOO, and this is not belt and braces. Thirteen of this crate's capabilities
       # are behind off-by-default cargo features, so a default-features run exercises a minority
       # of the code: at 0.9.0 that is roughly 320 tests against roughly 710. A regression in
       # DPoP, mTLS, PAR, RAR, token exchange or consent would otherwise reach `qa` unnoticed,
@@ -46,8 +46,27 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
       - name: tests (all features)
         run: cargo test -p oauth-as --locked --all-features
+      # RUSTDOC, and it is a gate rather than a nicety. Nothing here ran rustdoc, and the cost of
+      # that was measurable: 23 warnings at 0.9.0, including public documentation pointing readers
+      # at pub(crate) items they cannot see, and two links to a type (`RouterBuilder`) renamed in
+      # the 0.9 rewrite and therefore dead since then. docs.rs is where most people meet this
+      # crate, and a rustdoc warning is the compiler saying the published documentation is wrong.
+      #
+      # --all-features because that is exactly what docs.rs builds (see the
+      # [package.metadata.docs.rs] table in crates/oauth-as/Cargo.toml), so this is the same
+      # rustdoc invocation modulo --cfg docsrs. --no-deps because a warning in somebody else's
+      # crate is not this gate's business.
+      - name: rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc -p oauth-as --locked --all-features --no-deps
+      # The doc examples must COMPILE. They are `no_run`, so nothing here binds a socket, but a
+      # quickstart that does not compile is worse than no quickstart: it is a wrong answer with
+      # the authority of documentation behind it.
+      - name: doc tests (all features)
+        run: cargo test -p oauth-as --locked --all-features --doc
       # FEATURE COMBINATIONS, and this job exists because of a real escape rather than on
-      # principle. Twelve optional features means default and --all-features are two points in a
+      # principle. Thirteen optional features means default and --all-features are two points in a
       # large space, and code gated `#[cfg(feature = "a")]` inside a function only compiled under
       # feature "b" is invisible to both. A `details` parameter used only under `rar` went out in
       # a `http,jwt` build (exactly what the conformance server compiles) and neither matrix saw
