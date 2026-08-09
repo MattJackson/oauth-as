@@ -887,6 +887,11 @@ async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
 /// advertised exactly when this server signs its access tokens, is covered by the sweep above
 /// rather than by a hand-written exception.
 async fn service_variants() -> Vec<(&'static str, Service)> {
+    // The `mut` is needed only by the `jwt-p256` push below, so without a backend it is an
+    // unused_mut, which `-D warnings` makes fatal in exactly the CI job that exists to compile
+    // this build. Allowed rather than restructured: the alternative spellings either hide which
+    // variant is conditional or rebuild the vector to dodge a lint.
+    #[cfg_attr(not(feature = "jwt-p256"), allow(unused_mut))]
     let mut variants = vec![("opaque tokens", fixture().await.service)];
     #[cfg(feature = "jwt-p256")]
     {
