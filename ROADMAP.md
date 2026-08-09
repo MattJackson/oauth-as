@@ -39,6 +39,44 @@ exceptions that remain non-goals and one item still outstanding:
   identifier. A host that also runs a resource server can now publish a
   conformant document; the crate does not serve one for it.
 
+### The measured efficiency backlog, and what is left of it
+
+A measured efficiency review produced seven findings with numbers attached. The
+two that were breaking changes to the public API have LANDED, because nothing is
+published yet, so breaking now costs nobody and breaking after 0.9.0 ships costs
+every adopter:
+
+- **`Storage`'s pure reads hand back `Arc`.** `get_client` alone was 7 of the 18
+  allocations on a device token poll, the cheapest call on the token plane, and
+  every authenticated request paid it. Measured after: the poll is 11, code
+  redemption 46 to 39, refresh rotation 39 to 33, RFC 7662 introspection 18 to
+  4. `get_device_grant` was tried and REVERTED, with its own measurement: the
+  poll mutates the grant it read, so an `Arc` moves the clone from the read to
+  the mutation and adds one allocation to re-wrap it.
+- **`ErrorResponse::error_description` is `Option<Cow<'static, str>>`.** One
+  allocation per REFUSED request, on a path an attacker sets the rate of, purely
+  to copy a `&'static str`. Size neutral, measured: 24 bytes either way, and
+  `ErrorResponse` is 56 bytes before and after.
+
+Five findings are still OPEN. They are recorded here rather than in a release
+heading because none of them breaks an API, so none of them has to wait for a
+particular number:
+
+- **`Box<str>` on the stored records**: 23 to 32 percent off `IssuedToken`,
+  `DeviceGrant` and `RefreshTokenRecord`. `IssuedToken::jkt` already does this
+  and carries the reasoning.
+- **`serde_json` declared unconditionally** while every use site is behind a
+  feature. Zero linked bytes at stake, but four crates compiled by every default
+  build that uses none of them.
+- **`p256`'s `pkcs8` feature costs 20,764 linked bytes for ONE constructor**,
+  more than `sha2` and `base64` combined. Wants its own sub-feature.
+- **Serialize-once violations under `jwt`**: the JWKS is recomputed per fetch and
+  the JOSE header per token, both fixed for the life of the config, and `par.rs`
+  re-parses a verifying key per request while its own comment says it is parsed
+  once.
+- **`registration` is the only capability with no cargo feature**, so a host that
+  never enables dynamic registration still compiles all of it.
+
 What this is still NOT is the surface area of Keycloak, Ory Hydra, Auth0 or
 Okta: no user store, no admin UI, no federation, no OIDC. That is the design,
 not a gap.
@@ -253,41 +291,6 @@ crate and fix what falls out.
   nothing in the crate can currently catch that.
 - Interop testing against real third party clients beyond the pinned `oauth2`
   crate.
-
-### 0.10.0: the measured efficiency backlog
-
-Deferred here DELIBERATELY rather than squeezed into 0.9.0. A measured
-efficiency review produced these with numbers attached; two are breaking changes
-to `Storage`, and the argument for doing them before 0.9.0 was that 0.9.0
-freezes the API. It does not: this is 0.x, breaking changes run through it and
-stop at 1.0, and landing a twelve-method refactor immediately before a full code
-audit would hand that audit a pile of fresh unreviewed code. Sequencing beats
-haste.
-
-- **`get_client` returns an owned `Client`.** MEASURED: `get_client` plus
-  `get_device_grant` are 14 of the 19 allocations on a device poll, the cheapest
-  token-plane call in the crate. Fix is `Arc<Client>`; object safety is not a
-  blocker, since `Storage` uses RPITIT and can never be a `dyn` trait, and the
-  atomicity contract governs `take_*` rather than the reads. Breaking, and it
-  touches the twelve read-path methods.
-- **`ErrorResponse::error_description` is `Option<String>`.** One allocation per
-  REFUSED request, on a path an attacker sets the rate of, to copy a
-  `&'static str`. `Option<Cow<'static, str>>` is MEASURED size-neutral (24 bytes
-  either way). The review called this the highest value per line in the crate.
-- **`Box<str>` on the stored records**: 23 to 32 percent off `IssuedToken`,
-  `DeviceGrant` and `RefreshTokenRecord`. `IssuedToken::jkt` already does this
-  and carries the reasoning.
-- **`serde_json` declared unconditionally** while every use site is behind a
-  feature. Zero linked bytes at stake, but four crates compiled by every default
-  build that uses none of them.
-- **`p256`'s `pkcs8` feature costs 20,764 linked bytes for ONE constructor**,
-  more than `sha2` and `base64` combined. Wants its own sub-feature.
-- **Serialize-once violations under `jwt`**: the JWKS is recomputed per fetch and
-  the JOSE header per token, both fixed for the life of the config, and `par.rs`
-  re-parses a verifying key per request while its own comment says it is parsed
-  once.
-- **`registration` is the only capability with no cargo feature**, so a host that
-  never enables dynamic registration still compiles all of it.
 
 ### 1.0.0: earned, not scheduled
 
