@@ -488,22 +488,15 @@ fn authorization_code_redemption_hot_path_allocation_bound() {
         let srv = AuthorizationServer::new(cfg, MemoryStorage::new());
         srv.register_client(code_test_client()).await.unwrap();
         let challenge = oauth_as::pkce::code_challenge_s256(verifier);
-        let req = AuthorizationRequest {
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: Default::default(),
-            response_type: Some("code".into()),
-            client_id: Some("public-app".into()),
-            redirect_uri: Some("https://app.example/cb".into()),
-            scope: Some("read write".into()),
-            state: Some("s".into()),
-            code_challenge: Some(challenge.into()),
-            code_challenge_method: Some("S256".into()),
-            #[cfg(feature = "consent")]
-            acr_values: None,
-            #[cfg(feature = "consent")]
-            max_age: None,
-        };
+        let req = AuthorizationRequest::from_pairs([
+            ("response_type", "code"),
+            ("client_id", "public-app"),
+            ("redirect_uri", "https://app.example/cb"),
+            ("scope", "read write"),
+            ("state", "s"),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+        ]);
         let validated = srv.validate_authorization_request(&req).await.unwrap();
         let response = srv
             .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
@@ -555,22 +548,15 @@ fn refresh_rotation_hot_path_allocation_bound() {
         let srv = AuthorizationServer::new(cfg, MemoryStorage::new());
         srv.register_client(code_test_client()).await.unwrap();
         let challenge = oauth_as::pkce::code_challenge_s256(verifier);
-        let req = AuthorizationRequest {
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: Default::default(),
-            response_type: Some("code".into()),
-            client_id: Some("public-app".into()),
-            redirect_uri: Some("https://app.example/cb".into()),
-            scope: Some("read write".into()),
-            state: Some("s".into()),
-            code_challenge: Some(challenge.into()),
-            code_challenge_method: Some("S256".into()),
-            #[cfg(feature = "consent")]
-            acr_values: None,
-            #[cfg(feature = "consent")]
-            max_age: None,
-        };
+        let req = AuthorizationRequest::from_pairs([
+            ("response_type", "code"),
+            ("client_id", "public-app"),
+            ("redirect_uri", "https://app.example/cb"),
+            ("scope", "read write"),
+            ("state", "s"),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+        ]);
         let validated = srv.validate_authorization_request(&req).await.unwrap();
         let response = srv
             .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
@@ -786,7 +772,7 @@ fn metadata_serialization_allocation_bound() {
 /// differences across platforms but not enough to hide a new heap-owning field for free.
 fn core_public_types_stay_within_their_size_budget() {
     // AuthorizationServer<MemoryStorage> is ServerConfig + MemoryStorage + SystemClock; MemoryStorage
-    // is a single Mutex<MemoryInner> of 6 empty-capacity HashMaps (3 words each: ptr, len, cap-ish
+    // is a single Mutex<MemoryInner> of 7 empty-capacity HashMaps (3 words each: ptr, len, cap-ish
     // RandomState overhead), so the server's size tracks ServerConfig's almost directly.
     //
     // The budget is stated PER FEATURE SET rather than loosened to the widest build, because the
@@ -817,11 +803,17 @@ fn core_public_types_stay_within_their_size_budget() {
     // because the point of this gate is that a field costs somebody a line: what it buys is a
     // `format!` of a fixed value removed from every DPoP proof and every client assertion, which
     // for a `private_key_jwt` client sending DPoP was twice per token request.
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     const TOKEN_ENDPOINT: usize = 16;
-    #[cfg(not(any(feature = "client_assertion", feature = "dpop")))]
+    #[cfg(not(any(feature = "client-assertion", feature = "dpop")))]
     const TOKEN_ENDPOINT: usize = 0;
-    let server_budget = 832 + PAR + JAR + RAR + TOKEN_ENDPOINT;
+    // The revocation barrier table in `MemoryInner`: one HashMap, 48 bytes, and UNCONDITIONAL,
+    // because `put_token` consults it in every build. It is declared on its own line rather than
+    // folded into the base for the reason this gate exists: a field should cost somebody a line,
+    // and this is the field that closes the resurrection defect at all six write sites
+    // `tests/revocation_resurrection.rs` pins. MEASURED: 936 before, 984 after, on `--all-features`.
+    const REVOCATION_BARRIERS: usize = 48;
+    let server_budget = 832 + REVOCATION_BARRIERS + PAR + JAR + RAR + TOKEN_ENDPOINT;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
@@ -865,11 +857,34 @@ fn core_public_types_stay_within_their_size_budget() {
     // `consent`: the RFC 9470 authentication report, an `Option<Box<Authentication>>`, 8
     // bytes, because the report itself lives behind the pointer and only a grant the host
     // actually described allocates it.
-    let issued_token_budget = 176
+    // `token-exchange`: the RFC 8693 s4.1 `act` claim, an `Option<Box<ActClaim>>`, 8 bytes,
+    // because the claim lives behind the pointer and only a DELEGATED token allocates it. An
+    // impersonation exchange and every other grant pay the null pointer and nothing else.
+    // What it buys: this crate's default access token is OPAQUE, so RFC 7662 introspection is
+    // the only channel a resource server has for learning that what it holds is "A acting for
+    // B" rather than "B". MEASURED: 232 before, 240 after, on `--all-features`.
+    // 176 -> 192 in 0.9.1, and the 16 bytes are ONE `SystemTime`: `grant_established_at`, which
+    // the revocation barrier is compared against. MEASURED at 192 default and 192 here, with
+    // `SystemTime` measured at 16 on this target.
+    //
+    // The alternative to spending it was comparing against `issued_at`, which costs nothing and is
+    // WRONG: a rotation and a code redemption both write at `now`, so `issued_at` cannot tell a
+    // grant that predates a revocation from one made after it. Sixteen bytes on a record already
+    // holding two `String`s and a `ScopeSet` buys the difference between a barrier that locks a
+    // re-approving user out for the life of a refresh token and one that does not.
+    //
+    // `RefreshTokenRecord` gained the same field and did NOT need its budget moved: measured 184
+    // against a base of 192, so it had the headroom already.
+    let issued_token_budget = 192
         + if cfg!(feature = "dpop") { 16 } else { 0 }
         + if cfg!(feature = "mtls") { 8 } else { 0 }
         + if cfg!(feature = "rar") { 24 } else { 0 }
-        + if cfg!(feature = "consent") { 8 } else { 0 };
+        + if cfg!(feature = "consent") { 8 } else { 0 }
+        + if cfg!(feature = "token-exchange") {
+            8
+        } else {
+            0
+        };
     assert!(
         size_of::<IssuedToken>() <= issued_token_budget,
         "IssuedToken grew past its size budget: {}",
@@ -893,7 +908,7 @@ fn core_public_types_stay_within_their_size_budget() {
         size_of::<Client>()
     );
     // `ClientAuth` is the classic box-the-large-variant candidate and it has already been handled:
-    // 48 bytes on EVERY feature set, so `client_assertion`'s `AssertionKeys` and `mtls`'s
+    // 48 bytes on EVERY feature set, so `client-assertion`'s `AssertionKeys` and `mtls`'s
     // `MtlsClientRegistration` both already fit inside what `ConfidentialSecret`'s `String` and
     // `ConfidentialSecretHash`'s `SecretHash` need. A future variant that did not would show up
     // here as `Client` growing for every deployment, including the ones that never use it.

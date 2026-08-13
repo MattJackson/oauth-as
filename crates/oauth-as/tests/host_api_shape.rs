@@ -3,12 +3,14 @@
 
 //! The shape a HOST codes against, as gates rather than as habits.
 //!
-//! Five properties, each of which was inconsistent across the crate rather than absent from it,
+//! Seven properties, each of which was inconsistent across the crate rather than absent from it,
 //! which is the worse failure: a host that learns the rule from one type is entitled to expect it
 //! from the next one.
 //!
 //! - [`error_code_is_non_exhaustive`]: a public enum that GAINS variants with a cargo feature must
 //!   not break a host's exhaustive `match` when a feature flag moves.
+//! - [`every_feature_varying_public_type_is_non_exhaustive`]: and so must EVERY other one, which is
+//!   the general form of the rule the test above states about a single enum.
 //! - [`error_code_http_status_chooses_a_status_for_every_variant`]: a new variant must force its
 //!   author to choose a status rather than inheriting 400 from a catch-all.
 //! - [`registration_error_response_is_a_std_error`]: a public type with a `Display` that describes
@@ -17,11 +19,15 @@
 //!   builders is a rule nobody is following.
 //! - [`every_public_request_cap_is_reexported_at_the_crate_root`]: a host sizing its own gateway
 //!   limits needs all of them, from one place.
+//! - [`every_type_in_a_storage_signature_is_reexported_at_the_crate_root`]: the general form of
+//!   that one, over the API a host cannot route around. It caught `RevocationWindow`, which a host
+//!   MUST name to declare three `Storage` methods and which was reachable only through
+//!   `oauth_as::store::`.
 //!
-//! Three of the five are SOURCE scans, in the same idiom (and for the same dependency-policy
-//! reason) as `tests/allocation.rs`'s scan for module-level statics: `#[non_exhaustive]` and
-//! `#[must_use]` are invisible from inside the crate that declares them, so no runtime assertion
-//! can see either.
+//! Five of the seven are SOURCE scans, in the same idiom (and for the same dependency-policy
+//! reason) as `tests/allocation.rs`'s scan for module-level statics: `#[non_exhaustive]`,
+//! `#[must_use]` and a MISSING re-export are all invisible from inside the crate that declares
+//! them, so no runtime assertion can see any of them.
 
 /// `ErrorCode` is the most widely matched enum this crate publishes, and its VARIANT SET depends on
 /// cargo features: `rar`, `consent`, `dpop`, `par` and `jar` each add one. Without
@@ -39,6 +45,161 @@ fn error_code_is_non_exhaustive() {
         preamble.contains("#[non_exhaustive]"),
         "ErrorCode gains variants with a cargo feature, so a host's exhaustive match must not \
          break on a feature flag"
+    );
+}
+
+/// THE GENERAL FORM of the test above, and the reason that one was not enough.
+///
+/// `ErrorCode` was found by reading; the rule it is an instance of covers twenty public types, and
+/// sixteen of them were missing the attribute at 0.9.0. Every one of this crate's fifteen features
+/// is OFF by default, so the failure always looks the same from a host's side: they write a struct
+/// literal or an exhaustive `match` against the feature set THEY enabled, it compiles, and it stops
+/// compiling the day an unrelated crate in their dependency graph enables a feature they never
+/// asked for. Cargo feature unification means they cannot prevent that and did nothing to cause it.
+///
+/// `#[non_exhaustive]` cannot be added after the fact, because by then the literal is in somebody's
+/// production tree, so this is a gate rather than a lint: a NEW feature-gated field or variant on a
+/// public type fails this test until its type carries the attribute, which is the moment the
+/// decision is still free.
+///
+/// The scan reads source rather than asserting at runtime for the reason the module doc gives: the
+/// attribute has no effect inside the crate that declares it, so there is nothing for a test
+/// compiled as part of this crate to observe. This one is compiled as a separate crate and STILL
+/// cannot observe it, because the only observable consequence is a compile error.
+#[test]
+fn every_feature_varying_public_type_is_non_exhaustive() {
+    /// Public types whose field or variant set varies with a feature and which are deliberately
+    /// NOT marked, each with the reason it would be redundant rather than merely unwanted. A name
+    /// here that the scan no longer finds is itself a failure, so the list cannot rot into a set of
+    /// excuses for types that have since changed shape.
+    const DELIBERATELY_UNMARKED: &[(&str, &str)] = &[
+        (
+            "ValidatedAuthorizationRequest",
+            "sealed by a private zero-sized field, so it is already unconstructible and \
+             un-destructurable from outside this crate; see its own doc comment",
+        ),
+        (
+            "ServiceBuilder",
+            "every field is private, so the attribute would add nothing: a host builds it with \
+             new() and the with_* seams and can name none of its insides",
+        ),
+        (
+            "AuthorizationServer",
+            "every field is private, for the same reason as ServiceBuilder. Its `token_endpoint` \
+             is derived under client-assertion or dpop and is not something a host may ever spell",
+        ),
+    ];
+
+    let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(src_dir)
+        .expect("the crate's src/ must be readable")
+        .map(|e| e.expect("a readable directory entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    files.sort();
+
+    let mut varying = Vec::new();
+    let mut offenders = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("a readable source file");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let rest = match trimmed
+                .strip_prefix("pub struct ")
+                .or_else(|| trimmed.strip_prefix("pub enum "))
+            {
+                Some(rest) => rest,
+                None => continue,
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            // The BODY, by brace balance from the declaration's opening brace. A tuple or unit
+            // struct reaches `(` or `;` first and has no field the scan can be about.
+            let mut depth = 0usize;
+            let mut started = false;
+            let mut body = Vec::new();
+            for body_line in lines[i..].iter() {
+                // Doc and comment lines are skipped for COUNTING, because a field's prose
+                // legitimately contains braces (`{issuer}/par` is one) and a stray one would
+                // truncate the body or run it to the end of the file.
+                let t = body_line.trim_start();
+                let is_prose = t.starts_with("///") || t.starts_with("//");
+                if !is_prose {
+                    if !started {
+                        if let Some(stop) = body_line.find(['{', '(', ';']) {
+                            if body_line.as_bytes()[stop] != b'{' {
+                                break;
+                            }
+                            started = true;
+                        }
+                    }
+                    if started {
+                        depth += body_line.matches('{').count();
+                        depth -= body_line.matches('}').count().min(depth);
+                    }
+                }
+                if started {
+                    body.push(*body_line);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if !started {
+                continue;
+            }
+            let varies = body.iter().any(|b| {
+                let t = b.trim_start();
+                t.starts_with("#[cfg(") && t.contains("feature")
+            });
+            if !varies {
+                continue;
+            }
+            varying.push(name.clone());
+            // The attribute sits in the contiguous doc/attribute block above the declaration.
+            // `starts_with` and not `contains`, because the house style is to explain the
+            // attribute in a doc comment that quotes it directly above the attribute itself.
+            let marked = lines[..i]
+                .iter()
+                .rev()
+                .take_while(|prev| {
+                    let p = prev.trim_start();
+                    p.starts_with("///") || p.starts_with("#[") || p.starts_with("//")
+                })
+                .any(|prev| prev.trim_start().starts_with("#[non_exhaustive]"));
+            if marked || DELIBERATELY_UNMARKED.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            offenders.push(format!("{}:{}: {}", path.display(), i + 1, name));
+        }
+    }
+
+    assert!(
+        varying.len() > 10,
+        "the scan found only {} feature-varying public types, so it has stopped finding them and \
+         is no longer testing anything",
+        varying.len()
+    );
+    for (name, why) in DELIBERATELY_UNMARKED {
+        assert!(
+            varying.iter().any(|v| v == name),
+            "{name} is on the deliberately-unmarked list ({why}) but the scan no longer finds it \
+             varying with a feature; drop the entry rather than leaving it to excuse a type that \
+             has changed shape since"
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "these public types gain a field or a variant with a cargo feature and are not \
+         #[non_exhaustive], so a host's struct literal or exhaustive match against them breaks \
+         when anything in their dependency graph enables a feature they did not ask for:\n{}",
+        offenders.join("\n")
     );
 }
 
@@ -157,9 +318,17 @@ fn must_use_on_consuming_builders_is_all_or_nothing() {
             }
         }
     }
+    // A COUNT, not a non-emptiness, and the sibling guard on the `#[non_exhaustive]` scan above
+    // already had it right. `!marked.is_empty() || !unmarked.is_empty()` is satisfied by finding
+    // ONE builder out of the twenty-odd this crate has, so a signature pattern that silently
+    // stopped matching -- a rename, a `where` clause moved onto its own line, a file the walk no
+    // longer reaches -- would leave this scan reporting on a single method while reading as though
+    // it had swept the crate. That is the same shape as an anti-rot guard that cannot rot.
+    let found = marked.len() + unmarked.len();
     assert!(
-        !marked.is_empty() || !unmarked.is_empty(),
-        "the scan found no consuming builders at all, so it has stopped testing anything"
+        found > 10,
+        "the scan found only {found} consuming builders, so it has stopped finding them and is no \
+         longer testing anything"
     );
     assert!(
         marked.is_empty() || unmarked.is_empty(),
@@ -169,6 +338,136 @@ fn must_use_on_consuming_builders_is_all_or_nothing() {
         marked.len() + unmarked.len(),
         marked.join("\n"),
         unmarked.join("\n")
+    );
+}
+
+/// THE SIBLING OF THE TEST BELOW, for the one API surface a host cannot route around.
+///
+/// `lib.rs` states the rule beside the `Storage` re-exports: "A host implementing `Storage` MUST
+/// name `WriteOutcome`, because it is what `put_token`, `put_refresh_token` and
+/// `put_pushed_authorization_request` return". That is right, and it is a rule about the whole
+/// signature set rather than about the two types it was written for. `RevocationWindow` sat two
+/// lines away from that comment, un-re-exported, while being a BY-VALUE parameter of
+/// `delete_client`, `revoke_token_family` and `revoke_consent`. Its obligation is the STRONGER one:
+/// a store may satisfy `RevocationBarrier` in SQL and never match on the type, but nobody can write
+/// `async fn delete_client(&self, _: &ClientId, window: ???)` without spelling the parameter. This
+/// crate's own Postgres backend paid for it four times, writing `oauth_as::store::RevocationWindow`
+/// inline at each of the three methods plus a helper.
+///
+/// The rule this gate states is therefore: EVERY type this crate defines and names in a `Storage`
+/// method signature is reachable from the crate root. A host should be able to write the impl from
+/// `use oauth_as::*` and the trait's own docs, without learning which module each parameter happens
+/// to live in.
+///
+/// A source scan, and it has to be: a re-export that is MISSING is not an error anywhere inside this
+/// crate, because `crate::store::RevocationWindow` resolves perfectly well from here. It is only an
+/// absence, and only from outside. Same idiom and same reason as the scans above.
+#[test]
+fn every_type_in_a_storage_signature_is_reexported_at_the_crate_root() {
+    /// Names that appear in `Storage` signatures and belong to `std`/`core` rather than to this
+    /// crate, so re-exporting them would be wrong rather than merely unnecessary. Kept as a literal
+    /// list because the alternative is a heuristic about which CamelCase words are ours, and a
+    /// heuristic that guesses wrong in the quiet direction turns this test off.
+    const NOT_OURS: &[&str] = &[
+        "Future",
+        "Output",
+        "Result",
+        "Option",
+        "Some",
+        "None",
+        "Send",
+        "Sync",
+        "Sized",
+        "Arc",
+        "Vec",
+        "String",
+        "SystemTime",
+        "Duration",
+        "Self",
+    ];
+
+    let store_src = include_str!("../src/store.rs");
+    let lib_src = include_str!("../src/lib.rs");
+
+    // The TRAIT BODY only: the `impl Storage for MemoryStorage` below it names private helpers that
+    // are nobody's business, and the free items above it are not part of the host's obligation.
+    let trait_at = store_src
+        .find("pub trait Storage: Send + Sync {")
+        .expect("the trait has to still be there");
+    let trait_end = store_src[trait_at..]
+        .find("\n}\n")
+        .expect("the trait has to end")
+        + trait_at;
+    let body = &store_src[trait_at..trait_end];
+
+    // The re-export surface: every `pub use` line in lib.rs, joined, so that a name inside a braced
+    // multi-line list counts. Matching the whole file would let a doc comment mentioning a type
+    // stand in for actually exporting it, which is the failure this test is about.
+    let mut reexports = String::new();
+    let mut in_use = false;
+    for line in lib_src.lines() {
+        if line.starts_with("pub use ") {
+            in_use = true;
+        }
+        if in_use {
+            reexports.push_str(line);
+            reexports.push('\n');
+            if line.trim_end().ends_with(';') {
+                in_use = false;
+            }
+        }
+    }
+
+    let mut named = Vec::new();
+    let mut missing = Vec::new();
+    let mut signature = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("///") || trimmed.starts_with("//") {
+            continue;
+        }
+        if signature.is_empty() && !line.starts_with("    fn ") {
+            continue;
+        }
+        signature.push(' ');
+        signature.push_str(trimmed);
+        if !trimmed.ends_with(';') {
+            continue;
+        }
+        // Split on anything that cannot be part of an identifier, then keep the CamelCase words.
+        for word in signature.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else { continue };
+            if !first.is_ascii_uppercase() || NOT_OURS.contains(&word) {
+                continue;
+            }
+            if !named.iter().any(|n| n == word) {
+                named.push(word.to_string());
+            }
+            // Word boundaries matter: `Client` must not be satisfied by `ClientId`, and this crate
+            // publishes both.
+            let exported = reexports
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|t| t == word);
+            if !exported && !missing.iter().any(|m| m == word) {
+                missing.push(word.to_string());
+            }
+        }
+        signature.clear();
+    }
+
+    assert!(
+        named.len() > 8,
+        "the scan found only {} crate-defined types in Storage signatures, so it has stopped \
+         finding them and is no longer testing anything: {named:?}",
+        named.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "these types appear in a `Storage` method signature and are NOT re-exported at the crate \
+         root, so a host cannot write the impl from `oauth_as::` alone: {missing:?}\n\
+         A re-export that is missing is an absence rather than an error, invisible from inside this \
+         crate; add each to the `pub use` list in lib.rs under the SAME `#[cfg]` its item carries."
     );
 }
 

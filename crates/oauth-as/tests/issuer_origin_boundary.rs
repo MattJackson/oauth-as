@@ -6,13 +6,26 @@
 //! [`oauth_as::http::ServiceBuilder::build`] answers a configuration it cannot serve with a
 //! [`oauth_as::http::ServiceError`]. That is the designed answer, and it is the whole reason
 //! `build` returns a `Result` rather than a service: a library does not abort its host's process
-//! over a value in its host's configuration file.
+//! over a value in its host's configuration file. What this file pins is that every issuer shape
+//! below — non-ASCII path components, one trailing slash, two, none — reaches that `Result` at all,
+//! for a whole `build`, which is the only thing a host can observe and the only thing an
+//! integration test is placed to check.
 //!
-//! The origin of the issuer is derived on that path (RFC 6454 s6.1 scheme, host and port, which
-//! is what the device verification form compares an `Origin` header against). Deriving it by
-//! subtracting the length of a TRIMMED path from an UNTRIMMED issuer puts the split point inside
-//! a multi-byte character as soon as the issuer carries both a non-ASCII path and a trailing
-//! slash, and slicing a `str` there panics.
+//! # WHAT THIS FILE DOES NOT PIN, and where that is pinned instead
+//!
+//! The origin of the issuer is derived on this path (RFC 6454 s6.1 scheme, host and port, which is
+//! what the device verification form compares an `Origin` header against), and the reported defect
+//! was in that derivation: subtracting the length of a TRIMMED path from an UNTRIMMED issuer puts
+//! the split point inside a multi-byte character and slicing a `str` there panics.
+//!
+//! THAT DEFECT IS NOT REACHABLE FROM HERE and this file cannot reproduce it. `build` goes through
+//! `AuthorizationServerMetadata::from_config`, which trims the issuer's trailing slashes before
+//! `issuer_origin` is ever handed one, so by the time the subtraction happened there was nothing
+//! left to shift the index. Restoring the subtraction leaves every test below green. The guard
+//! that does reproduce it calls `issuer_origin` directly and can only live inside the crate:
+//! `the_issuer_origin_does_not_slice_inside_a_character` in `src/tests/http.rs`, whose own doc
+//! says the same thing from the other side. This file is kept as the outer half — the shapes
+//! really do build — with its claim cut back to that.
 //!
 //! `\u{e9}` is spelled as an escape rather than written literally because this repository is
 //! ASCII-only, source included.
@@ -35,9 +48,9 @@ fn builds(issuer: &str) -> bool {
         .is_ok()
 }
 
-/// The reported case: a two-byte character in the issuer's path, and two trailing slashes, so the
-/// trimmed path is two bytes shorter than the untrimmed one and the subtraction lands inside the
-/// character.
+/// The shape the report named: a two-byte character in the issuer's path, and two trailing
+/// slashes. Whether the panic is REACHABLE through `build` is settled in this file's module docs
+/// (it is not); what is asserted here is only that this configuration builds.
 #[test]
 fn an_issuer_with_a_multi_byte_path_and_trailing_slashes_does_not_panic() {
     assert!(

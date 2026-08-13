@@ -11,31 +11,50 @@ members = [
     # manifest even optionally, and implementing the trait from OUTSIDE is what proves the seam is
     # usable through the public API alone. Not published; see its own README.
     "crates/oauth-as-postgres",
+    # A REAL DOWNSTREAM CONSUMER of `delegate_storage!`, and the only thing here that can gate it:
+    # `macro_rules!` resolves an emitted `#[cfg(feature = ...)]` against the crate the macro expands
+    # IN, so the macro's forwarders can only be checked from OUTSIDE oauth-as. The doctest cannot do
+    # it (rustdoc uses the declaring crate's cfgs). Never published; asks for no features, so it adds
+    # nothing to the unification described below. See its own Cargo.toml.
+    "crates/oauth-as-delegate-fixture",
 ]
 
 # fuzz/ IS EXCLUDED, and the reason is FEATURE UNIFICATION rather than taste. Read this before
 # moving it into `members`, because it was tried there first and it does not work today.
 #
 # The fuzz targets exist to attack the parsers behind the optional features (`par`, `jar`, `dpop`,
-# `client_assertion`, `rar`, `http`, `jwt`, `mtls`), so the fuzz manifest has to turn those on.
+# `client-assertion`, `rar`, `http`, `jwt`, `mtls`), so the fuzz manifest has to turn those on.
 # Under resolver 2, a feature any workspace member asks for is enabled for EVERY member's build of
 # that package in the same `cargo build --workspace` invocation. So making fuzz/ a member silently
 # turns those features on for `crates/oauth-as-postgres` and for `crates/oauth-as`'s own test
 # targets, and MEASURED, on 2026-08-08, that breaks the workspace gate in two places:
 #
-#   1. `crates/oauth-as-postgres` does not implement `Storage::put_pushed_authorization_request`,
-#      `take_pushed_authorization_request` or `claim_replay_id`. Those trait items only exist when
-#      `par` / `dpop` / `client_assertion` are on, so the crate has never been compiled against
-#      them. That is a REAL GAP in the Postgres store, not an artifact of fuzzing: a host that
-#      enables PAR or DPoP cannot use it. It is recorded here rather than papered over.
-#   2. `crates/oauth-as/tests/http_par_jar_routing.rs` is gated
-#      `#![cfg(all(feature = "http", feature = "par"))]` but calls `axum::Router` and
-#      `axum::serve`, which need the separate `axum` feature. `http` + `par` without `axum` is a
-#      legal combination that nothing had ever built, so the under-gating was invisible.
+#   1. CORRECTED on 2026-08-09, and the earlier text here was FALSE. It said
+#      `crates/oauth-as-postgres` does not implement `Storage::put_pushed_authorization_request`,
+#      `take_pushed_authorization_request` or `claim_replay_id`, and called that a REAL GAP that
+#      left PAR and DPoP hosts unable to use the store. It implements all three:
+#      `put_pushed_authorization_request`, `take_pushed_authorization_request` and
+#      `claim_replay_id` in crates/oauth-as-postgres/src/store.rs (named rather than cited by line,
+#      because line numbers in a file that keeps changing go stale silently), and
+#      `cargo build -p oauth-as-postgres --features par,dpop,client-assertion` compiles clean.
+#   2. ALSO CORRECTED on 2026-08-09, and the earlier text here was FALSE TOO. It said
+#      `crates/oauth-as/tests/http_par_jar_routing.rs` is gated
+#      `#![cfg(all(feature = "http", feature = "par"))]` while calling `axum::Router` and
+#      `axum::serve`, so that `http` + `par` without `axum` failed to build. That file is gated
+#      `#![cfg(all(feature = "axum", feature = "par"))]` today, with a comment on the gate giving
+#      the reason, and MEASURED at commit bc111da in a clean worktree,
+#      `cargo build -p oauth-as --tests --features http,par` compiles.
 #
-# Neither is a defect in the fuzz targets and neither is this workstream's to fix, so fuzz/ carries
-# its own `[workspace]` table and resolves independently. `cargo package --list -p oauth-as` is
-# unaffected either way; nothing in crates/oauth-as depends on it, in any configuration.
+# So BOTH stated reasons are now gone, and the honest statement is that the measurement this
+# exclusion was justified by no longer reproduces. That is NOT the same as saying fuzz/ should be
+# moved into `members`: the feature-unification mechanism described above is unchanged, membership
+# would still turn `par`, `jar`, `dpop`, `client-assertion`, `rar`, `http`, `jwt` and `mtls` on for
+# every other member's build, and what that costs today has not been measured. WHETHER THE
+# EXCLUSION SHOULD REMAIN IS AN OPEN QUESTION FOR THE OWNER, not one this comment decides. It is
+# left in place because removing a working arrangement on the strength of two disproven reasons
+# would be a change made for no measured benefit. `cargo package --list -p oauth-as` is unaffected
+# either way; nothing in crates/oauth-as depends on fuzz/, in any configuration, so fuzz/ carries
+# its own `[workspace]` table and resolves independently.
 #
 # ROT PROTECTION, which is what membership was wanted for, is kept and is not weaker for being a
 # separate invocation: .github/workflows/qa.yml's `fuzz` job runs `cargo fmt --check` and

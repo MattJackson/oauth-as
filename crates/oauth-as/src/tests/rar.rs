@@ -151,10 +151,26 @@ fn depth_counts_containers_and_the_member_budget_is_exact() {
         "exactly at the member depth budget must be accepted"
     );
     let over = nest(MAX_MEMBER_DEPTH);
+    let refusal = AuthorizationDetails::parse(&over).unwrap_err();
     assert_eq!(
-        AuthorizationDetails::parse(&over).unwrap_err().error,
+        refusal.error,
         ErrorCode::InvalidAuthorizationDetails,
         "one level over must be refused"
+    );
+    // THE DESCRIPTION, not only the code, and the reason is that the code cannot tell these apart:
+    // all six refusal arms of `parse` answer `InvalidAuthorizationDetails`, so asserting it alone
+    // passes whether the depth rule fired or the document was rejected for being the wrong shape,
+    // for naming no `type`, or for any other reason. The at-limit acceptance above bounds that, but
+    // only for a fixture that stays well formed as it grows. This is the assertion that names the
+    // rule under test.
+    assert!(
+        refusal
+            .error_description
+            .as_deref()
+            .is_some_and(|d| d.contains("nested more deeply")),
+        "the refusal must come from the member depth rule and not from some other arm of parse \
+         that answers the same code: {:?}",
+        refusal.error_description
     );
 }
 

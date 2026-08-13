@@ -1,14 +1,8 @@
 target
-
-# cargo-mutants writes its report tree here. It is build output: large, machine
-# specific, and regenerated on every run.
-mutants.out
-# cargo-mutants rotates the previous run here rather than deleting it, so the
-# same reasoning applies to the rotated copy.
-mutants.out.old
-
-# Agent worktrees used for isolated parallel work.
-.claude/worktrees
-
-# Python bytecode from the integration patch scripts.
 __pycache__
+.DS_Store
+
+# cargo-mutants report trees. Build output: large, machine specific, regenerated
+# on every run, and rotated to .old rather than deleted.
+mutants.out
+mutants.out.old

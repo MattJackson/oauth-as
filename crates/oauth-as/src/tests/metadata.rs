@@ -123,3 +123,54 @@ fn without_the_jwt_feature_jwks_uri_is_whatever_the_host_declared() {
         Some("https://keys.example/jwks".to_string())
     );
 }
+
+/// KILLS the 0.9.1 survivor `replace AuthorizationServerMetadata::es256_verification_is_available
+/// with ()`.
+///
+/// The method tells the RFC 8414 document that ES256 verification exists, in a build where this
+/// crate has no ES256 BACKEND and the host installed a verifier itself. Under `--all-features`
+/// `jwt-p256` is on and `from_config` has already added everything, so emptying the method changes
+/// nothing there and the mutant survived. It is NOT equivalent: the whole reason the method is
+/// documented as idempotent is that it also runs in the configuration where `from_config` did not
+/// add these, and that configuration is the one no test was building.
+#[cfg(feature = "client-assertion")]
+#[test]
+fn announcing_es256_verification_adds_what_the_document_was_missing() {
+    let cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    let mut doc = AuthorizationServerMetadata::from_config(&cfg);
+
+    // Strip what a `jwt-p256` build would already have put there, so what follows is about THIS
+    // method rather than about `from_config`.
+    doc.token_endpoint_auth_methods_supported
+        .retain(|m| m != "private_key_jwt");
+    doc.token_endpoint_auth_signing_alg_values_supported = None;
+
+    doc.es256_verification_is_available();
+
+    assert!(
+        doc.token_endpoint_auth_methods_supported
+            .iter()
+            .any(|m| m == "private_key_jwt"),
+        "a deployment whose host installed an ES256 verifier must advertise private_key_jwt, or an \
+         RFC 7523 client reading the document concludes it cannot authenticate that way: {:?}",
+        doc.token_endpoint_auth_methods_supported
+    );
+    assert!(
+        doc.token_endpoint_auth_signing_alg_values_supported
+            .as_ref()
+            .is_some_and(|algs| algs.iter().any(|a| a == "ES256")),
+        "and it must name ES256 among the algorithms it accepts"
+    );
+
+    // IDEMPOTENT, which is what lets it run in a build where `from_config` already added these.
+    // A document naming private_key_jwt twice would be a defect of its own.
+    doc.es256_verification_is_available();
+    assert_eq!(
+        doc.token_endpoint_auth_methods_supported
+            .iter()
+            .filter(|m| *m == "private_key_jwt")
+            .count(),
+        1,
+        "calling it twice must not duplicate the entry"
+    );
+}

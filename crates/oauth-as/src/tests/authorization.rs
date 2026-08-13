@@ -49,9 +49,11 @@ fn implicit_grant_is_not_representable() {
 #[test]
 fn c13_authorization_code_record_debug_format_redacts_code_and_tokens() {
     let record = AuthorizationCodeRecord {
+        issued_at: std::time::UNIX_EPOCH,
         code: "the-secret-code-value".to_string(),
         client_id: crate::client::ClientId::new("some-client"),
         redirect_uri: "https://registered.example/callback".to_string(),
+        redirect_uri_was_explicit: true,
         scope: crate::scope::ScopeSet::parse("read").unwrap(),
         subject: "user-1".to_string(),
         code_challenge: "some-challenge".to_string(),
@@ -101,6 +103,7 @@ fn c11_only_the_sealed_constructor_produces_a_validated_request() {
     let validated = ValidatedAuthorizationRequest::new(
         crate::client::ClientId::new("victim-client"),
         "https://registered.example/callback".to_string(),
+        true,
         crate::scope::ScopeSet::parse("read").unwrap(),
         None,
         "some-challenge".to_string(),

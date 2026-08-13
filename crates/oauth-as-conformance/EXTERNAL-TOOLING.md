@@ -1,8 +1,8 @@
 # External tooling: what has been run at this AS, and what cannot be
 
-Written for 0.9.0, whose entire purpose (ROADMAP.md) is "prove it against the outside world". It
-is a record of investigation, not a marketing page, so it records refusals and negative results in
-the same detail as successes. Where a claim here is not backed by a citation to a primary source,
+Written for 0.9.0, whose entire purpose was to prove this server against the outside world rather
+than against its own tests. It is a record of investigation, not a marketing page, so it records
+refusals and negative results in the same detail as successes. Where a claim here is not backed by a citation to a primary source,
 it says so.
 
 An authorization server decides who gets access to everything else. The scarcest thing this
@@ -216,8 +216,8 @@ reasoning behind `authgent-baseline.json`. In short:
 
 ## 4. OAuch: the headless spike, and why it stays impossible
 
-`ROADMAP.md` asked 0.9.0 for "a headless OAuch spike, or a written record of why it remains
-impossible". This is the record. It is not "we could not find a way"; it is a structural finding,
+0.9.0 was required to produce either a headless OAuch spike or a written record of why it remains
+impossible. This is the record. It is not "we could not find a way"; it is a structural finding,
 and the authors say it themselves.
 
 OAuch (`https://github.com/DistriNet/OAuch`, DistriNet/KU Leuven, MIT) is the only OAuth-first

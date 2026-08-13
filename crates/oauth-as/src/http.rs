@@ -62,7 +62,7 @@
 //!
 //! 1. Authenticating the RESOURCE OWNER ([`ServiceBuilder::with_subject_resolver`]). This module
 //!    cannot know how a host logs a user in.
-//! 2. CONSENT at the authorization endpoint ([`ServiceBuilder::with_consent_resolver`]). RFC 6749
+//! 2. CONSENT at the authorization endpoint ([`ServiceBuilder::with_approval_resolver`]). RFC 6749
 //!    s10.12 requires the AS to ensure the resource owner is aware of, and explicitly consents
 //!    to, the authorization. A subject resolver answers "who is this"; it does not answer "did
 //!    they agree", and treating the first as the second is an AS that silently authorizes any
@@ -113,7 +113,7 @@ use crate::server::{AuthorizationServer, Clock, DeviceApprovalError, TokenReques
 use crate::store::Storage;
 use crate::token::TokenTypeHint;
 
-/// Re-exported so a host building a [`ConsentDecision::Respond`] body does not have to name
+/// Re-exported so a host building a [`ApprovalDecision::Respond`] body does not have to name
 /// `bytes` in its own manifest just to agree with this crate about which version it means.
 pub use bytes::Bytes;
 
@@ -200,7 +200,7 @@ impl http_body::Body for Body {
 }
 
 /// The response type this module produces, and the one
-/// [`ConsentDecision::Respond`] carries.
+/// [`ApprovalDecision::Respond`] carries.
 ///
 /// A plain [`http::Response`], deliberately: the host that renders a consent screen builds it with
 /// whatever it already has, and `http` 1.x is the one HTTP vocabulary every Rust web framework
@@ -231,7 +231,15 @@ pub type SubjectResolver = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Syn
 /// [`ServiceBuilder::with_csrf_tokens`] for the contract the two hooks satisfy together.
 pub type CsrfTokenHook = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
-/// What the host's consent step decided about one authorization request.
+/// What the host's approval step decided about one authorization request.
+///
+/// APPROVAL, not CONSENT, and the distinction is what the rename in 0.9.1 bought. This type is a
+/// UI PROMPT: a question asked about one request, answered once, and never stored. The `consent`
+/// module's [`crate::consent::ConsentRecord`] is a PERSISTED GRANT: a durable statement that
+/// survives the request and can be withdrawn. Both were called "consent" at the crate root, which
+/// is two meanings of one word in the one place a reader looks first. The direct API already
+/// called the prompt's answer [`crate::server::UserApproval`], so this is the crate agreeing with
+/// itself rather than inventing a third vocabulary.
 ///
 /// Naming the third variant `Respond` is the point of the type: a real host shows a consent
 /// SCREEN, which means the first request renders HTML and a later one carries the answer. The
@@ -240,7 +248,7 @@ pub type CsrfTokenHook = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>
 /// `#[non_exhaustive]`: this type's shape already varies with the cargo features a host
 /// enables, so an exhaustive match on it was never portable between builds of this crate.
 #[non_exhaustive]
-pub enum ConsentDecision {
+pub enum ApprovalDecision {
     /// The resource owner has agreed to this exact request. RFC 6749 s4.1.2: mint the code.
     Approve,
     /// The resource owner refused. RFC 6749 s4.1.2.1: `access_denied` at the redirect URI, which
@@ -254,12 +262,21 @@ pub enum ConsentDecision {
     /// consent nobody asked it to remember, and it will not approve one it does remember.
     #[cfg(feature = "consent")]
     ApproveAndRemember,
-    /// Serve this response instead, unchanged: a consent screen, a login redirect, a step-up
-    /// challenge. Nothing is issued.
+    /// Serve this response instead, unchanged: a consent screen, a step-up challenge, a redirect
+    /// back into the host's own flow. Nothing is issued.
+    ///
+    /// READ WHEN THIS IS REACHED, because one case a reader expects is not among them. The
+    /// authorization endpoint refuses BEFORE this resolver runs when
+    /// [`ServiceBuilder::with_subject_resolver`] answers `None`, so a resolver cannot answer a
+    /// signed-out visitor with a login redirect through this router: there is no subject to build
+    /// an [`ApprovalRequest`] around, and inventing one would be this crate deciding who the user
+    /// is. A host that wants to send an anonymous visitor to its login page does it in front of
+    /// this service, where its session already lives; what this variant serves is every decision
+    /// taken about a user the host has already named, step-up included.
     Respond(Box<Response>),
 }
 
-/// What the host's consent resolver is told about the request it is being asked to approve.
+/// What the host's approval resolver is told about the request it is being asked to approve.
 ///
 /// Everything borrows: the resolver is called inside the request path and nothing here outlives
 /// it. The request has already passed RFC 6749 s4.1.1 validation, so `client_id`, `redirect_uri`
@@ -268,7 +285,7 @@ pub enum ConsentDecision {
 /// `#[non_exhaustive]`: this type's shape already varies with the cargo features a host
 /// enables, so an exhaustive match on it was never portable between builds of this crate.
 #[non_exhaustive]
-pub struct ConsentRequest<'a> {
+pub struct ApprovalRequest<'a> {
     /// The request's headers, so the host can find its own session.
     pub headers: &'a HeaderMap,
     /// The authenticated resource owner, as named by the subject resolver.
@@ -281,6 +298,28 @@ pub struct ConsentRequest<'a> {
     pub redirect_uri: &'a str,
     /// The client's `state`, if it sent one.
     pub state: Option<&'a str>,
+    /// The RFC 8707 resource indicators this request asked for, already validated against the
+    /// server's `allowed_resources`. Empty when the client named none.
+    ///
+    /// It is here because the audience a token will carry is part of what the user is being asked
+    /// to approve: "read your calendar" means something different at one resource server than at
+    /// another, and the host cannot recover this from the query. For a PAR request the query holds
+    /// only `client_id` and the request URI, and the pushed record has already been consumed by
+    /// the time this resolver runs; for a JAR request the values are inside the signed object.
+    pub resource: &'a [String],
+    /// The RFC 9396 `authorization_details` this request asked for, already parsed and already
+    /// checked against the server's supported types (section 5).
+    ///
+    /// THE TYPE CHECK IS NOT AN APPROVAL. `AuthorizationDetails::require_supported_types` inspects
+    /// the `type` string alone, so the amount, the `identifier`, the creditor account and every
+    /// other type-specific member of an element reach the issued token unexamined unless this
+    /// resolver looks at them. RFC 9396 section 2 makes the elements the thing being authorized,
+    /// and this crate never renders a screen, so the decision belongs here: a host that shows only
+    /// [`ApprovalRequest::scope`] is asking the user to approve a payment they were never shown.
+    /// Like [`ApprovalRequest::resource`], it cannot be recovered from the query on the PAR or JAR
+    /// paths.
+    #[cfg(feature = "rar")]
+    pub authorization_details: &'a crate::rar::AuthorizationDetails,
     /// The full request URI, so a host that renders a consent screen can round-trip the user
     /// back to exactly this request after they answer.
     pub uri: &'a Uri,
@@ -292,17 +331,25 @@ pub struct ConsentRequest<'a> {
     /// depends on how long ago it was, what the scope means in this deployment, and whether the
     /// user is on a device the host trusts, none of which this crate knows. So it is handed over,
     /// and nothing here ever approves on the strength of it.
+    ///
+    /// `covers` takes all three of what is being asked for, and the third is
+    /// [`ApprovalRequest::authorization_details`], wrapped by
+    /// [`crate::consent::RequestedDetails::of`]. It answers `false` for any request that carries
+    /// one, so a resolver that skips its prompt on a `true` still asks about every RFC 9396
+    /// element: a remembered consent records a scope and a resource list, and an element it never
+    /// recorded is not something it can be said to cover. That method's docs give the argument in
+    /// full, including why the answer would barely change if it did record them.
     #[cfg(feature = "consent")]
     pub remembered: Option<&'a crate::consent::ConsentRecord>,
 }
 
-/// How the host makes the RFC 6749 s10.12 consent decision. See
-/// [`ServiceBuilder::with_consent_resolver`].
-pub type ConsentResolver = Arc<dyn Fn(&ConsentRequest<'_>) -> ConsentDecision + Send + Sync>;
+/// How the host makes the RFC 6749 s10.12 approval decision. See
+/// [`ServiceBuilder::with_approval_resolver`].
+pub type ApprovalResolver = Arc<dyn Fn(&ApprovalRequest<'_>) -> ApprovalDecision + Send + Sync>;
 
 /// How the host answers "when, and how, did you authenticate this user".
 ///
-/// The third identity seam, and the one RFC 9470 needs: a subject resolver answers WHO, a consent
+/// The third identity seam, and the one RFC 9470 needs: a subject resolver answers WHO, an approval
 /// resolver answers WHETHER THEY AGREED, and this answers HOW STRONGLY AND HOW RECENTLY. `None`
 /// means the host is not reporting one, which satisfies no `acr_values` and no `max_age`; see
 /// [`ServiceBuilder::with_authentication_reporter`].
@@ -361,6 +408,15 @@ pub enum ServiceError {
         /// The serializer's message.
         detail: String,
     },
+    /// The document advertises a `jwks_uri` under the issuer, in a build with no `jwt` feature.
+    /// Nothing here can serve a key set, so the member is a promise of a path that can only 404.
+    /// A key set some other component holds is still fine: point the member outside the issuer,
+    /// which is what "some other component holds the keys" looks like in a URL.
+    #[cfg(not(feature = "jwt"))]
+    JwksNotServable {
+        /// The URL as advertised.
+        url: String,
+    },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -381,6 +437,12 @@ impl std::fmt::Display for ServiceError {
             ServiceError::JwksNotSerializable { detail } => {
                 write!(f, "RFC 7517 key set could not be serialized: {detail}")
             }
+            #[cfg(not(feature = "jwt"))]
+            ServiceError::JwksNotServable { url } => write!(
+                f,
+                "advertised jwks_uri ({url}) is under the issuer, but this build has no jwt \
+                 feature and so has no key set to serve there"
+            ),
         }
     }
 }
@@ -404,7 +466,7 @@ struct Inner<S: Storage, C: Clock> {
     /// because comparing against a freshly parsed issuer on every POST is pure waste.
     origin: String,
     subject: Option<SubjectResolver>,
-    consent: Option<ConsentResolver>,
+    approval: Option<ApprovalResolver>,
     #[cfg(feature = "consent")]
     authentication: Option<AuthenticationReporter>,
     verification: VerificationProtection,
@@ -427,13 +489,13 @@ impl<S: Storage, C: Clock> Inner<S, C> {
 /// [`with_subject_resolver`](ServiceBuilder::with_subject_resolver) alone is NOT enough to run an
 /// authorization server safely, and this is the one thing to read in this file. It answers "who
 /// is this user"; RFC 6749 s10.12 also demands "did the user knowingly agree". Wire
-/// [`with_consent_resolver`](ServiceBuilder::with_consent_resolver) and
+/// [`with_approval_resolver`](ServiceBuilder::with_approval_resolver) and
 /// [`with_csrf_tokens`](ServiceBuilder::with_csrf_tokens) too, or the authorization endpoint and
 /// the device verification form refuse rather than guessing that silence means yes.
 pub struct ServiceBuilder<S: Storage, C: Clock> {
     server: Arc<AuthorizationServer<S, C>>,
     subject: Option<SubjectResolver>,
-    consent: Option<ConsentResolver>,
+    approval: Option<ApprovalResolver>,
     #[cfg(feature = "consent")]
     authentication: Option<AuthenticationReporter>,
     verification: VerificationProtection,
@@ -446,7 +508,7 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
         ServiceBuilder {
             server,
             subject: None,
-            consent: None,
+            approval: None,
             #[cfg(feature = "consent")]
             authentication: None,
             verification: VerificationProtection::Unwired,
@@ -460,8 +522,8 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
     /// session model by design, so without a resolver both endpoints refuse with 403 rather than
     /// inventing a user.
     ///
-    /// This resolver is IDENTITY ONLY. It does not express consent; see
-    /// [`with_consent_resolver`](ServiceBuilder::with_consent_resolver).
+    /// This resolver is IDENTITY ONLY. It does not express approval; see
+    /// [`with_approval_resolver`](ServiceBuilder::with_approval_resolver).
     pub fn with_subject_resolver<F>(mut self, resolver: F) -> Self
     where
         F: Fn(&HeaderMap) -> Option<String> + Send + Sync + 'static,
@@ -482,16 +544,16 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
     /// With NO resolver the authorization endpoint refuses with 403 and issues nothing. That is
     /// deliberate and it is a behaviour change: a host that previously wired only
     /// [`with_subject_resolver`](ServiceBuilder::with_subject_resolver) was running an
-    /// AUTO-APPROVING authorization server, and the fix is to say what the consent step is rather
+    /// AUTO-APPROVING authorization server, and the fix is to say what the approval step is rather
     /// than to leave it implied.
     ///
-    /// Return [`ConsentDecision::Respond`] to render a consent screen and finish the flow on a
-    /// later request; return [`ConsentDecision::Approve`] only once the user has actually agreed.
-    pub fn with_consent_resolver<F>(mut self, resolver: F) -> Self
+    /// Return [`ApprovalDecision::Respond`] to render a consent screen and finish the flow on a
+    /// later request; return [`ApprovalDecision::Approve`] only once the user has actually agreed.
+    pub fn with_approval_resolver<F>(mut self, resolver: F) -> Self
     where
-        F: Fn(&ConsentRequest<'_>) -> ConsentDecision + Send + Sync + 'static,
+        F: Fn(&ApprovalRequest<'_>) -> ApprovalDecision + Send + Sync + 'static,
     {
-        self.consent = Some(Arc::new(resolver));
+        self.approval = Some(Arc::new(resolver));
         self
     }
 
@@ -574,10 +636,38 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
         // the seams the host installed on the server as well as on the configuration, and RFC 7523
         // `private_key_jwt` is the case that separates the two. See
         // [`crate::AuthorizationServer::metadata`].
-        let meta = self.server.metadata();
+        // `mut` for the RFC 8705 strip below, which is the one place the document this service
+        // SERVES has to say less than the document the server describes itself with.
+        #[allow(unused_mut)]
+        let mut meta = self.server.metadata();
         // `from_config` trims the issuer, and derives every default endpoint from that trimmed
         // form, so the prefix relation below holds for an unconfigured host by construction.
         let issuer = meta.issuer.clone();
+
+        // RFC 8705 sections 2.1.1, 2.2.1 and 3.3, REMOVED from the served document.
+        //
+        // Every one of them is true of `AuthorizationServer` reached through a host's own handler
+        // with a certificate its TLS terminator verified, and none of them is true of THIS router,
+        // which is handed an already-parsed request and passes `certificate: None` on every
+        // credential it builds (see `Credentials::credential`). A client that reads
+        // `tls_client_auth` here and presents a certificate is answered `invalid_client` forever;
+        // one that reads the section 3.3 flag believes its token is certificate bound when it is a
+        // bearer token. The field doc used to offer "a host that is not doing that should not
+        // compile the `mtls` feature in", which cargo feature unification takes out of the host's
+        // hands: one other crate in the graph enabling `mtls` makes this router lie.
+        //
+        // Only the SERVED copy is touched. `AuthorizationServer::metadata()` is unchanged, so a
+        // host serving its own routes still publishes the full document, which for that host is
+        // the honest one.
+        #[cfg(feature = "mtls")]
+        {
+            meta.token_endpoint_auth_methods_supported.retain(|m| {
+                m != crate::mtls::TLS_CLIENT_AUTH && m != crate::mtls::SELF_SIGNED_TLS_CLIENT_AUTH
+            });
+            meta.tls_client_certificate_bound_access_tokens = false;
+        }
+
+        let default_introspection_endpoint = format!("{issuer}/introspect");
 
         let authorize = endpoint_path(
             &issuer,
@@ -590,10 +680,22 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
             "device_authorization_endpoint",
             &meta.device_authorization_endpoint,
         )?;
-        let introspect = match &meta.introspection_endpoint {
-            Some(u) => Some(endpoint_path(&issuer, "introspection_endpoint", u)?),
-            None => None,
-        };
+        // RFC 7662. The one route derived from the CONFIGURATION rather than from the document,
+        // and deliberately: `from_config` publishes `introspection_endpoint` only where the host
+        // named it, because this server answers introspection for the token's own client and for
+        // nobody else (see the field's doc in `crate::metadata`). Withdrawing the ROUTE with the
+        // promise would take away the half that works -- a client asking about its own token --
+        // which is a functional regression rather than an honesty fix. Serving a path the document
+        // does not name misleads nobody; the rule this module opens with is about the other
+        // direction.
+        let introspect = Some(endpoint_path(
+            &issuer,
+            "introspection_endpoint",
+            match &config.introspection_endpoint {
+                Some(u) => u,
+                None => &default_introspection_endpoint,
+            },
+        )?);
         let revoke = match &meta.revocation_endpoint {
             Some(u) => Some(endpoint_path(&issuer, "revocation_endpoint", u)?),
             None => None,
@@ -658,6 +760,27 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
             Some(url) => Some(endpoint_path(&issuer, "jwks_uri", url)?),
             None => None,
         };
+        // RFC 8414 s2 `jwks_uri` in a build WITHOUT the `jwt` feature, which is a build that signs
+        // nothing and has no key set to serve. `http` does not imply `jwt` and
+        // `ServerConfig::jwks_uri` is a plain public field, so the document could advertise the
+        // member while every branch that routes it above is compiled out: `build` returned `Ok`,
+        // the document promised the endpoint, and `resolve` answered `None`. An advertised endpoint
+        // that 404s is the exact defect this module's docs open by naming, and RFC 9068 s4 makes it
+        // expensive: a resource server that cannot fetch the keys cannot verify anything.
+        //
+        // Refused rather than silently dropped, and only when the URL is UNDER the issuer. Off
+        // issuer is the documented case for this build (`metadata::advertised_jwks_uri`: some other
+        // component holds the keys), this service never claimed that path, and nothing it serves
+        // 404s. Under the issuer there is no reading on which the promise is kept.
+        #[cfg(not(feature = "jwt"))]
+        if let Some(url) = &meta.jwks_uri {
+            if endpoint_path(&issuer, "jwks_uri", url).is_ok() {
+                return Err(ServiceError::JwksNotServable {
+                    url: url.to_string(),
+                });
+            }
+        }
+
         // Serialized ONCE here rather than per request: a key set changes only when the host
         // rebuilds the router, and a verifier may fetch this on every cold cache.
         #[cfg(feature = "jwt")]
@@ -676,7 +799,10 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
         // RFC 8414 s3.1: the well-known string is inserted BETWEEN the host and the issuer's
         // path, so this route is NOT `{issuer path}/.well-known/...` and is not the bare
         // well-known path either once the issuer has a path. See `metadata::well_known_path`.
-        let well_known = well_known_path(&issuer);
+        // Normalised like every route `endpoint_path` produces, and for the same reason: this one
+        // also carries the issuer's path, so a tenant whose name a client must escape is escaped
+        // here too and the document is served at the path the client actually asks for.
+        let well_known = encode_route_path(&well_known_path(&issuer));
 
         let metadata = serde_json::to_vec(&meta)
             .map_err(|e| ServiceError::MetadataNotSerializable {
@@ -724,13 +850,27 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
                 metadata,
                 #[cfg(feature = "jwt")]
                 jwks,
-                // RFC 7617 s2: the realm is a quoted string. The issuer is a URL and so contains
-                // no double quote or backslash, which is what would need escaping here.
-                challenge: HeaderValue::from_str(&format!("Basic realm=\"{issuer}\""))
-                    .unwrap_or_else(|_| HeaderValue::from_static("Basic realm=\"oauth\"")),
+                // RFC 7617 s2: the realm is a quoted-string, so `"` and `\` must be escaped.
+                //
+                // The issuer OUGHT to be a URL and so ought to contain neither, and until the
+                // 0.9.1 audit this code said so and stopped there. But `ServerConfig::issuer` is a
+                // bare `String` that this crate deliberately does not validate — it does not even
+                // require `https` — so "the issuer is a URL" is an assumption about the host's
+                // configuration, not a property of the type. A stray quote picked up from a config
+                // template would otherwise put a second `realm` auth-param on every 401 this
+                // server sends, which a conforming client parses as a different challenge.
+                //
+                // `HeaderValue::from_str` already refuses CR and LF, so there was never a response
+                // splitting hole here; the escape is about producing a challenge that parses as
+                // the one thing it means.
+                challenge: HeaderValue::from_str(&format!(
+                    "Basic realm=\"{}\"",
+                    escape_quoted_string(&issuer)
+                ))
+                .unwrap_or_else(|_| HeaderValue::from_static("Basic realm=\"oauth\"")),
                 origin: issuer_origin(&issuer).to_string(),
                 subject: self.subject,
-                consent: self.consent,
+                approval: self.approval,
                 #[cfg(feature = "consent")]
                 authentication: self.authentication,
                 verification: self.verification,
@@ -803,7 +943,12 @@ fn endpoint_path(issuer: &str, endpoint: &'static str, url: &str) -> Result<Stri
             let mut path = String::with_capacity(prefix.len() + rest.len());
             path.push_str(prefix);
             path.push_str(rest);
-            Ok(path)
+            // NORMALISED TO WIRE FORM here, at build time, and nowhere else. The issuer arrives
+            // exactly as the host configured it and the two legal spellings of a path a client
+            // must escape produce the same bytes on the wire; `encode_route_path` is what makes
+            // the table hold those bytes, so `handle` can compare the raw path and nothing that
+            // sits in front of this service disagrees with it about which route was asked for.
+            Ok(encode_route_path(&path))
         }
         _ => Err(ServiceError::EndpointOutsideIssuer {
             endpoint,
@@ -874,7 +1019,9 @@ enum Route<'a> {
     Revoke,
     Verification,
     Register,
-    /// RFC 7592: the `client_id` segment, still percent-encoded.
+    /// RFC 7592: the `client_id` segment, RAW as it arrived. Decoded at the match arms by
+    /// `decode_path_segment`, and only after the route has been decided, for the reason the
+    /// resolver's own comment gives: the path is matched in wire form.
     Manage(&'a str),
     #[cfg(feature = "par")]
     Par,
@@ -928,9 +1075,12 @@ impl Routes {
         if self.jwks.as_deref() == Some(path) {
             return Some(Route::Jwks);
         }
-        // ONE segment, and a non-empty one. A `client_id` containing a slash would have been
-        // percent-encoded into the URL this server itself minted (RFC 7592 s3
-        // `registration_client_uri`), so a raw slash here is a different path, not a client id.
+        // ONE segment, and a non-empty one. `crate::registration`'s `registration_client_uri`
+        // percent-encodes the id into the URL this server itself minted (RFC 7592 s3), and
+        // `decode_path_segment` undoes exactly that below, so a RAW slash arriving here is a
+        // different path rather than a client id whose name contains one. Until the 0.9.1 audit
+        // this comment asserted the encoding while the minting side did not perform it; the
+        // asymmetry was invisible only because a minted id is 32 hex characters.
         if let Some(prefix) = &self.manage {
             if let Some(rest) = path.strip_prefix(prefix.as_str()) {
                 if !rest.is_empty() && !rest.contains('/') {
@@ -1018,7 +1168,28 @@ impl<S: Storage, C: Clock> AuthorizationService<S, C> {
         let headers = parts.headers;
         let uri = parts.uri;
 
-        let route = match state.routes.resolve(uri.path()) {
+        // THE RAW WIRE PATH, matched byte for byte. The normalisation happens on the other side:
+        // `ServiceBuilder::build` runs every route through `encode_route_path`, so the table is
+        // already in the form a client sends. Decoding here instead would make `/%74oken` the
+        // token endpoint and `/%72egister` the registration endpoint, which is a different string
+        // to every reverse proxy, ingress rule and WAF in front of this service and the same one
+        // to this service: a host restricting RFC 7591 registration to an internal network BY PATH
+        // would be serving it to everyone. Only the captured RFC 7592 id is decoded, and only
+        // after the route has been decided.
+        //
+        // "BYTE FOR BYTE" IS QUALIFIED BY ONE RULE, and only one: RFC 3986 s6.2.2.1 says the
+        // hexadecimal digits of a percent-encoding are case INSENSITIVE and directs a normaliser
+        // to prefer the uppercase form, so `%c3` and `%C3` are the same octet and any client
+        // library, proxy or ingress in the path is entitled to convert between them. Both sides
+        // are therefore brought to the uppercase form -- the table by `encode_route_path` at build
+        // time, the wire path by `uppercase_escapes` here -- and compared verbatim after that.
+        // This is NOT decoding and gives none of decoding's ground away: `%74oken` uppercases to
+        // `%74oken`, which is still not `/token`, and every rule in front of this service that
+        // matched the raw path is looking at a string this transformation cannot alter the
+        // meaning of. It costs a scan for `%` per request and allocates only for a path that
+        // carries a lowercase escape.
+        let path = uppercase_escapes(uri.path());
+        let route = match state.routes.resolve(&path) {
             Some(route) => route,
             None => return respond(StatusCode::NOT_FOUND, Body::empty()),
         };
@@ -1092,9 +1263,12 @@ impl<S: Storage, C: Clock> AuthorizationService<S, C> {
                 verification_submit_handler(state, &headers, &form_body!()).await
             }
             (Route::Register, "POST") => register_handler(state, &headers, &form_body!()).await,
-            // The captured segment is still percent-encoded, because that is what travelled in
-            // the `registration_client_uri` this server minted (RFC 7592 s3) and a client id may
-            // contain characters a path segment reserves.
+            // The captured segment arrives RAW, because the route was decided on the wire path
+            // (see `handle`), and it is decoded here: a client id may contain characters a path
+            // segment reserves, and `registration_client_uri` percent-encodes them into the URL
+            // this server minted (RFC 7592 s3), so this is the other half of that round trip. It
+            // is the ONE decode this module performs on a path, and it happens after the route is
+            // settled, so it can never turn one route into another.
             (Route::Manage(client_id), "GET") => {
                 read_registration_handler(state, &headers, &decode_path_segment(client_id)).await
             }
@@ -1132,11 +1306,13 @@ enum BodyError {
 /// are what an HTTP client (and every proxy between it and here) already understands.
 fn body_error(e: BodyError) -> Response {
     match e {
-        BodyError::TooLarge => respond(
+        BodyError::TooLarge => text_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request body exceeds this server's limit",
         ),
-        BodyError::Incomplete => respond(StatusCode::BAD_REQUEST, "request body was not received"),
+        BodyError::Incomplete => {
+            text_response(StatusCode::BAD_REQUEST, "request body was not received")
+        }
     }
 }
 
@@ -1204,6 +1380,66 @@ where
 /// a second table that could disagree with the first. A 404 from
 /// [`AuthorizationService::handle`] is a path this server does not serve, which is exactly what a
 /// fallback means.
+///
+/// # Why the request is answered on a spawned task
+///
+/// BECAUSE A CLIENT THAT HANGS UP MUST NOT BE ABLE TO STOP THE SERVER MID-SEQUENCE. hyper drops
+/// the service future when the connection closes, and a dropped future does not fail: the code
+/// after the `.await` it was suspended on simply never runs. `crate::server` has no transactions
+/// (`Storage` deliberately offers none), so several of its sequences are an atomic TAKE followed
+/// by a write, and every one of those arguments about which way the pair fails assumes that a
+/// failure HAPPENS. The refresh rotation is the sharp case: `Storage::take_refresh_token` removes
+/// the chain and the spent marker that arms RFC 9700 s4.14.2 reuse detection is written after it,
+/// so a drop in between leaves the chain gone with no marker, which is the exact state that
+/// ordering exists to prevent. The authorization code path has the same shape with its consumed
+/// record. Neither is a race an attacker has to win by timing: whoever presents the credential is
+/// whoever decides when to close the socket.
+///
+/// Awaiting a `JoinHandle` moves the cancellation to the RIGHT place. The client's disconnect
+/// cancels this adapter's await on the handle; the spawned task keeps its own place in the runtime
+/// and runs the store sequence to the end. Nothing else in this crate can do this, because the
+/// `http` feature deliberately pulls in no runtime; the `axum` feature is the one place a runtime
+/// is already present (`axum = ["http", "dep:axum", "dep:tokio"]`), so it is the one place this can
+/// be contained. A HOST MOUNTING [`AuthorizationService::handle`] ITSELF OWNS THIS, and should
+/// spawn for the same reason.
+///
+/// # What a host may notice
+///
+/// IN-FLIGHT WORK IS NO LONGER BOUNDED BY CONNECTIONS. That is the point of the spawn and it is
+/// also its cost: a client that hangs up stops waiting but no longer stops the work, so axum's and
+/// hyper's connection limits, and any accept-side bound the host set, no longer bound the tasks
+/// this service is running. The bound becomes request RATE times handler latency. In this crate
+/// that is already narrow, because the rate limiter runs INSIDE
+/// [`AuthorizationService::handle`] and refuses before the store is touched, and because a handler
+/// does a bounded number of store calls with no unbounded waits of its own. A host that wants a
+/// hard ceiling anyway should take a semaphore permit before the spawn, or spawn into a `JoinSet`
+/// it owns, and answer 503 when it cannot get one.
+///
+/// A PANIC in a handler no longer unwinds into hyper. It arrives here as a `JoinError` and is
+/// answered with an empty 500, which is what the panicking connection produced anyway, minus the
+/// connection dying with it. RUNTIME SHUTDOWN is the other `JoinError`: a task cancelled because
+/// its runtime is going away answers the same 500. The two are not distinguished on the wire on
+/// purpose, because they are the same news to the client (this request did not complete and it
+/// does not know whether anything happened), and both are already visible to the host: a panic
+/// through its own hook, a shutdown because it asked for one.
+///
+/// # Cost
+///
+/// One `tokio::spawn` per request, which is ONE allocation: measured with `tests/support/alloc.rs`
+/// on aarch64-apple-darwin at 1 alloc and 128 bytes for a trivial task, the block sized by the task
+/// header plus the handler future. `tests/allocation.rs` budgets the REQUEST path, which this does
+/// not touch: nothing inside [`AuthorizationService::handle`] changes, and the token endpoint's own
+/// budget there is two orders of magnitude larger than one task. It buys the store sequence the
+/// right to finish.
+///
+/// The other half of the cost is not an allocation. Detaching the handler from the connection
+/// means in-flight work is bounded by request RATE rather than by concurrent connections: a client
+/// that disconnects immediately after sending no longer sheds any load, because the handler it
+/// started runs to completion regardless. That is the same property that buys the store sequence
+/// its right to finish, seen from the load side. A host that relied on disconnects for
+/// backpressure needs a concurrency limit in front of this service — `tower::limit` or the
+/// equivalent — and the rate limiter this crate already has does not substitute for one, because
+/// it refuses attempts rather than bounding work already accepted.
 #[cfg(feature = "axum")]
 impl<S, C> From<AuthorizationService<S, C>> for axum::Router
 where
@@ -1214,12 +1450,20 @@ where
         axum::Router::new().fallback(move |request: axum::extract::Request| {
             let service = service.clone();
             async move {
-                // `Body` is already a complete `Bytes`, so this is a move, not a copy or a
-                // stream adapter.
-                service
-                    .handle(request)
-                    .await
-                    .map(|body| axum::body::Body::from(body.into_bytes()))
+                match tokio::spawn(async move { service.handle(request).await }).await {
+                    // `Body` is already a complete `Bytes`, so this is a move, not a copy or a
+                    // stream adapter.
+                    Ok(response) => response.map(|body| axum::body::Body::from(body.into_bytes())),
+                    // A panic, or a runtime being torn down. No body: there is nothing this
+                    // service knows about the failure that a client could act on, and every
+                    // endpoint here answers a different content type, so an invented JSON error
+                    // would be a guess about which one this request wanted.
+                    Err(_) => {
+                        let mut response = axum::http::Response::new(axum::body::Body::empty());
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        response
+                    }
+                }
             }
         })
     }
@@ -1298,10 +1542,49 @@ fn error_response(err: &ErrorResponse, via_header: bool, challenge: &HeaderValue
     resp
 }
 
+/// The RFC 8628 verification page, and the only HTML this server emits.
+///
+/// It carries more headers than any other response here because it is the only one a BROWSER
+/// renders, and the only one whose defences a browser can be tricked into satisfying on the user's
+/// behalf.
+///
+/// FRAMING. The page's CSRF defence is `Sec-Fetch-Site: same-origin` (see
+/// `same_origin_submission`), and a document inside a cross-site iframe posting to its own origin
+/// sends exactly that. So without a framing refusal the whole defence is decorative against a
+/// clickjack: an attacker frames the page invisibly, starts a device flow of their own, and lands
+/// the user's click on Approve. `frame-ancestors 'none'` is the standard's answer and
+/// `X-Frame-Options: DENY` is the one older browsers obey; both are sent because they are
+/// enforced by different code paths and neither supersedes the other everywhere.
+///
+/// CACHING. The body carries a live single-use CSRF token and the details of a third party's
+/// pending grant. This was the one response in this file that did not call `no_store`, which
+/// meant a shared cache, or a browser's back button, could re-serve another user's approval form.
+///
+/// The rest is the ordinary hardening for a page with no scripts, no styles, no images and one
+/// same-origin form: `default-src 'none'` (nothing may be loaded), `form-action 'self'` (the
+/// submission cannot be redirected off-origin by injected markup), `base-uri 'none'` (a `<base>`
+/// cannot relocate the relative form action), `nosniff`, and `no-referrer` so the user code in
+/// the deep-link URL is not handed to a third party.
 fn html_response(status: StatusCode, body: String) -> Response {
     let mut resp = respond(status, body);
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, html_content_type());
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, html_content_type());
+    no_store(headers);
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     resp
 }
 
@@ -1333,8 +1616,160 @@ fn decode_component(raw: &str) -> Cow<'_, str> {
 /// `application/x-www-form-urlencoded` gives it the "space" meaning. Decoding it as a space here
 /// would rewrite the RFC 7592 s3 `registration_client_uri` this server itself minted, and a client
 /// whose id contains a plus would find its own management URL pointing at a different client.
+///
+/// ONE SEGMENT, never the whole path. For a few days of the 0.9.1 audit this crate decoded the
+/// entire request path before matching it, to make a raw non-ASCII issuer routable, and the price
+/// was two defects at once: `/%74oken` became the token endpoint and `/%72egister` became the RFC
+/// 7591 registration endpoint, under every reverse proxy, ingress rule and WAF that had matched
+/// the RAW path and seen no such string; and an issuer spelled the way RFC 3986 section 3.3
+/// requires (`https://as.example/tenant%20a`) stopped routing at all, because
+/// [`endpoint_path`] holds the issuer verbatim. Both directions are fixed in the ROUTE TABLE
+/// instead, by [`encode_route_path`]: the table is normalised into wire form once at build time
+/// and the wire path is compared byte for byte, which is what every layer in front of this service
+/// is also doing.
 fn decode_path_segment(raw: &str) -> Cow<'_, str> {
     percent_decode(raw, false)
+}
+
+/// Normalise a route-table path into the form a client puts on the wire.
+///
+/// The table is derived from the issuer AS THE HOST CONFIGURED IT (see [`endpoint_path`]), and a
+/// host may legitimately configure either of two spellings for a path a client must escape: the
+/// RFC 3986 section 3.3 one, `https://as.example/tenant%20a`, which is a legal URI, or a raw
+/// non-ASCII one, `https://as.example/\u{e9}`, which is not but which this crate accepts and
+/// `tests/issuer_origin_boundary.rs` pins as buildable. A client fetching from either sends the
+/// same bytes: percent-encoded ones. So the table is brought to that form ONCE, here, and the
+/// matcher never touches the wire path.
+///
+/// `%` IS LEFT ALONE, which is what makes the first spelling survive: an issuer that already
+/// carries escapes passes through unchanged rather than being encoded a second time into `%2520`.
+/// The cost is that a literal `%` in an issuer that is not an escape cannot be expressed, which is
+/// a URI that is malformed under section 2.1 anyway.
+///
+/// Left alone EXCEPT FOR THE CASE OF ITS TWO HEX DIGITS, which are uppercased. RFC 3986 s6.2.2.1
+/// makes those digits case insensitive and directs a normaliser to prefer the uppercase form, so
+/// `https://as.example/caf%c3%a9` and `https://as.example/caf%C3%A9` are the same issuer and a
+/// client, proxy or ingress that normalises sends the uppercase one whichever the document
+/// carried. Uppercasing here is what makes the table CANONICAL rather than a copy of one host's
+/// spelling; `uppercase_escapes` does the same to the wire path, and the comparison between the
+/// two is still byte for byte. A `%` NOT followed by two hex digits is not an escape at all and
+/// keeps the pass-through behaviour above.
+///
+/// Run once per route at build time, so its cost is not on any request path.
+fn encode_route_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut skip = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if b == b'%' {
+            if let (Some(&h), Some(&l)) = (bytes.get(i + 1), bytes.get(i + 2)) {
+                if hex_value(h).is_some() && hex_value(l).is_some() {
+                    out.push('%');
+                    out.push(h.to_ascii_uppercase() as char);
+                    out.push(l.to_ascii_uppercase() as char);
+                    skip = 2;
+                    continue;
+                }
+            }
+        }
+        // RFC 3986 s3.3 `pchar` (unreserved / sub-delims / ":" / "@"), plus the separator itself
+        // and the escape introducer.
+        let verbatim = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'/'
+                    | b'%'
+            );
+        if verbatim {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// The wire half of [`encode_route_path`]'s normalisation: uppercase the hex digits of every
+/// percent-encoding in a path and change nothing else.
+///
+/// RFC 3986 s6.2.2.1 defines this as case normalisation and it is the only transformation this
+/// service applies to a path before matching it. It is NOT decoding: the number of characters is
+/// unchanged, `%74oken` stays `%74oken`, and every rule in front of this service that matched on
+/// the raw path is matching a string this cannot alter. Doing it on both sides is what lets a host
+/// spell its issuer's escapes either way and a client normalise or not: all four combinations meet
+/// in the same canonical form, and a table normalised alone would have swapped one broken pairing
+/// for another.
+///
+/// Borrows unless the path actually carries a lowercase escape, so an ASCII route (every route, in
+/// every deployment that does not put an escape in its issuer) allocates nothing and pays one scan
+/// for `%`.
+fn uppercase_escapes(path: &str) -> Cow<'_, str> {
+    let bytes = path.as_bytes();
+    let needs = bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'%'
+            && matches!(
+                (bytes.get(i + 1), bytes.get(i + 2)),
+                (Some(&h), Some(&l))
+                    if hex_value(h).is_some()
+                        && hex_value(l).is_some()
+                        && (h.is_ascii_lowercase() || l.is_ascii_lowercase())
+            )
+    });
+    if !needs {
+        return Cow::Borrowed(path);
+    }
+    // Written as its own loop rather than as a call to `encode_route_path`: that function also
+    // ESCAPES what is not a `pchar`, which is right for a path a host configured and wrong for one
+    // that arrived on the wire, where anything outside the grammar is the client's problem and not
+    // something this service should quietly rewrite into a route.
+    //
+    // Copied in RUNS between escapes rather than byte by byte, which keeps it correct for a
+    // multi-byte character (`%` is ASCII, so every index this slices at is a character boundary)
+    // as well as cheaper.
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&h), Some(&l)) if hex_value(h).is_some() && hex_value(l).is_some() => {
+                out.push('%');
+                out.push(h.to_ascii_uppercase() as char);
+                out.push(l.to_ascii_uppercase() as char);
+                i += 3;
+            }
+            _ => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'%' {
+                    i += 1;
+                }
+                out.push_str(&path[start..i]);
+            }
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// The shared decoder. Borrows when there is nothing to unescape, which is what keeps the common
@@ -1407,10 +1842,28 @@ struct TooManyParameters;
 /// query string, because the payload being refused is the parameter list; 414 would assert the
 /// URI was too long in BYTES, which it need not be.
 fn too_many_parameters() -> Response {
-    respond(
+    text_response(
         StatusCode::PAYLOAD_TOO_LARGE,
         "request carries too many parameters",
     )
+}
+
+/// A refusal that happens BEFORE the request is parsed far enough to have an OAuth error code.
+///
+/// These are the only responses in this file that carry bytes without an RFC 6749 s5.2 JSON body:
+/// the body cap and the parameter cap both fire on the raw request, where there is no `grant_type`
+/// and no `client_id` to name, and inventing an OAuth error for them would be a claim about a
+/// request this server never read. They still need a `Content-Type` (RFC 9110 s8.3) or the client
+/// cannot decode the sentence explaining what happened — which is what they are for. The payloads
+/// are fixed ASCII literals with no attacker-controlled substring, so `text/plain` is safe here in
+/// a way it would not be for anything echoing input.
+fn text_response(status: StatusCode, body: &'static str) -> Response {
+    let mut resp = respond(status, body);
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain;charset=UTF-8"),
+    );
+    resp
 }
 
 /// Split a form body or query string into decoded pairs. A parameter with no `=` is kept with an
@@ -1535,10 +1988,10 @@ struct Credentials {
     /// `None` for a public client, which has no secret to present.
     client_secret: Option<String>,
     /// RFC 7521 s4.2 `client_assertion_type`, verbatim.
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     client_assertion_type: Option<String>,
-    /// RFC 7523 `client_assertion`, verbatim.
-    #[cfg(feature = "client_assertion")]
+    /// RFC 7523 `client-assertion`, verbatim.
+    #[cfg(feature = "client-assertion")]
     client_assertion: Option<String>,
 }
 
@@ -1548,9 +2001,9 @@ impl Credentials {
     fn credential(&self) -> crate::server::ClientCredential<'_> {
         crate::server::ClientCredential {
             client_secret: self.client_secret.as_deref(),
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion_type: self.client_assertion_type.as_deref(),
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion: self.client_assertion.as_deref(),
             // ALWAYS `None`, and it has to be. This router is handed a parsed request; it
             // does not terminate TLS and never sees the connection, so there is no
@@ -1652,7 +2105,7 @@ fn credentials_where(
     // is a complete client authentication on its own and s2.2 makes `client_id` OPTIONAL alongside
     // it: the assertion already names the client, so requiring the parameter would refuse a
     // conforming client over a redundancy.
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     if let Some(assertion) = param(form, "client_assertion") {
         // RFC 6749 s2.3: one authentication method per request. Basic credentials or a
         // `client_secret` alongside an assertion is two, and a server that resolves the ambiguity
@@ -1692,9 +2145,9 @@ fn credentials_where(
             Ok(Credentials {
                 client_id,
                 client_secret: Some(client_secret),
-                #[cfg(feature = "client_assertion")]
+                #[cfg(feature = "client-assertion")]
                 client_assertion_type: None,
-                #[cfg(feature = "client_assertion")]
+                #[cfg(feature = "client-assertion")]
                 client_assertion: None,
             })
         }
@@ -1703,9 +2156,9 @@ fn credentials_where(
             Ok(Credentials {
                 client_id,
                 client_secret: Some(client_secret),
-                #[cfg(feature = "client_assertion")]
+                #[cfg(feature = "client-assertion")]
                 client_assertion_type: None,
-                #[cfg(feature = "client_assertion")]
+                #[cfg(feature = "client-assertion")]
                 client_assertion: None,
             })
         }
@@ -1716,9 +2169,9 @@ fn credentials_where(
         (false, Some(id), secret) => Ok(Credentials {
             client_id: id.to_string(),
             client_secret: secret.map(str::to_string),
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion_type: None,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion: None,
         }),
         // RFC 6749 s5.2 names this case explicitly under `invalid_client`: "no client
@@ -1833,6 +2286,17 @@ async fn token_handler<S: Storage, C: Clock>(
         let mut values = headers.get_all(crate::dpop::DPOP_HEADER).iter();
         let first = values.next();
         if values.next().is_some() {
+            // EMITTED like every other proof refusal. These two are refused HERE rather than in
+            // `verify_proof`, which is the only reason they were silent through 0.9.0: a
+            // deployment reading `DpopProofRefused` to tell its failure modes apart would have
+            // seen nothing whatever for a client sending two headers, which is a client bug the
+            // operator is the only one who can report back.
+            state
+                .server
+                .hooks()
+                .emit(|| crate::events::Event::DpopProofRefused {
+                    failure: crate::dpop::DpopFailure::Malformed,
+                });
             return error_response(
                 &ErrorResponse::new(ErrorCode::InvalidDpopProof)
                     .with_description("more than one DPoP header (RFC 9449 s4.3)"),
@@ -1847,12 +2311,18 @@ async fn token_handler<S: Storage, C: Clock>(
             // proof rather than an absent one, and answering "absent" would silently downgrade a
             // client that asked for a bound token to a bearer one.
             Some(Err(_)) => {
+                state
+                    .server
+                    .hooks()
+                    .emit(|| crate::events::Event::DpopProofRefused {
+                        failure: crate::dpop::DpopFailure::Malformed,
+                    });
                 return error_response(
                     &ErrorResponse::new(ErrorCode::InvalidDpopProof)
                         .with_description("the DPoP header is not a compact JWS"),
                     via_header,
                     &state.challenge,
-                )
+                );
             }
         }
     };
@@ -1926,6 +2396,21 @@ async fn token_handler<S: Storage, C: Clock>(
             // refusal is what an operator who turned DPoP on can actually see.
             #[cfg(feature = "dpop")]
             if dpop_proof.is_some() {
+                // And it is REPORTED, for the same reason it is refused loudly: a client asking
+                // this server for something it cannot do is a wiring mistake, and the operator who
+                // turned DPoP on is the only party who can tell the client's author.
+                //
+                // `NotAcceptedHere`, NOT `Malformed`, which is what this said until the 0.9.1
+                // audit: the proof has not been parsed at this point and is probably a perfectly
+                // good JWS. Reporting it as malformed described the client's string instead of
+                // this server's capability, and pointed the one person who could fix it at the one
+                // person who could not.
+                state
+                    .server
+                    .hooks()
+                    .emit(|| crate::events::Event::DpopProofRefused {
+                        failure: crate::dpop::DpopFailure::NotAcceptedHere,
+                    });
                 return error_response(
                     &ErrorResponse::new(ErrorCode::InvalidDpopProof).with_description(
                         "this server does not issue sender-constrained tokens through RFC 8693 \
@@ -1940,7 +2425,7 @@ async fn token_handler<S: Storage, C: Clock>(
             // that is not confidential: forwarding only `client_secret` first made every exchange
             // `invalid_client` (the `None` the other arms carry), and then, once the secret was
             // restored, still refused every client registered for `private_key_jwt` or
-            // `client_secret_jwt`, whose credential arrives in `client_assertion`. Half a repair
+            // `client_secret_jwt`, whose credential arrives in `client-assertion`. Half a repair
             // is what left the second half invisible.
             return token_exchange_response(state, &form, client_id, &creds, via_header).await;
         }
@@ -1957,7 +2442,10 @@ async fn token_handler<S: Storage, C: Clock>(
         // one here and a duplicate is a smuggled parameter rather than a second value.
         // That is the opposite of `resource`, which s2 of RFC 8707 explicitly allows to
         // repeat, and the difference is why the two are read differently.
-        #[cfg(feature = "rar")]
+        //
+        // READ IN EVERY BUILD, not only under `rar`: a build that supports no authorization
+        // detail type has to refuse the parameter (RFC 9396 s5), and a router that never read it
+        // off the form left the endpoint nothing to refuse. See `TokenRequestContext`.
         authorization_details: param(&form, "authorization_details"),
         #[cfg(feature = "dpop")]
         dpop_proof,
@@ -2054,9 +2542,9 @@ async fn token_exchange_response<S: Storage, C: Clock>(
         // RFC 7521 s4.2 / RFC 7523 s2.2, forwarded rather than dropped: without these two an
         // assertion-authenticated confidential client cannot use this grant at all, and this is
         // the endpoint that advertises it.
-        #[cfg(feature = "client_assertion")]
+        #[cfg(feature = "client-assertion")]
         client_assertion_type: creds.client_assertion_type.as_deref(),
-        #[cfg(feature = "client_assertion")]
+        #[cfg(feature = "client-assertion")]
         client_assertion: creds.client_assertion.as_deref(),
         subject_token,
         subject_token_type,
@@ -2232,7 +2720,7 @@ async fn revoke_handler<S: Storage, C: Clock>(
 
     // The WHOLE credential, exactly as the other three protected endpoints in this module do.
     // Forwarding only `client_secret` dropped every other way a client can authenticate: an RFC
-    // 7523 assertion arrives in `client_assertion`, not in `client_secret`, so an
+    // 7523 assertion arrives in `client-assertion`, not in `client_secret`, so an
     // assertion-authenticated confidential client was refused `invalid_client` at this endpoint
     // and could never revoke anything through this service. Same defect, same cause and same
     // invisibility as the RFC 8693 one `tests/wire_reachability.rs` was written after: an arm not
@@ -2285,12 +2773,20 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 fn registration_error(failure: &crate::registration::RegistrationFailure) -> Response {
     let status =
         StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // The `Content-Type` goes on the arm that HAS a body. An empty octet stream is not a valid
+    // `application/json` document (RFC 8259 s2), and announcing it as one turns every RFC 7592
+    // 401, 404 and 500 into a decode exception in the client rather than into the status it meant
+    // to report: `response.json()` raises before anything can read `response.status`.
     let mut resp = match failure {
-        crate::registration::RegistrationFailure::Invalid(body) => respond(status, json_body(body)),
+        crate::registration::RegistrationFailure::Invalid(body) => {
+            let mut resp = respond(status, json_body(body));
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, json_content_type());
+            resp
+        }
         _ => respond(status, Body::empty()),
     };
     let headers = resp.headers_mut();
-    headers.insert(header::CONTENT_TYPE, json_content_type());
     no_store(headers);
     if status == StatusCode::UNAUTHORIZED {
         headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -2376,11 +2872,30 @@ async fn update_registration_handler<S: Storage, C: Clock>(
     client_id: &str,
     body: &Bytes,
 ) -> Response {
+    // AUTHENTICATE FIRST, and unlike `register_handler` this handler can afford to. RFC 7591 s3.1
+    // registration may be anonymous, so there is nothing to check before the body there; RFC 7592
+    // management is credentialed on every request, and parsing up to `MAX_BODY_BYTES` of a
+    // stranger's JSON before looking at the credential is the shape `MAX_FORM_PARAMETERS`'s own
+    // comment argues against: a refusal is work an attacker sets the rate of. The read and delete
+    // handlers already touched nothing before the token; this one parsed first, and that asymmetry
+    // was the whole of the defect.
+    //
+    // The check is repeated inside `update_registration`, which is deliberate: this one is a
+    // cheaper refusal, not the authority. The cost of the repeat is one storage read and one hash
+    // on the SUCCESS path of an endpoint a deployment uses rarely, against a full JSON parse an
+    // anonymous caller could buy at whatever rate it liked.
+    let token = bearer_token(headers).unwrap_or_default();
+    if let Err(e) = state
+        .server
+        .authenticate_registration(&ClientId::new(client_id), token)
+        .await
+    {
+        return registration_error(&e);
+    }
     let metadata = match client_metadata(body) {
         Ok(m) => m,
         Err(response) => return *response,
     };
-    let token = bearer_token(headers).unwrap_or_default();
     match state
         .server
         .update_registration(&ClientId::new(client_id), token, &metadata)
@@ -2506,6 +3021,22 @@ async fn authorize_handler<S: Storage, C: Clock>(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Response {
+    // WHEN THIS REQUEST ARRIVED, read before anything is looked up, and the instant the code
+    // minted below is dated from.
+    //
+    // The decision this handler acts on is not always made during this handler. With a remembered
+    // consent it was made when the user first approved, and the read that surfaces it happens
+    // several awaits from here. Dating the code at ISSUANCE would let a standing approval outrank
+    // a withdrawal recorded in between: the user clicks "remove this application" elsewhere, the
+    // withdrawal cascades and records its barrier, this request resumes on its pre-withdrawal
+    // snapshot, and a code dated NOW postdates the barrier — so the token is issued and its
+    // refresh chain inherits the same instant and rotates long after the barrier is swept.
+    //
+    // Request entry is the latest instant this service can honestly claim: any withdrawal
+    // recorded before it is one the consent read below would have seen, and any recorded after it
+    // is later than this instant and refuses the write. See `UserApproval::granted_at`.
+    let received_at = state.server.now();
+
     let pairs = match parse_pairs(uri.query().unwrap_or_default()) {
         Ok(pairs) => pairs,
         Err(TooManyParameters) => return too_many_parameters(),
@@ -2527,17 +3058,28 @@ async fn authorize_handler<S: Storage, C: Clock>(
     let subject = match state.subject(headers) {
         Some(s) => s,
         // Deliberately NOT an error redirect. `access_denied` at the client's redirect URI would
-        // tell the client a user refused, when in truth no user was ever asked: this host has not
-        // wired up authentication. A direct 403 says that without lying to the client.
+        // tell the client a user refused, when in truth no user was ever asked. A direct 403 says
+        // that without lying to the client.
+        //
+        // TWO STATES, and they are not the same mistake, which is why they are no longer the same
+        // sentence. Until the 0.9.1 audit both said "the host must supply a subject resolver", and
+        // for the common one that is false: `SubjectResolver` documents `None` as "nobody is
+        // logged in", so an ordinary signed-out browser navigation told a fully wired host to
+        // install what it had already installed, and sent whoever read it to the wrong file.
         None => {
-            return unwired(
-                "no authenticated resource owner; the host must supply a subject resolver",
-            )
+            return match state.subject.is_some() {
+                true => {
+                    unwired("no authenticated resource owner: nobody is signed in for this request")
+                }
+                false => unwired(
+                    "no authenticated resource owner; the host must supply a subject resolver",
+                ),
+            }
         }
     };
 
     // RFC 6749 s10.12: knowing WHO the user is does not establish that they agreed. Without a
-    // consent seam this endpoint would mint a code on any cross-site top-level navigation a
+    // approval seam this endpoint would mint a code on any cross-site top-level navigation a
     // logged-in user's browser is made to follow, so an unwired host refuses. This is a direct
     // 403 for the same reason as the missing subject above: no user refused, none was asked.
 
@@ -2551,14 +3093,17 @@ async fn authorize_handler<S: Storage, C: Clock>(
         .await
         .unwrap_or(None);
 
-    let consent = match &state.consent {
-        Some(resolver) => resolver(&ConsentRequest {
+    let approval = match &state.approval {
+        Some(resolver) => resolver(&ApprovalRequest {
             headers,
             subject: &subject,
             client_id: &validated.client_id,
             scope: &validated.scope,
             redirect_uri: &validated.redirect_uri,
             state: validated.state.as_deref(),
+            resource: &validated.resource,
+            #[cfg(feature = "rar")]
+            authorization_details: &validated.authorization_details,
             uri,
             #[cfg(feature = "consent")]
             // Deref through the shared `Arc<ConsentRecord>` the storage seam now returns: the
@@ -2567,7 +3112,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
         }),
         None => {
             return unwired(
-                "no consent step is configured; the host must supply a consent resolver \
+                "no approval step is configured; the host must supply an approval resolver \
                  (RFC 6749 s10.12)",
             )
         }
@@ -2575,14 +3120,14 @@ async fn authorize_handler<S: Storage, C: Clock>(
     // Only ever set by the host's own `ApproveAndRemember`; see that variant's docs.
     #[cfg(feature = "consent")]
     let mut remember = false;
-    match consent {
-        ConsentDecision::Approve => {}
+    match approval {
+        ApprovalDecision::Approve => {}
         #[cfg(feature = "consent")]
-        ConsentDecision::ApproveAndRemember => remember = true,
+        ApprovalDecision::ApproveAndRemember => remember = true,
         // A refusal is an answer the client is entitled to receive at its (validated) redirect
         // URI, which is exactly what RFC 6749 s4.1.2.1 `access_denied` is for.
-        ConsentDecision::Deny => return redirect(validated.denied().location()),
-        ConsentDecision::Respond(response) => return *response,
+        ApprovalDecision::Deny => return redirect(validated.denied().location()),
+        ApprovalDecision::Respond(response) => return *response,
     }
 
     // The host's report of how and when it authenticated this user, for RFC 9470 s4's parameters to
@@ -2598,10 +3143,12 @@ async fn authorize_handler<S: Storage, C: Clock>(
     let issued = state
         .server
         .issue_authorization_code_with_authentication(
-            // The assertion `UserApproval::granted` makes is exactly what this service has just
-            // finished doing: the consent resolver returned `Approve` for THIS request, on behalf
-            // of the subject the host's own resolver named. Nowhere else in this file may mint one.
-            UserApproval::granted(&validated, subject.clone()),
+            // The assertion `UserApproval::granted_at` makes is exactly what this service has
+            // just finished doing: the approval resolver returned `Approve` for THIS request, on
+            // behalf of the subject the host's own resolver named. Nowhere else in this file may
+            // mint one. It is dated from request entry rather than from now because the decision
+            // may be a standing one; see `received_at` above.
+            UserApproval::granted_at(&validated, subject.clone(), received_at),
             &validated.authentication_requirement,
             authentication.as_ref(),
         )
@@ -2609,7 +3156,7 @@ async fn authorize_handler<S: Storage, C: Clock>(
     #[cfg(not(feature = "consent"))]
     let issued = state
         .server
-        .issue_authorization_code(UserApproval::granted(&validated, subject))
+        .issue_authorization_code(UserApproval::granted_at(&validated, subject, received_at))
         .await;
 
     // AFTER issuance, and only on success: a consent records that the user granted something, and
@@ -2655,14 +3202,29 @@ fn unwired(why: &'static str) -> Response {
 /// A 302 to `location`.
 ///
 /// RFC 6749 s4.1.2 leaves the exact 3xx to the server; 302 is what the RFC's own examples show
-/// and what every client understands. A non-ASCII location cannot be a header value, and the
-/// only strings reaching here are percent-encoded by [`crate::authorization`], so the fallback is
-/// unreachable rather than load-bearing.
+/// and what every client understands.
+///
+/// `no_store`, because this is a credential-bearing response like any other on the token plane:
+/// the `Location` of a successful authorization carries the authorization CODE and the `state`.
+/// RFC 9111 s4.2.2 does not list 302 as heuristically cacheable, so a conforming shared cache will
+/// not keep it — but `no-store` is what turns that from a hope about the intermediary into an
+/// instruction, and every other credential-bearing constructor in this file already sends it.
+///
+/// THE FALLBACK IS REACHABLE, contrary to what this comment said until the 0.9.1 audit. The
+/// appended parameters are percent-encoded by [`crate::authorization`], but the REGISTERED
+/// redirect URI is pushed verbatim, and only the RFC 7591 dynamic path validates it
+/// ([`crate::registration`]'s `redirect_uri_is_registerable`) — a host calling
+/// `register_client` directly supplies a bare `Vec<String>`. A URI with a space in it therefore
+/// reaches `HeaderValue::from_str` and fails it, AFTER the code has been minted and persisted.
+/// The 500 is the honest answer at that point; the fix belongs at registration, and the failure
+/// is named here so that whoever meets it once knows where to look.
 fn redirect(location: String) -> Response {
     match HeaderValue::from_str(&location) {
         Ok(value) => {
             let mut resp = respond(StatusCode::FOUND, Body::empty());
-            resp.headers_mut().insert(header::LOCATION, value);
+            let headers = resp.headers_mut();
+            headers.insert(header::LOCATION, value);
+            no_store(headers);
             resp
         }
         Err(_) => error_response(
@@ -2726,8 +3288,41 @@ fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(origin))
 }
 
+/// What the RFC 8628 section 5.1 throttle has already been told about the user code a page is
+/// about to display.
+///
+/// ONE CODE ENTRY IS CHARGED ONCE, however many times a single request resolves it. A wrong code
+/// posted with `action=approve` is resolved TWICE — once by
+/// [`crate::server::AuthorizationServer::approve_device`], and again by the re-render that reports
+/// the failure — and charging both halved every budget a host configured: a 200-unit-per-minute
+/// limiter documented as allowing twenty wrong entries a minute allowed ten. The error was
+/// fail-closed, which is why nothing noticed it. This enum is how the second resolution says "that
+/// entry is already counted" without any handler having to remember the rule.
+#[derive(Clone, Copy)]
+enum CodeEntry {
+    /// Nothing on this request has counted this entry yet, so the lookup counts it. Every
+    /// separately-attackable entry point is this: the RFC 8628 s3.3.1 deep link, and the
+    /// stage-one POST that types a code to see what it is for. Making those free would let an
+    /// attacker walk the code space for nothing, which is a worse defect than the double charge.
+    Uncharged,
+    /// A handler earlier in THIS request already counted this exact entry, so the lookup must not
+    /// count it a second time.
+    AlreadyCharged,
+    /// The throttle already REFUSED this entry earlier in this request. There is nothing to look
+    /// up: a lookup would answer, for free, the one question the refusal exists to leave
+    /// unanswered.
+    Refused,
+}
+
+/// The throttle refused to answer for this user code (RFC 8628 section 5.1).
+///
+/// A distinct outcome from "nothing pending matches", and the distinction is the point: they are
+/// the same value to the ATTACKER (see [`THROTTLED_MESSAGE`]) but they are not the same value to
+/// this code, which must not tell a user with a perfectly good code that it was not recognised.
+struct Throttled;
+
 /// The pending grant behind an entered user code, plus the client's display name, for the
-/// consent screen. `None` when nothing pending matches.
+/// consent screen. `Ok(None)` when nothing pending matches.
 ///
 /// Read through the public storage seam rather than through a server method, and deliberately
 /// NOT treated as authoritative: expiry and state are re-checked inside
@@ -2736,7 +3331,8 @@ fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
 async fn pending_grant<S: Storage, C: Clock>(
     state: &Inner<S, C>,
     entered_user_code: &str,
-) -> Option<(DeviceGrant, Option<String>)> {
+    entry: CodeEntry,
+) -> Result<Option<(DeviceGrant, Option<String>)>, Throttled> {
     // THIS LOOKUP IS A GUESSING ORACLE, so it goes through the host's throttle exactly as
     // AuthorizationServer::pending_grant_by_user_code does. The response distinguishes a live
     // pending code from an unknown one perfectly (one renders the client and the scope, the other
@@ -2747,9 +3343,20 @@ async fn pending_grant<S: Storage, C: Clock>(
     // RFC 8628 s5.1 makes the user code's entropy adequate only IN COMBINATION WITH rate limiting
     // of code entry, and s5.4 names this exact URL, the verification_uri_complete deep link, as
     // the higher-risk entry point.
+    //
+    // `entry` decides whether THIS resolution is the one that pays; see [`CodeEntry`].
     let hooks = state.server.hooks();
-    if hooks.check(Attempt::DeviceUserCodeEntry) == RateLimitDecision::Deny {
-        return None;
+    match entry {
+        CodeEntry::Refused => return Err(Throttled),
+        CodeEntry::Uncharged => {
+            if hooks.check(Attempt::DeviceUserCodeEntry) == RateLimitDecision::Deny {
+                return Err(Throttled);
+            }
+        }
+        // The check is skipped along with the charge, and deliberately: the handler that charged
+        // this entry was ALLOWED through, so asking the limiter again could only refuse a request
+        // it has already accepted, halfway through answering it.
+        CodeEntry::AlreadyCharged => {}
     }
     let normalized = normalize_user_code(entered_user_code);
     let grant = state
@@ -2761,15 +3368,21 @@ async fn pending_grant<S: Storage, C: Clock>(
         .flatten()
         .filter(|g| g.state == DeviceGrantState::Pending);
     // Report the outcome, because a guessing attack shows up in FAILURES, not in traffic volume.
-    hooks.record(
-        Attempt::DeviceUserCodeEntry,
-        if grant.is_some() {
-            AttemptOutcome::Succeeded
-        } else {
-            AttemptOutcome::Failed
-        },
-    );
-    let grant = grant?;
+    // Only when this resolution is the one paying for the entry: a second report of one entry is
+    // a second charge, which is the whole defect [`CodeEntry`] exists to describe.
+    if matches!(entry, CodeEntry::Uncharged) {
+        hooks.record(
+            Attempt::DeviceUserCodeEntry,
+            if grant.is_some() {
+                AttemptOutcome::Succeeded
+            } else {
+                AttemptOutcome::Failed
+            },
+        );
+    }
+    let Some(grant) = grant else {
+        return Ok(None);
+    };
     let name = state
         .server
         .store()
@@ -2790,16 +3403,29 @@ async fn pending_grant<S: Storage, C: Clock>(
         // click. Refusing to render at all would mean an unrelated store hiccup ended a login the
         // user is in the middle of, and would do it on the ONE screen where the user is watching.
         .and_then(|c| c.name.clone());
-    Some((grant, name))
+    Ok(Some((grant, name)))
 }
 
+/// What a user is told when the RFC 8628 section 5.1 throttle refused their code entry.
+///
+/// One string for both the POST and the GET path, because they owe the user the same answer. It
+/// says nothing about whether the code was real: that is the question the throttle exists to stop
+/// being asked, and a page that answered it for refused attempts would hand back the oracle the
+/// refusal just took away.
+const THROTTLED_MESSAGE: &str = "Too many attempts. Wait and try again.";
+
 /// Render the verification page for whatever `entered` resolves to, with a fresh CSRF token.
+///
+/// `status` and `message` are what the CALLER already worked out, and they win: the submit handler
+/// has an outcome in hand and has chosen the status to match it. They are absent on the display
+/// paths, which is where the lookup below gets to decide.
 async fn render_verification<S: Storage, C: Clock>(
     state: &Inner<S, C>,
     headers: &HeaderMap,
     entered: &str,
     status: StatusCode,
     message: Option<&str>,
+    entry: CodeEntry,
 ) -> Response {
     let csrf = match &state.verification {
         // RFC 6749 s10.12 is the AS's obligation, so an unwired host is served an explanation
@@ -2826,17 +3452,23 @@ async fn render_verification<S: Storage, C: Clock>(
         VerificationProtection::Disabled => None,
     };
 
-    let grant = match entered.is_empty() {
-        true => None,
-        false => pending_grant(state, entered).await,
+    let looked_up = match entered.is_empty() {
+        true => Ok(None),
+        false => pending_grant(state, entered, entry).await,
     };
-    // A code that was typed but matches nothing pending is worth saying so, rather than
-    // rendering a consent screen with nothing on it.
-    let message = match (message, entered.is_empty(), grant.is_some()) {
-        (Some(m), _, _) => Some(m),
-        (None, false, false) => Some("That code was not recognised."),
-        _ => None,
+    // A code that was typed but matches nothing pending is worth saying so, rather than rendering
+    // a consent screen with nothing on it — but a code the THROTTLE refused matches nothing for a
+    // completely different reason, and until 0.9.1 this page told those users their perfectly good
+    // code was not recognised, at HTTP 200. The sibling POST path has always distinguished the two
+    // (see `verification_submit_handler`); this is the deep-linked entry point RFC 8628 s5.4 warns
+    // about, so it is the one that most wants the honest status.
+    let (status, message) = match (message, &looked_up) {
+        (Some(m), _) => (status, Some(m)),
+        (None, Err(Throttled)) => (StatusCode::TOO_MANY_REQUESTS, Some(THROTTLED_MESSAGE)),
+        (None, Ok(None)) if !entered.is_empty() => (status, Some("That code was not recognised.")),
+        (None, _) => (status, None),
     };
+    let grant = looked_up.unwrap_or(None);
     html_response(
         status,
         verification_page(entered, message, grant.as_ref(), csrf.as_deref()),
@@ -2859,7 +3491,17 @@ async fn verification_page_handler<S: Storage, C: Clock>(
         Err(TooManyParameters) => return too_many_parameters(),
     };
     let prefill = param(&pairs, "user_code").unwrap_or_default();
-    render_verification(state, headers, prefill, StatusCode::OK, None).await
+    // A separately-attackable entry point, and the one RFC 8628 s5.4 singles out: this request has
+    // charged nothing yet, so the lookup charges it.
+    render_verification(
+        state,
+        headers,
+        prefill,
+        StatusCode::OK,
+        None,
+        CodeEntry::Uncharged,
+    )
+    .await
 }
 
 /// The verification form's submission: the user has entered the code shown on their device.
@@ -2920,12 +3562,14 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
     }
 
     if user_code.is_empty() {
+        // No code was entered, so there is nothing to look up and nothing to charge either way.
         return render_verification(
             state,
             headers,
             "",
             StatusCode::BAD_REQUEST,
             Some("Enter the code shown on your device."),
+            CodeEntry::Uncharged,
         )
         .await;
     }
@@ -2939,7 +3583,17 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
     let denied = action == "deny";
     let approved = action == "approve" || !protected;
     if !denied && !approved {
-        return render_verification(state, headers, user_code, StatusCode::OK, None).await;
+        // Stage one of the two-stage form: this request has resolved the code nowhere else, and a
+        // POST of a guessed code is exactly what the throttle counts, so it pays here.
+        return render_verification(
+            state,
+            headers,
+            user_code,
+            StatusCode::OK,
+            None,
+            CodeEntry::Uncharged,
+        )
+        .await;
     }
 
     // Approval binds the grant to a USER, so the same rule as the authorization endpoint applies:
@@ -2979,7 +3633,7 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
                 // The host's own limiter refused this before the code was even looked up
                 // (RFC 8628 section 5.1). Deliberately says nothing about whether the code was
                 // real: that is the question the throttle exists to stop being asked.
-                DeviceApprovalError::RateLimited => "Too many attempts. Wait and try again.",
+                DeviceApprovalError::RateLimited => THROTTLED_MESSAGE,
             };
             let status = match e {
                 DeviceApprovalError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2990,9 +3644,38 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
             };
             // The CSRF token was consumed above, so this re-render mints a fresh one; without
             // that a mistyped code would leave the user with a form that can never be submitted.
-            render_verification(state, headers, user_code, status, Some(message)).await
+            //
+            // `approve_device`/`deny_device` resolved this exact code entry a few lines up, and
+            // charged the throttle for it. The re-render must not charge it again — that is the
+            // double charge `CodeEntry` documents — and when the throttle REFUSED, it must not
+            // look the code up at all, because a refused attempt that still rendered the client
+            // and the scope would be the oracle handed back.
+            let entry = match e {
+                DeviceApprovalError::RateLimited => CodeEntry::Refused,
+                _ => CodeEntry::AlreadyCharged,
+            };
+            render_verification(state, headers, user_code, status, Some(message), entry).await
         }
     }
+}
+
+/// Escape a value for an RFC 9110 s5.6.4 quoted-string: `\` and `"` become `\\` and `\"`.
+///
+/// Borrows when there is nothing to escape, which is every well-formed issuer, so the ordinary 401
+/// costs no allocation. See the `challenge` construction for why a value this crate treats as a URL
+/// is nonetheless escaped.
+fn escape_quoted_string(value: &str) -> Cow<'_, str> {
+    if !value.contains(['"', '\\']) {
+        return Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Cow::Owned(out)
 }
 
 /// Escape the five characters that can break out of HTML text or an attribute value. The user

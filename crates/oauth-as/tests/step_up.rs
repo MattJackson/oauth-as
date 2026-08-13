@@ -74,8 +74,8 @@ fn requirement(acr_values: Option<&str>, max_age: Option<&str>) -> Authenticatio
 
 /// Run one authorization request through validation and code issuance, with whatever the host says
 /// it did about authenticating the user.
-async fn authorize(
-    srv: &oauth_as::AuthorizationServer<oauth_as::MemoryStorage, ManualClock>,
+async fn authorize<S: oauth_as::Storage>(
+    srv: &oauth_as::AuthorizationServer<S, ManualClock>,
     requirement: &AuthenticationRequirement,
     authentication: Option<&Authentication>,
 ) -> Result<oauth_as::AuthorizationResponse, AuthorizationError> {
@@ -129,9 +129,24 @@ async fn a_request_with_no_reported_authentication_is_refused() {
 /// An authentication older than the requested `max_age` is refused, and NOTHING is minted: no code
 /// exists to be redeemed afterwards. A server that issued the code and merely omitted `auth_time`
 /// would leave the resource server no better off than before it challenged.
+///
+/// HOW "NOTHING WAS MINTED" IS ACTUALLY CHECKED. It cannot be checked by making a second, DIFFERENT
+/// request and watching that one succeed — which is what this test used to do, under a comment
+/// saying "Nothing was issued". That second request proves the fixture works and says nothing
+/// whatever about whether the refused one wrote a record; the test passed either way.
+///
+/// The store is the only witness, so the store is what answers. `FaultStorage` is set to fail
+/// EVERY `put_authorization_code`, which turns "a code was written" into an observable event: if
+/// the refusal came after the write, the write's failure is what the caller would see, and the
+/// answer would not be `insufficient_user_authentication`. Getting the step-up refusal back means
+/// the code path never reached the store at all.
 #[tokio::test]
 async fn an_authentication_older_than_max_age_is_refused_and_mints_nothing() {
-    let srv = support::server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
+    let srv =
+        support::fault_server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
+    srv.store()
+        .fail_put_authorization_code
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let stale = Authentication::at(at(NOW - 3_600));
 
     let err = authorize(&srv, &requirement(None, Some("300")), Some(&stale))
@@ -140,11 +155,16 @@ async fn an_authentication_older_than_max_age_is_refused_and_mints_nothing() {
 
     assert_eq!(
         redirect_error(err),
-        ErrorCode::InsufficientUserAuthentication
+        ErrorCode::InsufficientUserAuthentication,
+        "the refusal must be the step-up one; a store error here would mean a code was written \
+         before the requirement was checked"
     );
-    // Nothing was issued: the refusal is not a code with a caveat attached.
+
+    // The control, on a store that works: the fixture really can mint, so the refusal above is the
+    // requirement doing its job rather than the harness being broken.
+    let working = support::server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
     let fresh = Authentication::at(at(NOW - 60));
-    let ok = authorize(&srv, &requirement(None, Some("300")), Some(&fresh))
+    let ok = authorize(&working, &requirement(None, Some("300")), Some(&fresh))
         .await
         .expect("a one-minute-old login satisfies max_age=300");
     assert!(!ok.code.is_empty());
@@ -196,11 +216,18 @@ async fn only_a_requested_acr_satisfies_the_request() {
 /// A refusal goes back to the CLIENT at its validated redirect URI (RFC 6749 s4.1.2.1), carrying
 /// the state it sent, because the client is the party that asked the question and the party that
 /// has to decide whether to send the user back to log in. It is not a page rendered at the AS.
+///
+/// THE REFUSED REQUEST REPORTS AN AUTHENTICATION, of the wrong class. With `None` there was no
+/// `auth_time` and no `acr` anywhere in the process, so the "nothing leaked" assertion at the end
+/// had nothing it could have caught: it was asserting that a value which did not exist was not
+/// present. A password login refused for not being `phr` is the case where the server HOLDS both
+/// values and must still not put them in the query.
 #[tokio::test]
 async fn a_step_up_refusal_is_a_redirect_carrying_state_and_iss() {
     let srv = support::server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
 
-    let err = authorize(&srv, &requirement(Some("phr"), None), None)
+    let password = Authentication::at(at(NOW)).with_acr("urn:acr:pwd");
+    let err = authorize(&srv, &requirement(Some("phr"), None), Some(&password))
         .await
         .expect_err("refused");
 
@@ -215,8 +242,10 @@ async fn a_step_up_refusal_is_a_redirect_carrying_state_and_iss() {
                 location.contains("error=insufficient_user_authentication"),
                 "{location}"
             );
-            // The client is not told when the user last logged in, or which acr they hold.
+            // The client is not told when the user last logged in, or which acr they hold. Both
+            // exist on this request, so both are values the redirect could have leaked.
             assert!(!location.contains("1700"), "{location}");
+            assert!(!location.contains("pwd"), "{location}");
         }
         other => panic!("expected a redirect refusal, got {other:?}"),
     }
@@ -236,9 +265,10 @@ async fn a_request_with_no_step_up_parameters_is_unaffected() {
 
 // ---------------------------------------------------------------- what the token then reports
 
-/// RFC 9470 s5: the token that comes out of a satisfied step-up REPORTS the authentication behind
+/// RFC 9470 s6.2: the token that comes out of a satisfied step-up REPORTS the authentication behind
 /// it, through RFC 7662 introspection, so the resource server that sent the challenge can check the
-/// answer rather than taking the client's word for it.
+/// answer rather than taking the client's word for it. (Section 5 is the AUTHORIZATION RESPONSE;
+/// section 6 is where the authentication information is conveyed, 6.1 in a JWT and 6.2 here.)
 #[tokio::test]
 async fn the_issued_token_reports_auth_time_and_acr_to_introspection() {
     let srv = support::server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;

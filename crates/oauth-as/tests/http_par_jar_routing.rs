@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, ServiceBuilder};
+use oauth_as::http::{ApprovalDecision, ServiceBuilder};
 use oauth_as::par::ParConfig;
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
@@ -123,10 +123,9 @@ async fn start(require_par: bool) -> SocketAddr {
     let addr = listener.local_addr().expect("local_addr");
     let issuer = format!("http://{addr}");
     let mut config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
-    config.par = Some(Box::new(ParConfig {
-        require_pushed_authorization_requests: require_par,
-        ..ParConfig::new()
-    }));
+    let mut par = ParConfig::new();
+    par.require_pushed_authorization_requests = require_par;
+    config.par = Some(Box::new(par));
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
 
     let scopes = ScopeSet::from_tokens(["read", "write"]).expect("scopes");
@@ -148,7 +147,7 @@ async fn start(require_par: bool) -> SocketAddr {
 
     let service = ServiceBuilder::new(server)
         .with_subject_resolver(|_headers| Some("test-user".to_string()))
-        .with_consent_resolver(|_req| ConsentDecision::Approve)
+        .with_approval_resolver(|_req| ApprovalDecision::Approve)
         .build()
         .expect("service");
     let router = axum::Router::from(service);
@@ -192,6 +191,25 @@ fn basic() -> String {
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(format!("{CONFIDENTIAL_ID}:{SECRET}"))
     )
+}
+
+/// Percent-encode a value for an `application/x-www-form-urlencoded` body, keeping only the RFC
+/// 3986 section 2.3 unreserved characters. Hand-written for the reason the rest of this file speaks
+/// HTTP by hand: a JSON `authorization_details` value contains the punctuation a form body uses as
+/// structure, and a helper crate deciding which characters were "safe enough" is exactly the layer
+/// this suite exists to remove.
+#[cfg(feature = "rar")]
+fn form_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// The form body of a well formed pushed authorization request.
@@ -509,7 +527,7 @@ async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
 
     let service = ServiceBuilder::new(server)
         .with_subject_resolver(|_headers| Some("test-user".to_string()))
-        .with_consent_resolver(|_req| ConsentDecision::Approve)
+        .with_approval_resolver(|_req| ApprovalDecision::Approve)
         .build()
         .expect("service");
     let router = axum::Router::from(service);
@@ -534,10 +552,19 @@ fn request_object_with(key: &oauth_as::jwt::EcdsaP256Key, issuer: &str, extra: &
         oauth_as::par::REQUEST_OBJECT_TYP,
         key.kid()
     );
+    // The `exp` is load bearing as of 0.9.1: a request object without one is refused, because an
+    // object that never expires authorizes its exact request for as long as the client's key stays
+    // registered, and this one is handed to the browser. Sixty seconds, inside the default
+    // `JarConfig::max_request_object_lifetime`, so no test here is accidentally about the ceiling.
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the test clock is after the epoch")
+        .as_secs()
+        + 60;
     let payload = format!(
         r#"{{"iss":"{CONFIDENTIAL_ID}","aud":"{issuer}","client_id":"{CONFIDENTIAL_ID}",
             "response_type":"code","redirect_uri":"{REDIRECT_URI}","scope":"read","state":"jarstate",
-            "code_challenge":"{CHALLENGE}","code_challenge_method":"S256"{extra}}}"#
+            "code_challenge":"{CHALLENGE}","code_challenge_method":"S256","exp":{exp}{extra}}}"#
     );
     oauth_as::jwt::compact_jws(header.as_bytes(), payload.as_bytes(), |signing_input| {
         key.sign_signing_input(signing_input)
@@ -770,5 +797,172 @@ async fn a_max_age_appended_to_the_query_of_a_signed_request_is_ignored() {
         location.contains("code="),
         "the signed object asked for no step-up, so the query must not have created one: \
          {location}"
+    );
+}
+
+/// RFC 9396 section 2, and the seam that has to see it: a pushed `authorization_details` element
+/// reaches the host's approval resolver, so that a consent screen can render the thing it is asking
+/// the user to approve.
+///
+/// WHY THIS IS A PAR TEST. It is on the PAR path that the gap could not be worked around. RFC 9126
+/// section 4 puts every parameter in the pushed record and leaves the query holding `client_id` and
+/// the handle, and the record is consumed by the time the approval resolver runs, so a host that
+/// wanted to look the elements up itself has nothing to look them up FROM. (The JAR path is the
+/// same story with the values inside a signed object.) What this crate hands the resolver is
+/// therefore the host's only sight of them.
+///
+/// WHY IT MATTERS. `AuthorizationDetails::require_supported_types` (section 5) checks the `type`
+/// string and nothing else, so an element's amount, its `identifier` and its creditor account are
+/// approved by nobody unless the resolver sees them. The scenario below is that gap made concrete:
+/// the client asks for scope `read`, which is what a scope-only consent screen renders, and pushes
+/// a payment naming an account the user is never shown.
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn a_pushed_authorization_detail_reaches_the_approval_screen() {
+    use std::sync::Mutex;
+
+    const IBAN: &str = "DE75512108001245126199";
+    const RESOURCE: &str = "https://payments.rs.example/api";
+
+    /// What a consent screen was able to render. A real one renders the scope; this one also
+    /// records the elements it was handed, which is the property under test.
+    #[derive(Default)]
+    struct Screen {
+        rendered_scope: Vec<String>,
+        rendered_details: Vec<String>,
+        /// The RFC 8707 audience the token will carry, which is the other half of "what am I
+        /// approving": the same scope means different things at different resource servers.
+        rendered_resource: Vec<String>,
+        /// The raw request URI, kept to show that nothing in the QUERY could have supplied the
+        /// elements: on the PAR path it holds the handle and nothing else.
+        query: String,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let issuer = format!("http://{addr}");
+    let mut config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
+    config.par = Some(Box::new(ParConfig::new()));
+    // Section 5: a server that publishes no supported types refuses every element, so the request
+    // below would never reach the approval step at all.
+    config.authorization_details_types_supported = Some(vec!["payment_initiation".to_string()]);
+    let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+    let scopes = ScopeSet::from_tokens(["read", "write"]).expect("scopes");
+    server
+        .register_client(Client {
+            client_id: ClientId::new(CONFIDENTIAL_ID),
+            auth: ClientAuth::ConfidentialSecret {
+                secret: SECRET.to_string(),
+            },
+            grant_types: vec![GrantType::AuthorizationCode],
+            redirect_uris: vec![REDIRECT_URI.to_string()],
+            allowed_scopes: scopes.clone(),
+            default_scopes: scopes,
+            name: None,
+            registration: None,
+        })
+        .await
+        .expect("register confidential");
+
+    let screen: Arc<Mutex<Screen>> = Arc::new(Mutex::new(Screen::default()));
+    let recorder = Arc::clone(&screen);
+    let service = ServiceBuilder::new(server)
+        .with_subject_resolver(|_headers| Some("test-user".to_string()))
+        .with_approval_resolver(move |req| {
+            let mut screen = recorder.lock().expect("screen");
+            screen.rendered_scope = req.scope.iter().map(|s| s.to_string()).collect();
+            screen.rendered_details = req
+                .authorization_details
+                .iter()
+                .map(|d| serde_json::to_string(d).expect("a parsed detail must re-serialize"))
+                .collect();
+            screen.rendered_resource = req.resource.to_vec();
+            screen.query = req.uri.to_string();
+            // THE POINT OF THE SEAM: this host approves only what it was able to show. An element
+            // it cannot render is one the user did not agree to, so it refuses rather than
+            // authorizing a payment on the user's behalf (RFC 6749 section 4.1.2.1
+            // `access_denied`).
+            if screen.rendered_details.is_empty() {
+                ApprovalDecision::Approve
+            } else {
+                ApprovalDecision::Deny
+            }
+        })
+        .build()
+        .expect("service");
+    let router = axum::Router::from(service);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let path = par_path(addr).await;
+    let details = format!(
+        r#"[{{"type":"payment_initiation","instructedAmount":{{"currency":"EUR","amount":"9999.00"}},"creditorAccount":{{"iban":"{IBAN}"}}}}]"#
+    );
+    let pushed = request(
+        addr,
+        "POST",
+        &path,
+        &[("Authorization", &basic())],
+        Some(&format!(
+            "{}&resource={}&authorization_details={}",
+            push_body(),
+            form_encode(RESOURCE),
+            form_encode(&details)
+        )),
+    )
+    .await;
+    assert_eq!(pushed.status, 201, "body was {:?}", pushed.body);
+    let request_uri = pushed.json()["request_uri"]
+        .as_str()
+        .expect("request_uri")
+        .to_string();
+    let encoded = request_uri.replace(':', "%3A");
+
+    let authorized = request(
+        addr,
+        "GET",
+        &format!("/authorize?client_id={CONFIDENTIAL_ID}&request_uri={encoded}"),
+        &[],
+        None,
+    )
+    .await;
+
+    let seen = screen.lock().expect("screen");
+    assert!(
+        !seen.rendered_scope.is_empty(),
+        "the resolver was never called at all, so this test proves nothing about it"
+    );
+    assert!(
+        !seen.query.contains(IBAN) && !seen.query.contains("authorization_details"),
+        "this test is vacuous unless the query really is the handle and nothing else: {}",
+        seen.query
+    );
+    assert!(
+        seen.rendered_details.iter().any(|d| d.contains(IBAN)),
+        "the approval resolver was asked to approve a payment it was never shown: it saw scope \
+         {:?} and details {:?}, and the pushed element named account {IBAN}",
+        seen.rendered_scope,
+        seen.rendered_details
+    );
+
+    assert_eq!(
+        seen.rendered_resource,
+        vec![RESOURCE.to_string()],
+        "the pushed RFC 8707 resource indicator never reached the approval screen either, so the \
+         host could not tell the user which resource server this token will be accepted at"
+    );
+
+    // And the outcome the user gets: because the host could see the element, it could refuse it,
+    // and no authorization code exists for a payment nobody approved.
+    assert_eq!(authorized.status, 302, "body was {:?}", authorized.body);
+    let location = authorized.header("location").expect("Location");
+    assert!(
+        !location.contains("code="),
+        "a code was minted for an unapproved payment: {location}"
+    );
+    assert!(
+        location.contains("error=access_denied"),
+        "RFC 6749 s4.1.2.1: a refusal is the answer the client is entitled to: {location}"
     );
 }

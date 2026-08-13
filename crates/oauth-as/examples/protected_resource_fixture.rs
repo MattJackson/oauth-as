@@ -41,9 +41,11 @@
 //! # Environment
 //!
 //! * `OAUTH_RS_ADDR` (default `127.0.0.1:8915`): the address to bind. Deliberately a DIFFERENT
-//!   port from the AS: RFC 9728 section 3.1 puts this document under the resource's identifier,
-//!   and serving it from the issuer's origin would demonstrate the exact mistake the module docs
-//!   warn about.
+//!   port from EITHER authorization server example, which bind `127.0.0.1:8914`
+//!   (`conformance_server.rs`) and `127.0.0.1:8916` (`production_server.rs`): RFC 9728 section
+//!   3.1 puts this document under the resource's identifier, and serving it from the issuer's
+//!   origin would demonstrate the exact mistake the module docs warn about. If you move this
+//!   fixture to resolve a port clash, move it to a THIRD port rather than onto an issuer's.
 //! * `OAUTH_RS_RESOURCE` (default `http://{OAUTH_RS_ADDR}`): the section 2 `resource` identifier.
 //!   Section 3.3 makes a client compare this against the identifier it built the request URL
 //!   from, so the default is derived from the bind address rather than configured separately.
@@ -95,6 +97,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         resource.trim_end_matches('/'),
         path
     );
+    // Built ONCE, HERE, and propagated. It used to be built inside the fallback handler, where
+    // `expect("ASCII challenge")` was a panic PER REQUEST: `OAUTH_RS_RESOURCE` is host
+    // configuration, so a non-ASCII value there is a boot-time mistake, and a boot-time mistake
+    // must fail at boot with a message rather than answer every caller with a dropped connection.
+    // RFC 9110 section 5.5 confines a field value to ASCII, which is what `from_str` is checking.
+    let challenge = HeaderValue::from_str(&challenge).map_err(|_| {
+        "OAUTH_RS_RESOURCE produced a non-ASCII WWW-Authenticate challenge (RFC 9110 s5.5); set \
+         it to an ASCII resource identifier"
+    })?;
 
     let doc_for_route = Arc::clone(&shared);
     let app = Router::new()
@@ -115,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
         )
         .fallback(move || {
-            let value = HeaderValue::from_str(&challenge).expect("ASCII challenge");
+            let value = challenge.clone();
             async move {
                 Response::builder()
                     .status(StatusCode::UNAUTHORIZED)

@@ -46,6 +46,29 @@ pub const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 pub const PUBLIC_REDIRECT: &str = "https://app.example/cb";
 pub const SECOND_REDIRECT: &str = "https://app.example/other";
 
+/// The revocation-barrier deadline for a test that is not about barrier EXPIRY.
+///
+/// Far enough out that the barrier stands for the whole of any test, so a test asserting a
+/// cascade is never accidentally passing because the barrier was reaped mid-run. A test that IS
+/// about expiry picks its own deadline, deliberately, rather than calling this.
+pub fn far_future() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+}
+
+/// The whole revocation window for a test that is about a CASCADE or a REFUSAL rather than about
+/// when the grant was established.
+///
+/// `recorded_at` is as far out as `until`, deliberately: every grant a test could plant was
+/// established before it, so the barrier covers all of them and the test sees the refusal it is
+/// about. A test that IS about the comparison — a re-approval, a re-provisioned client — must
+/// build its own window, or drive the revocation through the server so the server's clock sets it.
+pub fn far_future_window() -> oauth_as::store::RevocationWindow {
+    oauth_as::store::RevocationWindow {
+        recorded_at: far_future(),
+        until: far_future(),
+    }
+}
+
 /// A public client with one registered redirect URI: the ordinary OAuth 2.1 native-app shape.
 pub fn public_client() -> Client {
     Client {
@@ -183,22 +206,15 @@ pub async fn mint_code_token<S: Storage>(
     subject: &str,
 ) -> TokenResponse {
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
-    let req = AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".to_string().into()),
-        client_id: Some(client_id.to_string().into()),
-        redirect_uri: Some(redirect_uri.to_string().into()),
-        scope: Some(scope.to_string().into()),
-        state: Some("mint-code-token-state".to_string().into()),
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".to_string().into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let req = AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("scope", scope),
+        ("state", "mint-code-token-state"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
     let validated = srv
         .validate_authorization_request(&req)
         .await
@@ -229,22 +245,14 @@ pub async fn mint_code_token_keeping_code<S: Storage>(
     subject: &str,
 ) -> (TokenResponse, String) {
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
-    let req = AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".to_string().into()),
-        client_id: Some(client_id.to_string().into()),
-        redirect_uri: Some(redirect_uri.to_string().into()),
-        scope: Some(scope.to_string().into()),
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".to_string().into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let req = AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("scope", scope),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
     let validated = srv
         .validate_authorization_request(&req)
         .await
@@ -292,6 +300,13 @@ pub struct FaultStorage {
     /// When set, `get_refresh_token` reports nothing, so the replay path finds no reachable chain
     /// and falls through to deleting the access token by name.
     pub fail_get_refresh: AtomicBool,
+    /// When set, `get_refresh_token` FAILS, which is a different answer from the one above and has
+    /// a different correct response. `Ok(None)` means there is no chain to revoke, which is a clean
+    /// outcome; `Err` means the store could not say, so the family revocation was never even
+    /// attempted and the attacker's chain may still be live. A server that folds the two together
+    /// reports a containment it did not achieve, which is the one thing the audit event exists to
+    /// prevent (see the `Err` arm in `AuthorizationServer::token`'s replay branch).
+    pub error_get_refresh: AtomicBool,
     /// When set, `put_pushed_authorization_request` fails. The one path that writes a pushed
     /// request BACK is the cross-client refusal (RFC 9126 s7.5), and losing that write destroys an
     /// honest client's live handle.
@@ -344,8 +359,20 @@ impl Storage for FaultStorage {
         self.inner.put_client(client).await
     }
 
-    async fn delete_client(&self, client_id: &ClientId) -> Result<bool, StorageError> {
-        self.inner.delete_client(client_id).await
+    async fn compare_and_swap_client(
+        &self,
+        expected: &Client,
+        updated: Client,
+    ) -> Result<bool, StorageError> {
+        self.inner.compare_and_swap_client(expected, updated).await
+    }
+
+    async fn delete_client(
+        &self,
+        client_id: &ClientId,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<bool, StorageError> {
+        self.inner.delete_client(client_id, window).await
     }
 
     async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
@@ -400,6 +427,16 @@ impl Storage for FaultStorage {
         self.inner.put_authorization_code(record).await
     }
 
+    async fn compare_and_swap_authorization_code(
+        &self,
+        expected: &oauth_as::authorization::AuthorizationCodeState,
+        updated: AuthorizationCodeRecord,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .compare_and_swap_authorization_code(expected, updated)
+            .await
+    }
+
     async fn take_authorization_code(
         &self,
         code: &str,
@@ -411,7 +448,7 @@ impl Storage for FaultStorage {
     async fn put_pushed_authorization_request(
         &self,
         record: oauth_as::PushedAuthorizationRequest,
-    ) -> Result<(), StorageError> {
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         if self.fail_put_pushed_request.load(Ordering::SeqCst) {
             return Err(StorageError::new("injected pushed-request write failure"));
         }
@@ -428,7 +465,10 @@ impl Storage for FaultStorage {
             .await
     }
 
-    async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
+    async fn put_token(
+        &self,
+        token: IssuedToken,
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         if self.fail_put_token.load(Ordering::SeqCst) {
             return Err(StorageError::new("injected token write failure"));
         }
@@ -450,7 +490,10 @@ impl Storage for FaultStorage {
         self.inner.delete_token(access_token).await
     }
 
-    async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {
+    async fn put_refresh_token(
+        &self,
+        record: RefreshTokenRecord,
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         if self.fail_put_refresh.load(Ordering::SeqCst) {
             return Err(StorageError::new("injected write failure"));
         }
@@ -462,6 +505,9 @@ impl Storage for FaultStorage {
         refresh_token: &str,
     ) -> Result<Option<std::sync::Arc<RefreshTokenRecord>>, StorageError> {
         self.record("get_refresh_token");
+        if self.error_get_refresh.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected refresh lookup failure"));
+        }
         if self.fail_get_refresh.load(Ordering::SeqCst) {
             return Ok(None);
         }
@@ -475,11 +521,15 @@ impl Storage for FaultStorage {
         self.inner.take_refresh_token(refresh_token).await
     }
 
-    async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
+    async fn revoke_token_family(
+        &self,
+        family_id: &str,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<u64, StorageError> {
         if self.fail_revoke_token_family.load(Ordering::SeqCst) {
             return Err(StorageError::new("injected family revocation failure"));
         }
-        self.inner.revoke_token_family(family_id).await
+        self.inner.revoke_token_family(family_id, window).await
     }
 
     // The consent operations delegate straight through: this store's two fault switches are about
@@ -516,11 +566,24 @@ impl Storage for FaultStorage {
     }
 
     #[cfg(feature = "consent")]
-    async fn revoke_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
-        self.inner.revoke_consent(consent_id).await
+    async fn compare_and_swap_consent(
+        &self,
+        expected: Option<&oauth_as::ConsentRecord>,
+        updated: oauth_as::ConsentRecord,
+    ) -> Result<bool, StorageError> {
+        self.inner.compare_and_swap_consent(expected, updated).await
     }
 
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(feature = "consent")]
+    async fn revoke_consent(
+        &self,
+        consent_id: &str,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<u64, StorageError> {
+        self.inner.revoke_consent(consent_id, window).await
+    }
+
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     async fn claim_replay_id(
         &self,
         id: &str,

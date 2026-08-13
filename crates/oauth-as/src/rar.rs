@@ -28,7 +28,7 @@
 //!
 //! `authorization_details` arrives unauthenticated at the authorization endpoint, before any user
 //! interaction, in a parameter whose grammar is "some JSON". An AS that parses whatever it is sent
-//! is a denial of service with extra steps, so three limits are applied. They are constants rather
+//! is a denial of service with extra steps, so four limits are applied. They are constants rather
 //! than configuration on purpose: a host cannot accidentally raise them, and nothing in RFC 9396
 //! asks for values larger than these.
 //!
@@ -37,10 +37,13 @@
 //! - [`MAX_AUTHORIZATION_DETAILS_BYTES`], on the RAW parameter, before `serde_json` is handed
 //!   anything. This is the only one that runs before a structure is built, and it is the one that
 //!   makes every cost below it finite, including the parser's own.
-//! - [`MAX_AUTHORIZATION_DETAILS_ELEMENTS`], on the PARSED array, and
+//! - [`MAX_AUTHORIZATION_DETAILS_ELEMENTS`], on the PARSED array,
+//! - [`MAX_DETAIL_LIST_ENTRIES`], on each section 2.2 list member of a parsed element, which is
+//!   what bounds the quadratic narrowing at the token endpoint (the element cap alone does not:
+//!   see that constant), and
 //! - [`MAX_AUTHORIZATION_DETAILS_DEPTH`], on nesting inside a parsed element.
 //!
-//! The last two run on an already-built tree. That is a deliberate choice and not an oversight:
+//! The last three run on an already-built tree. That is a deliberate choice and not an oversight:
 //! applying them earlier would mean a second JSON scanner, written here, that has to agree with
 //! `serde_json` about strings and escapes in order to count brackets correctly, and a second
 //! scanner that disagrees with the first is a parser differential, which is a worse class of bug
@@ -87,9 +90,73 @@ pub const MAX_AUTHORIZATION_DETAILS_BYTES: usize = 4096;
 /// 16 distinct authorization details in ONE request is already beyond anything the RFC
 /// illustrates; the point of the parameter is that a request names the specific things it needs.
 /// The bound matters because narrowing at the token endpoint compares every requested element
-/// against every granted one, which is quadratic: bounded at 16 that is 256 comparisons, and
-/// unbounded it is a CPU denial of service that a single request can aim at this server.
+/// against every granted one, which is quadratic in the element count: bounded at 16 that is at
+/// most 256 calls to [`AuthorizationDetail::is_narrowing_of`], and unbounded it is a CPU denial of
+/// service that a single request can aim at this server.
+///
+/// # 256 element PAIRS is not 256 comparisons
+///
+/// This constant used to claim it was, and that was wrong by three orders of magnitude.
+/// `is_narrowing_of` is not O(1): it runs a subset check over four section 2.2 lists, and a subset
+/// check is `subset.len() * superset.len()` string comparisons in the worst case. Until
+/// [`MAX_DETAIL_LIST_ENTRIES`] existed, nothing bounded those lengths, so the element count factored
+/// out entirely and the byte cap was the only thing left holding the line.
+///
+/// The arithmetic, counted rather than estimated. `[{"type":"t","actions":["a","a",...]}]` is 27
+/// bytes of wrapper, so 4069 remain, and `"a",` is 4 bytes with no trailing comma on the last:
+/// 1017 entries fit inside [`MAX_AUTHORIZATION_DETAILS_BYTES`]. Note that the entries do NOT have
+/// to be distinct, and that is what makes the worst case reachable rather than merely describable:
+/// the granted side is 1016 copies of `"z"` followed by one `"a"`, the requested side is 1017
+/// copies of `"a"`, and every one of the 1017 `any` scans runs the whole superset before it
+/// matches at the end. 1017 x 1017 = 1,034,289 `Box<str>` comparisons for ONE token request,
+/// recurring on every refresh because the granted details ride the chain. (A fixture built from
+/// DISTINCT entries cannot get there: three-digit entries are 6 bytes, and only 832 distinct
+/// entries of any length fit at all. The distinctness was never the point; the position of the
+/// match is.)
+///
+/// Splitting the budget across several elements or across the four lists cannot beat that, because
+/// the total is the sum over lists of `requested_len * granted_len` against fixed sums of lengths,
+/// which is largest when it is all in one list, and every extra element spends bytes on another
+/// wrapper.
+///
+/// With both caps the product is finite from the constants alone: at most 16 x 16 element pairs,
+/// each at most 4 x 16 x 16 comparisons, so at most 262,144. The REACHABLE figure is lower, because
+/// an element carrying four full sixteen-entry lists is 323 bytes and only 12 of those fit in
+/// [`MAX_AUTHORIZATION_DETAILS_BYTES`]: 12 x 12 x 4 x 16 x 16 = 147,456. So what the per-list cap
+/// bought is a factor of seven on the worst case, and, more to the point, a worst case that both
+/// factors of are constants in this file rather than a length the request chooses.
 pub const MAX_AUTHORIZATION_DETAILS_ELEMENTS: usize = 16;
+
+/// The largest number of entries in any ONE of the RFC 9396 section 2.2 list members
+/// (`locations`, `actions`, `datatypes`, `privileges`) of a single element.
+///
+/// # Why this exists
+///
+/// [`MAX_AUTHORIZATION_DETAILS_ELEMENTS`] bounds how many elements a request may carry and nothing
+/// else. The quadratic work at the token endpoint is over LIST ENTRIES, not elements, so without
+/// this cap a request could put its whole byte budget into one element's `actions` and pay the
+/// 1,034,289 comparisons the element cap was introduced to prevent. See that constant for the
+/// arithmetic, which is counted rather than estimated.
+///
+/// # Why 16
+///
+/// The largest published RFC 9396 example lists three actions. Sixteen is the number this crate
+/// already uses for every other repeatable thing a request carries
+/// ([`MAX_AUTHORIZATION_DETAILS_ELEMENTS`], [`crate::server::MAX_RESOURCE_INDICATORS`]), so a
+/// reader does not have to hold a fourth number, and a deployment naming more than sixteen actions
+/// on one resource in one detail has an element that has stopped describing a transaction.
+///
+/// # It refuses, it does not truncate
+///
+/// Dropping the entries past the cap would grant a detail OTHER than the one requested, with
+/// nothing told to anyone, which is the failure the whole of this module's `other` handling exists
+/// to avoid. `invalid_authorization_details` (section 5) is the answer.
+///
+/// Applied by [`AuthorizationDetails::parse`], which is the wire. It is NOT applied by
+/// [`AuthorizationDetails::from_elements`], for the reason given there: that is the host's own data.
+/// The cap on the REQUESTED side is what bounds the narrowing regardless, since every subset check
+/// is `requested.len() * granted.len()` and the requested side always came off the wire.
+pub const MAX_DETAIL_LIST_ENTRIES: usize = 16;
 
 /// The deepest JSON nesting allowed, counting the array itself as level 1 and an element object as
 /// level 2.
@@ -206,9 +273,15 @@ impl AuthorizationDetail {
 
 /// Every value in `subset` also appears in `superset`.
 ///
-/// A linear scan rather than a set: these lists are bounded by
-/// [`MAX_AUTHORIZATION_DETAILS_BYTES`] and are in practice two or three entries, so building a
-/// `BTreeSet` per comparison would allocate more than it saved.
+/// A linear scan rather than a set: these lists are bounded by [`MAX_DETAIL_LIST_ENTRIES`] and are
+/// in practice two or three entries, so building a `BTreeSet` per comparison would allocate more
+/// than it saved.
+///
+/// The bound named here used to be [`MAX_AUTHORIZATION_DETAILS_BYTES`], and that was the defect:
+/// a byte cap of 4096 admits 1017 entries in one list, so this scan was
+/// `subset.len() * superset.len()` over a length a request chose. See
+/// [`MAX_AUTHORIZATION_DETAILS_ELEMENTS`] for the arithmetic. The cost is quadratic either way;
+/// what changed is that both factors are now constants.
 fn is_subset(subset: &[Box<str>], superset: &[Box<str>]) -> bool {
     subset.iter().all(|want| superset.iter().any(|g| g == want))
 }
@@ -273,6 +346,24 @@ impl AuthorizationDetails {
                     .with_description(
                         "each authorization_details element needs a non-empty type (RFC 9396 s2)",
                     ));
+            }
+            // The section 2.2 list members, bounded per LIST rather than per element. The element
+            // cap above bounds how many `is_narrowing_of` calls a narrowing makes; this bounds what
+            // each of those calls costs, which is where the quadratic actually lives. See
+            // [`MAX_DETAIL_LIST_ENTRIES`].
+            for list in [
+                &detail.locations,
+                &detail.actions,
+                &detail.datatypes,
+                &detail.privileges,
+            ] {
+                if list.len() > MAX_DETAIL_LIST_ENTRIES {
+                    return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                        .with_description(
+                            "an authorization_details element lists more locations, actions, \
+                             datatypes or privileges than this server accepts",
+                        ));
+                }
             }
             for value in detail.other.values() {
                 if depth(value) > MAX_MEMBER_DEPTH {

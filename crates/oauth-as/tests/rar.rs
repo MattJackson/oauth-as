@@ -40,6 +40,7 @@ mod support;
 
 use oauth_as::rar::{
     AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES, MAX_AUTHORIZATION_DETAILS_ELEMENTS,
+    MAX_DETAIL_LIST_ENTRIES,
 };
 use oauth_as::server::UserApproval;
 use oauth_as::{
@@ -154,10 +155,7 @@ async fn token_asking_for(
 ) -> Result<oauth_as::TokenResponse, oauth_as::ErrorResponse> {
     srv.token_with_context(
         request,
-        TokenRequestContext {
-            authorization_details: Some(requested),
-            ..Default::default()
-        },
+        TokenRequestContext::default().with_authorization_details(requested),
     )
     .await
 }
@@ -550,6 +548,110 @@ async fn too_many_elements_are_refused() {
     );
     let error = AuthorizationDetails::parse(&raw).expect_err("too many elements must be refused");
     assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
+}
+
+/// THE FINDING. The element cap above is not what bounds the narrowing, and until
+/// `MAX_DETAIL_LIST_ENTRIES` existed nothing was.
+///
+/// `is_narrowing_of` is not one comparison. It runs a subset check over each of the four section
+/// 2.2 lists, and a subset check is `requested.len() * granted.len()` string comparisons in the
+/// worst case. So the element count factors OUT: one element with a thousand `actions` on each
+/// side costs what a thousand elements would. The byte cap was the only thing left holding it, and
+/// 4096 bytes of `"a",` is 1017 entries, so ONE token request could buy 1,034,289 `Box<str>`
+/// comparisons, recurring on every refresh because the granted set rides the chain.
+///
+/// The worst case is BUILT here rather than described, and it is built to the byte cap rather than
+/// to a round number, because a fixture that asserts its own premise has to be able to satisfy it.
+/// `granted` is 1016 copies of `"z"` with a single `"a"` at the end; `requested` is 1017 copies of
+/// `"a"`. Every one of the 1017 lookups therefore scans the whole superset before it matches on the
+/// last entry: 1017 x 1017 = 1,034,289 comparisons, and both sides are inside
+/// `MAX_AUTHORIZATION_DETAILS_BYTES`, which is what made it reachable.
+///
+/// The entries deliberately are NOT distinct. An earlier version of this test insisted they were
+/// and could not hold: three-digit entries are six bytes, and only 832 distinct entries of any
+/// length fit in 4096 bytes at all. Distinctness was never what the quadratic needed; the POSITION
+/// of the match is.
+#[tokio::test]
+async fn one_element_cannot_carry_a_thousand_actions() {
+    // Grown to the cap rather than guessed at, so the numbers in the doc above are checked by the
+    // fixture instead of asserted alongside it.
+    let element = |entries: &[&str]| {
+        format!(
+            r#"[{{"type":"t","actions":[{}]}}]"#,
+            entries
+                .iter()
+                .map(|e| format!("\"{e}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let mut entries = 0;
+    while element(&vec!["a"; entries + 1]).len() <= MAX_AUTHORIZATION_DETAILS_BYTES {
+        entries += 1;
+    }
+    assert_eq!(
+        entries, 1017,
+        "the byte cap admits this many one-byte entries"
+    );
+
+    let mut superset = vec!["z"; entries - 1];
+    superset.push("a");
+    let granted = element(&superset);
+    let requested = element(&vec!["a"; entries]);
+    // Both sides are under the only bound that used to apply, which is the whole point, and the
+    // list is sixty times the per-list cap.
+    assert!(granted.len() <= MAX_AUTHORIZATION_DETAILS_BYTES);
+    assert!(requested.len() <= MAX_AUTHORIZATION_DETAILS_BYTES);
+    assert!(entries > MAX_DETAIL_LIST_ENTRIES * 60);
+
+    for raw in [&granted, &requested] {
+        let error = AuthorizationDetails::parse(raw)
+            .expect_err("a list past the per-list cap must be refused, not narrowed against");
+        assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
+    }
+}
+
+/// The per-list cap applies to EACH of the four section 2.2 list members, not just to `actions`,
+/// because `is_narrowing_of` runs the same scan over all four and a cap on one of them bounds a
+/// quarter of the work.
+#[tokio::test]
+async fn each_section_2_2_list_is_capped() {
+    for member in ["locations", "actions", "datatypes", "privileges"] {
+        let over: Vec<String> = (0..=MAX_DETAIL_LIST_ENTRIES)
+            .map(|i| format!(r#""v{i}""#))
+            .collect();
+        let raw = format!(
+            r#"[{{"type":"payment_initiation","{member}":[{}]}}]"#,
+            over.join(",")
+        );
+        let error = AuthorizationDetails::parse(&raw)
+            .err()
+            .unwrap_or_else(|| panic!("{member} one past the cap must be refused"));
+        assert_eq!(error.error, ErrorCode::InvalidAuthorizationDetails);
+    }
+}
+
+/// The ACCEPTING side of the per-list cap, which is the side an off-by-one breaks. Exactly the cap
+/// is a legal request and every entry of it survives: this cap REFUSES rather than truncates, and a
+/// silently shortened `actions` list would grant a detail other than the one requested.
+#[tokio::test]
+async fn exactly_the_per_list_cap_is_accepted_whole() {
+    let at_cap: Vec<String> = (0..MAX_DETAIL_LIST_ENTRIES)
+        .map(|i| format!(r#""a{i}""#))
+        .collect();
+    let raw = format!(
+        r#"[{{"type":"payment_initiation","actions":[{}],"locations":[{}],"datatypes":[{}],"privileges":[{}]}}]"#,
+        at_cap.join(","),
+        at_cap.join(","),
+        at_cap.join(","),
+        at_cap.join(",")
+    );
+    let parsed = AuthorizationDetails::parse(&raw).expect("exactly the cap is legal");
+    let detail = parsed.iter().next().expect("one element");
+    assert_eq!(detail.actions.len(), MAX_DETAIL_LIST_ENTRIES);
+    assert_eq!(detail.locations.len(), MAX_DETAIL_LIST_ENTRIES);
+    assert_eq!(detail.datatypes.len(), MAX_DETAIL_LIST_ENTRIES);
+    assert_eq!(detail.privileges.len(), MAX_DETAIL_LIST_ENTRIES);
 }
 
 /// Nesting is bounded so that no walk in this crate, and no `Drop` of what it built, can be driven

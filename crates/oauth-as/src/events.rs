@@ -32,9 +32,17 @@
 //! The crate doc promises a host that never turns something on pays nothing for it, and this
 //! module is built to keep that promise structurally rather than by intention:
 //!
-//! - [`Hooks`] is ONE pointer wide: three seams behind three trait objects would be 48 bytes on
-//!   every [`crate::server::AuthorizationServer`] value, paid by every host, so the three live
-//!   inside a boxed struct that is not allocated at all until something is installed.
+//! - [`Hooks`] is ONE pointer wide. The seams behind it are four in a default build (an
+//!   [`EventSink`], a [`RateLimiter`], a [`crate::client::SecretVerifier`] and a
+//!   [`crate::registration::RegistrationPolicy`]) and six with `jar` and `jwt` (a
+//!   `RequestObjectKeys` and an `Es256Verifier`). Held as separate `Option<Box<dyn _>>` fields they
+//!   would be 16 bytes each on every [`crate::server::AuthorizationServer`] value, so 64 bytes paid
+//!   by every host and 96 by one enabling both features; instead they live inside a boxed struct
+//!   that is not allocated at all until something is installed.
+//!
+//!   The registration policy is worth naming rather than counting, because it is the seam whose
+//!   ABSENCE is the security behaviour: with none installed, every RFC 7591 registration is REFUSED
+//!   (see [`Hooks::registration_policy`]), which is the opposite default to the rate limiter's.
 //! - [`Hooks::emit`] takes a CLOSURE, not an [`Event`]. With no sink installed the closure is
 //!   never called, so the event is never built: no allocation, no formatting, no vtable dispatch,
 //!   just one null check on a pointer that is already in cache. `tests/events.rs` measures exactly
@@ -69,6 +77,10 @@
 //!   prevent; the alternative of logging nothing makes the revocation untraceable.
 
 use crate::client::SecretVerifier;
+#[cfg(feature = "client-assertion")]
+use crate::client_assertion::AssertionFailure;
+#[cfg(feature = "dpop")]
+use crate::dpop::DpopFailure;
 use crate::error::ErrorCode;
 use crate::grant::GrantType;
 use crate::registration::RegistrationPolicy;
@@ -81,6 +93,13 @@ use crate::token::TokenTypeHint;
 /// probe which client ids exist. The AUDIT channel separates them just as deliberately: the host
 /// is not the attacker, and "a thousand unknown client ids" and "a thousand wrong secrets for one
 /// real client" are different incidents with different responses.
+///
+/// Shared by BOTH planes: it is the reason carried by
+/// [`Event::ClientAuthenticationFailed`] (the token plane) and by
+/// [`Event::ClientRegistrationAuthenticationFailed`] (the RFC 7592 management plane). One
+/// vocabulary rather than two, because a host counting credential guesses wants to count the same
+/// shapes wherever they happen; WHICH plane an attempt arrived on is the event variant, not this
+/// enum, so a sink can separate them without having to learn a second set of names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ClientAuthFailure {
@@ -100,6 +119,16 @@ pub enum ClientAuthFailure {
     /// investigate. A run of these after a rotation deadline is expected; a run of them before one
     /// means the deployment's clock or its issued lifetimes are wrong.
     SecretExpired,
+    /// MANAGEMENT PLANE ONLY. The `client_id` names a client the HOST provisioned itself, which
+    /// carries no RFC 7591 registration record and therefore no registration access token that
+    /// could ever verify.
+    ///
+    /// Separated from [`ClientAuthFailure::UnknownClient`] because it says something that one does
+    /// not: the client id was REAL. A run of these is somebody walking a deployment's static client
+    /// ids looking for one that happens to be dynamically registered and therefore rewritable
+    /// through RFC 7592 section 2.2; a run of `UnknownClient` is somebody who has not found a live
+    /// id yet. The wire tells the caller neither (both are the same `401`).
+    NoDynamicRegistration,
     /// The registration authenticates with RFC 8705 mutual TLS and NO certificate reached
     /// this crate. Worth separating from a mismatch: in practice it usually means the TLS
     /// terminator is not configured to request, verify or forward a client certificate, which
@@ -119,8 +148,21 @@ pub enum ClientAuthFailure {
     /// Separated from [`ClientAuthFailure::SecretMismatch`] because the responses differ. A run of
     /// wrong secrets is credential stuffing; a run of REPLAYED assertions is somebody who has
     /// captured a client's traffic, which is a different incident and a much worse one.
-    #[cfg(feature = "client_assertion")]
-    AssertionInvalid,
+    ///
+    /// CARRIES THE REASON, because collapsing the nine into one told the operator nothing they
+    /// could act on. `AssertionFailure` documents itself as existing "for the host's audit channel,
+    /// where the reader is not the attacker", and until 0.9.1 the server discarded it here, so a
+    /// burst of these was indistinguishable between clock skew on the client
+    /// (`Expired`/`NotYetValid`, fix NTP), a key rotation the registration did not follow
+    /// (`BadSignature`, fix the registration), and assertions captured at another authorization
+    /// server and replayed here (`WrongAudience`, an incident). The mutual-TLS arm beside it
+    /// already forwarded its failure verbatim, which is how the omission was found.
+    #[cfg(feature = "client-assertion")]
+    AssertionInvalid {
+        /// Which of the RFC 7523 section 3 checks the assertion failed. Never reaches the wire:
+        /// every one of them is the same `invalid_client` there.
+        reason: AssertionFailure,
+    },
 }
 
 /// The OPERATOR's sentence, never the client's. Everything here is what the wire deliberately
@@ -134,6 +176,10 @@ impl std::fmt::Display for ClientAuthFailure {
             ClientAuthFailure::SecretExpired => {
                 "the registration's client_secret_expires_at has passed"
             }
+            ClientAuthFailure::NoDynamicRegistration => {
+                "that client id exists but was provisioned by the host, so it has no registration \
+                 access token"
+            }
             #[cfg(feature = "mtls")]
             ClientAuthFailure::NoCertificatePresented => {
                 "the registration authenticates with mutual TLS and no certificate was presented"
@@ -142,8 +188,12 @@ impl std::fmt::Display for ClientAuthFailure {
             ClientAuthFailure::CertificateMismatch => {
                 "the presented certificate is not one this registration authenticates with"
             }
-            #[cfg(feature = "client_assertion")]
-            ClientAuthFailure::AssertionInvalid => "the client assertion did not verify",
+            #[cfg(feature = "client-assertion")]
+            // The REASON is appended rather than dropped: `AssertionFailure` already writes one
+            // sentence per check, and this is the channel those sentences were written for.
+            ClientAuthFailure::AssertionInvalid { reason } => {
+                return write!(f, "the client assertion did not verify: {reason}")
+            }
         })
     }
 }
@@ -160,8 +210,10 @@ impl std::error::Error for ClientAuthFailure {}
 /// sink installed pay only for what its sink chooses to keep. See the module docs for the rule on
 /// what may and may not appear here.
 ///
-/// `#[non_exhaustive]`: later releases will add events (RFC 7591 registration, DPoP proof failures)
-/// and adding one must not be a breaking change for a host that matched on this.
+/// `#[non_exhaustive]`: later releases will add events, and adding one must not be a breaking change
+/// for a host that matched on this. The RFC 7591 and 7592 registration events below arrived exactly
+/// that way and are here now, as did [`Event::DpopProofRefused`], which this paragraph named as
+/// the next candidate until 0.9.1 added it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event<'a> {
@@ -197,6 +249,23 @@ pub enum Event<'a> {
         grant_type: GrantType,
         /// The error code that went back on the wire.
         error: ErrorCode,
+    },
+    /// An RFC 9449 DPoP proof was refused, and WHY.
+    ///
+    /// No `client_id`, and its absence is the honest shape rather than an omission: the proof is
+    /// checked BEFORE anything authenticates (see `AuthorizationServer::verify_dpop`), because it
+    /// binds to the REQUEST rather than to the grant, so at the moment this fires there is no
+    /// established identity to name. A host that wants to correlate has its own request context,
+    /// exactly as [`Attempt::DeviceUserCodeEntry`] requires.
+    ///
+    /// Every one of these is the same `invalid_dpop_proof` on the wire. The distinction is the
+    /// operator's, and `DpopFailure` documents itself as existing for exactly that; through 0.9.0
+    /// the server discarded it and emitted NO event at all, so a deployment could not tell a
+    /// client with a skewed clock from one whose proofs were being captured and replayed.
+    #[cfg(feature = "dpop")]
+    DpopProofRefused {
+        /// Which of the RFC 9449 section 4.3 checks the proof failed.
+        failure: DpopFailure,
     },
     /// A user approved a device grant at the host's verification UI (RFC 8628 section 3.3).
     DeviceGrantApproved {
@@ -246,8 +315,25 @@ pub enum Event<'a> {
         client_id: &'a str,
         /// The revoked family. See the module docs for why this is safe to log.
         family_id: &'a str,
-        /// How many records the family revocation removed.
+        /// How many records the family revocation removed. `0` when the revocation itself failed,
+        /// which `containment_failed` is what tells apart from a family that was already swept.
         records_revoked: u64,
+        /// Whether the family revocation failed to persist, exactly as on
+        /// [`Event::AuthorizationCodeReplayDetected`].
+        ///
+        /// The reuse is real and is reported either way: the token was consumed before this was
+        /// judged, so the server cannot un-know that two parties hold it, and the presenter is
+        /// answered `invalid_grant` whatever the store did. This event is therefore the ONLY place
+        /// the truth about what was actually done can be told, and an event that overstates the
+        /// containment is worse than no event — it is what an operator reads while deciding not to
+        /// investigate.
+        ///
+        /// `true` means the compromised grant's tokens ARE STILL LIVE, up to their own expiry: the
+        /// access tokens the family issued still authorize, and the refresh chain the thief rotated
+        /// away can still be rotated again. The presented token's `Spent` record is put back so a
+        /// further presentation is still detected as reuse, but nothing was revoked. Treat it as an
+        /// incident that needs a human, not as a storage warning.
+        containment_failed: bool,
     },
     /// A token was revoked through the RFC 7009 endpoint.
     TokenRevoked {
@@ -292,6 +378,32 @@ pub enum Event<'a> {
         /// The identifier the server minted.
         client_id: &'a str,
     },
+    /// A caller failed to authenticate at the RFC 7592 registration MANAGEMENT endpoint.
+    ///
+    /// The sibling of [`Event::ClientAuthenticationFailed`], and separate from it on purpose: the
+    /// two planes are guessed at for different reasons, and a sink that could not tell them apart
+    /// would report a management-plane brute force as token-endpoint noise. What is being guessed
+    /// here is the registration access token, and RFC 7592 section 2.2 lets its holder replace the
+    /// whole metadata document INCLUDING `redirect_uris`, which is where this client's
+    /// authorization codes are delivered. A landed guess is therefore not "an attacker can act as
+    /// this client"; it is "an attacker can have this client's codes sent to a URI they chose".
+    ///
+    /// Emitted for all three refusals of a management request, which the wire deliberately cannot
+    /// tell apart (they are one `401`, because distinguishing them is an enumeration oracle over
+    /// the client table): an unknown `client_id`
+    /// ([`ClientAuthFailure::UnknownClient`]), a host-provisioned client that has no registration
+    /// at all ([`ClientAuthFailure::NoDynamicRegistration`]), and a registration access token that
+    /// did not verify ([`ClientAuthFailure::SecretMismatch`]).
+    ///
+    /// Carries no credential: not the presented token, not a prefix of it, not its length. See the
+    /// module docs for the rule.
+    ClientRegistrationAuthenticationFailed {
+        /// The `client_id` the request named, which may name no registration. Not a secret
+        /// (RFC 6749 section 2.2).
+        client_id: &'a str,
+        /// Which of the three indistinguishable-on-the-wire refusals this actually was.
+        failure: ClientAuthFailure,
+    },
     /// A registration was rewritten through RFC 7592 section 2.2.
     ///
     /// An update can change the redirect URIs, which is the whole of where this client's
@@ -306,6 +418,30 @@ pub enum Event<'a> {
     ClientRegistrationDeleted {
         /// The registration that is now gone.
         client_id: &'a str,
+    },
+    /// The host's own [`crate::registration::RegistrationPolicy`] refused a registration or an
+    /// update.
+    ///
+    /// Distinct from [`Event::ClientRegistrationAuthenticationFailed`], and the distinction is the
+    /// point: that one is somebody who could not prove who they are, this one is somebody who
+    /// DID and was then told no. On the management plane the caller has already presented a valid
+    /// registration access token, so a stream of these is a client with a working credential
+    /// repeatedly attempting something the deployment's policy forbids, which is a different
+    /// investigation from a brute force and was previously invisible in both directions.
+    ///
+    /// It is also the only signal a host gets that its own policy is doing anything at all. The
+    /// wire answer is a bare `401` chosen so that a policy refusing on CONTENT does not confirm
+    /// what content it dislikes (see `register_dynamic_client`), which means the operator learns
+    /// nothing from it either.
+    ///
+    /// Carries no credential: not the initial access token, not the registration access token, and
+    /// not the rejected metadata document, which is attacker-supplied text of the host's own
+    /// choosing to log or not.
+    ClientRegistrationRefusedByPolicy {
+        /// The registration being updated, for an RFC 7592 section 2.2 management request. `None`
+        /// for an initial RFC 7591 registration, which has no `client_id` yet: the refusal happens
+        /// before one is minted, deliberately, so that a refused attempt allocates nothing.
+        client_id: Option<&'a str>,
     },
 }
 
@@ -340,6 +476,39 @@ pub enum Attempt<'a> {
     /// [`crate::server::AuthorizationServer::deny_device`]). This is the attempt RFC 8628 section
     /// 5.1 requires a deployment to rate limit.
     DeviceUserCodeEntry,
+    /// A request at the AUTHORIZATION endpoint
+    /// ([`crate::server::AuthorizationServer::validate_authorization_request`], and again where an
+    /// approved request is turned into a code).
+    ///
+    /// The endpoint that takes NO CREDENTIAL at all, which is why it wants a variant of its own
+    /// rather than sharing [`Attempt::ClientAuthentication`]'s: there is nothing here for a limiter
+    /// counting credential guesses to count, and the `client_id` is the presented one (RFC 6749
+    /// section 2.2 makes it public), so a caller may name any registration they like. What a
+    /// deployment is bounding is work and STORAGE: every request costs a `get_client`, and an
+    /// approved one WRITES an authorization code record that nothing but
+    /// [`crate::store::Storage::sweep_expired`] reclaims.
+    ///
+    /// Checked twice on a completed flow, deliberately, because the two points cost different
+    /// things: the validation is a read, and the issuance is the write. A limiter that charged the
+    /// second to the first would let a caller who validates once issue without further charge.
+    AuthorizationRequest {
+        /// The `client_id` the request named, which may name no registration.
+        client_id: &'a str,
+    },
+    /// An RFC 7591 dynamic client registration
+    /// ([`crate::server::AuthorizationServer::register_dynamic_client`]).
+    ///
+    /// THE ONE UNBOUNDED WRITE IN THE CRATE, and the reason is that a [`crate::client::Client`] has
+    /// no expiry: no deadline, no sweep, nothing that ever reclaims one. Every other attacker-driven
+    /// record this server writes (a code, a token, a device grant, a replay `jti`) carries a
+    /// deadline and is reclaimed by [`crate::store::Storage::sweep_expired`], so an unthrottled
+    /// endpoint there is a burst. Here it is permanent growth, one row per request, forever.
+    ///
+    /// NO `client_id`, and its absence is deliberate rather than an oversight: at the moment this
+    /// is checked no identifier has been minted, and none is minted for a refusal, so a refused
+    /// registration allocates nothing at all. A limiter that wants to key on the caller has to use
+    /// its own request context, exactly as [`Attempt::DeviceUserCodeEntry`] requires.
+    ClientRegistration,
 }
 
 /// What a [`RateLimiter`] decided.
@@ -371,6 +540,29 @@ pub enum AttemptOutcome {
 /// implementation this crate ships, in memory, with no new dependency and with defaults derived
 /// from the section 5.1 arithmetic. Implement this trait yourself when you have something the
 /// library does not: a request IP, a session, a user, or a store shared across nodes.
+///
+/// # MUST NOT PANIC, and should not block
+///
+/// Both methods MUST answer for every input. There is no error channel and none is needed:
+/// [`RateLimitDecision::Allow`] and [`RateLimitDecision::Deny`] are both always available, and a
+/// limiter that cannot reach its shared counter should decide which of the two its deployment
+/// prefers rather than unwinding. This crate catches no unwind anywhere on a request path.
+///
+/// NAMING THE CONSEQUENCE, once per method, because the two sit at different points of a request:
+///
+/// - [`RateLimiter::check`] runs BEFORE any credential is evaluated, which is the whole point of
+///   it, and that puts it on the paths an UNAUTHENTICATED caller reaches: the authorization
+///   request, RFC 8628 section 5.1 user-code entry, and client authentication at the token
+///   endpoint. A panic here is remotely reachable by anyone who can open a socket, and it takes
+///   the request down before the throttle that would have limited how often they could try it.
+/// - [`RateLimiter::record`] runs AFTER the request has done its work, including after the store
+///   writes it drove. A panic here unwinds a request whose records are already written and whose
+///   response never reaches the client: the credential was spent, the client was told nothing, and
+///   the only place the two could have been reconciled was the response that was lost.
+///
+/// Blocking is the same argument one notch quieter. `check` is called inline on the caller's
+/// executor thread, so a limiter that waits on a network round trip to a shared counter adds that
+/// wait to every request, and on a current-thread runtime it adds it to every OTHER request too.
 pub trait RateLimiter: Send + Sync {
     /// Decide whether `attempt` may proceed. Called BEFORE any credential is evaluated, so a
     /// `Deny` costs the attacker a lookup and tells them nothing.
@@ -403,9 +595,10 @@ struct Installed {
 /// The server's slot for the host seams: exactly one pointer wide, and null until the host
 /// installs something.
 ///
-/// This shape is the design decision the module docs argue for. Holding three `Option<Box<dyn _>>`
-/// fields directly on [`crate::server::AuthorizationServer`] would add 48 bytes to every server
-/// value in every deployment, including every deployment that installs nothing, and
+/// This shape is the design decision the module docs argue for. Holding the seams as separate
+/// `Option<Box<dyn _>>` fields directly on [`crate::server::AuthorizationServer`] would add 16
+/// bytes each, 64 in a default build and 96 with `jar` and `jwt`, to every server value in every
+/// deployment, including every deployment that installs nothing, and
 /// `tests/allocation.rs` holds that type to a size budget precisely so a convenience like that
 /// cannot be paid for silently.
 #[derive(Default)]
@@ -422,35 +615,47 @@ impl Hooks {
         self.0.get_or_insert_with(Default::default)
     }
 
+    // THE INSTALLERS ARE `pub(crate)`, and the READERS below are `pub`. That asymmetry is the
+    // whole shape of this type: `Hooks` is a LAYOUT decision (one nullable pointer, size-gated in
+    // `tests/allocation.rs`), not a second installation API. A host installs through the six
+    // `AuthorizationServer::with_*` builders, which are the one verb for the one job; it reads
+    // through `AuthorizationServer::hooks()` when it wants to emit onto the same channel or
+    // consult its own limiter. Through 0.9.0 both spellings were public and only one of them was
+    // reachable, because `AuthorizationServer::new` builds its own `Hooks` and hands out only a
+    // shared reference: every in-tree caller of the `install_*` form was a test.
+
     /// Install the audit sink, replacing any previous one.
-    pub fn install_event_sink(&mut self, sink: Box<dyn EventSink>) {
+    pub(crate) fn install_event_sink(&mut self, sink: Box<dyn EventSink>) {
         self.installed().events = Some(sink);
     }
 
     /// Install the rate limiter, replacing any previous one.
-    pub fn install_rate_limiter(&mut self, limiter: Box<dyn RateLimiter>) {
+    pub(crate) fn install_rate_limiter(&mut self, limiter: Box<dyn RateLimiter>) {
         self.installed().rate_limiter = Some(limiter);
     }
 
     /// Install the client secret verifier, replacing any previous one.
-    pub fn install_secret_verifier(&mut self, verifier: Box<dyn SecretVerifier>) {
+    pub(crate) fn install_secret_verifier(&mut self, verifier: Box<dyn SecretVerifier>) {
         self.installed().secret_verifier = Some(verifier);
     }
 
     /// Install the RFC 7591 registration policy, replacing any previous one.
-    pub fn install_registration_policy(&mut self, policy: Box<dyn RegistrationPolicy>) {
+    pub(crate) fn install_registration_policy(&mut self, policy: Box<dyn RegistrationPolicy>) {
         self.installed().registration_policy = Some(policy);
     }
 
     /// Install the RFC 9101 request object verification keys, replacing any previous source.
     #[cfg(feature = "jar")]
-    pub fn install_request_object_keys(&mut self, keys: Box<dyn crate::par::RequestObjectKeys>) {
+    pub(crate) fn install_request_object_keys(
+        &mut self,
+        keys: Box<dyn crate::par::RequestObjectKeys>,
+    ) {
         self.installed().request_object_keys = Some(keys);
     }
 
     /// Install the ES256 backend used to VERIFY signatures, replacing any previous one.
     #[cfg(feature = "jwt")]
-    pub fn install_es256_verifier(
+    pub(crate) fn install_es256_verifier(
         &mut self,
         verifier: std::sync::Arc<dyn crate::jwt::Es256Verifier>,
     ) {

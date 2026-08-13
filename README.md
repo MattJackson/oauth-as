@@ -17,22 +17,35 @@ the consent experience; the library owns the protocol.
 oauth-as = "0.9"
 ```
 
-## Alpha
+## Beta
 
-**0.9.0 is an alpha, published so it can be built against and reported on. It is not recommended
-for production yet.** Two things are true of this release and worth knowing before you adopt it:
+**0.9.1 is a beta.** 0.9.0 was an alpha, published so it could be built against and reported on;
+this is the release meant to be tested in earnest, and it exists because auditing that alpha found
+things worth fixing. It is still pre-1.0 and the API is not frozen.
 
-- **Reuse detection can be raced during token signing.** Detecting a stolen refresh token revokes
-  the family, but an issuance already in flight across the `await` inside ES256 signing can
-  complete behind the revocation and leave a live access token. The window scales with signing
-  latency: effectively closed for the built-in `jwt-p256` backend, **open if you implement
-  `Es256Signer` against a remote KMS or HSM**. Confirmed and reproduced; the fix needs a breaking
-  `Storage` change and lands in 0.9.1.
-- **Mutation coverage is incomplete.** `MUTANTS.md` names every surviving mutant individually
-  rather than quoting a percentage.
+**It contains a BREAKING CHANGE to `Storage`, and one to a feature name.** A host implementing
+`Storage` itself has work to do; a host on `MemoryStorage` or `oauth-as-postgres` does not. See
+`CHANGELOG.md` for the migration, and run `oauth_as::storage_conformance` against your store,
+which now checks the new rule.
 
-The known-defects section of `CHANGELOG.md` has the detail, including the test names. The API is
-not frozen before 1.0.
+What 0.9.0 listed here as a known defect is FIXED:
+
+- **Reuse detection can no longer be raced during token signing.** In 0.9.0, detecting a stolen
+  refresh token revoked the family, but an issuance already in flight across the `await` inside
+  ES256 signing could complete behind the revocation and leave a live access token, which was
+  effectively closed for the built-in `jwt-p256` backend and OPEN for an `Es256Signer` fronting a
+  remote KMS or HSM. The fix needed the breaking `Storage` change this release makes: a revocation
+  now records a durable barrier, and the writes that would resurrect what it removed are refused.
+  The same held for authorization code replay, and that half needed a second mechanism. The two
+  reproductions that shipped `#[ignore]`d in 0.9.0 are green and no longer ignored.
+
+What is still true and worth knowing before you adopt it:
+
+- **Mutation coverage is incomplete.** Surviving mutants are tracked individually rather than as a
+  percentage, and the ones that are not killed by a test are argued in writing beside the code they
+  mutate. A green test run does not yet mean the tests would have caught any given change.
+
+The known-defects section of `CHANGELOG.md` has the detail, including the test names.
 
 ## What it does
 
@@ -41,7 +54,7 @@ not frozen before 1.0.
 | Authorization code grant | RFC 6749 s4.1 | PKCE required, `S256` only, exact redirect URI matching |
 | PKCE | RFC 7636 | Verified against the appendix B vector |
 | Device authorization grant | RFC 8628 | Full state machine: pending, `slow_down`, expiry, denial, single use |
-| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, reuse detection revokes the family (with a [known gap](#alpha) under a remote signer) |
+| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, reuse detection revokes the family, and the revocation cannot be undone by an issuance already in flight |
 | Client credentials | RFC 6749 s4.4 | Confidential clients only, no refresh token |
 | Server metadata | RFC 8414 | Derived from config, so an advertised endpoint is one that exists |
 | Token introspection | RFC 7662 | Unknown, expired and other clients' tokens all read `{"active": false}` |
@@ -55,7 +68,7 @@ Behind off-by-default features:
 | Capability | Spec | Feature |
 | ---------- | ---- | ------- |
 | JWT access tokens and JWKS | RFC 9068 / 7517 | `jwt` |
-| JWT client authentication | RFC 7523 | `client_assertion` |
+| JWT client authentication | RFC 7523 | `client-assertion` |
 | DPoP sender-constrained tokens | RFC 9449 | `dpop` |
 | mTLS client auth and certificate-bound tokens | RFC 8705 | `mtls` |
 | Pushed authorization requests | RFC 9126 | `par` |
@@ -73,7 +86,8 @@ Plus the seams a real deployment needs: an audit **event sink**, a **rate limiti
 secret verifier** so hosts store a hash rather than a secret, a **consent** seam, and **CSRF**
 protection on the device verification form.
 
-See [ROADMAP.md](ROADMAP.md) for what is coming and, more usefully, what is missing today.
+What is missing today is in "What is not claimed", below. It is written down rather than left to be
+discovered.
 
 ## Features
 
@@ -87,7 +101,7 @@ Fifteen features. The default set is **empty**, and stays that way.
 | `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, over the `Es256Signer` / `Es256Verifier` seam | | `serde_json` |
 | `jwt-p256` | The built-in ES256 backend for that seam, for a host with no opinion about where its signing key lives | `jwt` | `p256` |
 | `jwt-pkcs8` | `EcdsaP256Key::from_pkcs8_der` / `to_pkcs8_der`, for a host whose key arrives as DER rather than as a raw scalar | `jwt-p256` | one crate, `pkcs8`; `der`, `spki` and `const_oid` are already in a `jwt-p256` tree via `sec1` |
-| `client_assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
+| `client-assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
 | `dpop` | RFC 9449 sender-constrained tokens | `jwt` | none of its own |
 | `jar` | RFC 9101 signed request objects | `jwt` | none of its own |
 | `mtls` | RFC 8705 mTLS client auth and certificate-bound tokens | | `serde_json` |
@@ -100,9 +114,9 @@ Fifteen features. The default set is **empty**, and stays that way.
 
 Five of the fifteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
 `token-exchange`, `resource-metadata` and `test-util` are serde shapes and comparisons over what is
-already there. Three more (`client_assertion`, `dpop`, `jar`) add no crate of their own; they turn
+already there. Three more (`client-assertion`, `dpop`, `jar`) add no crate of their own; they turn
 on `jwt`, which brings `serde_json`. The other seven each bring at least one crate: `serde_json`
-for `jwt`, `mtls` and `rar` (it is optional as of 0.9.1, so a default build no longer carries it),
+for `jwt`, `mtls` and `rar` (it is optional as of 0.9.0, so a default build no longer carries it),
 `http`/`http-body`/`bytes` for `http`, `axum` and `tokio` for `axum`, `p256` for `jwt-p256`, and
 `pkcs8` for `jwt-pkcs8`. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
 whose major has never moved, so they can appear in this crate's public signatures without making a
@@ -126,26 +140,31 @@ difference between two linked binaries, one with the crate and one without, buil
 
 | You enable | It costs | Into a host that already has serde_json, http, bytes and sha2 |
 | ---------- | -------- | ------------------------------------------------------------ |
-| *(default)* the protocol core | **195 KiB** | 182 KiB |
-| `jwt` | 259 KiB | 240 KiB |
-| `http` | 388 KiB | not measured |
-| `http` + `jwt` | 451 KiB | 378 KiB |
-| `axum` (with a tokio runtime and a bound listener) | 600 KiB | not measured |
-| everything, all fifteen features | 1103 KiB | 1022 KiB |
+| *(default)* the protocol core | **229 KiB** | 216 KiB |
+| `jwt` | 263 KiB | 244 KiB |
+| `http` | 428 KiB | not measured |
+| `http` + `jwt` | 461 KiB | 389 KiB |
+| `axum` (with a tokio runtime and a bound listener) | 662 KiB | not measured |
+| everything, all fifteen features | 1340 KiB | 1259 KiB |
 
 What each optional feature adds on top of the core:
 
 | Feature | Adds | Feature | Adds |
 | ------- | ---- | ------- | ---- |
-| `mtls` | 6 KiB | `jwt` | 34 KiB (the seam and the JWS surface: NO curve implementation) |
-| `resource-metadata` | 6 KiB | `jwt-p256` | 68 KiB (`jwt` plus the built-in backend, so 34 KiB over `jwt`) |
-| `token-exchange` | 8 KiB | `rar` | 95 KiB |
-| `par` | 17 KiB | `test-util` | 148 KiB |
-| `consent` | 24 KiB | `http` | 191 KiB |
-|  |  | `axum` | 405 KiB (214 of it over `http`, and nearly all of that is tokio) |
+| `mtls` | 7 KiB | `jwt` | 34 KiB (the seam and the JWS surface: NO curve implementation) |
+| `resource-metadata` | 7 KiB | `jwt-p256` | 69 KiB (`jwt` plus the built-in backend, so 35 KiB over `jwt`) |
+| `token-exchange` | 11 KiB | `rar` | 96 KiB |
+| `par` | 19 KiB | `test-util` | 242 KiB |
+| `consent` | 33 KiB | `http` | 199 KiB |
+|  |  | `axum` | 433 KiB (234 of it over `http`, and nearly all of that is tokio) |
 
-and on top of `jwt-p256`: `dpop` 46 KiB, `jar` 45 KiB, `client_assertion` 50 KiB, `jwt-pkcs8`
+and on top of `jwt-p256`: `dpop` 46 KiB, `jar` 46 KiB, `client-assertion` 53 KiB, `jwt-pkcs8`
 30 KiB.
+
+`test-util` is the largest single feature, and it is larger than the whole HTTP surface. That is
+the conformance harness a host runs against its own `Storage` implementation, and it grew by 94 KiB
+in 0.9.1 because it gained twenty-seven checks. It is a dev-dependency feature: nothing that ships
+to production should enable it, and no other row in this table includes it.
 
 The `jwt` row is the one that moved: it was 64 KiB when the feature implied `p256`. A host that
 brings its own ES256 backend (a cloud KMS, an HSM, or the `ring` it already links through `rustls`)
@@ -220,21 +239,45 @@ available terms.
 
 ## Minimum supported Rust version
 
-Measured per feature, because there is not one number, and each is built at exactly that toolchain
-in CI with `--locked`:
+Measured per feature, because there is not one number. The last column is what CI actually builds
+with `--locked`, and it is a separate column because for one row it is NOT the same as the floor:
 
-| Feature set | Floor | Set by |
-| ----------- | ----- | ------ |
-| default | **1.75** | this crate (RPITIT in `Storage`) |
-| `jwt` | **1.75** | `p256` builds there |
-| `http` | **1.75** | this crate; `http`, `http-body` and `bytes` are all lower |
-| `axum` | **1.80** | `axum` 0.8 declares it |
+| Feature set | Floor | Set by | Built in CI at |
+| ----------- | ----- | ------ | -------------- |
+| default | **1.75** | this crate (RPITIT in `Storage`) | 1.75 |
+| `jwt` | **1.75** | this crate; `jwt` adds only `serde_json`, which declares 1.71 | 1.75, and `jwt-p256` at 1.75 too |
+| `http` | **1.75** | this crate; `http`, `http-body` and `bytes` are all lower | **1.80 only, never 1.75** |
+| `axum` | **1.80** | `axum` 0.8 declares it | 1.80, via `--features http` and `--all-features` |
+
+The `jwt` row's REASON changed with the ES256 seam split, and the table said the old one until
+2026-08-09: it gave `p256` as what set that floor, which stopped being true the moment `jwt`
+became `["dep:serde_json"]` and the backend moved to `jwt-p256 = ["jwt", "dep:p256"]`. The floor
+NUMBER was correct and still is; only the cause was stale. `jwt` pulls no `p256` at all now, so
+nothing it adds sets a floor above this crate's own, and `p256`'s 1.65 belongs to the `jwt-p256`
+row instead.
+
+The `http` row is the one to read carefully. `cargo +1.75 build -p oauth-as --locked --features
+http` does succeed, and that was re-measured for this release, but it was measured on a
+workstation: no job in `.github/workflows/qa.yml` builds `http` on 1.75. The `MSRV (1.75) build`
+job builds default, `jwt` and `jwt-p256` only, and `http` is built by the separate
+`MSRV (1.80) http feature` job. So 1.80 is the number for `http` that a stranger can verify from
+CI logs alone, and 1.75 is a local measurement that nothing re-checks on every push.
+
+Every MSRV job BUILDS and none of them TEST, and that is deliberate rather than an omission. An
+MSRV is a promise to a consumer that their toolchain can compile this library, and a consumer
+never compiles our dev-dependencies. Ours cannot run at 1.75: `cargo +1.75 test -p oauth-as
+--locked --no-run` fails with `package litemap v0.7.5 cannot be built because it requires rustc
+1.81 or newer`, reached through `url -> idna -> idna_adapter -> icu_normalizer ->
+icu_properties -> icu_locid`, and both `url` and `oauth2` need it. Behaviour is verified by the
+full test suite on stable instead. So what is checked at the floor is "it compiles"; what is not
+checked at the floor, and cannot be without dragging every dev-dependency back, is "it passes its
+tests".
 
 `axum` is the only feature that raises the floor, and it raises it because a dependency it pulls
 in says so, not because of anything in this crate. Of the other fourteen, five add no crate at all
 (`par`, `consent`, `token-exchange`, `resource-metadata`, `test-util`) and so add no floor, and the
 rest add only crates whose own declared floor is below this one: `serde_json` 1.71 for `jwt` (and
-so for `client_assertion`, `dpop` and `jar`, which turn it on), for `mtls` and for `rar`,
+so for `client-assertion`, `dpop` and `jar`, which turn it on), for `mtls` and for `rar`,
 `http` 1.57 / `http-body` 1.61 / `bytes` 1.57 for `http`, `p256` 1.65 for `jwt-p256`, and
 `pkcs8` 1.65 for `jwt-pkcs8`.
 
@@ -264,8 +307,9 @@ trust, including by its authors. So:
 - **Adversarial security review**, with each fix beginning as a test that reproduced the attack and
   failed. It found, among others, a cross site device approval chain, missing refresh token reuse
   detection, and a constant time comparison that returned true for unequal inputs.
-- **Mutation testing**, because a passing suite does not prove the tests constrain the code. See
-  [MUTANTS.md](MUTANTS.md), which records what is still open rather than only what is closed.
+- **Mutation testing**, because a passing suite does not prove the tests constrain the code. It is
+  run against a frozen tree between releases, and what it finds is recorded as still-open rather
+  than only as closed.
 
 ### What is not claimed
 
@@ -300,8 +344,9 @@ that.
   never links against it, and is never published.
 - `scripts/oauth-conformance.sh` runs it: `--selftest` proves the gate can go red, `--check` runs
   it against a live server.
-- [GOAL.md](GOAL.md) defines done as gates that can be checked. [SECURITY.md](SECURITY.md) is the
-  disclosure policy. [CONTRIBUTING.md](CONTRIBUTING.md) has the house rules, which are unusual.
+- [SECURITY.md](SECURITY.md) is the disclosure policy. [CONTRIBUTING.md](CONTRIBUTING.md) has the
+  house rules, which are unusual. [CHANGELOG.md](CHANGELOG.md) carries a migration for every
+  breaking change and a section for what each release knowingly left open.
 
 ## License
 

@@ -34,7 +34,7 @@ use serde_json::Value;
 use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 use oauth_as::{
     AuthorizationServer, Client, ClientAuth, ClientId, Clock, GrantType, MemoryStorage,
-    RefreshTokenRecord, RefreshTokenState, ScopeSet, ServerConfig, Storage, TokenRequest,
+    RefreshTokenRecord, ScopeSet, ServerConfig, Storage, TokenRequest,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -256,28 +256,43 @@ fn rfc7515_appendix_a3_signature_verifies_against_its_own_key() {
     assert!(!es256_verify(tampered.as_bytes(), &sig, &x, &y));
 }
 
+/// THE APPENDIX'S OWN KEY, THROUGH OUR OWN ENCODER, COMPARED BYTE FOR BYTE.
+///
+/// This test compared nothing with the appendix until the 0.9.1 audit: it took a freshly GENERATED
+/// key, checked that its `x` and `y` were 43 characters, unpadded, and 32 bytes decoded, and used
+/// the appendix only for the constant 43. All three of those are guaranteed by the types
+/// (`public_jwk` encodes an UNCOMPRESSED `EncodedPoint<NistP256>`, whose coordinates are 32 bytes
+/// by construction), so the assertions could not fail and the vector contributed one integer and
+/// no bytes.
+///
+/// What it does now: RFC 7515 Appendix A.3's private key `d` is loaded through
+/// `EcdsaP256Key::from_scalar_bytes`, and the `x` and `y` this crate publishes for it are compared
+/// against the appendix's published `x` and `y`. That is the interoperability property the name
+/// claims, and it is the one that catches the classic JWK bug the encoder's own comment names:
+/// a coordinate whose leading zero byte was trimmed instead of left-padded still decodes, still
+/// looks like base64url, and no longer equals the value every other implementation publishes.
 #[test]
 fn our_jwks_coordinate_encoding_matches_the_rfc7515_appendix_a3_form() {
     let Some(vectors) = rfc_vectors() else {
         eprintln!("SKIPPED: vendored rfc_vectors.json not present (packaged tarball)");
         return;
     };
-    // The appendix fixes what a P-256 JWK looks like: 32-byte fixed-width coordinates, unpadded
-    // base64url, 43 characters each. Our own generated key must present the same shape.
     let a3 = &vectors["jws_a3_es256"];
-    let jwks = jwt_config(signing_key()).jwks();
-    let doc = serde_json::to_value(&jwks).unwrap();
+    let d = URL_SAFE_NO_PAD
+        .decode(a3["jwk_d"].as_str().unwrap())
+        .unwrap();
+    let key = EcdsaP256Key::from_scalar_bytes("a3", &d)
+        .expect("the appendix's own private key is a valid P-256 scalar");
+
+    let doc = serde_json::to_value(jwt_config(key).jwks()).unwrap();
     let k = &doc["keys"][0];
     for field in ["x", "y"] {
-        let ours = k[field].as_str().unwrap();
-        let theirs = a3[format!("jwk_{field}")].as_str().unwrap();
         assert_eq!(
-            ours.len(),
-            theirs.len(),
-            "{field} must be 43 chars: unpadded base64url of a fixed-width 32 byte coordinate"
+            k[field].as_str().unwrap(),
+            a3[format!("jwk_{field}")].as_str().unwrap(),
+            "RFC 7515 A.3 publishes {field} for this key; anything else is a JWK no other \
+             implementation can use with ours"
         );
-        assert!(!ours.contains('='), "no base64 padding in a JWK coordinate");
-        assert_eq!(URL_SAFE_NO_PAD.decode(ours).unwrap().len(), 32);
     }
 }
 
@@ -384,27 +399,18 @@ async fn claims_are_rfc9068_s2_2() {
 #[tokio::test]
 async fn subject_falls_back_to_client_id_when_there_is_no_resource_owner() {
     let srv = jwt_server(ManualClock::at_epoch(), signing_key()).await;
-    srv.store()
-        .put_refresh_token(RefreshTokenRecord {
-            #[cfg(feature = "dpop")]
-            jkt: None,
-            #[cfg(feature = "mtls")]
-            x5t_s256: None,
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: Default::default(),
-            refresh_token: "seeded-refresh".into(),
-            client_id: ClientId::new("device-client"),
-            subject: None,
-            scope: ScopeSet::parse("read").unwrap(),
-            expires_at: None,
-            // A seeded chain still needs a family, since reuse detection revokes by family
-            // (OAuth 2.1 s6.1, RFC 9700 s4.14.2). Active, because this one has not been rotated.
-            family_id: "seeded-family".into(),
-            state: RefreshTokenState::Active,
-            #[cfg(feature = "consent")]
-            authentication: None,
-        })
+    let _ = srv
+        .store()
+        // A seeded chain still needs a family, since reuse detection revokes by family
+        // (OAuth 2.1 s6.1, RFC 9700 s4.14.2). Active, which is what `new` leaves it, because this
+        // one has not been rotated.
+        .put_refresh_token(RefreshTokenRecord::new(
+            "seeded-refresh",
+            ClientId::new("device-client"),
+            None,
+            ScopeSet::parse("read").unwrap(),
+            "seeded-family",
+        ))
         .await
         .unwrap();
     let token = srv
@@ -561,4 +567,92 @@ async fn the_token_issuer_matches_the_published_issuer_identifier_exactly() {
         "the signed token's iss must be byte-identical to the published issuer identifier"
     );
     assert_eq!(claims["iss"], serde_json::json!("https://as.example"));
+}
+
+/// AN AUDIENCE THAT RESTRICTS NOTHING MUST NOT BE MINTABLE.
+///
+/// [`AccessTokenClaims`]'s own doc says every required claim is not an `Option` because "a missing
+/// required claim should be impossible to express, not merely discouraged", and `JwtConfig::new`
+/// says the audience "has no default: a guessed `aud` is a token that is valid somewhere nobody
+/// intended". `Audience::Many(vec![])` is `#[serde(untagged)]`, so it expressed the missing claim
+/// anyway: the literal `"aud": []` on every token the configuration signs.
+///
+/// It is worse than the outage it looks like. A resource server whose check is "if `aud` is present
+/// and non-empty it must contain me" reads an empty array as NO RESTRICTION, which is the
+/// FAIL-OPEN reading of the one claim the authorization server believed it was constraining. An
+/// empty audience STRING is the degenerate form of the same mistake and fails the other way, a
+/// token valid nowhere, which is an outage the operator cannot see in the configuration.
+mod empty_audience {
+    use oauth_as::jwt::{AccessTokenClaims, Audience, EcdsaP256Key, JwtConfig};
+
+    fn config() -> JwtConfig {
+        JwtConfig::new(EcdsaP256Key::generate("k1"), "https://rs.example")
+    }
+
+    fn claims(aud: Audience) -> AccessTokenClaims {
+        AccessTokenClaims::new(
+            "https://as.example",
+            1_700_003_600,
+            aud,
+            "alice",
+            "app",
+            1_700_000_000,
+            "jti-1",
+        )
+    }
+
+    /// The builder refuses rather than storing something it cannot honestly sign.
+    #[test]
+    fn an_empty_audience_list_is_refused_by_the_builder() {
+        assert!(
+            config().with_audiences(Vec::new()).is_err(),
+            "an empty audience list restricts nothing and must not be configurable"
+        );
+        assert!(
+            config().with_audiences(vec![String::new()]).is_err(),
+            "an empty audience string names no resource server and must not be configurable"
+        );
+        assert!(
+            config()
+                .with_audiences(vec!["https://a.example".into(), String::new()])
+                .is_err(),
+            "one empty element is enough: the array would carry a member that names nobody"
+        );
+        assert!(
+            config()
+                .with_audiences(vec!["https://a.example".into(), "https://b.example".into()])
+                .is_ok(),
+            "and a real list is still accepted"
+        );
+    }
+
+    /// The builder is not the only door: `Audience` is public and a host builds
+    /// `AccessTokenClaims` itself, so the refusal has to stand where the bytes are produced.
+    #[tokio::test]
+    async fn an_empty_audience_is_refused_at_signing_time() {
+        for aud in [
+            Audience::Many(Vec::new()),
+            Audience::One(String::new()),
+            Audience::Many(vec![String::new()]),
+        ] {
+            let signed = config().sign_access_token(&claims(aud.clone())).await;
+            assert!(
+                signed.is_err(),
+                "a token whose aud restricts nothing must not be minted: {aud:?} produced {:?}",
+                signed.ok()
+            );
+        }
+    }
+
+    /// `JwtConfig::new` cannot refuse without becoming fallible for its forty callers, so the
+    /// signing-time check above is what covers its degenerate case too.
+    #[tokio::test]
+    async fn an_empty_audience_configured_through_new_is_refused_at_signing_time() {
+        let config = JwtConfig::new(EcdsaP256Key::generate("k1"), "");
+        let aud = config.audience().clone();
+        assert!(
+            config.sign_access_token(&claims(aud)).await.is_err(),
+            "an empty audience string configured at construction must not reach the wire"
+        );
+    }
 }

@@ -234,10 +234,10 @@ fuzz_target!(|input: Input| {
             client_secret: None,
             scope: None,
         },
-        TokenRequestContext {
-            credential: ClientCredential::assertion(Some(&assertion_type), &assertion),
-            ..Default::default()
-        },
+        TokenRequestContext::new(ClientCredential::assertion(
+            Some(&assertion_type),
+            &assertion,
+        )),
     ));
 
     match outcome {

@@ -27,8 +27,13 @@
 //!    token and is followed in the token by `.`. RFC 7515 section 5.1 makes the signature cover
 //!    the received octets; a re-joined string is a second chance to sign something other than
 //!    what was sent, and this invariant is what proves it was not re-joined.
-//! 3. THE SEGMENTS ACCOUNT FOR THE WHOLE TOKEN. `signing_input.len() + 1 + signature_segment` is
-//!    the token length, so no trailing bytes are being ignored.
+//! 3. THE SEGMENTS ACCOUNT FOR THE WHOLE TOKEN, so no trailing bytes are being ignored. Stated
+//!    as: the WHOLE tail after the signing input's `.` base64url-decodes to exactly the
+//!    `signature` the parser handed back. That is the only form of this invariant worth
+//!    asserting. It used to also carry `signing_input.len() + 1 + signature_segment.len() ==
+//!    raw.len()`, which was a TAUTOLOGY: `signature_segment` was defined in the target as the
+//!    slice from `signing_input.len() + 1` to the end, so the equation held for every input by
+//!    construction and no mutation of `parse` could ever have made it fire.
 //! 4. NO PANIC ON A MULTI-BYTE BOUNDARY. `signing_input` is produced by slicing the token by
 //!    byte offset; the target feeds non-ASCII tokens specifically to prove that slice is always
 //!    on a character boundary.
@@ -185,13 +190,12 @@ fuzz_target!(|token: Token| {
         "the signing input is not exactly two segments: {raw:?}"
     );
 
-    // 3.
+    // 3. Everything after the signing input's separator, to the END of the token: a parser that
+    // ignored trailing bytes would have decoded its signature from a shorter slice than this one,
+    // so the equality below is what carries the invariant. (The arithmetic identity that stood
+    // here as well, `signing_input.len() + 1 + signature_segment.len() == raw.len()`, was true by
+    // the definition of the slice and asserted nothing about `parse`.)
     let signature_segment = &raw[parsed.signing_input.len() + 1..];
-    assert_eq!(
-        parsed.signing_input.len() + 1 + signature_segment.len(),
-        raw.len(),
-        "the three segments do not account for the whole token: {raw:?}"
-    );
     // The decoded signature must be what that segment holds, and nothing else.
     assert_eq!(
         URL_SAFE_NO_PAD.decode(signature_segment).ok(),

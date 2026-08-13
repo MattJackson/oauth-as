@@ -58,11 +58,28 @@
 //!
 //! Read this before quoting a green run at anyone.
 //!
-//! WHAT IT PROVES. That the verifier accepts a signature the RFC itself vouches for and rejects
-//! four specific corruptions of it; that the signer's output is the fixed-width form, is bound to
-//! the bytes it was handed, and verifies under the key the signer publishes.
+//! WHAT IT PROVES. That the verifier accepts a signature the RFC itself vouches for, rejects four
+//! specific corruptions of it, rejects six wrong LENGTHS (including the zero-length one a JWS
+//! ending in a bare `.` produces), rejects an OFF-CURVE key and an EMPTY signing input, and does
+//! not PANIC on any of them; that the signer's output is the fixed-width form, is bound to the
+//! bytes it was handed, verifies under the key the signer publishes, and that the signer does not
+//! PANIC either.
+//!
+//! Those five are the exact list [`crate::jwt::Es256Verifier`]'s MUST NOT PANIC clause enumerates
+//! ("a zero-length signature, a 63-byte one, a 65-byte one, an off-curve key, an empty signing
+//! input"), and every one of them is reachable by an unauthenticated client, so a harness that
+//! presented only some of them left the rest enforced NOWHERE.
 //!
 //! WHAT IT DOES NOT PROVE:
+//!
+//! - **That the verifier checks the key is ON THE CURVE**, which [`crate::jwt::Es256Verifier`]
+//!   requires and which [`crate::jwt::PublicJwk`] deliberately does not do for it. The off-curve
+//!   key IS presented, so a verifier that decodes the point with an `unwrap` is caught, and that is
+//!   the failure that actually reaches production. What stays invisible is the quiet half: handed
+//!   an off-curve key and any signature, a verifier that VALIDATES and one that merely fails to
+//!   verify both answer `false`, and telling them apart needs a signature forged on the curve's
+//!   twist, which means the very arithmetic this crate stopped shipping. Use a backend whose point
+//!   decoding validates (`p256`'s does) or read the one that does not.
 //!
 //! - **Nothing about the private key's protection.** A green run says the arithmetic is right, not
 //!   that the key is in an HSM, not that it is non-exportable, not that the IAM policy around it
@@ -82,11 +99,13 @@
 //! behind the feature.
 
 use std::fmt;
+use std::future::Future as _;
+use std::panic::AssertUnwindSafe;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
-use crate::jwt::{Es256Signer, Es256Verifier, Jwk, PublicJwk};
+use crate::jwt::{Es256Signer, Es256Verifier, Jwk, PublicJwk, SignerError};
 
 /// One way in which a signer or a verifier failed its contract.
 ///
@@ -114,7 +133,10 @@ pub const CHECKS: &[&str] = &[
     VERIFIER_REJECTS_A_TAMPERED_INPUT,
     VERIFIER_REJECTS_A_TAMPERED_SIGNATURE,
     VERIFIER_REJECTS_DER,
+    VERIFIER_REJECTS_A_WRONG_LENGTH_SIGNATURE,
+    VERIFIER_DOES_NOT_PANIC,
     SIGNER_SIGNS,
+    SIGNER_DOES_NOT_PANIC,
     SIGNER_IS_NOT_DER,
     SIGNER_VERIFIES_UNDER_ITS_OWN_JWK,
     SIGNER_REJECTED_BY_ANOTHER_KEY,
@@ -130,7 +152,10 @@ const VERIFIER_REJECTS_A_FOREIGN_KEY: &str = "verifier/rejects_a_foreign_key";
 const VERIFIER_REJECTS_A_TAMPERED_INPUT: &str = "verifier/rejects_a_tampered_signing_input";
 const VERIFIER_REJECTS_A_TAMPERED_SIGNATURE: &str = "verifier/rejects_a_tampered_signature";
 const VERIFIER_REJECTS_DER: &str = "verifier/rejects_the_der_encoding";
+const VERIFIER_REJECTS_A_WRONG_LENGTH_SIGNATURE: &str = "verifier/rejects_a_wrong_length_signature";
+const VERIFIER_DOES_NOT_PANIC: &str = "verifier/does_not_panic";
 const SIGNER_SIGNS: &str = "signer/signs";
+const SIGNER_DOES_NOT_PANIC: &str = "signer/does_not_panic";
 const SIGNER_IS_NOT_DER: &str = "signer/output_is_not_der";
 const SIGNER_VERIFIES_UNDER_ITS_OWN_JWK: &str = "signer/verifies_under_its_own_public_jwk";
 const SIGNER_REJECTED_BY_ANOTHER_KEY: &str = "signer/does_not_verify_under_another_key";
@@ -164,6 +189,34 @@ const A3_Y: &str = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
 const A3_SIGNATURE: &str =
     "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
 
+/// A valid ES256 signature whose FIRST BYTE IS ZERO, with the key and message it was made over.
+///
+/// It exists for exactly one case in [`SignerConformance::check_wrong_length_signatures`], and the
+/// leading zero is the whole point. A verifier that LEFT-PADS a short signature up to 64 bytes is
+/// undetectable with a truncation of any ordinary signature, because padding a truncation back out
+/// produces a different 64 bytes that verify under nothing. Strip the leading ZERO byte from this
+/// one and the 63 bytes that remain pad back to exactly the signature that made them, so a padding
+/// verifier answers `true` and a conforming verifier answers `false`. Nothing else can tell the
+/// two apart from outside.
+///
+/// Generated here rather than quoted from an RFC, because no RFC prints a vector chosen for this
+/// property, and the choosing is what makes it useful. That it is genuinely valid is not taken on
+/// trust: `tests/signer_conformance_selftest.rs` drives a verifier that pads short signatures and
+/// REJECTS long ones, which no case in this file can catch except this one, and asserts on the
+/// reported detail rather than on the check name. A wrong constant fails that test.
+///
+/// Both halves of that arrangement were bought with a defect. The padding fault used to truncate
+/// long inputs as well, so the 65-byte case below caught it, and the selftest asserted only that
+/// the check name appeared: `verifier/rejects_a_wrong_length_signature` went red without these
+/// four constants ever being consulted, a typo in any of them was invisible, and a backend that
+/// left-pads short signatures while handling long ones correctly passed. The signature is
+/// deterministic (RFC 6979), so it is reproducible from the message and the scalar `[3u8; 32]`.
+const LEADING_ZERO_X: &str = "WRq3ceu8_W2cuQlNEGUordGmnUTCwfYn8InsWLnGGt8";
+const LEADING_ZERO_Y: &str = "n05qvw0EXAxpOjxorXyXynK-ZN70om_s0mPdmKkngPA";
+const LEADING_ZERO_INPUT: &str = "oauth-as.signer-conformance.leading-zero.250";
+const LEADING_ZERO_SIGNATURE: &str =
+    "ABYodUnuRFUgxNDUB00nlZCrb6c1obObltfhhXjcK115K8XgwahkHOzKfoLF_A_RxR9Oj31_WVjYyXl7-xEuTg";
+
 /// A second well-formed P-256 public key, used as the key a signature must NOT verify under.
 ///
 /// The RFC's own key is not reused for that job: a host whose signer IS the appendix key would
@@ -172,6 +225,21 @@ const A3_SIGNATURE: &str =
 /// A.1's example EC public key.
 const OTHER_X: &str = "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4";
 const OTHER_Y: &str = "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM";
+
+/// A pair of coordinates of the RIGHT WIDTH that is NOT a point on P-256: the appendix A.3 key's
+/// `x` with its `y` altered in the lowest bit.
+///
+/// This is not a hypothetical input. [`crate::jwt::PublicJwk::from_json`] checks `kty`, `crv` and
+/// that each coordinate is exactly 32 bytes, and deliberately does NOT check the curve equation,
+/// because doing so would mean this crate carrying the arithmetic the [`Es256Verifier`] seam exists
+/// to externalise. RFC 9449 section 4.3 hands the `jwk` straight out of a DPoP proof header, so
+/// these 64 bytes are whatever an unauthenticated client typed, and a verifier written
+/// `VerifyingKey::from_sec1_bytes(&sec1).unwrap()` PANICS on them while passing every other check
+/// in this file. `y ^ 1` rather than random bytes because it is checkable by inspection: for a
+/// point on the curve the only other `y` over the same `x` is `p - y`, which differs in nearly
+/// every bit, so a one-bit change cannot land back on the curve.
+const OFF_CURVE_X: &str = A3_X;
+const OFF_CURVE_Y: &str = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a4";
 
 /// The two signing inputs the signer is asked for. They must differ, since
 /// [`SIGNER_BINDS_THE_SIGNING_INPUT`] is exactly the check that one signature does not cover the
@@ -208,16 +276,83 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
 
     // ------------------------------------------------------------------------ the verifier
 
+    /// EVERY call this harness makes to the verifier under test goes through here, and a PANIC is
+    /// reported as [`VERIFIER_DOES_NOT_PANIC`] rather than being allowed to end the run.
+    ///
+    /// Two reasons it is not enough to simply call `verify`. A host runs this harness from its own
+    /// test suite, and a panic there aborts the whole test binary, so the one line the host needs
+    /// ("your verifier panicked on a zero-length signature") arrives as a stack trace in the middle
+    /// of an unrelated failure, if it arrives at all. And a verifier that panics has broken the
+    /// contract whatever it would have RETURNED, so the harness has to keep going to report the
+    /// rest.
+    ///
+    /// `AssertUnwindSafe` is required and is honest here: `V` is a host type this harness never
+    /// mutates, the harness's own state across the boundary is `&self` plus a `&mut Vec` it only
+    /// appends to, and the run ends in a returned value rather than in any state a caller could
+    /// observe half-updated.
+    ///
+    /// A panic is treated as `false` for the purpose of the check that made the call. That is the
+    /// reading that cannot invent a pass: a check asking "did this WRONGLY verify?" gets `false`
+    /// and stays quiet, since the real defect is already reported under its own name; a check
+    /// asking "did this verify?" gets `false` and goes red, which is correct, because a verifier
+    /// that panics did not verify anything.
+    ///
+    /// Under `panic = "abort"` there is nothing to catch and the host's test binary dies on the
+    /// spot. That is a build the host chose, and it is still a louder failure than shipping.
+    fn verify(
+        &self,
+        context: &str,
+        key: &PublicJwk,
+        signing_input: &[u8],
+        signature: &[u8],
+        out: &mut Vec<Violation>,
+    ) -> bool {
+        let called = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.verifier.verify(key, signing_input, signature)
+        }));
+        match called {
+            Ok(verified) => verified,
+            Err(_) => {
+                // ONE violation per run, naming the FIRST input that panicked. Six checks feeding
+                // one panicking verifier would otherwise report six times and bury the length that
+                // mattered.
+                if !out.iter().any(|v| v.check == VERIFIER_DOES_NOT_PANIC) {
+                    out.push(Violation {
+                        check: VERIFIER_DOES_NOT_PANIC,
+                        detail: format!(
+                            "the verifier PANICKED on {context} ({} signature bytes, {} \
+                             signing-input bytes). `signature` is the third segment of a JWS an \
+                             unauthenticated client sent, base64url-decoded, and nothing checks \
+                             its length before you see it: `signature[..64]` and \
+                             `Signature::from_slice(&signature[..64])` both panic on the empty \
+                             slice a token ending in a bare '.' produces. Test the length, or use \
+                             `signature.try_into()` into a [u8; 64]. `key` is no safer: its \
+                             coordinates are width-checked and NOT curve-checked, so \
+                             `VerifyingKey::from_sec1_bytes(&sec1).unwrap()` panics on the jwk of \
+                             a DPoP proof anyone can send. Every input must return false instead",
+                            signature.len(),
+                            signing_input.len()
+                        ),
+                    });
+                }
+                false
+            }
+        }
+    }
+
     fn check_verifier(&self, out: &mut Vec<Violation>) {
         let key = jwk(A3_X, A3_Y);
         let signature = decode(A3_SIGNATURE);
 
         // The known-answer test. A verifier that fails this is wrong in a way no amount of
         // agreement with the host's own signer would reveal.
-        if !self
-            .verifier
-            .verify(&key, A3_SIGNING_INPUT.as_bytes(), &signature)
-        {
+        if !self.verify(
+            "the RFC 7515 A.3 vector",
+            &key,
+            A3_SIGNING_INPUT.as_bytes(),
+            &signature,
+            out,
+        ) {
             out.push(Violation {
                 check: VERIFIER_RFC7515_A3,
                 detail: "the RFC 7515 appendix A.3 ES256 vector did not verify. Either the \
@@ -231,10 +366,12 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         // reasons and a verifier can get one right and the others wrong: an implementation that
         // ignores the key, one that ignores the message, and one that ignores the signature are
         // three different defects with three different blast radii.
-        if self.verifier.verify(
+        if self.verify(
+            "the A.3 vector under a foreign key",
             &jwk(OTHER_X, OTHER_Y),
             A3_SIGNING_INPUT.as_bytes(),
             &signature,
+            out,
         ) {
             out.push(Violation {
                 check: VERIFIER_REJECTS_A_FOREIGN_KEY,
@@ -251,7 +388,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         // that flipped a byte near the front.
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        if self.verifier.verify(&key, &tampered, &signature) {
+        if self.verify("a tampered signing input", &key, &tampered, &signature, out) {
             out.push(Violation {
                 check: VERIFIER_REJECTS_A_TAMPERED_INPUT,
                 detail: "a signature verified over a signing input that was not the one signed. \
@@ -263,10 +400,13 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
 
         let mut bad_signature = signature.clone();
         bad_signature[0] ^= 0x01;
-        if self
-            .verifier
-            .verify(&key, A3_SIGNING_INPUT.as_bytes(), &bad_signature)
-        {
+        if self.verify(
+            "a byte-flipped signature",
+            &key,
+            A3_SIGNING_INPUT.as_bytes(),
+            &bad_signature,
+            out,
+        ) {
             out.push(Violation {
                 check: VERIFIER_REJECTS_A_TAMPERED_SIGNATURE,
                 detail: "a corrupted signature verified. The verifier is not checking the \
@@ -278,10 +418,13 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         // RFC 7518 s3.4 admits exactly ONE encoding. A verifier that also accepts DER gives one
         // signature two spellings, which is signature malleability: a value a deployment recorded
         // as a unique identifier (a replay cache key, an audit line) stops being unique.
-        if self
-            .verifier
-            .verify(&key, A3_SIGNING_INPUT.as_bytes(), &der(&signature))
-        {
+        if self.verify(
+            "the DER re-encoding of a valid signature",
+            &key,
+            A3_SIGNING_INPUT.as_bytes(),
+            &der(&signature),
+            out,
+        ) {
             out.push(Violation {
                 check: VERIFIER_REJECTS_DER,
                 detail: "the ASN.1 DER encoding of a valid signature verified. RFC 7518 s3.4 \
@@ -290,9 +433,199 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
                     .to_string(),
             });
         }
+
+        // THE OTHER TWO INPUTS THE CONTRACT NAMES. `Es256Verifier`'s MUST NOT PANIC clause lists
+        // five: a zero-length signature, a 63-byte one, a 65-byte one, an OFF-CURVE KEY, and an
+        // EMPTY SIGNING INPUT. The lengths are below; these two are here, and until they were
+        // presented a verifier could panic on either one and collect a green run from this file.
+        //
+        // Both are unauthenticated-reachable. The key is the `jwk` member of a DPoP proof header,
+        // which `PublicJwk::from_json` width-checks and does not curve-check; the signing input is
+        // empty for a JWS whose first two segments are empty, which parses.
+        //
+        // A `true` here is reported under the rejection check it violates rather than under a name
+        // of its own, because that is what it means: a signature that verifies under a point that
+        // is not on the curve verified under a key that did not produce it, and one that verifies
+        // over no bytes at all verified over a message that was not signed.
+        if self.verify(
+            "an OFF-CURVE key of the correct coordinate width",
+            &jwk(OFF_CURVE_X, OFF_CURVE_Y),
+            A3_SIGNING_INPUT.as_bytes(),
+            &signature,
+            out,
+        ) {
+            out.push(Violation {
+                check: VERIFIER_REJECTS_A_FOREIGN_KEY,
+                detail: "a signature verified under coordinates that are NOT a point on P-256. \
+                         PublicJwk only width-checks the coordinates, so the curve check is the \
+                         verifier's, and it is what an invalid-curve attack needs to find missing"
+                    .to_string(),
+            });
+        }
+
+        if self.verify("an EMPTY signing input", &key, &[], &signature, out) {
+            out.push(Violation {
+                check: VERIFIER_REJECTS_A_TAMPERED_INPUT,
+                detail: "a valid 64-byte signature verified over an EMPTY signing input. The \
+                         verifier is not hashing the message it was handed, so a signature made \
+                         over one token is good for every other"
+                    .to_string(),
+            });
+        }
+
+        self.check_wrong_length_signatures(&key, &signature, out);
+    }
+
+    /// THE LENGTHS NOBODY ELSE PRESENTS. Every check above hands the verifier 64 bytes or more (the
+    /// A.3 vector, three corruptions of it that are still 64 bytes, and a DER form that is 70 to
+    /// 72), so a verifier that indexes `signature[..64]` and PANICS, or that pads a short input up
+    /// to 64 and ACCEPTS it, passed all of them and shipped.
+    ///
+    /// That was the harness failing at exactly its own stated purpose. The host's backend is
+    /// unreachable from this crate's tests, so an obligation this harness does not exercise is
+    /// enforced NOWHERE, and the obligation in question is the one [`crate::jwt::Es256Verifier`]
+    /// states most explicitly. Worse, it is the obligation whose input is reachable by anyone:
+    /// `signature` is the third JWS segment base64url-decoded, so a DPoP proof, a request object or
+    /// a client assertion ending in a bare `.` hands the verifier a ZERO-LENGTH slice, and a 4
+    /// kilobyte DPoP header can hand it three thousand bytes.
+    ///
+    /// The cases are DERIVED FROM THE VALID SIGNATURE rather than made of random bytes, so the only
+    /// thing wrong with each one is its length: a verifier that rejects them for being noise would
+    /// prove nothing about a verifier that pads. Every one must be `false`.
+    fn check_wrong_length_signatures(
+        &self,
+        key: &PublicJwk,
+        signature: &[u8],
+        out: &mut Vec<Violation>,
+    ) {
+        // 65 bytes is the valid signature with one trailing zero, which is what an encoder that
+        // emits a length prefix or a DER-style sign pad produces; a verifier that reads a 64-byte
+        // PREFIX and ignores the rest accepts it.
+        let mut too_long = signature.to_vec();
+        too_long.push(0x00);
+
+        // The padding case needs its OWN key and message: see `LEADING_ZERO_SIGNATURE` for why no
+        // truncation of the A.3 vector can catch a verifier that left-pads.
+        let padding_key = jwk(LEADING_ZERO_X, LEADING_ZERO_Y);
+        let leading_zero = decode(LEADING_ZERO_SIGNATURE);
+        let a3 = A3_SIGNING_INPUT.as_bytes();
+
+        let cases: [(&str, &PublicJwk, &[u8], &[u8]); 6] = [
+            // The one that arrives from the wire for free: a token ending in a bare `.`.
+            ("0 bytes (an empty third JWS segment)", key, a3, &[]),
+            ("1 byte", key, a3, &signature[..1]),
+            ("32 bytes (R alone, S missing)", key, a3, &signature[..32]),
+            (
+                "63 bytes (a valid signature, truncated by one)",
+                key,
+                a3,
+                &signature[..63],
+            ),
+            (
+                "63 bytes (a valid signature with its LEADING ZERO byte removed, which a verifier \
+                 that left-pads back up to 64 reconstructs exactly)",
+                &padding_key,
+                LEADING_ZERO_INPUT.as_bytes(),
+                &leading_zero[1..],
+            ),
+            (
+                "65 bytes (a valid signature plus a trailing zero)",
+                key,
+                a3,
+                &too_long,
+            ),
+        ];
+
+        for (description, case_key, case_input, wrong) in cases {
+            if self.verify(
+                &format!("a wrong-length signature of {description}"),
+                case_key,
+                case_input,
+                wrong,
+                out,
+            ) {
+                out.push(Violation {
+                    check: VERIFIER_REJECTS_A_WRONG_LENGTH_SIGNATURE,
+                    detail: format!(
+                        "a signature of {description} VERIFIED. RFC 7518 s3.4 fixes the ES256 \
+                         signature at exactly 64 bytes of fixed-width R || S, so anything else \
+                         must be false. A verifier that pads a short input up to 64, or that \
+                         reads a 64-byte prefix and ignores the rest, gives a valid signature \
+                         many spellings and accepts values the signer never produced"
+                    ),
+                });
+            }
+        }
     }
 
     // -------------------------------------------------------------------------- the signer
+
+    /// EVERY call this harness makes to the signer under test goes through here, and a PANIC is
+    /// reported as [`SIGNER_DOES_NOT_PANIC`] and then handed on as an `Err`.
+    ///
+    /// [`crate::jwt::Es256Signer::sign`] says "**MUST NOT PANIC, for any input, ever**" and says
+    /// why: a panic unwinds out of `JwtConfig::sign_access_token` and into the host's token
+    /// endpoint, where a runtime that aborts takes the whole server down and one that does not
+    /// leaves a poisoned task. Until this existed, that clause was checked NOWHERE — the verifier
+    /// had `SignerConformance::verify` and the signer was called bare — and the reasons given
+    /// there apply here with a larger blast radius: a panic in the host's test suite aborts the
+    /// test binary, so the one line the host needs arrives as a stack trace in the middle of an
+    /// unrelated failure, and a signer that panicked has broken the contract whatever it would
+    /// have returned, so the harness has to keep going to report the rest.
+    ///
+    /// TWO catches, because a `sign` returning `impl Future` has two places to panic and an
+    /// implementor's `unwrap` is as likely to sit in either: the synchronous part that BUILDS the
+    /// future (where a KMS client marshals its request) and the poll (where it reads the response).
+    /// The future is boxed so the second catch needs no `unsafe`; this crate forbids it, and one
+    /// allocation per signature in a conformance harness is not worth a pin projection.
+    ///
+    /// `AssertUnwindSafe` is honest for the same reasons it is on the verifier: `S` is a host type
+    /// this harness never mutates and the run ends in a returned value rather than in state a
+    /// caller could observe half-updated.
+    ///
+    /// The panic is then returned as `Err`, so [`SIGNER_SIGNS`] reports it too and the run stops
+    /// where it stops for a signer that refused. Nothing below a missing signature can be checked,
+    /// and a cascade of failures caused by one absent signature would bury the fact worth reading.
+    async fn sign(
+        &self,
+        context: &str,
+        signing_input: &[u8],
+        out: &mut Vec<Violation>,
+    ) -> Result<[u8; 64], SignerError> {
+        let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            Box::pin(self.signer.sign(signing_input))
+        }));
+        let signed = match built {
+            Ok(mut future) => {
+                std::future::poll_fn(move |cx| {
+                    match std::panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                        Ok(polled) => polled.map(Some),
+                        Err(_) => std::task::Poll::Ready(None),
+                    }
+                })
+                .await
+            }
+            Err(_) => None,
+        };
+        match signed {
+            Some(result) => result,
+            None => {
+                out.push(Violation {
+                    check: SIGNER_DOES_NOT_PANIC,
+                    detail: format!(
+                        "the signer PANICKED while signing {context} ({} signing-input bytes). \
+                         Every failure you can have (the KMS was unreachable, the key was \
+                         disabled, the credential expired, the response was the wrong length or \
+                         the wrong encoding) is an Err(SignerError), which this crate turns into \
+                         an RFC 6749 s5.2 server_error. A panic instead unwinds into the host's \
+                         token endpoint, and the deployment loses more than the one request",
+                        signing_input.len()
+                    ),
+                });
+                Err(SignerError::new("the signer panicked"))
+            }
+        }
+    }
 
     async fn check_signer(&self, out: &mut Vec<Violation>) {
         let published = self.signer.public_jwk();
@@ -339,7 +672,10 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             });
         }
 
-        let signature = match self.signer.sign(INPUT_A.as_bytes()).await {
+        // Bound to a local before the `match`, so that the `&mut out` the call borrows is released
+        // before the arms use it again.
+        let signed = self.sign("the first input", INPUT_A.as_bytes(), out).await;
+        let signature = match signed {
             Ok(signature) => signature,
             Err(e) => {
                 // Nothing below can run, and reporting a cascade of failures caused by one absent
@@ -375,10 +711,13 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         }
 
         let public = published.to_public_jwk();
-        if !self
-            .verifier
-            .verify(&public, INPUT_A.as_bytes(), &signature)
-        {
+        if !self.verify(
+            "the signer's own signature under its own JWK",
+            &public,
+            INPUT_A.as_bytes(),
+            &signature,
+            out,
+        ) {
             out.push(Violation {
                 check: SIGNER_VERIFIES_UNDER_ITS_OWN_JWK,
                 detail: "the signature did not verify under the signer's OWN public_jwk(). Either \
@@ -389,10 +728,13 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             });
         }
 
-        if self
-            .verifier
-            .verify(&jwk(OTHER_X, OTHER_Y), INPUT_A.as_bytes(), &signature)
-        {
+        if self.verify(
+            "the signer's own signature under a foreign key",
+            &jwk(OTHER_X, OTHER_Y),
+            INPUT_A.as_bytes(),
+            &signature,
+            out,
+        ) {
             out.push(Violation {
                 check: SIGNER_REJECTED_BY_ANOTHER_KEY,
                 detail: "the signature verified under a key that did not produce it. A signer \
@@ -406,18 +748,38 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         // second signature rather than by reusing the first against a different message, so that a
         // signer which ignores its argument entirely (returning one fixed signature, or signing a
         // fixed message) is caught by the value it returns as well as by where it verifies.
-        match self.signer.sign(INPUT_B.as_bytes()).await {
+        let signed_again = self.sign("the second input", INPUT_B.as_bytes(), out).await;
+        match signed_again {
             Ok(other) => {
                 // TWO facts, reported as one check because they are one property. The second
                 // signature must cover the SECOND input (a signer that signs a fixed message, or
                 // returns a constant, fails here on a different message than the check above used,
                 // which is what stops that check passing by coincidence); and neither signature
                 // may verify over the other's input.
-                let covers_its_own = self.verifier.verify(&public, INPUT_B.as_bytes(), &other);
-                let crosses = self.verifier.verify(&public, INPUT_A.as_bytes(), &other)
-                    || self
-                        .verifier
-                        .verify(&public, INPUT_B.as_bytes(), &signature);
+                let covers_its_own = self.verify(
+                    "the second input's signature over the second input",
+                    &public,
+                    INPUT_B.as_bytes(),
+                    &other,
+                    out,
+                );
+                // Both arms are evaluated deliberately: `||` would short circuit past the second
+                // call, and a panic there is a fact worth reporting.
+                let one_way = self.verify(
+                    "the second input's signature over the FIRST input",
+                    &public,
+                    INPUT_A.as_bytes(),
+                    &other,
+                    out,
+                );
+                let other_way = self.verify(
+                    "the first input's signature over the SECOND input",
+                    &public,
+                    INPUT_B.as_bytes(),
+                    &signature,
+                    out,
+                );
+                let crosses = one_way || other_way;
                 if !covers_its_own || crosses {
                     out.push(Violation {
                         check: SIGNER_BINDS_THE_SIGNING_INPUT,

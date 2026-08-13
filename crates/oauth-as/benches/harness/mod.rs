@@ -6,9 +6,9 @@
 //! # Why this is hand rolled rather than criterion or divan
 //!
 //! MEASURED on 2026-08-09, not assumed. Both of the obvious off-the-shelf choices break
-//! `cargo +1.75 test -p oauth-as --locked`, which is `GOAL.md` Gate 6's own CHECK command, and
-//! they break it for the exact reason `KICKOFF.md`'s MSRV entry already records about
-//! `base64ct` and `zeroize`:
+//! `cargo +1.75 test -p oauth-as --locked`, which is this crate's MSRV check, and they break it
+//! for the same reason `base64ct` and `zeroize` do — a dependency that raises its own
+//! `rust-version` raises this crate's floor with it, whether or not this crate's code changed:
 //!
 //! - `criterion` 0.8.2 declares `rust-version = "1.86"`, eleven minors above this crate's
 //!   measured 1.75 floor. Pinning back to `criterion` 0.5.1 does not help: it resolves

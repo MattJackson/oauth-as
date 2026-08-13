@@ -81,6 +81,15 @@ async fn server(key: &EcdsaP256Key) -> AuthorizationServer<MemoryStorage, Frozen
 /// override. Everything the authorization request itself needs is fixed and valid, so any refusal
 /// below is about the claim under test and nothing else.
 fn request_object(key: &EcdsaP256Key, extra: serde_json::Value) -> String {
+    // `exp` is in the BASE claims, not spliced in per test, because 0.9.1 refuses a request object
+    // without one and every test in this file is about something else: an aud array, an nbf, a
+    // crit. A fixture missing it would make all of them fail for a reason none of them names. A
+    // test that IS about the lifetime overrides it through `extra`, which is applied after.
+    // Sixty seconds past `NOW`, the FROZEN clock this suite runs on, NOT past the wall clock. A
+    // real-time `exp` here is years beyond a clock frozen in 2023, which trips
+    // `JarConfig::max_request_object_lifetime` and reds every test in the file for a reason none of
+    // them is about. Worth stating because the ceiling catching that is the ceiling working.
+    let exp = NOW + 60;
     let mut claims = serde_json::json!({
         "client_id": "app",
         "response_type": "code",
@@ -88,6 +97,7 @@ fn request_object(key: &EcdsaP256Key, extra: serde_json::Value) -> String {
         "scope": "read",
         "code_challenge": oauth_as::pkce::code_challenge_s256(VERIFIER),
         "code_challenge_method": "S256",
+        "exp": exp,
     });
     let object = claims.as_object_mut().expect("an object");
     for (k, v) in extra.as_object().expect("extra must be an object") {
@@ -148,15 +158,22 @@ async fn an_aud_array_naming_this_server_is_accepted_and_one_naming_another_is_n
     );
 }
 
-/// KILLS: `par.rs replace < with <= in verified_request_object` and `replace < with == in
-/// verified_request_object` (the `nbf` bound).
+/// KILLS: `par.rs replace <= with < in verified_request_object` (the `nbf` bound).
 ///
-/// RFC 7519 section 4.1.5: `nbf` identifies "the time before which the JWT MUST NOT be accepted",
-/// so the instant `now == nbf` is the FIRST acceptable one, not the last unacceptable one. A
-/// client that stamps `nbf` with the same second as `iat`, which is what every JWT library this
-/// crate's clients are likely to use does by default, sends a request object that is refused for
-/// the whole of the second it was minted in. That is an intermittent, unreproducible
-/// `invalid_request_object` on a correct client.
+/// THE OPERATOR IS `<=`, AND IT HAS THE CLOCK-SKEW LEEWAY ON THE LEFT OF IT: the refusal is
+/// `now + CLOCK_SKEW_LEEWAY <= nbf`, with the leeway `skew.rs` defines once for the whole crate at
+/// sixty seconds. So the object is refused from `nbf = NOW + 60` upwards and accepted below it,
+/// and the naive reading — "the instant `now == nbf` is the first acceptable one" — is off by the
+/// whole leeway. Naming the operator that is actually there matters here more than usual, because
+/// these headers are what tells the next person which mutants a case can and cannot kill: a header
+/// naming mutants of `<` describes mutants cargo-mutants will never generate.
+///
+/// RFC 7519 section 4.1.5 makes `nbf` "the time before which the JWT MUST NOT be accepted", and
+/// the leeway is granted in the one direction that can only ever admit a request that was going to
+/// be fine a moment later (see `skew::CLOCK_SKEW_LEEWAY`). A client that stamps `nbf` with the same
+/// second as `iat` — the default of every JWT library this crate's clients are likely to use — is
+/// comfortably inside it, and must not spend the second it was minted in earning an intermittent,
+/// unreproducible `invalid_request_object`.
 #[tokio::test]
 async fn a_request_object_valid_from_this_instant_is_accepted() {
     assert_eq!(
@@ -164,25 +181,45 @@ async fn a_request_object_valid_from_this_instant_is_accepted() {
         None,
         "RFC 7519 s4.1.5: at nbf the object has become valid, it has not stopped being valid"
     );
+    // The LAST accepted instant, one second below the leeway. Tightening the comparison to `<`
+    // would still accept this, which is why the refusal a second later is the case that kills it.
+    assert_eq!(
+        refusal(serde_json::json!({"nbf": NOW + 59})).await,
+        None,
+        "one second inside the sixty-second skew leeway is still accepted"
+    );
 }
 
-/// KILLS: `par.rs replace < with == in verified_request_object` and `replace < with > in
-/// verified_request_object`.
+/// KILLS: `par.rs replace <= with < in verified_request_object`, `replace <= with ==`, and
+/// `replace <= with >`.
 ///
 /// The other half of the same bound, and the half with an attacker in it. An object stamped for
 /// the future is one whose validity window has not opened; accepting it lets a client (or whoever
-/// captured the object) pre-mint authorization requests and hold them, which is exactly the
-/// replay window `nbf` narrows.
+/// captured the object) pre-mint authorization requests and hold them, which is exactly the replay
+/// window `nbf` narrows.
+///
+/// TWO FIXTURES, AND THE FAR ONE IS NOT REDUNDANT. `NOW + 60` sits EXACTLY on
+/// `now + CLOCK_SKEW_LEEWAY`, which is what makes it the first refused instant and what kills the
+/// `<` mutant — but it is also the one value at which `==` agrees with `<=`, so a suite that
+/// tested only the boundary let `<= -> ==` survive: a comparison that refuses objects stamped
+/// precisely sixty seconds out and accepts every object stamped further ahead than that, which is
+/// every object an attacker would pre-mint. `NOW + 3600` is clear of the leeway and separates them.
 #[tokio::test]
 async fn a_request_object_not_yet_valid_is_refused() {
     assert_eq!(
         refusal(serde_json::json!({"nbf": NOW + 60})).await,
         Some(ErrorCode::InvalidRequestObject),
-        "an object whose nbf has not arrived must not be accepted"
+        "nbf exactly one leeway ahead is the FIRST instant the bound refuses"
+    );
+    assert_eq!(
+        refusal(serde_json::json!({"nbf": NOW + 3600})).await,
+        Some(ErrorCode::InvalidRequestObject),
+        "an object stamped an hour into the future is pre-minted, and is what a bound that only \
+         refused the exact boundary would hand back"
     );
 }
 
-/// KILLS: `par.rs replace < with > in verified_request_object`.
+/// KILLS: `par.rs replace <= with > in verified_request_object`.
 ///
 /// The ordinary case, and the one a reversed comparison destroys: a request object minted a moment
 /// ago, with `nbf` in the past, is the shape of every real request. Reversing the bound refuses

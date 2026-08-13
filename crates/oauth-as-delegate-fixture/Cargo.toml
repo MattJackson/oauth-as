@@ -1,0 +1,47 @@
+# A REAL EXTERNAL CONSUMER of `oauth_as::delegate_storage!`, and the only thing in this repository
+# that can gate it. Never published.
+#
+# WHY A WHOLE CRATE. `macro_rules!` performs no cfg hygiene: a `#[cfg(feature = "consent")]` that a
+# macro EMITS is resolved against the crate the macro expands IN, not the crate it was written in.
+# rustc says so itself ("using a cfg inside a macro will use the cfgs from the destination crate and
+# not the ones from the defining crate"). The macro's only test used to be the doctest in
+# crates/oauth-as/src/delegate.rs, and rustdoc compiles doctests with the DECLARING crate's cfg
+# flags, so the doctest and the macro agreed by accident and nine of the twenty-nine forwarders were
+# generated in no host crate at all. A doctest cannot catch this. A separate compilation unit can,
+# and only a separate compilation unit can.
+#
+# WHY IT DECLARES NO `[features]` TABLE AND ASKS FOR NO FEATURES OF `oauth-as`. Both halves are
+# load-bearing:
+#
+#   * No `[features]` of its own is the WHOLE POINT. A host that happens to define a feature
+#     literally named `consent` would mask the defect. Almost no host does. This crate must be the
+#     ordinary case.
+#   * No `features = [...]` on the dependency is what keeps this crate out of the root workspace's
+#     feature unification. Under resolver 2 a feature any member asks for is enabled for every
+#     member's build of that package in the same invocation, so a fixture that pinned
+#     `features = ["consent", "par", "dpop", "client-assertion"]` would turn those on for
+#     `cargo test --workspace --locked` and silently delete the crate's only default-features gate.
+#     That is the same mechanism the root Cargo.toml documents at length for fuzz/, and paying it
+#     here would cost more than the fixture is worth.
+#
+# So the feature set this compiles against is whatever the INVOCATION gives `oauth-as`, which is
+# exactly the variable under test:
+#
+#   cargo build --workspace --locked                 -> oauth-as default: the trait wants 20, the
+#                                                       macro must generate 20.
+#   cargo build --workspace --locked --all-features  -> oauth-as full:    the trait wants 29, the
+#                                                       macro must generate 29, and THIS crate still
+#                                                       has no feature named `par` or `consent`.
+#
+# The second is the one that was red before 0.9.1's fix, with E0046 naming all nine missing methods.
+# Both are already run by .github/workflows/qa.yml, so this crate is gated by construction.
+[package]
+name = "oauth-as-delegate-fixture"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+oauth-as = { path = "../oauth-as" }

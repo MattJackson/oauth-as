@@ -24,7 +24,7 @@ mod harness;
 
 #[cfg(all(
     feature = "jwt-p256",
-    any(feature = "dpop", feature = "client_assertion")
+    any(feature = "dpop", feature = "client-assertion")
 ))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,13 +33,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// default, which is what keeps these benchmarks measuring what they always measured.
 #[cfg(all(
     feature = "jwt-p256",
-    any(feature = "dpop", feature = "client_assertion")
+    any(feature = "dpop", feature = "client-assertion")
 ))]
 const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
 
 #[cfg(all(
     feature = "jwt-p256",
-    any(feature = "dpop", feature = "client_assertion")
+    any(feature = "dpop", feature = "client-assertion")
 ))]
 fn secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
@@ -218,7 +218,7 @@ fn main() {
     }
 
     // ====================================================================== RFC 7523 client assertion
-    #[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+    #[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
     {
         use oauth_as::client_assertion::{verify_assertion, AssertionKeys, ClientSecretKey};
         use oauth_as::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};

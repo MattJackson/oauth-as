@@ -9,7 +9,7 @@
 //!
 //! This module SIGNS in its first half and VERIFIES in its second, and the two jobs are not
 //! symmetric. The module doc used to be able to say this crate "never parses a JWT it did not
-//! make"; the `client_assertion` and `dpop` features ended that. An RFC 7523 client assertion and
+//! make"; the `client-assertion` and `dpop` features ended that. An RFC 7523 client assertion and
 //! an RFC 9449 DPoP proof are both JWTs a CLIENT made, so [`CompactJws::parse`], [`PublicJwk`] and
 //! [`verify_es256`] are handling attacker-controlled input, and anyone verifying against them
 //! needs these three rules rather than a pointer at the source.
@@ -28,7 +28,7 @@
 //!    `alg` a caller can be made to route an HMAC verification at a public key it already
 //!    published. `none` is not implemented at all: no code path here accepts an unsigned JWS. A
 //!    caller still has to check that the `alg` it was handed is the one the REGISTRATION expects,
-//!    which is why the `client_assertion` module's `AssertionKeys` holds one algorithm, not a
+//!    which is why the `client-assertion` module's `AssertionKeys` holds one algorithm, not a
 //!    set.
 //! 3. NOTHING IS DECODED TWICE. The signature is verified over the EXACT received bytes of
 //!    `header.payload` ([`CompactJws::signing_input`] borrows them), never over a re-serialization
@@ -37,7 +37,12 @@
 //!
 //! A JWK presented to this module is also refused outright if it carries any PRIVATE or symmetric
 //! member (`d`, the RSA CRT parameters, `k`): RFC 9449 section 4.3 makes that a requirement, and
-//! [`PublicJwk::from_json`] is the only route into the type, including through `serde`.
+//! [`PublicJwk::from_json`] is the only route from JSON into the type, including through `serde`,
+//! whose `Deserialize` impl is routed through it rather than derived. The type's fields are sealed,
+//! so the other constructors are the only alternatives and neither can express a private member:
+//! [`PublicJwk::from_coordinates`] takes two P-256 coordinates and nothing else, and
+//! [`Jwk::to_public_jwk`] converts a key this crate PUBLISHED, which by construction has no private
+//! half in it. See [`PublicJwk`] on what each does and does not revalidate.
 //!
 //! # Why this is hand-rolled
 //!
@@ -216,6 +221,22 @@ pub trait Es256Signer: Send + Sync {
     /// Sign the bytes as given. Do not hash them first: `ES256` is ECDSA/P-256/SHA-256, so the
     /// SHA-256 is part of the signature scheme, and a KMS whose API wants a digest is a KMS you
     /// hash for exactly once.
+    ///
+    /// # What you may assume about `signing_input`, and what you MUST NOT do
+    ///
+    /// `signing_input` is built by THIS crate, not by a client: it is non-empty printable ASCII,
+    /// it always contains exactly one `.`, and it is roughly a kilobyte. Its CONTENT is not
+    /// entirely this crate's, because the claims carry a `client_id`, a `sub` and a `scope` that
+    /// came from somewhere, but its SHAPE is. You may assume nothing further, and in particular
+    /// nothing about its length.
+    ///
+    /// **MUST NOT PANIC, for any input, ever.** Every failure you can have here (the KMS was
+    /// unreachable, the key was disabled, the credential expired, the response was the wrong
+    /// length) is `Err(SignerError)`, which this crate turns into an RFC 6749 section 5.2
+    /// `server_error`. A panic instead unwinds out of [`JwtConfig::sign_access_token`] and into
+    /// the host's token endpoint, where a runtime that aborts on panic takes the whole server
+    /// down and one that does not leaves a poisoned task; either way the deployment loses more
+    /// than the one request. Nothing about the difference is worth an `unwrap`.
     fn sign(
         &self,
         signing_input: &[u8],
@@ -270,6 +291,37 @@ impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
 ///   malformed key, a wrong-length signature and a signature that simply does not verify all have
 ///   the same and only safe answer, and distinguishing them would only invite a caller to treat
 ///   one as recoverable.
+///
+/// # What you may assume about the arguments, which is LESS than it looks
+///
+/// The paragraph above says what `true` may mean. This one says what you are handed, because the
+/// clause "reject any other length" is the one an implementor reads as "the length will be 64".
+///
+/// - **`signature` IS ATTACKER-CONTROLLED BYTES OF ANY LENGTH, INCLUDING ZERO.** It is the third
+///   segment of a JWS somebody sent this server, base64url-decoded, and NOTHING between the wire
+///   and you checks its length. A DPoP proof, an RFC 9101 request object and an RFC 7523 client
+///   assertion all arrive this way; on a 4 kilobyte DPoP header the third segment decodes to
+///   anything from 0 to about 3000 bytes, and a token ending in a bare `.` decodes to an EMPTY
+///   slice, which parses fine and reaches you.
+/// - **`key` HAS PASSED SHAPE VALIDATION AND NOTHING MORE.** [`PublicJwk::from_json`] guarantees
+///   `kty` is `EC`, `crv` is `P-256`, and that `x` and `y` are each exactly 32 base64url-decoded
+///   bytes. It does NOT guarantee the point is on the curve, is not the point at infinity, or is a
+///   point at all: those 64 bytes came from a client. See the on-curve clause above.
+/// - **`signing_input` may be empty and is not required to be UTF-8** for your purposes. Hash the
+///   bytes as given.
+///
+/// # MUST NOT PANIC
+///
+/// **Return `false`. Do not panic, for any input, ever.** Every case above is a `false`: a
+/// zero-length signature, a 63-byte one, a 65-byte one, an off-curve key, an empty signing input.
+///
+/// This is not a formality, and it is the one clause a natural implementation breaks. Having read
+/// "MUST be the 64-byte fixed-width `r || s`", the obvious KMS-shaped verifier begins
+/// `&signature[..64]` or `Signature::from_slice(&signature[..64])`, and both PANIC on a token whose
+/// third segment is empty. The panic unwinds out of this crate and into the host's token endpoint,
+/// where it is reachable unauthenticated by anyone who can send a string with two dots in it. Test
+/// the length before you slice, or match on `signature.try_into()` into a `[u8; 64]`, which cannot
+/// be got wrong.
 ///
 /// # Before you deploy one
 ///
@@ -529,6 +581,20 @@ impl Es256Verifier for P256Verifier {
 ///
 /// The fields are the complete set this crate ever emits. There is deliberately no `d`
 /// (RFC 7517 section 6.2.2.1, the private key parameter) and no way to add one.
+///
+/// THE FIELDS ARE PUBLIC, unlike [`PublicJwk`]'s, and the difference is what each type is for: this
+/// one is what a HOST FILLS IN. [`Es256Signer::public_jwk`] returns it, so every host implementing
+/// that seam over a KMS or a PKCS#11 token has to build one by hand, and sealing it would mean
+/// shipping a fallible constructor for a value the host already knows is correct.
+///
+/// What that costs is worth stating where the literal gets written: [`Jwk::to_public_jwk`] does not
+/// revalidate, so a `Jwk` literal whose `x` and `y` are not 32-byte base64url produces a
+/// [`PublicJwk`] that [`PublicJwk::from_json`] would have refused. It fails CLOSED — nothing
+/// verifies under such a key, so the effect is a signer whose signatures never check out and, on the
+/// DPoP path, a token bound to a thumbprint nobody can present — but it fails at verification time
+/// rather than here. [`crate::signer_conformance`] is the check that catches it: it verifies a real
+/// signature against the key the signer publishes, which is exactly the mismatch this shape allows.
+/// Run it against any signer before a deployment trusts it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Jwk {
     /// Key type; always `EC` (RFC 7518 section 6.2).
@@ -560,6 +626,13 @@ impl Jwk {
     /// Used by [`crate::signer_conformance`] to check a signer's output against the key that
     /// signer publishes, which is the one check that catches a `public_jwk()` belonging to some
     /// other key.
+    ///
+    /// It REVALIDATES NOTHING, and cannot usefully: it is infallible, so there is no channel for a
+    /// refusal, and making it fallible would push a `Result` onto every caller for a value they
+    /// produced themselves. "Produced here" is doing the work, and [`Jwk`]'s own docs say plainly
+    /// what it means for a host that hand-builds one with coordinates that are not 32 bytes: this
+    /// hands back a [`PublicJwk`] that [`PublicJwk::from_json`] would have refused, which fails
+    /// closed at verification rather than being caught here.
     pub fn to_public_jwk(&self) -> PublicJwk {
         PublicJwk {
             kty: self.kty.to_string(),
@@ -590,10 +663,47 @@ pub enum Audience {
     Many(Vec<String>),
 }
 
+impl Audience {
+    /// Whether this actually names somebody.
+    ///
+    /// AN EMPTY `aud` IS NOT A HARMLESS ONE. `Many(vec![])` serializes untagged as the literal
+    /// `"aud": []`, and a resource server whose check reads "if `aud` is present and non-empty it
+    /// must contain me" treats that as NO RESTRICTION: the fail-open reading of the one claim the
+    /// authorization server believed it was constraining. `One(String::new())` is the degenerate
+    /// form and fails the other way, a token valid nowhere, which is an outage an operator cannot
+    /// see in their configuration. An empty ELEMENT of a list is the first case wearing the second
+    /// one's clothes, so it counts against the whole value.
+    ///
+    /// This is what makes [`AccessTokenClaims`]'s "a missing required claim should be impossible to
+    /// express" true rather than aspirational: the type could always express it, so the check has
+    /// to stand where the bytes are produced. See `JwtConfig::signing_input` (crate-private: it is
+    /// the step [`JwtConfig::sign_access_token`] runs before it hands anything to a signer).
+    pub fn names_a_resource_server(&self) -> bool {
+        match self {
+            Audience::One(one) => !one.is_empty(),
+            Audience::Many(many) => !many.is_empty() && many.iter().all(|a| !a.is_empty()),
+        }
+    }
+}
+
 /// The RFC 9068 section 2.2 claim set. Every field here except `scope` is REQUIRED by the RFC, so
 /// they are not `Option`: a missing required claim should be impossible to express, not merely
 /// discouraged.
+///
+/// TYPES CANNOT CARRY THAT ALONE, and `aud` is where it showed. Dropping the `Option` stops a claim
+/// being ABSENT; it does not stop it being EMPTY, and `Audience::Many(vec![])` serialized untagged
+/// as the literal `"aud": []`, which a resource server that checks `aud` only when it is non-empty
+/// reads as no restriction at all. So the promise above is kept by a check as well as by a shape:
+/// `JwtConfig::signing_input`, the crate-private step behind
+/// [`JwtConfig::sign_access_token`], refuses to sign a claim set whose audience names nobody. See
+/// [`Audience::names_a_resource_server`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `#[non_exhaustive]`: `rar` adds `authorization_details` and either sender-constraining feature
+/// adds `cnf`, and the `cnf` doc below records what it cost to get that gate wrong once already.
+/// A host DOES construct this, because [`JwtConfig::sign_access_token`] takes one, so
+/// [`AccessTokenClaims::new`] takes the claims RFC 9068 section 2.2 makes REQUIRED and leaves the
+/// conditional ones as public fields, which is the same split the paragraph above describes.
+#[non_exhaustive]
 pub struct AccessTokenClaims {
     /// The authorization server's issuer identifier.
     pub iss: String,
@@ -644,6 +754,64 @@ pub struct AccessTokenClaims {
     #[cfg(any(feature = "dpop", feature = "mtls"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cnf: Option<crate::token::Confirmation>,
+    /// RFC 8693 section 4.1 `act`: who authority was delegated TO, present exactly when this token
+    /// came out of a DELEGATION token exchange.
+    ///
+    /// RFC 9068 section 2.2.3 allows claims beyond the required set, and section 4.1 of RFC 8693
+    /// defines this one as a claim IN the issued token, which is what makes it belong here rather
+    /// than only on the stored record.
+    ///
+    /// Both routes are needed and the reason is the two token formats, not belt and braces. A JWT
+    /// is typically validated OFFLINE by a resource server that never calls introspection, so a
+    /// delegation recorded only on this server's record is invisible to it; an OPAQUE token is the
+    /// mirror image, carrying nothing itself and reachable only through RFC 7662. Persisting the
+    /// claim without also putting it here would have moved the deficiency from one deployment
+    /// shape to the other. See [`crate::token_exchange`]'s module docs.
+    ///
+    /// Omitted rather than sent as `null`, like `cnf` above: a member that is present and null
+    /// invites a careless reader to treat it as answered.
+    #[cfg(feature = "token-exchange")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "token-exchange")))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<crate::token_exchange::ActClaim>,
+}
+
+impl AccessTokenClaims {
+    /// The seven claims RFC 9068 section 2.2 makes REQUIRED, in the order the section lists them,
+    /// and nothing else.
+    ///
+    /// `scope` is section 2.2.3 CONDITIONAL and the other two are feature-gated extensions, so all
+    /// three are public fields set on the returned value. That is the same distinction the struct
+    /// doc draws between a claim that cannot be missing and one that can: a required claim is an
+    /// argument the caller cannot forget, and a conditional one is a decision the caller makes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        iss: impl Into<String>,
+        exp: u64,
+        aud: Audience,
+        sub: impl Into<String>,
+        client_id: impl Into<String>,
+        iat: u64,
+        jti: impl Into<String>,
+    ) -> Self {
+        AccessTokenClaims {
+            iss: iss.into(),
+            exp,
+            aud,
+            sub: sub.into(),
+            client_id: client_id.into(),
+            iat,
+            jti: jti.into(),
+            scope: None,
+            #[cfg(feature = "rar")]
+            authorization_details: crate::rar::AuthorizationDetails::none(),
+            #[cfg(any(feature = "dpop", feature = "mtls"))]
+            cnf: None,
+            // The required-set constructor: a delegation is not one of the seven.
+            #[cfg(feature = "token-exchange")]
+            act: None,
+        }
+    }
 }
 
 /// Everything needed to issue RFC 9068 access tokens: the ACTIVE signing key, any RETIRED keys
@@ -843,9 +1011,26 @@ impl JwtConfig {
     }
 
     /// Configure signing for several audiences (RFC 7519 section 4.1.3 array form).
-    pub fn with_audiences(mut self, audiences: Vec<String>) -> Self {
-        self.audience = Audience::Many(audiences);
-        self
+    ///
+    /// FALLIBLE, unlike every other builder here, and the one thing it refuses is an audience that
+    /// names nobody: an empty list, or a list with an empty member. It used to accept both and mint
+    /// `"aud": []` on every token the configuration signed, which
+    /// [`Audience::names_a_resource_server`] explains is the FAIL-OPEN reading of the claim to a
+    /// resource server that checks `aud` only when it is non-empty. A `Result` costs a deployment
+    /// nothing because this is called once, at construction, on a value the operator wrote down.
+    ///
+    /// [`JwtConfig::new`] stays infallible and takes one audience, so the same mistake in its
+    /// degenerate form (an empty string) is caught at signing time instead; see
+    /// [`Audience::names_a_resource_server`] for why both doors need closing.
+    pub fn with_audiences(mut self, audiences: Vec<String>) -> Result<Self, JwtError> {
+        let audience = Audience::Many(audiences);
+        if !audience.names_a_resource_server() {
+            return Err(JwtError(
+                "aud must name at least one resource server, and no member may be empty".into(),
+            ));
+        }
+        self.audience = audience;
+        Ok(self)
     }
 
     /// The URL at which the host serves [`JwtConfig::jwks`]. This crate does not fetch or serve
@@ -911,6 +1096,27 @@ impl JwtConfig {
         // this configuration, so serializing and encoding it per token produced identical bytes at
         // a cost paid on every token issued.
         let header = &self.encoded_header;
+
+        // THE LAST DOOR ON AN `aud` THAT NAMES NOBODY, and the only one that closes all of them.
+        // `AccessTokenClaims`'s doc says a missing required claim "should be impossible to express",
+        // and RFC 9068 section 2.2 makes `aud` required, but `Audience` is a public enum with public
+        // variants and the claim set is built by the caller, so the type has never actually made it
+        // impossible: `Audience::Many(vec![])` serializes untagged as the literal `"aud": []`, and
+        // `JwtConfig::new(signer, "")` yields `"aud": ""`. `with_audiences` refuses its half, but it
+        // is a builder and not a chokepoint. This is the chokepoint. See
+        // `Audience::names_a_resource_server` for why an empty array is the FAIL-OPEN one of the
+        // two and therefore the one worth a refusal rather than a warning.
+        //
+        // Refusing HERE rather than panicking or minting anyway is what `JwtError`'s doc already
+        // prescribes for every other way signing can fail: mint no token, answer RFC 6749 section
+        // 5.2 `server_error`. A misconfiguration is a server error; a token valid at a resource
+        // server nobody intended is not recoverable at all.
+        if !claims.aud.names_a_resource_server() {
+            return Err(JwtError(
+                "aud must name at least one resource server, and no member may be empty".into(),
+            ));
+        }
+
         let claims_json = serde_json::to_vec(claims)
             .map_err(|e| JwtError(format!("claims serialization: {e}")))?;
 
@@ -985,10 +1191,14 @@ impl Eq for JwtConfig {}
 /// [`AccessTokenFormat::Opaque`] is the DEFAULT and is what this crate did before the `jwt`
 /// feature existed: a 256-bit random string that means nothing without asking the AS. It is the
 /// right default because it leaks nothing, is revocable in the only sense that matters (the AS
-/// stops honouring it immediately), and costs a resource server one introspection call.
+/// stops honouring it immediately), and costs one introspection call per protected request.
+/// Through 0.9.1 introspection answers only the token's own client, so a deployment whose resource
+/// servers must validate independently wants [`AccessTokenFormat::Jwt`] until the resource-server
+/// channel lands in 0.9.2.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AccessTokenFormat {
-    /// Opaque random access tokens (RFC 7662 introspection is how a resource server reads them).
+    /// Opaque random access tokens (RFC 7662 introspection reads them; through 0.9.1 only for the
+    /// token's own client).
     #[default]
     Opaque,
     /// RFC 9068 `at+jwt` access tokens, signed with ES256. The record is still persisted, so
@@ -1066,7 +1276,10 @@ const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "
 /// signs with.
 ///
 /// Deserialization goes through [`PublicJwk::from_json`], including through `serde`, so there is no
-/// route into this type that skips the private-parameter rejection.
+/// route from JSON into this type that skips the private-parameter rejection. The two other
+/// constructors take no JSON at all: [`PublicJwk::from_coordinates`] takes the two coordinates and
+/// runs the same width check, and [`Jwk::to_public_jwk`] converts a key this crate published, which
+/// has no private half to reject (see that method on what it does not revalidate).
 ///
 /// The FIELDS ARE SEALED, which is what makes the sentence above true. They were public through
 /// 0.9, and a struct literal was exactly such a route: an `AssertionKeys::PublicKeys` built by hand
@@ -1310,6 +1523,35 @@ impl<'a> CompactJws<'a> {
     /// A string-valued member of the protected header, or `None` when absent or not a string.
     pub fn header_str(&self, name: &str) -> Option<&str> {
         self.header.get(name).and_then(|v| v.as_str())
+    }
+
+    /// RFC 7515 section 4.1.11 `crit`: refuse a JWS whose header names an extension this server
+    /// does not implement.
+    ///
+    /// It is UNCONDITIONAL, and that is the point of the member: the producer is stating that
+    /// understanding the named parameters is required to process the JWS correctly, so ignoring
+    /// one is not a lenient reading, it is processing a different message from the one that was
+    /// signed. RFC 8725 section 3.10 names this as an attack surface. This verifier implements NO
+    /// JWS extensions, so any `crit` at all is a refusal, and an EMPTY array is separately
+    /// forbidden by 4.1.11 itself.
+    ///
+    /// ON `CompactJws` RATHER THAN AT ONE CALL SITE, deliberately. Until 0.9.1's audit this rule
+    /// was implemented once, in `par.rs`, for request objects — while client assertions and DPoP
+    /// proofs, which are also attacker-supplied JWS parsed by this same type, checked `typ` and
+    /// `alg` and nothing else. One hardened reader and two unhardened ones is the shape that
+    /// produced this crate's earlier `claim_time` defect, where the hand-rolled copy was the one
+    /// that failed open. Every verifier now asks the same question of the same parser.
+    pub fn reject_unknown_crit(&self) -> Result<(), VerifyError> {
+        match self.header.get("crit") {
+            None => Ok(()),
+            Some(serde_json::Value::Array(names)) if names.is_empty() => Err(VerifyError::new(
+                "the header has an empty crit, which RFC 7515 s4.1.11 forbids",
+            )),
+            Some(serde_json::Value::Array(_)) => Err(VerifyError::new(
+                "the header's crit names an extension this server does not implement",
+            )),
+            Some(_) => Err(VerifyError::new("the header's crit is not an array")),
+        }
     }
 
     /// A string-valued claim, or `None` when absent or not a string.

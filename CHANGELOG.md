@@ -5,10 +5,512 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Publishing note, so this file is not read out of context: per `GOAL.md`, the crate publishes to
+Publishing note, so this file is not read out of context: the crate publishes to
 crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, tested, and pushed
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
+
+## [0.9.1] - unreleased
+
+**0.9.1 is the BETA.** 0.9.0 was an alpha published so it could be built against; this is the
+release meant to be tested in earnest, and it exists because that alpha was audited hard the day it
+shipped. Three audit rounds over the published code found 42 items, and the ones that mattered were
+not in the protocol surface, which several earlier rounds had already swept. They were in the
+places nobody had read: the cryptographic seam, the `Storage` contract, and the gates themselves.
+
+### UPGRADING FROM 0.9.0: persisted records gain fields, and a rolling upgrade needs both halves
+
+The resurrection rule below works by comparing WHEN a grant was authorized against WHEN a
+revocation was recorded, so four persisted records gained an instant: `IssuedToken` and
+`RefreshTokenRecord` gained `grant_established_at`, `AuthorizationCodeRecord` gained `issued_at`
+(and, separately, `redirect_uri_was_explicit`), and `PushedAuthorizationRequest` gained `pushed_at`.
+
+A record written by 0.9.0 carries none of them. **There is nothing to run.** Every one of the new
+fields has a `#[serde(default)]` whose default is the FAIL-CLOSED value — the epoch for the four
+instants, which predates every barrier that could be recorded, so an old record is REFUSED by a
+standing revocation rather than admitted by one. Without the default the read fails outright and
+the endpoint answers `server_error`; with a far-future default it would deserialize just as happily
+and ADMIT every record written by 0.9.0, which is the resurrection this whole release is about.
+
+A Postgres backfill migration was written for this and then deliberately REMOVED, which is worth
+recording because it looks like the obvious thing to do. It covered strictly LESS than the serde
+defaults — it cannot reach a 0.9.0 node still writing field-less payloads during a rolling upgrade,
+which is the window that actually matters — and it was the wrong shape by this crate's own
+standards: an unbounded single-statement rewrite of every live credential row, inside the
+transaction holding the advisory lock every other node's boot waits on. That is a multi-minute boot
+stall and a full table of dead tuples on a large deployment, bought for nothing.
+
+`oauth-as-postgres`'s `records_written_by_0_9_0_survive_the_upgrade` is the test that holds this:
+it writes a row whose payload is missing each new instant in turn — the shape a 0.9.0 node wrote
+for that field — and asserts each reads back as the epoch, so flipping any of these defaults to a fail-open value is red rather than silent. Note that
+it lives in the Postgres crate but guards the CORE crate's defaults.
+
+This is a patch bump that changes how stored records are interpreted, so it deserves saying plainly:
+no outage, no coordinated restart, no migration — but a grant that predates the upgrade is treated
+as maximally old, which for an access token means its next refresh is refused if any revocation
+stands against its client or subject.
+
+### BREAKING: `Storage` gains a rule, and the methods to enforce it
+
+**A write must not resurrect state that a revocation removed.** This is the reason 0.9.1 exists,
+and it is a breaking change to the `Storage` trait, which hosts implement. A host on
+`MemoryStorage` or `oauth-as-postgres` does not have to do anything beyond taking the new version
+and running the migration; a host with its own store does.
+
+WHAT WAS WRONG. Every revocation in this crate removes records that a concurrent request may
+already be holding, mid read-modify-write, and every one of those requests ends in a write. There
+was no way to express "put this back only if nothing deleted it", so the last writer won, and the
+last writer was the one that had been told to stop. Seven confirmed sites, including the one shipped
+as a known defect in 0.9.0: reuse detection and code replay raced across the `await` inside ES256
+signing, which was effectively closed for the built-in backend and OPEN for an `Es256Signer`
+fronting a remote KMS.
+
+ONE RULE, TWO EVIDENCES, because there are exactly two shapes of the problem:
+
+- Where a revocation leaves DURABLE ABSENCE, the write states what it believed the store held, and
+  a deleted record fails the comparison. New: `compare_and_swap_client`,
+  `compare_and_swap_authorization_code`, `compare_and_swap_consent`, joining the
+  `compare_and_swap_device_grant` that already existed.
+- Where the writer ITSELF took the record, absence is the normal case and proves nothing: a
+  rotation that took a refresh token cannot tell "I took this" from "a revocation took this".
+  There the evidence is a `RevocationBarrier`, recorded BY the revocation and consulted BY the
+  write.
+
+WHAT A HOST HAS TO CHANGE:
+
+- `put_token`, `put_refresh_token` and `put_pushed_authorization_request` return `WriteOutcome`
+  instead of `()`. They must consult the
+  barriers covering the record's own `client_id`, `family_id` and `subject`, and answer
+  `RefusedRevoked` instead of writing. The check and the write must be ONE atomic step.
+- `delete_client`, `revoke_token_family` and `revoke_consent` take a `RevocationWindow`
+  and must record a barrier ATOMICALLY with their removals.
+- `sweep_expired` must reclaim barriers at (and not before) that deadline, and count them.
+- The four `compare_and_swap_*` methods must compare and write as one step, and MUST NOT insert.
+- `AuthorizationCodeState` gains a third variant, `Replayed`. A detected replay records it, which
+  is what lets a redemption suspended in the host's signer discover that the grant it is halfway
+  through issuing was contained while it slept.
+
+`oauth_as::storage_conformance` now publishes twenty-two checks for all of this, each with a planted
+fault that has been watched to make it go red. Run it against your store: the failure this rule is
+about is invisible to every other check, because a cascade only reaches what is in the store when
+it runs and the write that undoes it arrives afterwards.
+
+ONE WRITE IS DELIBERATELY EXEMPT and says so: `put_authorization_code`. Refusing it would disarm
+replay detection at the moment a grant is being revoked, because the consumed record is written
+BEFORE issuance precisely so a store failure cannot take the alarm offline. What the exemption
+leaves behind is a consumed code row belonging to no live grant, which mints nothing and which
+`sweep_expired` reclaims: a row, not a capability.
+
+Postgres: a new unconditional migration, `0005_revocation_barriers.sql`. `PostgresStorage::migrate`
+applies it. If you run migrations yourself, apply it before upgrading.
+
+### BREAKING: a barrier refuses a grant, not an identity
+
+FOUND BY THE 0.9.1 CODE AUDIT, in the mechanism 0.9.1 exists to add. Two independent reviewers
+landed on it, and it was red-proven before it was fixed.
+
+A `RevocationBarrier` was keyed on identity — a `client_id`, or a (`client_id`, `subject`) pair —
+and consulted by every `put_token`. Nothing clears a barrier but the sweep at its deadline, which
+is `now + the longest lifetime this server mints`. So a user who withdrew an application and then
+approved it again held a live consent record and COULD NOT OBTAIN A TOKEN FROM IT for as long as a
+refresh token lives. The same shape locked out any `client_id` a host re-provisioned after an RFC
+7592 deletion.
+
+The refusal tests all passed, and that is the part worth keeping. Refusing MORE than intended is
+invisible to a test that asks "did it refuse?", and the one existing test aimed at this asserted
+that the consent RECORD came back — `put_consent` does not consult the barrier; `put_token` does.
+It stopped one step short of the property it claimed.
+
+WHAT CHANGED. `Storage`'s three revocation methods take a `RevocationWindow` (`recorded_at`,
+`until`) in place of a bare deadline, and records carry the instant their GRANT was authorized:
+
+- `IssuedToken::grant_established_at` and `RefreshTokenRecord::grant_established_at`, the latter
+  carried across rotation and never restamped.
+- `AuthorizationCodeRecord::issued_at` and `PushedAuthorizationRequest::pushed_at`, because
+  `expires_at` cannot stand in for either: a code minted a minute before a withdrawal expires
+  minutes AFTER it, so comparing the deadline would admit the very redemption a barrier exists to
+  refuse.
+
+A `Client` or `Consent` barrier now refuses only a grant established at or before `recorded_at`.
+A `TokenFamily` barrier still refuses UNCONDITIONALLY, deliberately: rotation mints fresh records
+inside an existing family, so comparing there would admit the rotation-after-cascade that RFC 9700
+section 4.14.2 containment exists to stop. Ties refuse, because the ordering is genuinely unknown.
+
+The instant compared is the GRANT's, never the write's. Comparing `issued_at` would have cost
+nothing and been wrong: a rotation and a code redemption both write at `now`.
+
+New host-facing conformance check `revocation_barrier/admits_a_later_grant`, with a planted fault,
+because a store that refuses on identity alone passes every other barrier check in the harness.
+
+### BREAKING: the `http` consent types are named for approval, not consent
+
+Four renames, with no deprecated alias. A host using the `http` feature's consent seam will not
+compile until it renames; that is deliberate, because a silent alias would leave two names for one
+concept in a public API that is about to be depended on in earnest.
+
+| 0.9.0 | 0.9.1 |
+|-------|-------|
+| `http::ConsentDecision` | `http::ApprovalDecision` |
+| `http::ConsentRequest` | `http::ApprovalRequest` |
+| `http::ConsentResolver` | `http::ApprovalResolver` |
+| `ServiceBuilder::with_consent_resolver` | `ServiceBuilder::with_approval_resolver` |
+
+The reason is that these three types never carried a `ConsentRecord`. They are the seam by which
+the host reports what the resource owner decided AT THIS REQUEST — an approval — and the crate's
+consent records are the separate, persisted, `consent`-feature thing that a withdrawal cascades
+over. Two different concepts sharing a word made every doc about either one ambiguous, and the
+step-up work in this release made that ambiguity load-bearing. `ConsentRecord`, `revoke_consent`
+and the `consent` feature keep their names, because those are consent.
+
+`ApprovalRequest` also gains two fields, `resource` and `authorization_details`, so a resolver can
+see what the request actually asked for before deciding.
+
+### BREAKING: `ConsentRecord::covers` takes a fourth argument
+
+`covers(&self, scope, resource, details: RequestedDetails<'_>)`. The new parameter is how a stored
+consent is asked whether it covers the RFC 9396 `authorization_details` in front of it; without it
+the method answered "covered" for a request whose details the record had never seen.
+`RequestedDetails::none()` is the honest value for a caller that has none, and is what a build
+without the `rar` feature passes.
+
+### BREAKING: the `Hooks` installers are no longer public
+
+`Hooks::{install_event_sink, install_rate_limiter, install_secret_verifier,
+install_registration_policy, install_request_object_keys, install_es256_verifier}` are now
+`pub(crate)`. They were never the supported way to do this and they let a host mutate a running
+server's hooks from outside; the supported way is and was the builder, which takes the same values
+before the server exists: `AuthorizationServer::with_event_sink`, `with_rate_limiter`,
+`with_secret_verifier`, `with_registration_policy`, `with_request_object_keys`,
+`with_es256_verifier`.
+
+### Changed: `introspection_endpoint` is advertised only where the host names it
+
+RFC 8414 metadata now carries `introspection_endpoint` only where the host set
+`ServerConfig::introspection_endpoint`. It used to be advertised unconditionally, defaulting to
+`/introspect`.
+
+**This is not a compile break.** Both `ServerConfig::introspection_endpoint` and
+`AuthorizationServerMetadata::introspection_endpoint` were already `Option<String>` at 0.9.0 and
+are unchanged; only the population changed. An earlier draft of this entry called it a breaking
+type change, which was wrong. It is a WIRE change: a deployment that did not set the field, and
+was relying on the default appearing in the document, will find the member absent.
+
+This is the visible half of an honesty ruling rather than a capability change. Through 0.9.1 this
+server answers introspection for the token's own client; it does not yet authenticate a resource
+server and answer for one. Advertising `introspection_endpoint` unconditionally in a document whose
+whole purpose is to tell a resource server what it can call was a claim the code did not support.
+So the member is now opt-in, and a host that publishes it is stating that its deployment has a use
+for it. The resource-server channel is 0.9.2 work. When it lands this member becomes unconditional
+again, and that is an addition to the document rather than a withdrawal.
+
+### Fixed: `verification_uri_complete` corrupted a verification URI that already had a query
+
+RFC 8628 section 3.3.1. The deep link was built with a hardcoded `?`, so a host whose
+`verification_uri` already carried a query got the user code folded into the previous parameter's
+value — `tenant=a?user_code=WDJB-MJHT` is one pair, not two. The page the link exists to prefill
+read no user code and rendered an empty form. The crate already had `query_separator` and used it
+for every authorization-response URL; this was the one place that answered the question twice.
+
+The existing test could not see it: its `verification_uri` had no query, so appending `?` happened
+to be right, and it asserted `contains(user_code)`, which stays true while the link stops working.
+
+### Fixed: arithmetic that panicked on host-configured values
+
+`SystemTime + Duration` panics on overflow, and `Duration += Duration` with it. Every
+ATTACKER-supplied duration in this crate already used `checked_add` with the reasoning written
+beside it; every HOST-supplied one used bare `+`, against `ServerConfig` TTL fields that are public
+and validated nowhere. A deployment reading a TTL from a config file could panic on an ordinary
+request rather than fail at startup. Now saturating, via `saturating_deadline`, at every token,
+code, device-grant, PAR and barrier deadline; `client_secret_expires_at` is a saturating `u64` add,
+which also stops a release-mode WRAP reporting a fresh secret as already expired; and the
+device-poll interval saturates rather than overflowing on a client-paced accumulation.
+
+### Fixed: Postgres did not serialize two concurrent first-time consents
+
+`compare_and_swap_consent` documented that `SELECT ... FOR UPDATE` made two concurrent creates for
+one pair serialize. It does not: a row lock on a query returning ZERO rows locks nothing, so at
+READ COMMITTED both transactions saw an empty pair and both inserted, and the pair index is
+deliberately not `UNIQUE`. `MemoryStorage` serializes both halves under its one mutex, so the two
+backends disagreed. The consequence is not untidiness: `revoke_consent` withdraws one `consent_id`,
+so the surviving duplicate keeps answering `find_consent` and the withdrawal is undone. Now taken
+under a transaction-scoped `pg_advisory_xact_lock` over the pair, which serializes when the pair is
+empty.
+
+### Fixed: an empty identifier revoked everything in memory and nothing in Postgres
+
+`delete_client("")` cascaded every record through `MemoryStorage` and — because the barrier insert
+runs first and violates a CHECK constraint — deleted NOTHING through `PostgresStorage` while
+returning an error. Same divergence for an empty `family_id` or `subject`. An empty string does not
+name an identity a barrier can be recorded for, so all three revocations now refuse it in both
+backends, before anything is mutated.
+
+### Fixed: the PKCE appendix B guard proved nothing
+
+`rfc7636_challenge_is_unpadded_base64url_of_a_32_byte_digest` said it decoded the challenge and
+pinned the RFC's bytes, as "a red-proof of the harness itself". It asserted only length 43, no
+padding, and a base64url alphabet — satisfied by ANY 43-character base64url string. The crate's
+headline PKCE claim rested on a single constant that the only other test compared the
+implementation against, so corrupting `code_challenge_s256` and updating the constant to match
+would have shipped green. It now decodes with a base64url decoder written for the test alone and
+compares against RFC 7636 appendix B's digest bytes.
+
+### Documented: DPoP `ath` is not verified, and a resource server must check it
+
+`verify_proof` is documented as the function a host's RESOURCE server can use for the RFC 9449
+section 7 check. It takes no access token, so it cannot verify the section 4.3 step 11 `ath`
+binding and does not. The module listed two unimplemented section 8 and section 10 features and
+did not list this one, so an RS built on it would accept a proof bound to a key and a request line
+but not to a token. The gap was in the docs, not the code; both now say so.
+
+### Added: `delegate_storage!`
+
+A macro that writes the forwarding methods for a store that specialises only some of them, which
+is what a host wants when clients live in Postgres and codes live in memory. It lands in the same
+release as the `Storage` break so that it forwards the final method set rather than one about to
+change. It takes a FIELD name, not an expression (`to inner`, not `to self.inner`), because macro
+hygiene makes a call-site `self` a different `self` from the generated method's.
+
+It forwards. It does not make two backends atomic with respect to each other, and no macro could;
+`delete_client`'s cascade spans both and the trait requires that to be one event.
+
+### Added: RFC 8693 `act` reaches a resource server by both routes
+
+The delegation claim is now persisted on `IssuedToken`, reported by RFC 7662 introspection, and
+carried as an RFC 9068 claim in the signed access token.
+
+Both are needed, and shipping only one is how this nearly went wrong: an OPAQUE token carries
+nothing itself, so introspection is its only channel, while a JWT is typically validated OFFLINE by
+a resource server that never introspects. Doing one and not the other moves the deficiency between
+deployment shapes rather than ending it, and RFC 8693 section 1.1's whole distinction between
+delegation and impersonation is a distinction FOR the resource server.
+
+Through 0.9.1 introspection answers only the token's own client, so on the opaque route the
+delegation is visible to that client rather than to a resource server; the resource-server channel
+is 0.9.2 work. The JWT route reaches a resource server today. The claim is persisted now because
+the RECORD, not the response, is the thing that cannot be added later.
+
+This was a known gap through 0.9.0, blocked on the persistence contract: `IssuedToken` is the
+record every host's `Storage` writes, so a new field is a migration in stores this crate does not
+own. 0.9.1 is already breaking that trait, so hosts migrate once instead of twice.
+
+### Added: RFC 7592 policy refusals reach the event sink
+
+`Event::ClientRegistrationRefusedByPolicy`. The three authentication failures on the management
+plane already emitted; the host's own `RegistrationPolicy` saying no did not, on either the
+registration or the management endpoint.
+
+The management one is the one worth having: by the time the policy is consulted the caller has
+already presented a registration access token this server verified, so a stream of these is a
+client with a WORKING credential repeatedly attempting something the deployment forbids. That is a
+different investigation from a brute force, and it was invisible in both directions, because the
+wire answer is deliberately uninformative so a policy refusing on content does not confirm what
+content it dislikes.
+
+It carries `Option<&str>`: an initial registration is refused before any client id is minted, and
+inventing one to fill the field would be the event asserting something that never existed.
+
+### Fixed: the Postgres integration tests actually run in CI
+
+They never had. CI ran `--all-features` only for `-p oauth-as`, so the one file that documents
+itself as the only evidence for cross-connection atomicity was silent. There is now a
+`postgres-atomicity` job with a health-gated PostgreSQL service.
+
+The important half is that a SKIPPED run is red. No assertion reachable from inside that suite can
+detect its own absence: drop the `pg-integration` feature and the support module is not compiled,
+every real test vanishes, and `cargo test` exits 0. So the guard is external, pins twenty-three
+test names,
+requires the observed race counts to appear, and rejects any ignored or filtered line. The job runs
+it against a deliberate default build FIRST and fails if the guard accepts, so the guard that runs
+is the guard that has been watched to fail.
+
+### Changed: behaviour a host feels without changing a line of its own code
+
+- **The authorization endpoint and RFC 7591 dynamic registration are now rate limited.** `Attempt`
+  gains `AuthorizationRequest { client_id }` and `ClientRegistration`, and `RateLimitConfig` gains
+  `authorization_request_capacity`, `authorization_request_failure_cost`,
+  `client_registration_capacity` and `client_registration_failure_cost` to size them. `Attempt` is
+  `#[non_exhaustive]`, so a host's own `RateLimiter` implementation still compiles — but it now
+  sees two variants it has never seen, and two endpoints that were never throttled now are. A host
+  that counts attempts per variant should look at its own arms before upgrading.
+- **The device-entry limiter no longer double-charges.** A `DeviceUserCodeEntry` was charged twice
+  per attempt, so a host's configured device throttle was effectively half what it wrote down.
+  Fixing it DOUBLES the effective allowance on upgrade. If the doubled figure is not what the
+  deployment wants, halve the configured capacity.
+- **The axum adapter now `tokio::spawn`s each request.** A client that disconnects mid-request no
+  longer cancels the handler, which is the point: the store sequence behind an issuance gets to
+  finish rather than leaving a token written and a code unconsumed. The consequence is that
+  in-flight work is now bounded by request RATE rather than by concurrent connections, so a
+  disconnecting client sheds no load. A host that relied on disconnects for backpressure should put
+  a concurrency limit in front of the service.
+- **Routing matches the raw wire path byte for byte.** Routes are percent-encoded at build time by
+  the router itself, and only the RFC 7592 client id captured from the path is decoded, after
+  routing. Both directions are a change: `/%74oken` no longer reaches the token endpoint, and an
+  issuer whose path component contains a percent-encoded byte now routes correctly where it
+  previously did not.
+- **`IntrospectionResponse` refuses a response it cannot represent.** Deserializing an
+  introspection response that carries a member this build has no field for is now an error instead
+  of a silently discarded value. A client parsing a richer server's response gets a refusal where
+  it used to get a lossy struct, which is the safer direction for a decision made on the result.
+- **New ceilings refuse requests that were previously accepted**: `acr_values` at `MAX_ACR_VALUES`
+  (16), RFC 9396 section 2.2 lists at `MAX_DETAIL_LIST_ENTRIES` (16), the `act` chain at
+  `MAX_ACT_CHAIN_DEPTH` (8), a client assertion at `MAX_ASSERTION_BYTES` (4096), a DPoP `jti` at
+  `MAX_JTI_BYTES` (128), and a pushed request URI lifetime at `MIN_REQUEST_URI_TTL`. Each is a
+  public constant so a host can check its own limits against them rather than discovering one in
+  production.
+- **New response headers on the HTML and redirect responses** the `http` feature serves.
+
+### Added: public API not covered by the sections above
+
+Types and modules: `RequestedDetails` (with `of` and `none`), `RevocationBarrier`, `pub mod
+delegate`.
+
+Methods and associated functions: `WriteOutcome::{is_applied, is_refused}`;
+`AuthorizationCodeState::minted`; `CompactJws::reject_unknown_crit`;
+`Audience::names_a_resource_server`; `SecretVerifier::dummy_hash`;
+`FixedWindowRateLimiter::tracked_authorization_clients`;
+`TokenRequestContext::{with_resources, with_authorization_details, with_dpop_proof}`; and `::new`
+constructors on `IssuedToken`, `RefreshTokenRecord`, `AuthorizationCodeRecord`,
+`PushedAuthorizationRequest`, `AccessTokenClaims` and `TokenRequestContext` — which exist because
+every one of those structs is `#[non_exhaustive]`, so a host outside the crate cannot build one
+with a struct literal and had no way to construct one at all.
+
+Fields and variants: `ServerConfig::allow_authorization_details_exchange`;
+`JarConfig::max_request_object_lifetime`; `UserApproval::{granted_at, decided_at}`;
+`Event::ClientRegistrationAuthenticationFailed`; `Event::DpopProofRefused`;
+`ClientAuthFailure::{NoDynamicRegistration, AssertionInvalid { reason }}`;
+`AssertionFailure::ReplayCheckUnavailable`.
+
+Constants: `CLIENT_AUTHENTICATION_FAILURE_CEILING_DIVISOR`,
+`DEFAULT_AUTHORIZATION_REQUEST_CAPACITY`, `DEFAULT_AUTHORIZATION_REQUEST_FAILURE_COST`,
+`DEFAULT_CLIENT_REGISTRATION_CAPACITY`, `DEFAULT_CLIENT_REGISTRATION_FAILURE_COST`, plus the six
+ceilings named above.
+
+### KNOWN, AND NOT FIXED IN THIS RELEASE
+
+Written for the same reason 0.9.0's list was: a third party finding a defect is a success of the
+method, and a third party finding that a CLAIM was false is not.
+
+**1. Mutation coverage is incomplete.** Surviving mutants are tracked individually rather than as
+a percentage, and each one that no test kills is argued in writing beside the code it mutates. Read
+those arguments before relying on "the tests constrain the code".
+
+**2. FIXED before promotion: `publish.yml`'s pre-publish gate ran DEFAULT FEATURES ONLY.** It ran
+`cargo clippy --workspace --all-targets --locked` and `cargo test --workspace --locked` and
+nothing else, which is roughly a third of the suite immediately before a permanent crates.io
+version, with every feature-gated capability unexercised. The defence was that `main` is only
+reached through `qa`; nothing enforces that, and this release found three separate defects that
+one matrix could not see while another could, so "the other branch checked it" is not a check. It
+now runs all three matrices plus rustdoc under `-D warnings`.
+
+**3. FIXED before promotion: `qa` was a strictly weaker gate than `dev`.**
+`scripts/size-report.sh --check` ran on `dev` and not on `qa`, so "qa green" meant less than "dev
+green", which is backwards for a promotion branch. The anti-drift check that exists to prevent
+exactly this compares step names WITHIN one job, so it could not see a whole job that was missing.
+`qa` now runs it too.
+
+It stays on `dev` as well, and that is measured rather than assumed: on the 0.9.1 green run the
+three `dev` jobs ran in parallel and the size job finished 50 seconds BEFORE the lint job, so it
+costs `dev` no wall-clock time. What it buys there is EARLY detection, which is what makes a budget
+get fixed rather than argued with: the 0.9.1 growth was caught on `dev`, and that is why the
+redundant `HashMap` behind it was found and removed instead of the number simply being raised.
+
+**4. FIXED before promotion: the storage conformance selftest now compiles and RUNS at
+`--features test-util` alone.** It did not, at 0.9.0 or through most of 0.9.1, so the guard that
+proves that harness can go red was exercised only under richer feature sets, and
+`not_runnable_in_this_build()`, whose entire purpose is the narrow build, was never exercised by
+one. Gating the consent fault fields closed it as a side effect of an unrelated fix, which is why
+it is stated as MEASURED rather than reasoned: 46 tests pass in that configuration, including
+`every_check_has_a_planted_fault`.
+
+**5. The `crates-io-publish` GitHub Environment still does not exist with reviewers.** Reaching
+`main` publishes, decided by the version number in `Cargo.toml`, and GitHub auto-creates a
+referenced environment UNPROTECTED on first use, which is why 0.9.0 published with no approval
+pause. Until that environment exists with required reviewers and a deployment-branches rule of
+`main` only, the `environment:` line in the workflow is decoration. This is an owner action; it
+cannot be done from inside a workflow file.
+
+### BREAKING: the `client_assertion` feature is now `client-assertion`
+
+The cargo feature is renamed. There is NO alias, deliberately: 0.9.x is pre-1.0, adoption is hours
+old, and an alias would carry the inconsistency into 1.0 where it could not be removed.
+
+To migrate, change the spelling wherever you name the feature:
+
+```toml
+oauth-as = { version = "0.9.1", features = ["client-assertion"] }
+```
+
+WHAT DOES NOT CHANGE, and it is the reason this rename is narrower than a search-and-replace: the
+RFC 7523 section 2.2 WIRE PARAMETER is also spelled `client_assertion`, as are
+`client_assertion_type` and the `TokenRequest` field that carries it. Those are protocol, not
+configuration, and renaming them would break every conforming client. The Rust module path
+`oauth_as::client_assertion` is unchanged too, because a Rust path cannot contain a hyphen.
+
+So a host changes its `Cargo.toml`, its `--features` lists and any `#[cfg(feature = ...)]` it
+wrote; it changes nothing it sends or receives.
+
+The hyphen matches every other multi-word feature in this crate (`token-exchange`,
+`resource-metadata`, `jwt-p256`), which is what made the odd one out worth fixing at all.
+`scripts/feature-mirrors.py` checks that the manifest, both CI no-backend lists, the size probe and
+the size report all agree, so the rename could not land in some of those places and not others.
+
+### The version number moved, and what that means
+
+`dev` carries 0.9.1 from the moment work on it starts, so a build from `dev` never claims to be the
+published 0.9.0. Publication is still decided by the version number reaching `main`, not by this
+line.
+
+### Fixed: feature-varying public types are sealed before anyone builds against them
+
+Twenty-six public types have a field or variant set that VARIES WITH CARGO FEATURES. Nineteen of
+them were not `#[non_exhaustive]`; sixteen are now sealed, and the remaining three are listed in
+`tests/host_api_shape.rs::DELIBERATELY_UNMARKED` with the argument for leaving them open. Two more
+that do not vary by feature — `ParConfig` and `JarConfig` — were sealed at the same time. Adding
+`ProtectedResourceMetadata` (recorded separately below) and `RequestedDetails`, a type new in this
+release and sealed at birth, the attribute count on public structs and enums moved from 19 to 39.
+
+Those numbers are stated exactly because the first version of this entry said "twenty", which was
+not the count of anything: not the types that vary, not the ones that were unmarked, not the ones
+that changed. It understated the change by six types and named none of them, in the one entry a
+host reads to decide whether 0.9.1 breaks their struct literals and their exhaustive matches. The
+0.9.1 audit caught it by re-running the project's own scan (`tests/host_api_shape.rs`) against
+`v0.9.0` and against this tree; that test asserts only `varying.len() > 10`, so nothing had gated
+the claim.
+
+Every one of the fifteen features is off by default, so a host writes a struct literal or an
+exhaustive `match` against the features THEY enabled, and their build breaks the day anything else
+in their dependency graph turns one on. `#[non_exhaustive]` cannot be added later without breaking
+people, which made this the last cheap moment to do it: 0.9.0 had been published for roughly an
+hour.
+
+### Changed (BREAKING): `ProtectedResourceMetadata` is `#[non_exhaustive]`
+
+The RFC 9728 document type was all-`pub` with no attribute, though the module header gives it the
+same argument the sealed types got: it is DERIVED from configuration rather than hand-written, and
+the members are an IANA registry that takes new entries. Nothing in this crate, its tests or its
+examples builds one by literal — `from_config` is the only constructor — so the change is invisible
+to every use the crate knows about. It is breaking for a host that wrote the literal by hand, and it
+is in 0.9.1 because 0.9.0 was published for an hour and this is the last release in which the
+attribute can go on at all. Deserialization, field reads and matches are unaffected.
+
+### Fixed: claims the code did not support
+
+Nine of them, in the documents a stranger reads before deciding whether to trust the crate. The
+README said the 1.75 floor "tests clean"; it does not and cannot, because `litemap 0.7.5`
+arrives through a dev-dependency and needs 1.81. The project's own planning notes named a
+dependency that had been made optional, and a `cargo +1.75 test` gate that cannot pass. The
+workspace manifest said
+`oauth-as-postgres` did not implement the PAR and replay methods; it implements all three. A
+manifest comment credited bench rot protection to a CI step that does not exist.
+
+### Fixed: gates that could not fail
+
+`qa` was missing dev's feature-combination build, so every promotion passed through a stage that
+checked LESS than the one before it, on precisely the check that catches under-gated `cfg` code. The
+publish workflow treated an unparseable crates.io response as "not yet published" and would have
+armed a publish on a proxy error page served with HTTP 200. Three hand-maintained copies of the
+feature list were cross-checked by nobody. A published `Storage` conformance check had no planted
+fault, so it had never been shown able to go red.
 
 ## [0.9.0] - 2026-08-09
 
@@ -45,10 +547,11 @@ consult, rather than a narrower window: a marker that a later write cannot resur
 breaking change to the `Storage` trait and it is why it is not in this release rather than rushed
 into it.
 
-**2. Mutation coverage is incomplete (`GOAL.md` gate 4 is OPEN).**
+**2. Mutation coverage is incomplete.**
 
-`MUTANTS.md` names every surviving mutant individually rather than reporting a percentage. Read it
-before assuming a green test run means the tests would have caught a given change.
+Surviving mutants are tracked individually rather than as a percentage, and each is argued in
+writing beside the code it mutates. Do not assume a green test run means the tests would have
+caught a given change.
 
 ### Everything else in 0.9.0
 
@@ -483,8 +986,8 @@ mutated.
   `remembered_consent` and `consents_for_subject` follow their storage methods.
 
   RFC 7662 introspection went from 18 allocations to 4. That is the number that mattered most:
-  this crate's default access token is opaque, so a resource server introspects on every protected
-  request it serves.
+  this crate's default access token is opaque, so the client introspects — and a 0.9.2 resource
+  server will introspect — on every protected request it serves.
 
   `get_device_grant` and `find_device_grant_by_user_code` were tried and REVERTED. The device poll
   mutates what it read (`last_poll_at`, and `interval` on a too-fast poll) and writes it back, so an
@@ -777,6 +1280,20 @@ while deciding not to investigate.
   code record back (which is what makes the NEXT replay detectable at all), were fire-and-forget
   too. All three now feed `containment_failed`. Hosts matching this variant exhaustively must add
   the field.
+- **BREAKING: `Event::RefreshTokenReuseDetected` gains `containment_failed: bool`, and a reuse the
+  server could not contain is now REPORTED rather than swallowed.** This is the other half of the
+  argument above, and the refresh path had the worse version of it: the event was not overstated,
+  it was ABSENT. `take_refresh_token` has already removed the spent record by the time the family
+  revocation runs, and that revocation's error was propagated with `?`, so three things were true
+  at once — the family was not revoked and the thief's rotated chain stayed live; the spent record
+  was gone and never put back, so RFC 9700 s4.14.2 reuse detection for that family was off
+  PERMANENTLY and a later presentation of the same string read as an unknown token; and no event
+  fired, so the host's only audit channel was never told. The event now fires on BOTH outcomes
+  (with `records_revoked: 0` on the failure), the spent record goes back so the alarm stays armed,
+  and the wire answer is `invalid_grant` either way, as it already was. Hosts matching this variant
+  exhaustively must add the field: `Event` is `#[non_exhaustive]`, but the VARIANT's fields are
+  not, so a `match` arm that destructures it without `..` fails to compile until it is updated.
+  The same is true of the two variants below and was true of them in this release already.
 - **BREAKING: `Event::TokenRevoked` gains `cascade_failed: bool`.** RFC 7009 s2.1's SHOULD, that
   revoking a refresh token also invalidates the access tokens of the same grant, remains
   deliberately non-fatal (turning a completed revocation into an error would tell an honest client
@@ -966,8 +1483,8 @@ loop, it was that nothing bounded `n`.
 
 ## [0.9.0-rc.1] - 2026-08-08 (development snapshot, superseded by 0.9.0 above)
 
-**0.9.0 adds no new protocol surface. It exists to prove the crate against the outside world**
-(`ROADMAP.md`), and the most valuable thing in it is an honest account of what could and could not
+**0.9.0 adds no new protocol surface. It exists to prove the crate against the outside world**,
+and the most valuable thing in it is an honest account of what could and could not
 be proven. Everything between 0.1.0 and 0.8.0 is folded in here, because those versions were built
 and promoted but never published: from crates.io's point of view this is the first release with an
 implementation in it.
@@ -984,8 +1501,8 @@ implementation in it.
   is trusted. Two independently written client libraries now accept this server's wire bytes.
 - **A third-party scanner now reaches this crate's RFC 8414 document**: the `authgent` MCP-OAuth
   scanner, pinned at `authgent-server==0.3.4` and wired into `qa.yml` through its own composite
-  action `authgent/authgent/.github/actions/mcp-lint@v0.3.4`. `KICKOFF.md` recorded that this
-  scanner bails without RFC 9728 protected resource metadata; RFC 9728 landed in the crate, so the
+  action `authgent/authgent/.github/actions/mcp-lint@v0.3.4`. That scanner bails without RFC 9728
+  protected resource metadata; RFC 9728 landed in the crate, so the
   blocker is now removable honestly, with a loopback fixture resource that publishes a document
   that is TRUE about the deployment under test. **This project is not an MCP server and does not
   claim to be one; the scanner's MCP verdict is quoted nowhere.** What is claimed is exactly that
@@ -1030,8 +1547,7 @@ implementation in it.
 
 ### Added: protocol surface, 0.2.0 through 0.8.0
 
-Folded in here because none of those versions was published. See `ROADMAP.md` for the slice each
-belongs to.
+Folded in here because none of those versions was published.
 
 - **RFC 7523 JWT client assertions**: `private_key_jwt` (ES256) and `client_secret_jwt` (HS256),
   behind an off-by-default `client_assertion` feature. Until this landed, a deployment whose
@@ -1252,10 +1768,10 @@ harness that judges it.
 
 ### Notes
 
-- `GOAL.md` records the honest state of the ten gates that define "done" for this project;
-  several are not yet closed at 0.1.0, including the RFC 9068 JWT access token feature, the HTTP
-  serve shim required for a live `--check` run, and mutation testing.
-- `KICKOFF.md` and `ROADMAP.md` document research into third-party conformance tooling: there is
+- Several of the gates that define "done" for this project are not yet closed at 0.1.0, including
+  the RFC 9068 JWT access token feature, the HTTP serve shim required for a live `--check` run,
+  and mutation testing.
+- On third-party conformance tooling: there is
   no OAuth 2.1 certification programme in existence, the OpenID Foundation suite has zero
   references to RFC 8628, and neither `authgent` nor OAuch could be wired into CI honestly as of
   2026-08-08. The independent judges of this release are the vendored RFC vectors and the pinned

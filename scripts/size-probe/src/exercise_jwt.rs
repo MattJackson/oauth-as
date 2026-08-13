@@ -6,7 +6,7 @@
 //! The core plane already signs, because `exercise::config` sets `AccessTokenFormat::Jwt` when
 //! this feature is on, so every token issued there goes through ES256. What this adds is the rest
 //! of the surface a host touches: key import and export, the published key set, and the
-//! VERIFICATION half that `jar`, `dpop` and `client_assertion` all rest on.
+//! VERIFICATION half that `jar`, `dpop` and `client-assertion` all rest on.
 
 use oauth_as::jwt::PublicJwk;
 
@@ -15,7 +15,7 @@ pub fn plane() -> u64 {
 
     // The SEAM half, which is all a host with its own backend links: a published JWK, serialized,
     // read back through the attacker-input parser, and thumbprinted. One copy of this code serves
-    // `jar`, `dpop` and `client_assertion` (see the VERIFICATION banner in src/jwt.rs), so it is
+    // `jar`, `dpop` and `client-assertion` (see the VERIFICATION banner in src/jwt.rs), so it is
     // charged to `jwt` here rather than three times over.
     #[cfg(not(feature = "f-jwt-p256"))]
     let jwk = {
@@ -58,7 +58,7 @@ pub fn plane() -> u64 {
         }
         // The ES256 VERIFICATION arithmetic is deliberately NOT exercised here, and that is
         // unchanged from before the seam: it is charged to the `jar`, `dpop` and
-        // `client_assertion` rows, which are the features a host turns on to use it. Charging it
+        // `client-assertion` rows, which are the features a host turns on to use it. Charging it
         // here as well would make this row incomparable with the `jwt` row it replaces.
         key.public_jwk()
     };

@@ -336,7 +336,7 @@ fn a_proof_is_refused_at_the_exact_instant_its_jti_stops_being_remembered() {
     //
     // The two predicates must therefore agree at every instant, and the boundary is where they can
     // disagree. The sweep's is exclusive (`now < exp`), so acceptance is exclusive too.
-    // `client_assertion` has never had this gap because its acceptance was exclusive already.
+    // `client-assertion` has never had this gap because its acceptance was exclusive already.
     let key = EcdsaP256Key::generate("k");
     let mut c = claims();
     let iat = secs(now()) - MAX_PROOF_AGE.as_secs();

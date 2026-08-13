@@ -34,7 +34,7 @@ use std::sync::Arc;
 use oauth_as::client::ClientId;
 use oauth_as::scope::ScopeSet;
 use oauth_as::store::Storage;
-use oauth_as::token::{RefreshTokenRecord, RefreshTokenState};
+use oauth_as::token::RefreshTokenRecord;
 use oauth_as_postgres::{naive, PostgresStorage};
 use tokio::sync::Barrier;
 
@@ -57,26 +57,21 @@ async fn two_connections(schema: &str) -> (PostgresStorage, PostgresStorage) {
 }
 
 fn refresh_record(token: &str) -> RefreshTokenRecord {
-    RefreshTokenRecord {
-        refresh_token: token.to_string(),
-        client_id: ClientId::new("client-two-connection"),
-        subject: Some("subject-two-connection".to_string()),
-        scope: ScopeSet::parse("read write").expect("a valid RFC 6749 s3.3 scope"),
-        resource: vec!["https://rs.example/".to_string()],
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        expires_at: Some(
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000),
-        ),
-        #[cfg(feature = "dpop")]
-        jkt: None,
-        #[cfg(feature = "mtls")]
-        x5t_s256: None,
-        family_id: "family-two-connection".to_string(),
-        state: RefreshTokenState::Active,
-        #[cfg(feature = "consent")]
-        authentication: None,
-    }
+    // Built through the constructor rather than as a literal, which is what a host implementing
+    // `Storage` out of tree now has to do: the record is `#[non_exhaustive]` because its field set
+    // moves with four cargo features. `state` is `Active` and the two sender-constraining
+    // thumbprints are `None` by construction, which is what this literal said.
+    let mut record = RefreshTokenRecord::new(
+        token,
+        ClientId::new("client-two-connection"),
+        Some("subject-two-connection".to_string()),
+        ScopeSet::parse("read write").expect("a valid RFC 6749 s3.3 scope"),
+        "family-two-connection",
+    );
+    record.resource = vec!["https://rs.example/".to_string()];
+    record.expires_at =
+        Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000));
+    record
 }
 
 /// One race over `take_refresh_token`, returning the number of callers handed the record.
@@ -152,7 +147,8 @@ async fn take_refresh_token_has_exactly_one_winner_across_two_connections() {
     let (a, b) = two_connections("oauth_as_two_conn_take").await;
     for round in 0..ROUNDS {
         let token = format!("rt-atomic-{round}");
-        a.put_refresh_token(refresh_record(&token))
+        let _ = a
+            .put_refresh_token(refresh_record(&token))
             .await
             .expect("plant the refresh record");
         let winners = race_take(&a, &b, &token, true).await;
@@ -173,7 +169,8 @@ async fn the_naive_take_is_caught_by_the_same_race() {
     let mut double_spends = 0;
     for round in 0..ROUNDS {
         let token = format!("rt-naive-{round}");
-        a.put_refresh_token(refresh_record(&token))
+        let _ = a
+            .put_refresh_token(refresh_record(&token))
             .await
             .expect("plant the refresh record");
         if race_take(&a, &b, &token, false).await > 1 {

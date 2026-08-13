@@ -37,7 +37,7 @@
 #        the Rust drive does not, because a second opinion on the same question is worth less
 #        than a first opinion on a new one. scripts/oauth-interop.sh, --selftest first.
 #     5. `authgent` (github.com/authgent/authgent, Apache 2.0, PyPI `authgent-server`), NOW
-#        WIRED IN, which reverses the decision recorded here on 2026-08-08 and in KICKOFF.md.
+#        WIRED IN, which reverses the decision recorded here on 2026-08-08 to leave it out.
 #        Nothing about the tool changed; this crate did. The scanner
 #        (server/authgent_server/scanner.py) fetches RFC 9728 Protected Resource Metadata first
 #        and, absent it, returns one critical "not an MCP server" finding and skips every
@@ -59,7 +59,7 @@
 #        threshold is always the default `error`; do not set `fail-on` here and expect it to do
 #        anything.
 #     6. OAuch (github.com/DistriNet/OAuch, MIT) is NOT wired in, and 0.9.0 closes the question
-#        rather than deferring it again. ROADMAP.md asked for a headless spike or a written record
+#        rather than deferring it again. 0.9.0 owed either a headless spike or a written record
 #        of why it is impossible; the record is section 4 of
 #        crates/oauth-as-conformance/EXTERNAL-TOOLING.md. The short version is structural, not a
 #        failure to look: `StartTests` has exactly one call site in the whole repository, inside
@@ -81,10 +81,18 @@
 #        to exist as of 2026-08-08. If one surfaces later, wire it in following the same pinning
 #        discipline as every other job in this file.
 #
-# NO continue-on-error anywhere: every step is load-bearing and a failure is RED. The
-# cargo-mutants job is a deliberate exception to "failure is RED" in spirit only: it is a
-# reporting job by design (see that job's comment), and it achieves non-blocking behaviour by
-# never letting a step fail rather than by using continue-on-error, per house rule.
+# NO continue-on-error anywhere, and NO exceptions: every job in this file is load-bearing and a
+# failure is RED. There used to be one exception, a `cargo-mutants` job that swallowed its own exit
+# code and reported for information, and it was REMOVED at 0.9.1 rather than kept.
+#
+# The argument for removing it is the one that applies to any job that cannot fail. CI answers
+# three questions: does it build, is it clean, is it tested. A job whose result nothing acts on
+# answers none of them, it costs several minutes on every promotion, and it makes a run look
+# unfinished while the answer is already known. Mutation testing asks a different question, whether
+# the tests actually CONSTRAIN the code, and that is a deep one-time analysis against a tree that
+# has stopped moving. It belongs with `/codeaudit`, run deliberately between releases, not on every
+# push. It is run against a frozen tree between releases, and what survives is either killed by a
+# test or argued in writing beside the code it mutates.
 
 name: qa full suite
 
@@ -92,6 +100,23 @@ on:
   push:
     branches: [qa]
 
+# LEAST PRIVILEGE FOR THE JOB TOKEN. See the identical block in dev.yml for the reasoning; the
+# short version is that with no `permissions:` key at all every job here runs with whatever scope
+# the repository SETTINGS grant, which is a value no reviewer of this file can see.
+#
+# It matters more here than in dev.yml, because this is the workflow that hands a checkout to a
+# THIRD-PARTY composite action (`mcp-lint`, in the `mcp-lint` job). Nothing in this file writes to
+# the repository: it lints, tests, measures, and scans.
+permissions:
+  contents: read
+
+# One run per ref, and the newer one wins. Unlike `publish.yml`'s group this one DOES cancel: a
+# superseded qa run is measuring a commit nobody is promoting any more, and the suite here is long
+# enough (a real PostgreSQL, the conformance drives, the fuzz build) that leaving stale runs to
+# finish starves the one that matters.
+#
+# Deleted by accident during the 0.9.1 audit, when the `permissions:` hunk above replaced it rather
+# than being added beside it, and found by a lens pointed at the audit's own changes.
 concurrency:
   group: qa-${{ github.ref }}
   cancel-in-progress: true
@@ -110,16 +135,194 @@ jobs:
   # is roughly 320 of this crate's 710 tests, so every feature-gated suite, and every no-backend
   # suite with it, reached the promotion branch unexecuted. If a step is added to dev.yml's
   # lint-and-test job it belongs here too, or this comment goes back to being untrue.
+  #
+  # AND IT WENT BACK TO BEING UNTRUE: `build feature combinations` was in dev.yml and not here, so
+  # the same shape survived the correction that was written to end it. Restating the rule in a
+  # comment has now failed twice, so the rule is CHECKED: the first step of this job compares this
+  # job's step names against dev.yml's and fails naming anything that is missing. Adding a step to
+  # dev.yml without adding it here is now a red qa run, not a paragraph nobody re-reads.
   lint-and-test:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # THE DRIFT CHECK ITSELF, because the comment above has now been untrue twice and a rule
+      # nothing enforces is a note. It asks three questions of dev.yml and this file, and each of
+      # the three exists because the previous version of this check missed something real:
+      #
+      #   1. Does qa have every JOB dev has? It did not compare jobs at all until 2026-08-12, and
+      #      the `size` job escaped through exactly that hole: it was on dev and missing here
+      #      through 0.9.1, was noticed by a human, and was patched by hand while the check that
+      #      should have caught it was left alone. A check that misses something and is not
+      #      strengthened afterwards will miss the same thing again.
+      #   2. Does qa's lint-and-test have every named STEP dev's does? This is the original check.
+      #   3. Does each shared step RUN THE SAME COMMAND? Names-only meant `- name: tests` here
+      #      could run something strictly weaker than `- name: tests` there and the check would
+      #      report agreement, which is the same "passes for a reason other than the one it names"
+      #      shape this whole file keeps finding.
+      #
+      # Extra jobs and extra steps in qa are fine (qa is allowed to be stronger); missing ones are
+      # not, because the promotion order is dev -> qa -> main and main publishes, so a weaker qa
+      # means the release stage checked less than the branch it was promoted from.
+      #
+      # FIRST STEP ON PURPOSE: it needs no toolchain and no cache, so the drift is reported in
+      # seconds rather than after the compile it was supposed to gate. It is also the one step
+      # here that cannot be copied from dev.yml, since dev is the source side of the comparison.
+      - name: qa must not check less than dev (workflow drift)
+        run: |
+          set -euo pipefail
+          # PyYAML, obtained by whichever route this image allows: it is usually already there,
+          # and the two fallbacks exist because a PEP 668 "externally managed" system python and a
+          # pip-less one are both plausible runner images. If none of the three works the step is
+          # RED, which is correct: the check must never be skipped for want of a parser.
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pyyaml \
+            || sudo apt-get install -y -qq python3-yaml
+          python3 - <<'PY'
+          import re
+
+          import yaml
+
+          JOB = "lint-and-test"
+
+          DEV = ".github/workflows/dev.yml"
+          QA = ".github/workflows/qa.yml"
+
+          # dev jobs that qa covers under DIFFERENT names, and what covers them. Each entry is a
+          # deliberate exception that a human wrote down, and each listed replacement must exist
+          # or this check fails: an exemption pointing at a job nobody runs is worse than no
+          # exemption. Adding a NEW job to dev.yml and nothing here is still a red run.
+          COVERED_ELSEWHERE = {
+              # dev runs --selftest and --check as two steps of one job; qa splits them into two
+              # jobs so the RED proof and the live run report separately.
+              "conformance": ["conformance-selftest", "conformance-check"],
+          }
+
+          problems = []
+
+
+          def load(path):
+              with open(path) as fh:
+                  return yaml.safe_load(fh)
+
+
+          def normalised(run):
+              """A step's shell body, comparable across the two files.
+
+              Comments go (dev.yml explains a step at length where qa.yml points at dev.yml), line
+              continuations are joined, and runs of whitespace collapse. What is left is the
+              commands, in order, which is the thing that has to match.
+              """
+              lines = [
+                  line for line in run.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              return re.sub(r"\s+", " ", " ".join(lines).replace("\\", " ")).strip()
+
+
+          dev_doc = load(DEV)
+          qa_doc = load(QA)
+
+          # A gate nobody has seen work is not a gate: if either file stops parsing the way this
+          # check assumes, it must fail rather than compare two empty structures and agree.
+          dev_jobs = dev_doc.get("jobs") or {}
+          qa_jobs = qa_doc.get("jobs") or {}
+          if not dev_jobs or not qa_jobs:
+              print("::error::drift check read no jobs (dev=%d, qa=%d); the check itself is "
+                    "broken and must be fixed before this result means anything"
+                    % (len(dev_jobs), len(qa_jobs)))
+              raise SystemExit(1)
+
+          # 1. JOBS.
+          for name in sorted(set(dev_jobs) - set(qa_jobs)):
+              covers = COVERED_ELSEWHERE.get(name)
+              if covers is None:
+                  problems.append(
+                      "dev.yml has a job '%s' that qa.yml does not. qa runs BEFORE main, and main "
+                      "publishes, so qa must never check less than dev. Copy the job here, or "
+                      "record what covers it in COVERED_ELSEWHERE in this check." % name
+                  )
+                  continue
+              for replacement in covers:
+                  if replacement not in qa_jobs:
+                      problems.append(
+                          "COVERED_ELSEWHERE says qa.yml's '%s' covers dev.yml's job '%s', and "
+                          "qa.yml has no such job. An exemption pointing at a job nobody runs is "
+                          "an exemption for nothing." % (replacement, name)
+                      )
+
+          # 2 and 3. STEPS of the shared job, by name and by command.
+          for path, doc in ((DEV, dev_jobs), (QA, qa_jobs)):
+              if JOB not in doc:
+                  print("::error::%s has no job named '%s'. If the job was renamed, rename it in "
+                        "BOTH workflows and update JOB in this check; a drift check that cannot "
+                        "find the jobs it compares proves nothing." % (path, JOB))
+                  raise SystemExit(1)
+
+          dev_steps = {s["name"]: s for s in dev_jobs[JOB]["steps"] if "name" in s}
+          qa_steps = {s["name"]: s for s in qa_jobs[JOB]["steps"] if "name" in s}
+          if not dev_steps or not qa_steps:
+              print("::error::drift check read no named steps (dev=%d, qa=%d) for job '%s'; the "
+                    "check itself is broken and must be fixed before this result means anything"
+                    % (len(dev_steps), len(qa_steps), JOB))
+              raise SystemExit(1)
+
+          compared = 0
+          for name, dev_step in dev_steps.items():
+              qa_step = qa_steps.get(name)
+              if qa_step is None:
+                  problems.append(
+                      "dev.yml's '%s' job has a step '%s' that qa.yml's does not. Copy the step "
+                      "into qa.yml's '%s' job." % (JOB, name, JOB)
+                  )
+                  continue
+              dev_run, qa_run = dev_step.get("run"), qa_step.get("run")
+              if (dev_run is None) != (qa_run is None):
+                  problems.append(
+                      "step '%s' is a `run:` step in one workflow and not in the other, so the "
+                      "two cannot be doing the same work under the same name." % name
+                  )
+                  continue
+              if dev_run is None:
+                  continue
+              compared += 1
+              if normalised(dev_run) != normalised(qa_run):
+                  problems.append(
+                      "step '%s' runs DIFFERENT commands in the two workflows. A shared step name "
+                      "carrying a weaker command here is the failure this comparison exists for; "
+                      "if the difference is deliberate, give the two steps different names.\n"
+                      "  dev.yml: %s\n  qa.yml : %s"
+                      % (name, normalised(dev_run), normalised(qa_run))
+                  )
+
+          if not compared:
+              print("::error::drift check compared zero `run:` bodies, so the command comparison "
+                    "proved nothing. Fix the check.")
+              raise SystemExit(1)
+
+          if problems:
+              for problem in problems:
+                  print("::error::%s" % problem)
+              raise SystemExit(1)
+
+          print("qa covers all %d jobs and all %d named steps of dev.yml's '%s' job, and the %d "
+                "shared `run:` bodies are identical"
+                % (len(dev_jobs), len(dev_steps), JOB, compared))
+          PY
+      # The FEATURE LIST drift check, which is a different question from the step-name one above:
+      # that one asks whether qa runs the same steps as dev, this one asks whether the feature
+      # lists inside those steps still describe the crate's [features] table. Both workflows carry
+      # a copy of the no-backend list and scripts/size-probe/Cargo.toml carries a third, so the
+      # script checks all three against crates/oauth-as/Cargo.toml; running it here as well as in
+      # dev.yml is what the step-name check above requires, and it costs a second.
+      - name: feature lists must match the crate manifest (feature drift)
+        run: python3 scripts/feature-mirrors.py
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy (deny warnings)
@@ -135,13 +338,45 @@ jobs:
       - name: tests (every feature EXCEPT the ES256 backend)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,mtls,par,jar,client_assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+      # See dev.yml's copy of this step for the full argument. Short version: RFC 9396 section 5's
+      # refusals are proven by two files gated `not(feature = "rar")`, and no feature set named
+      # anywhere ran them. One was never compiled at all. The rule is `--all-features` minus `rar`.
+      - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
+        run: |
+          cargo test -p oauth-as --locked --features \
+            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,test-util
       - name: rustdoc (deny warnings)
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc -p oauth-as --locked --all-features --no-deps
       - name: doc tests (all features)
         run: cargo test -p oauth-as --locked --all-features --doc
+      # FEATURE COMBINATIONS. This step was MISSING here while dev.yml had it, which made qa a
+      # strictly weaker gate than dev on precisely the check that catches under-gated `cfg` code
+      # (see the long comment on the matching step in dev.yml for the escape that put it there).
+      # The list is kept identical to dev.yml's on purpose; the drift check at the top of this job
+      # only compares step NAMES, so a divergence in the feature list itself is still a human
+      # matter -- change both or neither.
+      #
+      # CLIPPY --all-targets, NOT `cargo build`: see the long note on the matching step in dev.yml
+      # for the seven live `-D warnings` errors that were sitting behind `cargo build` compiling
+      # the library and nothing else.
+      - name: clippy feature combinations (all targets)
+        run: |
+          set -e
+          for f in "" "http" "jwt" "jwt-p256" "http,jwt" "http,jwt-p256" "jwt,rar" \
+                   "http,jwt,dpop" "jwt,mtls" "dpop,jar,client-assertion" \
+                   "jwt,client-assertion" "http,jwt,par,jar" "jwt,token-exchange" \
+                   "consent" "resource-metadata" "test-util" "test-util,jwt"; do
+            echo "::group::features: ${f:-<default>}"
+            if [ -z "$f" ]; then
+              cargo clippy -p oauth-as --locked --all-targets --no-default-features -- -D warnings
+            else
+              cargo clippy -p oauth-as --locked --all-targets --features "$f" -- -D warnings
+            fi
+            echo "::endgroup::"
+          done
 
   # MSRV verification. The floor is 1.75, and it is MEASURED rather than declared: 1.74 fails on
   # return-position impl Trait in the Storage trait, and 1.75 compiles clean. A declared floor
@@ -152,18 +387,56 @@ jobs:
   # to require a much newer toolchain than the library. Building it here would make the harness's
   # dependencies silently dictate the library's MSRV, which is exactly backwards.
   #
-  # Every feature combination is checked, because an optional dependency is perfectly capable of
-  # raising the floor for the consumers who enable it while the default build stays fine.
+  # THE FEATURE SETS BELOW ARE THE ONES THAT CAN MOVE THE FLOOR, which is a narrower and truer
+  # claim than the one this comment used to make ("every feature combination is checked", while
+  # three of fifteen were). An optional dependency can raise the floor for the consumers who
+  # enable it while the default build stays fine, so what has to be covered is every feature that
+  # ADDS A DEPENDENCY: `jwt-p256` brings p256 and its tree, `jwt-pkcs8` brings p256's `pkcs8`
+  # feature and the der/spki crates behind it, and `http`/`axum` bring the ones with the higher
+  # floor and are therefore measured separately in the `msrv-http` job below. The rest
+  # (`par`, `rar`, `consent`, `mtls`, ...) enable no dependency the default build does not already
+  # have, or only `serde_json`, which the default build compiles anyway.
+  #
+  # THE TOOLCHAIN IS DERIVED FROM THE MANIFEST, not typed here. It was hardcoded as `1.75` in the
+  # job name, the step name and the `uses:` ref, with nothing tying any of them to
+  # `rust-version` in crates/oauth-as/Cargo.toml. Lowering the manifest to 1.74 would have left
+  # this job installing 1.75, passing, and certifying a floor the crate had never been built at,
+  # which is the same shape as every other finding in this file: a check that passes for a reason
+  # other than the one it names. Now a change to `rust-version` changes what this job installs, on
+  # the same commit.
   msrv:
-    name: MSRV (1.75) build
+    name: MSRV build (toolchain from rust-version)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust 1.75 toolchain
-        uses: dtolnay/rust-toolchain@1.75
-      - uses: Swatinem/rust-cache@v2
+      # The runner's preinstalled stable cargo reads the manifest; the toolchain it names is what
+      # the next step installs. `next()` with no default on purpose: a manifest with no oauth-as
+      # package raises rather than yielding a fallback, and an absent `rust-version` is caught
+      # below. A floor this job had to guess at would not be a floor.
+      - name: Read the declared MSRV out of crates/oauth-as/Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          floor="$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["rust_version"] for p in d["packages"] if p["name"]=="oauth-as") or "")')"
+          if [ -z "$floor" ]; then
+            echo "::error::crates/oauth-as/Cargo.toml declares no rust-version, so this job has no floor to verify. Declare one; a published crate without an MSRV is a promise nobody can check."
+            exit 1
+          fi
+          echo "declared MSRV: $floor"
+          echo "toolchain=$floor" >> "$GITHUB_OUTPUT"
+      # `id:` so the commands below can use the action's own `name` output rather than the string
+      # from the manifest. rustup normalises "1.75" to the toolchain it actually installed
+      # ("1.75.0-x86_64-unknown-linux-gnu"), so `cargo +1.75` is not guaranteed to resolve; the
+      # action publishes the resolved name for exactly this.
+      - name: Install the declared MSRV toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
-          key: msrv-1.75
+          toolchain: ${{ steps.msrv.outputs.toolchain }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+        with:
+          key: msrv-${{ steps.msrv.outputs.toolchain }}
       # --locked throughout: an MSRV that only holds when cargo is free to pick different
       # dependency versions is not a floor anyone can rely on. Note this also requires every
       # entry in Cargo.lock to be PARSEABLE by this cargo, which is why base64ct and zeroize are
@@ -187,17 +460,27 @@ jobs:
       #
       # So the floor is verified the way a consumer meets it: the library compiles. Behaviour is
       # verified by the full test suite on stable, in the fmt/clippy/test job above.
-      - name: build on 1.75, default features
-        run: cargo build -p oauth-as --locked
+      #
+      # Every command below is `cargo +$MSRV`, not a bare `cargo`: the toolchain step above makes
+      # the derived version the default, and naming it here as well means a step that somehow ran
+      # before it would fail loudly rather than quietly measuring stable.
+      - name: build at the MSRV, default features
+        run: cargo "+${{ steps.toolchain.outputs.name }}" build -p oauth-as --locked
       # The jwt SURFACE, which since the signing seam landed carries no crypto dependency at all.
-      - name: build on 1.75, jwt feature
-        run: cargo build -p oauth-as --locked --features jwt
+      - name: build at the MSRV, jwt feature
+        run: cargo "+${{ steps.toolchain.outputs.name }}" build -p oauth-as --locked --features jwt
       # The built-in ES256 BACKEND, which is where p256 and its tree actually enter. Building only
       # `jwt` would no longer prove the floor for the crypto, because `jwt` no longer pulls any:
       # that is exactly what the seam changed, and this job has to change with it or it silently
       # stops checking the thing it was written to check.
-      - name: build on 1.75, jwt-p256 backend
-        run: cargo build -p oauth-as --locked --features jwt-p256
+      - name: build at the MSRV, jwt-p256 backend
+        run: cargo "+${{ steps.toolchain.outputs.name }}" build -p oauth-as --locked --features jwt-p256
+      # jwt-pkcs8, and it was the one uncovered feature that genuinely adds dependencies: it turns
+      # on p256's own `pkcs8` feature, which pulls the der/spki/pkcs8 tree that none of the three
+      # builds above compiles. So the crate declared a floor for a capability it had never built at
+      # that floor, which is exactly the state this job exists to make impossible.
+      - name: build at the MSRV, jwt-pkcs8 key import and export
+        run: cargo "+${{ steps.toolchain.outputs.name }}" build -p oauth-as --locked --features jwt-pkcs8
 
   # The `http` feature has its OWN, HIGHER floor, and it is reported separately rather than
   # averaged into one number. axum 0.8 declares rust-version 1.80, so no amount of care on our
@@ -213,14 +496,382 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust 1.80 toolchain
-        uses: dtolnay/rust-toolchain@1.80
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: "1.80"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
         with:
           key: msrv-1.80-http
       - name: build on 1.80, http feature
         run: cargo build -p oauth-as --locked --features http
       - name: build on 1.80, all features
         run: cargo build -p oauth-as --locked --all-features
+
+  # THE CROSS-CONNECTION ATOMICITY PROOF, and the one gate in this file whose absence was itself
+  # the defect. Until this job existed, CI ran `--all-features` only for `-p oauth-as`, so
+  # crates/oauth-as-postgres/tests/two_connection.rs had NEVER executed on any runner. That file
+  # says, in its own module docs, that it is the only evidence this repository has that `take_*`
+  # and `claim_replay_id` are atomic ACROSS CONNECTIONS, which is precisely the property the core
+  # crate's in-process conformance harness states it cannot prove (one process, one map, one lock:
+  # it can prove single-winner within a process and nothing about two clients on two sockets). A
+  # suite that names itself the evidence and then never runs is worse than an ordinary skipped
+  # test, because the claim is on the record and the check is not.
+  #
+  # WHY A SERVICE AND NOT `docker run` IN A STEP. scripts/postgres-conformance.sh will start its
+  # own throwaway container when OAUTH_AS_POSTGRES_TEST_URL is unset, and that would work on this
+  # runner. A `services:` block is used anyway because the runner then owns the readiness probe:
+  # the job does not start until `pg_isready` has succeeded, so a slow first boot surfaces as a
+  # container that never became healthy rather than as a connection error inside a test, which
+  # would read like a storage bug.
+  #
+  # WHY THE SCRIPT AND NOT A BARE `cargo test`. The script is the command a developer runs on a
+  # workstation. Spelling the cargo invocation out here as well would create a second copy of the
+  # feature list and the `--nocapture` decision, and the copy that drifts is always the one nobody
+  # runs by hand. `--nocapture` matters: the naive-implementation tests print their observed race
+  # counts ("red proof: read-then-delete double-spent in 100/100 rounds"), and those lines are the
+  # reason to believe the atomic tests are passing because the SQL is atomic rather than because
+  # the race never happened on this runner.
+  postgres-atomicity:
+    name: Postgres cross-connection atomicity proof
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: oauth_as_test
+        ports:
+          - 5432:5432
+        # Health-gated on purpose: without this the job can reach `cargo test` before the server
+        # accepts connections, and the failure then looks like a driver fault.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d oauth_as_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # 127.0.0.1 rather than `localhost`: the runner publishes the service port on the host, and
+      # `localhost` can resolve to ::1 first, where nothing is listening.
+      OAUTH_AS_POSTGRES_TEST_URL: postgres://postgres:postgres@127.0.0.1:5432/oauth_as_test
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+        with:
+          key: postgres-atomicity
+      # THE GUARD, written to a file because two steps below run it: once on output that MUST be
+      # rejected, and once on the real run. Keeping it in one place is what makes the self-test
+      # meaningful; a second, separately maintained copy would let the real check drift away from
+      # the one that was proven able to fail.
+      #
+      # WHY A LOG GUARD AND NOT AN ASSERTION INSIDE THE TEST SUPPORT MODULE. The failure this job
+      # exists to prevent is not "the tests ran and found nothing". It is "the tests were never
+      # compiled at all". crates/oauth-as-postgres/tests/support/mod.rs already panics loudly when
+      # OAUTH_AS_POSTGRES_TEST_URL is missing, and that panic is the right answer for a local run,
+      # but it lives in code that only exists when `--features pg-integration` is on. Drop the
+      # feature flag from the command below and that file is not built, every real test vanishes,
+      # tests/disabled_notice.rs is the entire suite, and `cargo test` exits 0. No assertion
+      # reachable from inside the suite can catch its own absence. Only something outside it,
+      # counting what actually ran, can.
+      - name: Install the ran-or-red guard
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/pg-ran-or-red.py" <<'PY'
+          """Fail unless the Postgres atomicity suite demonstrably RAN.
+
+          Reads a `cargo test` log and checks three things. Argument 1 is the log path;
+          argument 2 is "expect-pass" or "expect-reject", the latter being the self-test mode
+          that proves this guard can go red.
+          """
+
+          import glob
+          import re
+          import sys
+
+          # THE FLOOR WAS MATHEMATICALLY DEAD, TWICE, and the second time was in the very commit
+          # that fixed the first. It was FLOOR = 12 against a REQUIRED of exactly 12 names, so if
+          # every required test passed the summaries necessarily totalled at least 12 and
+          # `total < FLOOR` could not fire except after a REQUIRED failure had already been
+          # appended. The fix raised it to 23 and grew REQUIRED to 23 names -- reproducing the
+          # identical relationship, and leaving a comment claiming it had been repaired.
+          #
+          # So the floor is GONE, because it was never the gate. REQUIRED is, and the only thing a
+          # second number can honestly add is the check below: that REQUIRED still names EVERY test
+          # in the suite. A test added and not pinned is the hole a floor was reaching for and
+          # never closed, since a floor cannot tell a new test from a replaced one.
+          #
+          # Found by a lens pointed at the audit's own changes. Nothing else would have caught it:
+          # a guard that cannot fire has no failing test, and its comment asserted the opposite.
+          # Every test function in the suite must be named in REQUIRED. Enforced against the
+          # sources rather than asserted, so adding a test and forgetting to pin it is red.
+          SUITE_GLOB = "crates/oauth-as-postgres/tests/*.rs"
+
+          # The named evidence. These are the assertions the crate's own docs point at when they
+          # say this suite is the only proof of cross-connection atomicity, so they are pinned by
+          # NAME rather than merely counted: a rename must be a deliberate edit here, not a
+          # silent loss of the check that the count alone would absorb.
+          REQUIRED = [
+              # `DELETE ... RETURNING` gives exactly one winner when two connections race.
+              "take_refresh_token_has_exactly_one_winner_across_two_connections",
+              # `INSERT ... ON CONFLICT DO NOTHING` likewise, for replay-id claiming.
+              "claim_replay_id_has_exactly_one_winner_across_two_connections",
+              # The conditional restore: one winner, and the loser observes that it lost.
+              "compare_and_swap_has_exactly_one_winner_across_two_connections",
+              # The resurrection rule at the storage layer: a swap after a redemption must not
+              # put the redeemed grant back.
+              "a_swap_after_redemption_does_not_resurrect_the_grant",
+              # The full Storage conformance harness, driven against real SQL rather than the
+              # in-memory store it usually runs on.
+              "storage_conformance_against_real_postgres",
+              "storage_conformance_with_more_racers",
+              # The four writes the barrier guards, each raced against the revocation. WHAT THEY
+              # ESTABLISH, stated accurately after the 2026-08-12 audit found this sentence
+              # overclaiming: that after both operations return, no credential survives for the
+              # identity that was revoked. That is the USER-VISIBLE outcome and it is what
+              # revocation_races.rs's own module docs say it asserts, deliberately, because a
+              # write that landed first and was then cascaded away is a correct store too.
+              #
+              # It is NOT, on its own, evidence that the barrier refuses a write already in
+              # flight: the outcome of the raced write is discarded (`let _ = write.await`), and
+              # the cascade in `delete_client` would satisfy the same assertion with the barrier
+              # removed. What the four DO prove is the advisory-lock mutual exclusion the module
+              # docs describe, which is the property the 0.9.1 audit found broken (Postgres checked
+              # the barrier and inserted in two statements with a round trip between them, so a
+              # revocation could commit entirely in the gap while `MemoryStorage` closed it under
+              # one mutex). A case asserting `WriteOutcome::RefusedRevoked` for a write whose
+              # transaction begins after the revocation commits is owed in the Postgres crate; it
+              # is not in this list because it does not exist yet, and naming it here would make
+              # this guard fail for a test nobody has written.
+              "a_token_cannot_land_behind_a_client_deletion",
+              "a_refresh_record_cannot_land_behind_a_family_revocation",
+              "a_token_cannot_land_behind_a_consent_withdrawal",
+              "a_pushed_request_cannot_land_behind_a_client_deletion",
+              # `migrate()` claims to be safe to run from several nodes at once, which was false
+              # until 0.9.1: `CREATE ... IF NOT EXISTS` races on the catalogue and crash-loops the
+              # losing replica. A claim in a doc comment that no job exercises is a claim nobody
+              # is holding.
+              "concurrent_migrations_all_succeed",
+              # A patch bump that changes how stored records are INTERPRETED. This asserts a
+              # 0.9.0-shaped payload still reads back AND that it reads back as the epoch, so a
+              # far-future default — which would deserialize just as happily and ADMIT every
+              # record written by 0.9.0 — fails here.
+              #
+              # NOTE FOR WHOEVER SEES THIS GO RED: it lives in the Postgres crate and guards the
+              # CORE crate's `#[serde(default)]` attributes on `IssuedToken::grant_established_at`,
+              # `RefreshTokenRecord::grant_established_at`, `AuthorizationCodeRecord::issued_at`
+              # and `PushedAuthorizationRequest::pushed_at`. If it fails, look there first; the
+              # crate the failure is reported against is not the crate that broke it. There is
+              # deliberately no backfill migration — the defaults cover a rolling upgrade and a
+              # backfill does not, and the one that was written was removed for that reason.
+              "records_written_by_0_9_0_survive_the_upgrade",
+              # THE UNPINNED ELEVEN, added 2026-08-12. Every one of these could be deleted with
+              # this job green, because the floor could not fire and nothing named them. They are
+              # not decoration:
+              #
+              # The four naive-implementation detectors. These are what turn the atomic tests'
+              # green from "the SQL prevents the race" into a claim with evidence: without them a
+              # green could mean the race simply never occurred on this runner. Three of them
+              # print the `red proof:` lines the check further down requires.
+              "the_naive_take_is_caught_by_the_same_race",
+              "the_naive_claim_is_caught_by_the_same_race",
+              "the_naive_swap_is_caught_by_the_same_race",
+              "the_naive_swap_resurrects_the_redeemed_grant",
+              # Lock ORDERING, which is the cost of the barrier being an advisory lock at all: two
+              # revocations touching the same rows in opposite orders deadlock, and a deadlock in
+              # a revocation path is a kill switch that hangs. Added by the 0.9.1 audit, and
+              # unpinned from the moment it was written.
+              "a_client_deletion_and_a_consent_withdrawal_do_not_deadlock",
+              # The barrier lookup must be indexed rather than a scan. A revocation check on the
+              # hot path of every write is a performance claim, and an unmeasured one rots.
+              "the_barrier_lookup_does_not_scan_the_barrier_table",
+              # Batched sweeping: that a backlog larger than one batch is swept WHOLE and the
+              # returned count is truthful, and that a live record is not collateral damage.
+              "a_backlog_of_several_batches_is_swept_whole_and_counted_truthfully",
+              "a_live_record_survives_a_multi_batch_sweep",
+              # What a ROW holds after a write, as opposed to what the trait's return value said.
+              # The index columns are documented as a projection of the payload and never a second
+              # source of truth; `compare_and_swap_authorization_code` rewrote only the payload,
+              # and only these tests can see that.
+              "a_swap_rewrites_the_index_columns_and_not_only_the_payload",
+              "a_withdrawal_cascades_a_code_the_swap_moved_to_that_subject",
+              "a_round_tripped_token_keeps_its_feature_gated_fields",
+          ]
+
+          # THE RED PROOFS, one required line PER DETECTOR. The naive-implementation tests print
+          # their observed race counts, and without them the atomic tests could be green because
+          # the race never occurred on this runner rather than because the SQL prevents it.
+          #
+          # This was ONE regex matched with `search` until 2026-08-12, which returns on the FIRST
+          # hit. Three different detectors emit a matching line, so two of the three could stop
+          # running entirely and the guard would still report the race as observed -- and, before
+          # the fix above, all three were also absent from REQUIRED, so they could stop running by
+          # being deleted. That is the same defect found the same day in tests/host_api_shape.rs,
+          # where an anti-rot guard passed on finding one builder out of twenty-odd. A guard that
+          # is satisfied by one out of three is a guard for one out of three.
+          #
+          # Keyed by the DISTINCTIVE phrase each detector prints, so a renamed race still fails
+          # loudly here rather than being absorbed by a sibling's line.
+          RED_PROOFS = {
+              "read-then-delete double-spent":
+                  "two_connection.rs, the naive read-then-delete refresh take",
+              "look-then-insert double-claimed":
+                  "two_connection.rs, the naive look-then-insert replay claim",
+              "read-compare-write lost an update":
+                  "two_connection.rs, the naive read-compare-write swap",
+          }
+          RED_PROOF_SHAPE = r"^red proof: [^\n]*%s[^\n]* in \d+/\d+ rounds$"
+
+          # `test <name> ... ok`. Doctest lines carry a path and a "(line N)" and cannot match a
+          # bare Rust identifier, so they are excluded without a special case.
+          PASSED = re.compile(r"^test ([A-Za-z_][A-Za-z0-9_]*) \.\.\. ok$", re.M)
+
+          # Per-binary summaries, used to catch the two silent-skip shapes that still show a
+          # green suite: an `#[ignore]` added to a test, and a stray filter argument.
+          SUMMARY = re.compile(
+              r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+              r"\d+ measured; (\d+) filtered out",
+              re.M,
+          )
+
+          # The NAME of the default-build notice test. Its presence proves the suite was compiled
+          # WITHOUT `pg-integration`, which is the exact state this guard exists to reject.
+          NOTICE = "skipped_postgres_atomicity_proof"
+
+
+          def problems(log):
+              found = []
+              names = set(PASSED.findall(log))
+
+              if NOTICE in log:
+                  found.append(
+                      "the log contains the default-build notice test (%s...), which only "
+                      "compiles when `pg-integration` is OFF. The real suite did not run."
+                      % NOTICE
+                  )
+
+              for name in REQUIRED:
+                  if name not in names:
+                      found.append("required test did not run and pass: %s" % name)
+
+              # THE ANTI-SHRINK GATE, and it is this rather than a total count. A floor cannot
+              # tell a deleted test from a replaced one, which is how the previous two floors
+              # came to be unreachable. This reads the sources and requires every test function
+              # to be pinned by name above, so deleting one is red and adding one without
+              # pinning it is red.
+              # Only `#[tokio::test]` functions, not the helpers beside them. Matching on
+              # `async fn` alone swept up `plant_tokens`, `race_take` and five other fixtures,
+              # which would have made this gate fire on a tree nobody had changed -- a guard
+              # that cries wolf gets deleted, which is how a repository ends up with the
+              # unreachable floor this replaces.
+              TEST_FN = re.compile(
+                  r"#\[tokio::test[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*async fn ([a-z0-9_]+)\("
+              )
+              declared = set()
+              for path in glob.glob(SUITE_GLOB):
+                  with open(path) as fh:
+                      declared.update(TEST_FN.findall(fh.read()))
+              unpinned = sorted(declared - set(REQUIRED))
+              if unpinned:
+                  found.append(
+                      "these Postgres tests exist but are not pinned in REQUIRED, so deleting "
+                      "them would leave this job green: %s" % ", ".join(unpinned)
+                  )
+              missing = sorted(set(REQUIRED) - declared)
+              if missing:
+                  found.append(
+                      "REQUIRED names tests that no longer exist, so the pin is stale: %s"
+                      % ", ".join(missing)
+                  )
+
+              ignored = sum(int(m[2]) for m in SUMMARY.findall(log))
+              if ignored:
+                  found.append(
+                      "%d test(s) were reported IGNORED. An #[ignore] here is a skip wearing "
+                      "a different hat and is not acceptable in this suite." % ignored
+                  )
+
+              filtered = sum(int(m[3]) for m in SUMMARY.findall(log))
+              if filtered:
+                  found.append(
+                      "%d test(s) were FILTERED OUT, so this run did not cover the whole "
+                      "suite. Remove the filter argument." % filtered
+                  )
+
+              for phrase, where in sorted(RED_PROOFS.items()):
+                  if not re.search(RED_PROOF_SHAPE % re.escape(phrase), log, re.M):
+                      found.append(
+                          "no `red proof: ... %s ... in N/M rounds` line in the log (%s). Either "
+                          "that naive-implementation test did not run, or --nocapture was "
+                          "dropped. Without it, a green from the matching atomic test could mean "
+                          "the race never happened rather than that the SQL prevents it."
+                          % (phrase, where)
+                      )
+
+              return found
+
+
+          def main():
+              path, mode = sys.argv[1], sys.argv[2]
+              with open(path, encoding="utf-8", errors="replace") as fh:
+                  log = fh.read()
+              found = problems(log)
+
+              if mode == "expect-reject":
+                  if found:
+                      print("guard self-test PASSED; it rejected the run, naming %d problem(s):"
+                            % len(found))
+                      for line in found:
+                          print("  - %s" % line)
+                      return 0
+                  print("::error::the ran-or-red guard ACCEPTED a run with the integration "
+                        "feature off. It cannot detect the failure it exists to detect, so "
+                        "every green it has ever produced is worthless. Fix the guard.")
+                  return 1
+
+              if found:
+                  for line in found:
+                      print("::error::%s" % line)
+                  return 1
+              print("the Postgres atomicity suite ran: all %d required tests are present, all %d "
+                    "races were observed, nothing was ignored or filtered."
+                    % (len(REQUIRED), len(RED_PROOFS)))
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
+          python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+            "$RUNNER_TEMP/pg-ran-or-red.py"
+      # RED FIRST, in the job itself and not in a paragraph. This runs the crate's DEFAULT build,
+      # which is the exact shape of the defect being fixed: `pg-integration` off, every real test
+      # absent, `cargo test` exits 0, and the only thing that ran is the notice. The guard must
+      # reject that log. If it does not, the step below is decoration and this job says so.
+      - name: Prove the guard rejects a run where the suite did not compile (RED)
+        run: |
+          set -euo pipefail
+          # This command is EXPECTED to succeed: an exit 0 from a suite that proved nothing is
+          # the whole point of the demonstration. `|| true` guards only against a genuine
+          # compile break, which the lint-and-test job would already have caught.
+          cargo test -p oauth-as-postgres --locked \
+            > "$RUNNER_TEMP/default-build.log" 2>&1 || true
+          echo "::group::default-build (no pg-integration) test log"
+          cat "$RUNNER_TEMP/default-build.log"
+          echo "::endgroup::"
+          python3 "$RUNNER_TEMP/pg-ran-or-red.py" "$RUNNER_TEMP/default-build.log" expect-reject
+      # THE RUN ITSELF. `tee` rather than a redirect so the test names, and the red-proof race
+      # counts, appear in the job log where a human reads them, and not only in a file the guard
+      # reads. `pipefail` keeps `tee` from swallowing a test failure.
+      - name: Cross-connection atomicity proof against a real PostgreSQL
+        run: |
+          set -euo pipefail
+          scripts/postgres-conformance.sh 2>&1 | tee "$RUNNER_TEMP/atomicity.log"
+      - name: The proof must have actually run (names, count, and the observed race)
+        run: python3 "$RUNNER_TEMP/pg-ran-or-red.py" "$RUNNER_TEMP/atomicity.log" expect-pass
 
   # Hermetic half of the independent harness: RFC vectors and validator self-checks.
   rfc-vectors:
@@ -229,8 +880,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       # RED first: a corrupted expectation must fail the suite, or the suite proves nothing.
       - name: Prove the vector suite can fail (deliberate corruption)
         run: |
@@ -257,8 +910,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: Conformance gate self-test (must go RED on a nonconformant AS)
         run: scripts/oauth-conformance.sh --selftest
 
@@ -273,8 +928,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: Live conformance check against a served AS
         run: scripts/oauth-conformance.sh --check
 
@@ -289,8 +946,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       # The version the job actually runs is pinned in
       # crates/oauth-as-conformance/interop/go/go.mod, with go.sum locking the module hashes.
       # This only supplies a toolchain new enough to build it.
@@ -314,10 +973,21 @@ jobs:
     name: authgent MCP-OAuth scanner (RFC 8414 / PKCE / RFC 9207 checks)
     runs-on: ubuntu-latest
     steps:
+      # persist-credentials: false, and this is the ONE job in this file where it is not merely
+      # hygiene. Every other job runs only code from this repository; this one hands the checked-out
+      # tree to a THIRD-PARTY composite action (see the pinned `uses:` below). By default
+      # actions/checkout writes an `http.extraheader` line into .git/config carrying the job's
+      # GITHUB_TOKEN, so any later step -- including one inside somebody else's action -- can read
+      # the token straight off the disk without ever being given it. Nothing in this job pushes,
+      # fetches or tags, so nothing needs the credential to survive the checkout step.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       # RED first, on both axes: no RFC 9728 document must fail (so the gate cannot pass having
       # silently lost its discovery hop), and an AS advertising `plain` PKCE and the implicit
       # grant must fail NAMING those checks (so the RFC 8414 checks are provably the ones doing
@@ -352,7 +1022,11 @@ jobs:
       # in that file. A missing baseline fails safe rather than open, because the scanner treats
       # an absent baseline as empty and every finding then counts as new.
       - name: Scan the fixture resource, gating on anything new
-        uses: authgent/authgent/.github/actions/mcp-lint@v0.3.4
+        # PINNED BY SHA. `@v0.3.4` is a tag in somebody else's repository and a tag is not an
+        # identity: they can move it to any commit at any time and this job silently starts running
+        # the new code, against this checkout, with this job's token. The tag is kept in the comment
+        # because it is what the reference MEANT and it is what the next person will diff against.
+        uses: authgent/authgent/.github/actions/mcp-lint@f6ef56bcbe77c2d79934ffe437606704f38d0009 # v0.3.4
         with:
           url: http://127.0.0.1:8915
           baseline: crates/oauth-as-conformance/authgent-baseline.json
@@ -361,18 +1035,72 @@ jobs:
   # Packaging must stay green so a release is never blocked by a stale manifest. Prints the
   # tarball file list to the job log so the published contents can be reviewed by a human
   # before any real publish (see the separate publish.yml, which is manually gated).
+  size:
+    name: linked size budgets
+    runs-on: macos-latest
+    # PRESENT ON `dev` TOO, and deliberately on both. `qa` is the promotion gate, so it has to be a
+    # SUPERSET of `dev` or "qa green" means less than "dev green", which is backwards. It was
+    # missing here through 0.9.1 and the anti-drift check at the top of `lint-and-test` could not
+    # see it, because that check compares STEP names within one job and this is a whole job.
+    #
+    # And it stays on `dev` rather than moving here, which is a measurement rather than a
+    # preference: on the 0.9.1 green run the three `dev` jobs ran in parallel and this one finished
+    # 50 seconds BEFORE the lint job, so it costs `dev` no wall-clock time at all. What it buys
+    # there is EARLY detection, and that is what makes a budget get fixed rather than argued with:
+    # the 0.9.1 growth was caught on `dev`, which is why the redundant `HashMap` behind it was
+    # found and removed instead of the number being raised to cover it.
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+        with:
+          # The probe is its own workspace (see scripts/size-probe/Cargo.toml on why), and its
+          # per-configuration target directories live under target/size-report. Neither is what
+          # this action caches by default, and without both every run is a cold fat-LTO link of
+          # nine binaries.
+          workspaces: |
+            .
+            scripts/size-probe
+          cache-directories: target/size-report
+      # RED FIRST, exactly like the conformance, interop and MCP-scanner gates in qa.yml, and this
+      # was the one shell gate in the repository without it. --selftest re-runs --check with the
+      # budget forced to 1 byte and requires exit 1: if the row set is empty, the probe did not
+      # build, the section parser did not understand the object format, or the comparison is not
+      # wired to the exit status, that run exits 0 and this step is RED. Only then does the green
+      # below mean the budgets were checked. It costs one extra link of the `default` row.
+      - name: prove the size gate can go RED
+        run: scripts/size-report.sh --selftest
+      - name: linked size within budget
+        run: scripts/size-report.sh --check
+
   package:
     name: cargo publish --dry-run and package listing
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: publish dry run
         run: cargo publish --dry-run --locked -p oauth-as
-      - name: package file list (review before any real publish)
-        run: cargo package --list --locked -p oauth-as
+      # COMPARED, not printed. See the matching step in publish.yml for why a `cargo package
+      # --list` nobody diffs is a step that can only fail when cargo errors. Here as well as there
+      # because qa is the promotion gate: catching a stray packaged file on `qa` costs a push,
+      # catching it in `publish` costs an approval, and not catching it costs a permanent version.
+      - name: package file list matches the committed manifest
+        run: |
+          set -euo pipefail
+          cargo package --list --locked -p oauth-as | LC_ALL=C sort > "$RUNNER_TEMP/package-list.txt"
+          if ! diff -u crates/oauth-as/package-manifest.txt "$RUNNER_TEMP/package-list.txt"; then
+            echo "::error::the files cargo would publish differ from crates/oauth-as/package-manifest.txt (- expected, + actual). If the change is intended, regenerate the manifest in the same commit: cargo package --list --locked -p oauth-as | LC_ALL=C sort > crates/oauth-as/package-manifest.txt"
+            exit 1
+          fi
+          echo "the package contains exactly the files crates/oauth-as/package-manifest.txt records"
 
   # A SHORT fuzz run, and deliberately not a soak.
   #
@@ -407,8 +1135,9 @@ jobs:
       # has to remember to bump a pin that will otherwise rot until the toolchain is unavailable.
       # If this job starts going red for compiler reasons rather than target reasons, pin it.
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
+          toolchain: nightly
           # rustfmt and clippy are NOT in the minimal profile this action installs, and the rot
           # check below runs both. It runs them against nightly rather than stable because this
           # step makes nightly the default toolchain, so an unqualified `cargo fmt` resolves
@@ -416,7 +1145,7 @@ jobs:
           # toolchain 'nightly'" before it has fuzzed anything, which is a red that says nothing
           # about the targets.
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
         with:
           key: fuzz
       - name: install cargo-fuzz
@@ -466,33 +1195,3 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
-
-  # Reporting job, not a hard gate, by explicit house instruction: mutation runs are slow and
-  # this is scoped to crates/oauth-as (the published library) rather than the whole workspace
-  # or the conformance harness. Non-blocking behaviour is achieved by never letting a step
-  # fail (the run's own exit code is captured and reported, but not propagated), NOT via
-  # continue-on-error, per the "no continue-on-error anywhere" house rule. This is intended to
-  # become a hard gate later, once a sensible survived-mutant baseline exists; until then it is
-  # informative only, and its summary belongs in the job log for a human to read.
-  mutants:
-    name: cargo-mutants (reporting only, not a hard gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: mutants
-      - name: install cargo-mutants
-        run: cargo install cargo-mutants --locked
-      - name: run cargo-mutants over crates/oauth-as (informative, does not fail the job)
-        run: |
-          set +e
-          cargo mutants --package oauth-as --timeout 300 --no-shuffle
-          rc=$?
-          set -e
-          echo "cargo-mutants exit code: $rc (0 = no survivors, nonzero = survivors or error)"
-          echo "This job is reporting-only by design; see the job comment in qa.yml. A"
-          echo "nonzero exit here is informative and does NOT fail this job or the workflow."
-          exit 0

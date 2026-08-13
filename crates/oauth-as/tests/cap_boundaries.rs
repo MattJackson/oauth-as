@@ -12,6 +12,14 @@
 //! `MAX_REGISTERED_REDIRECT_URIS`, `MAX_CONSENT_RESOURCES`, `MAX_AUDIENCE_VALUES`, all three
 //! `authorization_details` bounds, and `MAX_RESOURCE_INDICATORS` at the AUTHORIZATION endpoint).
 //! The ones here did not.
+//!
+//! Two more sit elsewhere because their boundary is not where the constant's name suggests, and
+//! both are named here so the claim above stays checkable. `MAX_FORM_PARAMETERS` is enforced as
+//! `separators >= MAX`, so its smallest REFUSED request carries one fewer parameter than the
+//! constant reads as; that request is `a_token_request_one_past_the_parameter_cap_is_refused` in
+//! `tests/http_parameter_cap.rs`. `MIN_CLIENT_SECRET_JWT_KEY_LENGTH` is a FLOOR rather than a
+//! ceiling, so its one-past case is one character BELOW it, in
+//! `a_client_secret_jwt_key_below_the_entropy_floor_is_refused` in `tests/api_safety.rs`.
 
 mod support;
 
@@ -24,7 +32,7 @@ use support::{server_with, ManualClock, PUBLIC_REDIRECT, RFC7636_VERIFIER};
 /// default, which is what keeps these tests measuring the behaviour they always measured.
 #[cfg(all(
     feature = "jwt-p256",
-    any(feature = "dpop", feature = "client_assertion")
+    any(feature = "dpop", feature = "client-assertion")
 ))]
 const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
 
@@ -86,12 +94,21 @@ fn a_proof_of_exactly_the_cap_is_accepted() {
     // not make every total reachable: `ceil(4n/3)` steps by 2, 1, 1, so one byte of `jti` padding
     // can only reach three totals in four. Padding the `kid` shifts the HEADER's length by one and
     // covers the fourth.
+    //
+    // THE PADDING IS NOT THE `jti`, and must not be. `MAX_JTI_BYTES` caps what a proof asks the
+    // host to WRITE DOWN, separately from `MAX_PROOF_BYTES` capping what it asks the host to read,
+    // so a fixture that reached the proof cap by growing the `jti` would be refused by the jti cap
+    // long before it reached the boundary under test, and would then be measuring the wrong cap
+    // while claiming to measure this one. The `jti` here is a realistic 22-character base64url
+    // random and the bulk is an unregistered claim, which is what a real proof carrying a large
+    // public JWK and a client's own extensions looks like.
     let payload_for = |pad: usize| {
         serde_json::to_vec(&serde_json::json!({
-            "jti": "x".repeat(pad),
+            "jti": "0123456789012345678901",
             "htm": "POST",
             "htu": TOKEN_ENDPOINT,
             "iat": 1_700_000_000u64,
+            "client_padding": "x".repeat(pad),
         }))
         .unwrap()
     };
@@ -132,17 +149,20 @@ fn a_proof_of_exactly_the_cap_is_accepted() {
 }
 
 /// The deepest `authorization_details` that fits inside `MAX_AUTHORIZATION_DETAILS_BYTES` is
-/// REFUSED rather than crashing, and this is the falsifiable half of the argument the module docs
-/// make about where the depth bound gets its stack safety from.
+/// REFUSED rather than crashing.
 ///
-/// The docs no longer claim `serde_json`'s recursion limit protects this, because that limit is a
-/// dependency's implementation detail rather than a contract. What they claim instead is that 4096
-/// bytes of raw JSON cannot express more than about 2047 levels, so the parse and the tree's
-/// recursive `Drop` are bounded whatever the parser was configured to allow. This sends exactly
-/// that worst case.
+/// WHAT THIS DOES AND DOES NOT EXERCISE, because the version of this test that sent 2048 open
+/// brackets did neither of the things it was cited for. `serde_json` is taken with default
+/// features, so its `RECURSION_LIMIT` of 128 refuses at level 128: no `Value` tree is ever built,
+/// `rar::depth` never runs, and the recursive `Drop` the production comment calls the falsifiable
+/// half of its argument never happens. Nor could the assertion say which rule refused — all six
+/// refusal arms of `parse` answer `invalid_authorization_details`, and this one was answered by
+/// the very first, "must be a JSON array of objects", from the parser giving up on the brackets.
+///
+/// That case is still worth pinning and is pinned below, as the parser refusal it actually is.
 #[cfg(feature = "rar")]
 #[test]
-fn the_deepest_authorization_details_that_fits_in_the_byte_cap_is_refused_not_fatal() {
+fn a_document_past_the_parsers_own_recursion_limit_is_refused_not_fatal() {
     use oauth_as::rar::{AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES};
 
     // As many open brackets as the byte cap admits, closed off so it is well formed JSON. Half
@@ -161,4 +181,55 @@ fn the_deepest_authorization_details_that_fits_in_the_byte_cap_is_refused_not_fa
     let refused = AuthorizationDetails::parse(&raw)
         .expect_err("2048 levels of nesting is not an RFC 9396 s2 array of objects");
     assert_eq!(refused.error, ErrorCode::InvalidAuthorizationDetails);
+    assert!(
+        refused
+            .error_description
+            .unwrap_or_default()
+            .contains("must be a JSON array of objects"),
+        "this document never becomes a tree: the PARSER refuses it, and naming that is the only \
+         way the test can be said to have exercised anything in particular"
+    );
+}
+
+/// THE DEPTH BOUND ITSELF, on a document that really does become a tree.
+///
+/// `MAX_MEMBER_DEPTH` is `MAX_AUTHORIZATION_DETAILS_DEPTH - 2`, enforced by `depth(value) >
+/// MAX_MEMBER_DEPTH` on each member of each element. Reaching that arm needs a document that is a
+/// well formed RFC 9396 s2 array of typed objects AND inside `serde_json`'s own recursion limit,
+/// so the parse succeeds, a `Value` tree exists, the recursive `depth` walk runs over it, and the
+/// tree's recursive `Drop` runs when the refusal returns. All three are the work the production
+/// comment argues is bounded; none of them happened under a bracket storm the parser threw out.
+///
+/// Deep enough to be nowhere near the bound (so this cannot be a boundary test in disguise, which
+/// is what the at-cap acceptance cases in `src/tests/rar.rs` are for) and shallow enough that the
+/// parser is not what answers.
+#[cfg(feature = "rar")]
+#[test]
+fn a_member_nested_past_the_depth_bound_is_refused_by_the_depth_rule() {
+    use oauth_as::rar::{AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES};
+
+    // 120 levels inside the member, plus the array and the element object, is 122 containers: well
+    // under `serde_json`'s 128 and far over this crate's own bound of 6.
+    const LEVELS: usize = 120;
+    let mut raw = String::from(r#"[{"type":"example","vendor_extension":"#);
+    for _ in 0..LEVELS {
+        raw.push('[');
+    }
+    for _ in 0..LEVELS {
+        raw.push(']');
+    }
+    raw.push_str("}]");
+    assert!(raw.len() <= MAX_AUTHORIZATION_DETAILS_BYTES);
+
+    let refused = AuthorizationDetails::parse(&raw)
+        .expect_err("120 levels inside one member is far past MAX_AUTHORIZATION_DETAILS_DEPTH");
+    assert_eq!(refused.error, ErrorCode::InvalidAuthorizationDetails);
+    assert!(
+        refused
+            .error_description
+            .unwrap_or_default()
+            .contains("nested more deeply than this server accepts"),
+        "the DEPTH rule has to be what refused: every arm of parse answers with the same code, so \
+         the code alone cannot tell this from a parser failure or a missing type"
+    );
 }

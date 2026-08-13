@@ -75,7 +75,7 @@ fn error_code(failure: RegistrationFailure) -> RegistrationErrorCode {
 
 // ------------------------------------------------------------------ validate
 
-/// SURVIVOR: `crates/oauth-as/src/registration.rs:518:30: replace != with == in validate`.
+/// SURVIVOR: `registration.rs replace != with == in validate`.
 ///
 /// The line is the response-type loop, `if value != RESPONSE_TYPE_CODE { return Err(...) }`.
 /// Flipped, this server ACCEPTS a registration asking for any response type except `code`, and
@@ -128,7 +128,7 @@ async fn a_response_type_other_than_code_is_refused_and_code_itself_is_accepted(
 
 // ------------------------------------------------------------------ registered_metadata
 
-/// SURVIVOR: `crates/oauth-as/src/registration.rs:644:17: delete ! in registered_metadata`.
+/// SURVIVOR: `registration.rs delete ! in registered_metadata`.
 ///
 /// The line is `scope: (!client.allowed_scopes.is_empty()).then(|| ...)`, which is what decides
 /// whether an RFC 7592 section 2.1 read echoes the registered scope. Without the `!` the two cases
@@ -182,8 +182,13 @@ async fn a_read_echoes_the_registered_scope_and_omits_it_only_when_there_is_none
 
 // ------------------------------------------------------------------ secret expiry arithmetic
 
-/// SURVIVOR, two of them: `crates/oauth-as/src/registration.rs:696:50: replace + with -` and
-/// `replace + with *`, in `register_dynamic_client`.
+/// SURVIVOR: mutants of the secret-expiry arithmetic in `register_dynamic_client`.
+///
+/// THE OPERATOR IS `saturating_add`, NOT `+`. This header named `replace + with -` and
+/// `replace + with *` until 0.9.1, and those describe mutants cargo-mutants will never generate
+/// here: the site reads `now.unwrap_or_default().saturating_add(ttl.as_secs())`, because a plain
+/// `+` panics in debug and WRAPS in release on a host-configured lifetime. What this case
+/// constrains is that the expiry lands a lifetime AFTER the mint, by whatever call produces it.
 ///
 /// The line computes the issued secret's expiry as `now + ttl`. Nothing pinned it because no test
 /// anywhere set [`RegistrationConfig::client_secret_ttl`], so the whole `Some(ttl)` arm was
@@ -214,8 +219,10 @@ async fn an_issued_secrets_expiry_is_the_issue_time_plus_the_configured_lifetime
     assert!(info.client_secret.is_some(), "a secret was issued");
 }
 
-/// SURVIVOR, two of them: `crates/oauth-as/src/registration.rs:890:81: replace + with -` and
-/// `replace + with *`, in `update_registration`.
+/// SURVIVOR: mutants of the same secret-expiry arithmetic in `update_registration`.
+///
+/// `saturating_add` here too, for the same reason, and this header carried the same wrong
+/// `replace + with -` claim until 0.9.1.
 ///
 /// The same arithmetic on the RFC 7592 section 2.2 path, reached when an update mints a secret
 /// for a client that had none. Same consequence, and the same reason nothing saw it: no test set
@@ -256,7 +263,7 @@ async fn a_secret_minted_by_an_update_expires_a_lifetime_after_it_is_minted() {
 
 // ------------------------------------------------------------------ the update path's auth
 
-/// SURVIVOR: `crates/oauth-as/src/registration.rs:873:66: replace != with == in
+/// SURVIVOR: `registration.rs replace != with == in
 /// update_registration`.
 ///
 /// The line is `let wants_secret = registered.token_endpoint_auth_method != AUTH_METHOD_NONE`.
@@ -324,7 +331,7 @@ async fn an_update_does_not_demote_a_confidential_client_to_a_public_one() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/registration.rs:875:40: replace && with || in
+/// SURVIVOR: `registration.rs replace && with || in
 /// update_registration`.
 ///
 /// The line is `let new_secret = (wants_secret && !had_secret).then(...)`: mint a secret only when
@@ -377,7 +384,7 @@ async fn an_update_does_not_rotate_a_secret_the_client_already_holds() {
     .expect("the secret the client holds still authenticates after an unrelated metadata edit");
 }
 
-/// SURVIVOR: `crates/oauth-as/src/registration.rs:875:43: delete ! in update_registration`.
+/// SURVIVOR: `registration.rs delete ! in update_registration`.
 ///
 /// The same expression with the negation dropped: `wants_secret && had_secret`. A PUBLIC client
 /// that updates itself to `client_secret_basic` then mints nothing, falls into the `(None, true)`
@@ -425,7 +432,7 @@ async fn an_update_that_turns_a_public_client_confidential_actually_issues_a_sec
 
 // ------------------------------------------------------------------ redaction
 
-/// SURVIVOR: `crates/oauth-as/src/registration.rs:319:9: replace <impl Debug for
+/// SURVIVOR: `registration.rs replace <impl Debug for
 /// RegistrationAttempt>::fmt -> std::fmt::Result with Ok(Default::default())`.
 ///
 /// The hand-written `Debug` exists for one reason: [`RegistrationAttempt::initial_access_token`]

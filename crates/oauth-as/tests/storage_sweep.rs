@@ -27,9 +27,9 @@ mod support;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::{
-    AuthorizationCodeRecord, AuthorizationCodeState, AuthorizationServer, ClientId,
-    CodeChallengeMethod, DeviceGrant, DeviceGrantState, ErrorCode, IssuedToken, MemoryStorage,
-    RefreshTokenRecord, RefreshTokenState, ScopeSet, ServerConfig, Storage,
+    AuthorizationCodeRecord, AuthorizationCodeState, AuthorizationServer, ClientId, DeviceGrant,
+    DeviceGrantState, ErrorCode, IssuedToken, MemoryStorage, RefreshTokenRecord, ScopeSet,
+    ServerConfig, Storage,
 };
 use support::{device_only_client, fault_server_with, ManualClock};
 
@@ -56,67 +56,43 @@ fn device_grant(device_code: &str, user_code: &str, expires_at: SystemTime) -> D
 }
 
 fn authorization_code(code: &str, expires_at: SystemTime) -> AuthorizationCodeRecord {
-    AuthorizationCodeRecord {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        code: code.to_string(),
-        client_id: ClientId::new("some-client"),
-        redirect_uri: "https://app.example/cb".into(),
-        scope: scope(),
-        subject: "user-1".into(),
-        code_challenge: "x".repeat(43),
-        code_challenge_method: CodeChallengeMethod::S256,
+    let mut record = AuthorizationCodeRecord::new(
+        code,
+        ClientId::new("some-client"),
+        "https://app.example/cb",
+        scope(),
+        "user-1",
+        "x".repeat(43),
         expires_at,
-        state: AuthorizationCodeState::Consumed {
-            access_token: Some("at".into()),
-            refresh_token: None,
-        },
-        #[cfg(feature = "consent")]
-        authentication: None,
-    }
+    );
+    record.state = AuthorizationCodeState::Consumed {
+        access_token: Some("at".into()),
+        refresh_token: None,
+    };
+    record
 }
 
 fn access_token(token: &str, expires_at: SystemTime) -> IssuedToken {
-    IssuedToken {
-        #[cfg(feature = "dpop")]
-        jkt: None,
-        #[cfg(feature = "mtls")]
-        x5t_s256: None,
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        access_token: token.to_string(),
-        client_id: ClientId::new("some-client"),
-        subject: Some("user-1".into()),
-        scope: scope(),
-        issued_at: now(),
+    IssuedToken::new(
+        token,
+        ClientId::new("some-client"),
+        Some("user-1".into()),
+        scope(),
+        now(),
         expires_at,
-        family_id: None,
-        #[cfg(feature = "consent")]
-        authentication: None,
-    }
+    )
 }
 
 fn refresh_token(token: &str, expires_at: Option<SystemTime>) -> RefreshTokenRecord {
-    RefreshTokenRecord {
-        #[cfg(feature = "dpop")]
-        jkt: None,
-        #[cfg(feature = "mtls")]
-        x5t_s256: None,
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        refresh_token: token.to_string(),
-        client_id: ClientId::new("some-client"),
-        subject: Some("user-1".into()),
-        scope: scope(),
-        expires_at,
-        family_id: "family-1".into(),
-        state: RefreshTokenState::Active,
-        #[cfg(feature = "consent")]
-        authentication: None,
-    }
+    let mut record = RefreshTokenRecord::new(
+        token,
+        ClientId::new("some-client"),
+        Some("user-1".into()),
+        scope(),
+        "family-1",
+    );
+    record.expires_at = expires_at;
+    record
 }
 
 /// The eviction seam a host needs in order to keep the store bounded. Without it, every record
@@ -144,24 +120,24 @@ async fn sweep_expired_removes_exactly_the_dead_records() {
         .put_authorization_code(authorization_code("code-live", live))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_token(access_token("at-dead", dead))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_token(access_token("at-live", live))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_refresh_token(refresh_token("rt-dead", Some(dead)))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_refresh_token(refresh_token("rt-live", Some(live)))
         .await
         .unwrap();
     // A chain with no absolute expiry is not dead and must survive any sweep.
-    store
+    let _ = store
         .put_refresh_token(refresh_token("rt-forever", None))
         .await
         .unwrap();

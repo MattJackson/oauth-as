@@ -25,7 +25,7 @@
 //!   was spent once.
 //! - DEVICE GRANT DOUBLE ISSUANCE, the same shape at the RFC 8628 redemption.
 //!
-//! `Storage::claim_replay_id` (compiled in with `client_assertion` or `dpop`) is the same defect
+//! `Storage::claim_replay_id` (compiled in with `client-assertion` or `dpop`) is the same defect
 //! shape and is checked the same way: RFC 7523 section 3 and RFC 9449 section 4.3 both make a
 //! `jti` single use, and a read-then-write claim tells two concurrent presentations of the SAME
 //! assertion that each of them was the first.
@@ -128,7 +128,7 @@ use crate::client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHas
 use crate::device::{normalize_user_code, DeviceGrant, DeviceGrantState};
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
-use crate::store::{Storage, StorageError};
+use crate::store::{Storage, StorageError, WriteOutcome};
 use crate::token::{IssuedToken, RefreshTokenRecord, RefreshTokenState};
 
 /// One way in which a store failed the [`Storage`] contract.
@@ -153,7 +153,7 @@ impl fmt::Display for Violation {
 /// filters on still exists rather than silently waiving a check that was renamed.
 ///
 /// The `claim_replay_id` names are listed unconditionally even though the checks themselves only
-/// run when `client_assertion` or `dpop` is compiled in: a host's waiver list should not have to
+/// run when `client-assertion` or `dpop` is compiled in: a host's waiver list should not have to
 /// be feature-conditional to be valid.
 pub const CHECKS: &[&str] = &[
     HARNESS_RACE_SETUP,
@@ -167,6 +167,8 @@ pub const CHECKS: &[&str] = &[
     SWAP_APPLIES_ON_MATCH,
     SWAP_HONOURS_EXPECTED,
     SWAP_NEVER_RESURRECTS,
+    SWAP_RETIRES_OLD_USER_CODE,
+    SWAP_REFUSES_DUPLICATE_USER_CODE,
     ATOMIC_TAKE_REFRESH_TOKEN,
     ATOMIC_TAKE_AUTHORIZATION_CODE,
     INDEX_RETIRES_OLD_USER_CODE,
@@ -178,6 +180,8 @@ pub const CHECKS: &[&str] = &[
     SWEEP_KEEPS_LIVE,
     SWEEP_COUNT,
     SWEEP_EMPTY_IS_ZERO,
+    SWEEP_CONCURRENT_WRITES,
+    SWEEP_RECLAIMS_PUSHED_REQUESTS,
     REVOKE_FAMILY_REMOVES,
     REVOKE_FAMILY_SPARES_OTHERS,
     REVOKE_FAMILY_COUNT,
@@ -190,10 +194,100 @@ pub const CHECKS: &[&str] = &[
     ATOMIC_TAKE_PUSHED_REQUEST,
     ROUND_TRIP_PUSHED_REQUEST,
     ROUND_TRIP_CONSENT,
+    CONSENTS_FOR_SUBJECT,
     REVOKE_CONSENT_CASCADES,
     REVOKE_CONSENT_SPARES_OTHERS,
     REVOKE_CONSENT_COUNT,
+    BARRIER_REFUSES_TOKEN,
+    BARRIER_REFUSES_REFRESH,
+    BARRIER_REFUSES_PUSHED_REQUEST,
+    BARRIER_SPARES_UNRELATED,
+    BARRIER_ADMITS_A_LATER_GRANT,
+    BARRIER_REPEAT_REVOCATION_MOVES_IT,
+    BARRIER_SWEPT_AT_DEADLINE,
+    BARRIER_KEPT_BEFORE_DEADLINE,
+    REVOCATION_REFUSES_EMPTY_SCOPE,
+    CLIENT_SWAP_APPLIES,
+    CLIENT_SWAP_HONOURS_EXPECTED,
+    CLIENT_SWAP_NEVER_RESURRECTS,
+    CLIENT_SWAP_ATOMIC,
+    CODE_SWAP_APPLIES,
+    CODE_SWAP_HONOURS_EXPECTED,
+    CODE_SWAP_NEVER_RESURRECTS,
+    CODE_SWAP_ATOMIC,
+    CONSENT_SWAP_APPLIES,
+    CONSENT_SWAP_HONOURS_EXPECTED,
+    CONSENT_SWAP_NEVER_RESURRECTS,
+    CONSENT_SWAP_ATOMIC,
+    SWAP_ATOMIC,
 ];
+
+// ------------------------------------------------------- the resurrection rule (0.9.1)
+//
+// A WRITE MUST NOT RESURRECT STATE THAT A REVOCATION REMOVED. See the `crate::store` module docs
+// for the rule in full. These are the checks a HOST needs, and until 0.9.1 there were none: the
+// rule was implemented and tested inside this crate while `check_storage` told a stranger's store
+// nothing about it at all.
+//
+// The failure they catch is invisible to every other check in this file, and that is the point. A
+// store can pass the whole cascade suite and still lose every revocation it makes, because a
+// cascade only reaches what is IN the store when it runs, and the write that undoes it arrives
+// afterwards from a request that was already in flight.
+
+/// A barrier recorded by a revocation must refuse a later `put_token` for a covered record.
+const BARRIER_REFUSES_TOKEN: &str = "revocation_barrier/refuses_put_token";
+/// The same for `put_refresh_token`, which is the write every rotation refusal path makes.
+const BARRIER_REFUSES_REFRESH: &str = "revocation_barrier/refuses_put_refresh_token";
+/// And the same for the pushed request, which is the SEVENTH site the 0.9.1 enumeration missed.
+const BARRIER_REFUSES_PUSHED_REQUEST: &str =
+    "revocation_barrier/refuses_put_pushed_authorization_request";
+/// And it must refuse only what it covers: a store that refuses everything also fails.
+const BARRIER_SPARES_UNRELATED: &str = "revocation_barrier/spares_unrelated_records";
+/// A `client` or `consent` barrier must ADMIT a grant established after the revocation.
+const BARRIER_ADMITS_A_LATER_GRANT: &str = "revocation_barrier/admits_a_later_grant";
+/// A second revocation of one scope must not SHORTEN the first, nor rewind its `recorded_at`.
+const BARRIER_REPEAT_REVOCATION_MOVES_IT: &str = "revocation_barrier/repeat_revocation_moves_it";
+/// Barriers are rows nothing else removes, so the sweep must reclaim them, and count them.
+const BARRIER_SWEPT_AT_DEADLINE: &str = "revocation_barrier/swept_at_its_deadline";
+/// Reaping one EARLY reopens the window it was recorded to close.
+const BARRIER_KEPT_BEFORE_DEADLINE: &str = "revocation_barrier/kept_before_its_deadline";
+/// The empty string does not name an identity, so no revocation may be recorded for it.
+const REVOCATION_REFUSES_EMPTY_SCOPE: &str = "revocation/refuses_an_empty_scope";
+
+const CLIENT_SWAP_APPLIES: &str = "compare_and_swap_client/applies_when_it_matches";
+const CLIENT_SWAP_HONOURS_EXPECTED: &str = "compare_and_swap_client/honours_expected";
+const CLIENT_SWAP_NEVER_RESURRECTS: &str = "compare_and_swap_client/never_resurrects";
+
+const CODE_SWAP_APPLIES: &str = "compare_and_swap_authorization_code/applies_when_it_matches";
+const CODE_SWAP_HONOURS_EXPECTED: &str = "compare_and_swap_authorization_code/honours_expected";
+const CODE_SWAP_NEVER_RESURRECTS: &str = "compare_and_swap_authorization_code/never_resurrects";
+
+const CONSENT_SWAP_APPLIES: &str = "compare_and_swap_consent/applies_when_it_matches";
+const CONSENT_SWAP_HONOURS_EXPECTED: &str = "compare_and_swap_consent/honours_expected";
+const CONSENT_SWAP_NEVER_RESURRECTS: &str = "compare_and_swap_consent/never_resurrects";
+
+// ------------------------------------------------- the atomicity all four swaps REQUIRE
+//
+// "The comparison and the write MUST happen as ONE atomic step. A store that reads, compares, and
+// then writes separately has reintroduced precisely the window this closes, and it will do so
+// silently." That sentence is on all four `compare_and_swap_*` methods, and until these four
+// checks existed NOTHING raced any of them: every swap check was a sequential put, swap, read
+// back, which a read-then-compare-then-write store passes without a mark against it.
+//
+// The interleaving is the one `compare_and_swap_device_grant`'s own doc says the deleted default
+// shim was deleted for: a poll whose read saw `Pending` lands its write after the user clicked
+// deny, and RFC 8628 section 3.3's first-decision-wins guarantee is void. The other three are the
+// same shape on records where the loser is an RFC 7592 update, a detected authorization code
+// replay, and a consent withdrawal.
+//
+// Shaped exactly like the `take_*` races, so `judge_race` can judge them: N racers swap ONE
+// `expected` to N DISTINCT `updated` values, `Ok(true)` maps to the winner and `Ok(false)` to a
+// loser, and exactly one racer may win — because the first write moves the record off `expected`
+// and every later comparison must therefore fail.
+const SWAP_ATOMIC: &str = "compare_and_swap_device_grant/atomic_under_a_race";
+const CLIENT_SWAP_ATOMIC: &str = "compare_and_swap_client/atomic_under_a_race";
+const CODE_SWAP_ATOMIC: &str = "compare_and_swap_authorization_code/atomic_under_a_race";
+const CONSENT_SWAP_ATOMIC: &str = "compare_and_swap_consent/atomic_under_a_race";
 
 const HARNESS_RACE_SETUP: &str = "harness/race_setup";
 const HARNESS_RACER_PANICKED: &str = "harness/racer_panicked";
@@ -206,6 +300,10 @@ const ATOMIC_TAKE_DEVICE_GRANT: &str = "atomic_take/take_device_grant";
 const SWAP_APPLIES_ON_MATCH: &str = "compare_and_swap_device_grant/applies_when_the_state_matches";
 const SWAP_HONOURS_EXPECTED: &str = "compare_and_swap_device_grant/honours_expected";
 const SWAP_NEVER_RESURRECTS: &str = "compare_and_swap_device_grant/never_resurrects";
+/// The two halves of the `put_device_grant` user-code index contract that the SWAP owes as well.
+const SWAP_RETIRES_OLD_USER_CODE: &str = "compare_and_swap_device_grant/retires_the_old_user_code";
+const SWAP_REFUSES_DUPLICATE_USER_CODE: &str =
+    "compare_and_swap_device_grant/refuses_a_duplicate_user_code";
 const ATOMIC_TAKE_REFRESH_TOKEN: &str = "atomic_take/take_refresh_token";
 const ATOMIC_TAKE_AUTHORIZATION_CODE: &str = "atomic_take/take_authorization_code";
 const INDEX_RETIRES_OLD_USER_CODE: &str = "user_code_index/retires_old_entry";
@@ -217,6 +315,8 @@ const SWEEP_REMOVES_DEAD: &str = "sweep_expired/removes_dead";
 const SWEEP_KEEPS_LIVE: &str = "sweep_expired/keeps_live";
 const SWEEP_COUNT: &str = "sweep_expired/count";
 const SWEEP_EMPTY_IS_ZERO: &str = "sweep_expired/empty_is_zero";
+const SWEEP_RECLAIMS_PUSHED_REQUESTS: &str = "sweep_expired/reclaims_pushed_requests";
+const SWEEP_CONCURRENT_WRITES: &str = "sweep_expired/safe_under_concurrent_writes";
 const REVOKE_FAMILY_REMOVES: &str = "revoke_token_family/removes_the_family";
 const REVOKE_FAMILY_SPARES_OTHERS: &str = "revoke_token_family/spares_other_families";
 const REVOKE_FAMILY_COUNT: &str = "revoke_token_family/count";
@@ -229,6 +329,7 @@ const SWEEP_RECLAIMS_REPLAY_IDS: &str = "sweep_expired/reclaims_replay_ids";
 const ATOMIC_TAKE_PUSHED_REQUEST: &str = "atomic_take/take_pushed_authorization_request";
 const ROUND_TRIP_PUSHED_REQUEST: &str = "round_trip/pushed_authorization_request";
 const ROUND_TRIP_CONSENT: &str = "round_trip/consent";
+const CONSENTS_FOR_SUBJECT: &str = "consents_for_subject/lists_that_subjects_consents";
 const REVOKE_CONSENT_CASCADES: &str = "revoke_consent/cascades";
 const REVOKE_CONSENT_SPARES_OTHERS: &str = "revoke_consent/spares_other_subjects";
 const REVOKE_CONSENT_COUNT: &str = "revoke_consent/count";
@@ -314,6 +415,8 @@ where
         self.round_trip_refresh_token(&mut report).await;
         self.atomic_take_device_grant(&mut report).await;
         self.compare_and_swap_device_grant(&mut report).await;
+        self.compare_and_swap_device_grant_user_code_index(&mut report)
+            .await;
         self.atomic_take_refresh_token(&mut report).await;
         self.atomic_take_authorization_code(&mut report).await;
         self.user_code_index(&mut report).await;
@@ -321,7 +424,7 @@ where
         self.revoke_family(&mut report).await;
         self.delete_client(&mut report).await;
         self.delete_token(&mut report).await;
-        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        #[cfg(any(feature = "client-assertion", feature = "dpop"))]
         self.claim_replay_id(&mut report).await;
         #[cfg(feature = "par")]
         self.round_trip_pushed_request(&mut report).await;
@@ -329,6 +432,21 @@ where
         self.atomic_take_pushed_request(&mut report).await;
         #[cfg(feature = "consent")]
         self.consent(&mut report).await;
+        self.revocation_barrier(&mut report).await;
+        self.barrier_admits_a_later_grant(&mut report).await;
+        self.compare_and_swap_client(&mut report).await;
+        self.compare_and_swap_authorization_code(&mut report).await;
+        #[cfg(feature = "consent")]
+        self.compare_and_swap_consent(&mut report).await;
+        self.compare_and_swap_device_grant_race(&mut report).await;
+        self.compare_and_swap_client_race(&mut report).await;
+        self.compare_and_swap_authorization_code_race(&mut report)
+            .await;
+        #[cfg(feature = "consent")]
+        self.compare_and_swap_consent_race(&mut report).await;
+        self.sweep_under_concurrent_writes(&mut report).await;
+        self.revocation_refuses_an_empty_scope(&mut report).await;
+        self.barrier_repeat_revocation_moves_it(&mut report).await;
         report.violations
     }
 
@@ -338,7 +456,7 @@ where
     /// produces two token responses somebody might notice, while a claim-if-absent that answers
     /// "you are first" to two callers produces exactly the request the client meant to send,
     /// twice, and nothing anywhere records that it happened.
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     async fn claim_replay_id(&self, report: &mut Report) {
         let store = self.store().await;
         let deadline = at(300);
@@ -444,6 +562,1294 @@ where
         Arc::new((self.new_store)().await)
     }
 
+    // -------------------------------------------------------------- the resurrection rule
+
+    /// A barrier must refuse a grant that PREDATES it and admit one established AFTER it.
+    ///
+    /// The other barrier checks give their revocation a `recorded_at` far enough out to cover
+    /// everything, because they are about the refusal. That makes them blind to the direction
+    /// tested here: a store that ignores `RevocationWindow::recorded_at` entirely, or compares it
+    /// the wrong way round, passes every one of them.
+    ///
+    /// It is not a tidiness check. `client` and `consent` barriers name an identity that can
+    /// legitimately be established again — a user re-approving an application, a host
+    /// re-provisioning a `client_id` it deleted — and a store that refuses on identity alone locks
+    /// that identity out until the barrier is swept, which is as long as the longest token the
+    /// server mints. The user re-approves, sees the application listed as authorised, and cannot
+    /// obtain a token from it for the life of a refresh token.
+    ///
+    /// `TokenFamily` is deliberately NOT tested this way, because it is deliberately
+    /// unconditional: rotation mints fresh records inside an existing family, so comparing there
+    /// would admit the very write RFC 9700 s4.14.2 containment exists to refuse.
+    async fn barrier_admits_a_later_grant(&self, report: &mut Report) {
+        let store = self.store().await;
+        let client = ClientId::new("client-relifecycle");
+
+        // REGISTERED first, so the deletion below is the one this check is named for: a client
+        // that was there and is removed. Deleting one that was never stored is a different
+        // property with a different failure mode, and `revocation_barrier` owns it.
+        if report
+            .ok(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                "put_client",
+                store.put_client(sample_client(client.as_str())).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        if report
+            .ok(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                "delete_client",
+                store
+                    .delete_client(
+                        &client,
+                        crate::store::RevocationWindow {
+                            recorded_at: at_before(0),
+                            until: barrier_until(),
+                        },
+                    )
+                    .await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // Established BEFORE the deletion: the in-flight write the barrier exists to refuse.
+        let mut stale = sample_token("at-grant-before-deletion", client.as_str(), None);
+        stale.grant_established_at = at_before(60);
+        match store.put_token(stale).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                "put_token wrote a token whose grant was established BEFORE the client was \
+                 deleted: that is the in-flight write the barrier exists to refuse, so the \
+                 deletion is undone by a request that was already running when it ran",
+            ),
+            Err(e) => report.fail(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // Established AFTER it: a new decision, which must be served.
+        let mut fresh = sample_token("at-grant-after-deletion", client.as_str(), None);
+        fresh.grant_established_at = at(60);
+        match store.put_token(fresh).await {
+            Ok(WriteOutcome::Applied) => {}
+            Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                "put_token refused a token whose grant was established AFTER the revocation. A \
+                 barrier that refuses on identity alone never lets the identity come back: a \
+                 re-provisioned client, or a user who withdrew an application and approved it \
+                 again, is locked out until the barrier is swept — as long as the longest token \
+                 this server mints. Compare the grant instant against \
+                 RevocationWindow::recorded_at for the client and consent scopes",
+            ),
+            Err(e) => report.fail(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // AND IT MUST NAME ONE CLIENT. Everything above uses a single `client_id`, so a store
+        // whose client-scope predicate ignores `client_id` altogether — a barrier table queried
+        // without its scope column, a predicate that matched on the barrier KIND — passes every
+        // line of it. The grant here predates the deletion, exactly as the refused one above does,
+        // so identity is the only thing that can tell them apart. RFC 7592 section 2.3 deletes one
+        // registration; a store that got this wrong stops every client in the deployment
+        // refreshing for the barrier's whole life, on a path an administrator drives by hand.
+        let mut bystander = sample_token(
+            "at-another-clients-grant-before-the-deletion",
+            "client-not-the-one-deleted",
+            None,
+        );
+        bystander.grant_established_at = at_before(60);
+        match store.put_token(bystander).await {
+            Ok(WriteOutcome::Applied) => {}
+            Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                BARRIER_SPARES_UNRELATED,
+                "put_token refused a token belonging to a DIFFERENT client than the one deleted: \
+                 the client barrier is not comparing its scope against the record's `client_id` at \
+                 all, so one RFC 7592 s2.3 deletion has stopped every client this server has",
+            ),
+            Err(e) => report.fail(
+                BARRIER_SPARES_UNRELATED,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // The pushed request is judged on `pushed_at`, and it is judged the same way round. This
+        // is the ADMIT half for the seventh site: a client re-provisioned under an id the host
+        // deleted must be able to push again, or the RFC 9126 endpoint answers `server_error` for
+        // it until the barrier is swept, which is a fail-closed PAR outage nothing reports.
+        #[cfg(feature = "par")]
+        {
+            let mut pushed_after = sample_pushed_request(
+                "urn:ietf:params:oauth:request_uri:pushed-after-the-deletion",
+            );
+            pushed_after.client_id = client.clone();
+            pushed_after.pushed_at = at(60);
+            match store.put_pushed_authorization_request(pushed_after).await {
+                Ok(WriteOutcome::Applied) => {}
+                Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                    BARRIER_ADMITS_A_LATER_GRANT,
+                    "put_pushed_authorization_request refused a request pushed AFTER the client \
+                     was deleted. The barrier compares `pushed_at`, so a handle authored after the \
+                     revocation belongs to whatever registration holds the id now; refusing on \
+                     identity alone makes every push fail for the barrier's life, silently and in \
+                     the fail-closed direction",
+                ),
+                Err(e) => report.fail(
+                    BARRIER_ADMITS_A_LATER_GRANT,
+                    format!("put_pushed_authorization_request failed unexpectedly: {e}"),
+                ),
+            }
+        }
+    }
+
+    /// THE RESURRECTION RULE, from the outside.
+    ///
+    /// A revocation removes what is in the store WHEN IT RUNS. A request that was already holding
+    /// one of those records writes afterwards, and without a barrier that write puts it back. The
+    /// cascade checks in this file cannot see this: they revoke, then look, and everything is
+    /// correctly gone. The defect is entirely in what happens NEXT.
+    ///
+    /// Driven through `revoke_token_family` because that is the narrowest scope and so the
+    /// sharpest test: a store that records a client-wide barrier when asked for a family one would
+    /// pass the refusal half and fail `spares_unrelated_records`.
+    async fn revocation_barrier(&self, report: &mut Report) {
+        let store = self.store().await;
+
+        // A family, revoked, with the barrier standing well past everything else this harness
+        // uses for time.
+        if report
+            .ok(
+                BARRIER_REFUSES_TOKEN,
+                "revoke_token_family",
+                store
+                    .revoke_token_family("fam-barrier", barrier_window())
+                    .await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // The write an issuance already in flight for that family is about to make.
+        match store
+            .put_token(sample_token(
+                "at-after-revocation",
+                "client-conformance",
+                Some("fam-barrier"),
+            ))
+            .await
+        {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                BARRIER_REFUSES_TOKEN,
+                "put_token wrote an access token for a family that had just been revoked: an \
+                 issuance already in flight when the revocation ran completes behind it, so RFC \
+                 9700 s4.14.2 containment reports success and the token it was containing is live",
+            ),
+            Err(e) => report.fail(
+                BARRIER_REFUSES_TOKEN,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // AND UNCONDITIONALLY, which is the one place this crate deliberately does NOT compare
+        // against `recorded_at`. Rotation legitimately mints fresh records inside an EXISTING
+        // family, so a family barrier that admitted a later-established grant would admit exactly
+        // the write RFC 9700 s4.14.2 containment exists to refuse: the rotation that completes
+        // after the cascade. Nothing legitimate is lost, because a new grant gets a new family_id.
+        //
+        // Every other record this harness plants predates the barrier, so a store that wrongly
+        // applied the grant-instant comparison to the family scope refused them all for the wrong
+        // reason and passed. This one is established a minute AFTER the revocation.
+        let mut later_in_the_family = sample_token(
+            "at-after-revocation-later-grant",
+            "client-conformance",
+            Some("fam-barrier"),
+        );
+        later_in_the_family.grant_established_at = at(60);
+        match store.put_token(later_in_the_family).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                BARRIER_REFUSES_TOKEN,
+                "put_token wrote a token for a REVOKED family because its grant instant was after \
+                 the revocation. The family scope refuses UNCONDITIONALLY: a rotation carries the \
+                 grant instant forward but mints its records at `now`, so comparing here readmits \
+                 the rotation that completes behind the cascade, which is the whole of what RFC \
+                 9700 s4.14.2 containment is for. Compare `recorded_at` for the client and consent \
+                 scopes only",
+            ),
+            Err(e) => report.fail(
+                BARRIER_REFUSES_TOKEN,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // The same for the refresh record, which is the write EVERY refusal path of a rotation
+        // makes, on a record `take_refresh_token` has already removed.
+        match store
+            .put_refresh_token(sample_refresh(
+                "rt-after-revocation",
+                "client-conformance",
+                "fam-barrier",
+            ))
+            .await
+        {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                BARRIER_REFUSES_REFRESH,
+                "put_refresh_token restored a refresh record for a family that had just been \
+                 revoked: the user was told the grant was revoked and the client still holds a \
+                 rotatable chain",
+            ),
+            Err(e) => report.fail(
+                BARRIER_REFUSES_REFRESH,
+                format!("put_refresh_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // AND IT MUST REFUSE ONLY WHAT IT COVERS. Without this a store that answered
+        // `RefusedRevoked` to everything would pass both checks above and issue nothing, ever.
+        match store
+            .put_token(sample_token(
+                "at-unrelated",
+                "client-conformance",
+                Some("fam-other"),
+            ))
+            .await
+        {
+            Ok(WriteOutcome::Applied) => {}
+            Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                BARRIER_SPARES_UNRELATED,
+                "put_token refused a token from a DIFFERENT family: the barrier is matching too \
+                 widely, so one revocation has stopped this client issuing anything at all",
+            ),
+            Err(e) => report.fail(
+                BARRIER_SPARES_UNRELATED,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // A REVOCATION OF SOMETHING THAT WAS NEVER THERE STILL RECORDS ITS BARRIER. The shape a
+        // host reaches for is `if rows_deleted > 0 { insert_barrier(..) }`, which satisfies every
+        // other word of `delete_client` and drops the protection in exactly the interleaving that
+        // needs it: absence of the registration row proves nothing about an issuance that is
+        // holding a `Client` it read before the deletion ran, and a second delete arriving from
+        // another node finds nothing to remove and must still refuse that issuance.
+        let never_registered = ClientId::new("client-never-registered");
+        if report
+            .ok(
+                BARRIER_REFUSES_TOKEN,
+                "delete_client (a client that was never stored)",
+                store
+                    .delete_client(&never_registered, barrier_window())
+                    .await,
+            )
+            .is_some()
+        {
+            match store
+                .put_token(sample_token(
+                    "at-for-a-client-that-was-never-registered",
+                    never_registered.as_str(),
+                    None,
+                ))
+                .await
+            {
+                Ok(WriteOutcome::RefusedRevoked) => {}
+                Ok(WriteOutcome::Applied) => report.fail(
+                    BARRIER_REFUSES_TOKEN,
+                    "delete_client recorded NO barrier because there was no registration to \
+                     remove, so a write covered by that deletion was accepted. Deleting a client \
+                     that is already gone answers Ok(false) and must still record the barrier: the \
+                     issuance the deletion is racing is holding a registration it read earlier, \
+                     and the empty result set says nothing about it",
+                ),
+                Err(e) => report.fail(
+                    BARRIER_REFUSES_TOKEN,
+                    format!("put_token failed unexpectedly: {e}"),
+                ),
+            }
+        }
+
+        // A barrier is a row nothing else removes, one per revocation, so an unswept store grows
+        // by one every time a user logs out. It must be reclaimed, and COUNTED, or a host
+        // implementing `sweep_expired` to the letter of its enumeration never reclaims the table.
+        //
+        // One second BEFORE the deadline first: reaping early reopens the window the barrier was
+        // recorded to close, which is the failure that costs a revocation rather than a row.
+        let before = report.ok(
+            BARRIER_KEPT_BEFORE_DEADLINE,
+            "sweep_expired",
+            store
+                .sweep_expired(barrier_until() - Duration::from_secs(1))
+                .await,
+        );
+        if before.is_some() {
+            match store
+                .put_refresh_token(sample_refresh(
+                    "rt-still-refused",
+                    "client-conformance",
+                    "fam-barrier",
+                ))
+                .await
+            {
+                Ok(WriteOutcome::RefusedRevoked) => {}
+                Ok(WriteOutcome::Applied) => report.fail(
+                    BARRIER_KEPT_BEFORE_DEADLINE,
+                    "a sweep BEFORE the barrier deadline reclaimed it, so a write that the \
+                     revocation should still be refusing was accepted: the window the barrier \
+                     exists to close has been reopened early",
+                ),
+                Err(e) => report.fail(
+                    BARRIER_KEPT_BEFORE_DEADLINE,
+                    format!("put_refresh_token failed unexpectedly: {e}"),
+                ),
+            }
+        }
+
+        // And AT the deadline it goes, and is counted.
+        let Some(removed) = report.ok(
+            BARRIER_SWEPT_AT_DEADLINE,
+            "sweep_expired",
+            store.sweep_expired(barrier_until()).await,
+        ) else {
+            return;
+        };
+        if removed == 0 {
+            report.fail(
+                BARRIER_SWEPT_AT_DEADLINE,
+                "sweep_expired reclaimed nothing at the barrier deadline: a barrier is a row \
+                 nothing else ever removes, so a store that does not sweep them grows by one per \
+                 revocation forever",
+            );
+        }
+    }
+
+    /// A second revocation of ONE scope must not weaken the first, in either of the two instants a
+    /// [`crate::store::RevocationWindow`] carries.
+    ///
+    /// Nothing else in this harness records two DIFFERENT windows for one scope: every other check
+    /// passes the same constant window twice, and two equal instants take neither branch of the
+    /// merge. So a store that upserts the row — which is the obvious implementation, and the one
+    /// both a `HashMap::insert` and an `INSERT ... ON CONFLICT DO UPDATE SET` give you for free —
+    /// passes everything else in this file while losing whichever of the two writes lands first.
+    ///
+    /// The earlier window is recorded SECOND, because that is the ordering that actually happens:
+    /// two nodes withdraw the same grant, each computes its window from its own clock, and the
+    /// slower node's write arrives last carrying the older instants. Both halves cost something
+    /// real. A rewound `recorded_at` admits a grant established between the two revocations, which
+    /// the later revocation was entitled to kill. A shortened `until` reaps the barrier early and
+    /// reopens the whole window it was recorded to close.
+    async fn barrier_repeat_revocation_moves_it(&self, report: &mut Report) {
+        let c = BARRIER_REPEAT_REVOCATION_MOVES_IT;
+        let store = self.store().await;
+        let client = ClientId::new("client-revoked-twice");
+        if report
+            .ok(
+                c,
+                "put_client",
+                store.put_client(sample_client(client.as_str())).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        let later = crate::store::RevocationWindow {
+            recorded_at: at(100),
+            until: barrier_until(),
+        };
+        let earlier = crate::store::RevocationWindow {
+            recorded_at: at_before(0),
+            until: at(200),
+        };
+        if report
+            .ok(
+                c,
+                "delete_client",
+                store.delete_client(&client, later).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if report
+            .ok(
+                c,
+                "delete_client (a second revocation, with an EARLIER window)",
+                store.delete_client(&client, earlier).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // `recorded_at` must be the LATER of the two. A grant established between the two
+        // revocations is one the second-recorded-but-later revocation was entitled to kill.
+        let mut between = sample_token("at-between-two-revocations", client.as_str(), None);
+        between.grant_established_at = at(50);
+        match store.put_token(between).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                c,
+                "after two revocations of one client, a token whose grant was established BETWEEN \
+                 them was written. The second revocation carried an EARLIER `recorded_at` and this \
+                 store took it, so the repeat revocation moved the barrier BACKWARDS and admitted \
+                 exactly the grant the first one covered. `recorded_at` must take the later of the \
+                 two, or a store whose two nodes race loses whichever revocation commits first",
+            ),
+            Err(e) => report.fail(c, format!("put_token failed unexpectedly: {e}")),
+        }
+
+        // And `until` must be the later of the two as well: a sweep past the SECOND window's
+        // deadline and well short of the first's must leave the barrier standing.
+        //
+        // One dead record is planted for that sweep to find, so that a store whose sweep errors
+        // when it matched no rows — a real fault, owned by `sweep_expired/empty_is_zero` — is not
+        // also reported here under a name that would send a host looking at its barrier table.
+        let mut fodder = sample_token("at-dead-sweep-fodder", "client-sweep-fodder", None);
+        fodder.expires_at = at_before(1);
+        if report
+            .ok(
+                c,
+                "put_token (a dead record for the sweep)",
+                store.put_token(fodder).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if report
+            .ok(
+                c,
+                "sweep_expired (past the second window's deadline, short of the first's)",
+                store.sweep_expired(at(300)).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let mut predating = sample_token("at-predating-both-revocations", client.as_str(), None);
+        predating.grant_established_at = at_before(60);
+        match store.put_token(predating).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                c,
+                "a second revocation of one client SHORTENED the first one's deadline: sweeping \
+                 past the second window's `until`, which is far short of the first's, reclaimed \
+                 the barrier, and a write the first revocation was still covering was accepted. A \
+                 repeat revocation must never shrink the protection already recorded",
+            ),
+            Err(e) => report.fail(c, format!("put_token failed unexpectedly: {e}")),
+        }
+    }
+
+    /// An empty identifier is REFUSED, by every store.
+    ///
+    /// The empty string does not name an identity a barrier can be recorded for, so a store that
+    /// accepts one has cascaded against a scope no later write can be compared to. This is not a
+    /// tidiness rule and it is not hypothetical: it was found by running the same call through
+    /// both bundled stores, where `delete_client("")` cascaded everything in memory and — because
+    /// the barrier insert ran first — deleted NOTHING through Postgres while returning an error.
+    /// A divergence like that is worse than either behaviour on its own, because a host that
+    /// tested against one backend and deployed on the other got neither.
+    ///
+    /// Only the two revocations that TAKE the scope as a parameter are probed. `revoke_consent`
+    /// owes the same refusal, and its trait doc says so, but the scope it would refuse comes from
+    /// the stored consent rather than from the call, so reaching it means persisting a consent
+    /// with an empty `client_id` or `subject` — a record no store is obliged to accept in the
+    /// first place, which would make a refusal here indistinguishable from a refusal there.
+    async fn revocation_refuses_an_empty_scope(&self, report: &mut Report) {
+        let c = REVOCATION_REFUSES_EMPTY_SCOPE;
+        let store = self.store().await;
+        // Something for a wrongly-accepted revocation to have removed. A refusal must leave the
+        // store exactly as it was, which is why the refusal has to come BEFORE the cascade.
+        if report
+            .ok(
+                c,
+                "put_token",
+                store
+                    .put_token(sample_token(
+                        "at-empty-scope",
+                        "client-empty-scope",
+                        Some("fam-empty-scope"),
+                    ))
+                    .await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        if let Ok(removed) = store
+            .delete_client(&ClientId::new(""), barrier_window())
+            .await
+        {
+            report.fail(
+                c,
+                format!(
+                    "delete_client accepted an EMPTY client_id and answered Ok({removed}). The \
+                     empty string names no registration, so there is nothing for the cascade to \
+                     mean and nothing a later write can be compared against; a store that keys \
+                     barriers by value must refuse it rather than record one for \"\""
+                ),
+            );
+        }
+        if let Ok(removed) = store.revoke_token_family("", barrier_window()).await {
+            report.fail(
+                c,
+                format!(
+                    "revoke_token_family accepted an EMPTY family_id and answered Ok({removed}). \
+                     RFC 6749 section 4.4 tokens carry no family at all, so a store that treats \
+                     \"\" as a family is one careless call away from a predicate that matches them"
+                ),
+            );
+        }
+
+        // AND THE STORE IS UNTOUCHED — but by a NARROWER argument than the one written here for
+        // several rounds, which claimed this caught "a store that cascades first and validates
+        // afterwards". It cannot. The only planted record names `client-empty-scope` and
+        // `fam-empty-scope`, so a cascade run faithfully with the EMPTY scope matches nothing and
+        // the token survives whichever order that store did its two steps in.
+        //
+        // What this probe genuinely detects is the store that treats "" as a WILDCARD rather than
+        // as a value — an unparameterised predicate, a `LIKE ''`, a `retain` whose closure is
+        // written the wrong way round for an empty key — which is the shape that empties the whole
+        // table on one careless call, and is the reason an empty scope is refused at all. Catching
+        // the ordering as well would need a record the empty scope actually names, meaning a token
+        // whose `client_id` is the empty string, and no store is obliged to accept one: a refusal
+        // on the way IN would be indistinguishable from the refusal being probed. That is the same
+        // argument this check's own doc gives for leaving `revoke_consent` out.
+        if let Some(found) = report.ok(c, "get_token", store.get_token("at-empty-scope").await) {
+            if found.is_none() {
+                report.fail(
+                    c,
+                    "a revocation refused for naming an empty scope had already removed records \
+                     by the time it refused: the caller is told the call failed and the store is \
+                     the one the failed call left behind",
+                );
+            }
+        }
+    }
+
+    /// `compare_and_swap_client`, the RFC 7592 s2.2 half of the rule.
+    ///
+    /// The resurrection this closes: an update reads a registration, awaits a policy decision, and
+    /// writes the whole record back. A s2.3 DELETE landing in that window was undone by a blind
+    /// put, restoring the client with its old credential and its old registration access token
+    /// hash, which makes deleting a compromised registration defeatable by whoever holds the
+    /// stolen token.
+    async fn compare_and_swap_client(&self, report: &mut Report) {
+        let store = self.store().await;
+        let original = sample_client("client-swap");
+        if report
+            .ok(
+                CLIENT_SWAP_APPLIES,
+                "put_client",
+                store.put_client(original.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // The expectation is what the store ACTUALLY HOLDS, read back, not what was written. A
+        // store that mutates a record on the way in (dropping a field, normalising a string) has a
+        // round-trip defect that `round_trip/client` already owns and names; without this read
+        // that defect would fire here a second time under a swap name, and a host would chase two
+        // bugs where there is one. Same reasoning as `index_already_dirty` in the device-grant
+        // swap check above.
+        let Some(original) = report.ok(
+            CLIENT_SWAP_APPLIES,
+            "get_client",
+            store.get_client(&ClientId::new("client-swap")).await,
+        ) else {
+            return;
+        };
+        let Some(original) = original.map(|a| (*a).clone()) else {
+            report.fail(
+                CLIENT_SWAP_APPLIES,
+                "the registration written a moment ago is not there to swap against",
+            );
+            return;
+        };
+
+        // Matches: applies.
+        let mut renamed = original.clone();
+        renamed.name = Some("renamed by the swap".to_string());
+        match store
+            .compare_and_swap_client(&original, renamed.clone())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => report.fail(
+                CLIENT_SWAP_APPLIES,
+                "a swap whose expected record is exactly what is stored reported that it did not \
+                 apply, so no RFC 7592 update can ever be recorded",
+            ),
+            Err(e) => report.fail(
+                CLIENT_SWAP_APPLIES,
+                format!("compare_and_swap_client failed unexpectedly: {e}"),
+            ),
+        }
+
+        // Stale expectation: refused, and nothing written.
+        let mut clobber = original.clone();
+        clobber.name = Some("clobbered".to_string());
+        match store.compare_and_swap_client(&original, clobber).await {
+            Ok(false) => {}
+            Ok(true) => report.fail(
+                CLIENT_SWAP_HONOURS_EXPECTED,
+                "a swap applied against a registration that had already changed: two concurrent \
+                 RFC 7592 updates silently lose one, and the loser is whichever landed first",
+            ),
+            Err(e) => report.fail(
+                CLIENT_SWAP_HONOURS_EXPECTED,
+                format!("compare_and_swap_client failed unexpectedly: {e}"),
+            ),
+        }
+        match store.get_client(&ClientId::new("client-swap")).await {
+            Ok(Some(live)) if live.name.as_deref() == Some("renamed by the swap") => {}
+            Ok(Some(_)) => report.fail(
+                CLIENT_SWAP_HONOURS_EXPECTED,
+                "a refused swap wrote anyway: `Ok(false)` must mean nothing changed",
+            ),
+            Ok(None) => report.fail(
+                CLIENT_SWAP_HONOURS_EXPECTED,
+                "the registration vanished during a refused swap",
+            ),
+            Err(e) => report.fail(
+                CLIENT_SWAP_HONOURS_EXPECTED,
+                format!("get_client failed unexpectedly: {e}"),
+            ),
+        }
+
+        // ABSENT: the case that matters. A swap must never insert.
+        if report
+            .ok(
+                CLIENT_SWAP_NEVER_RESURRECTS,
+                "delete_client",
+                store
+                    .delete_client(&ClientId::new("client-swap"), barrier_window())
+                    .await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        match store
+            .compare_and_swap_client(&renamed, renamed.clone())
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => report.fail(
+                CLIENT_SWAP_NEVER_RESURRECTS,
+                "a swap against a DELETED registration reported that it applied: `Ok(false)` is \
+                 the only correct answer for a row that is not there",
+            ),
+            Err(e) => report.fail(
+                CLIENT_SWAP_NEVER_RESURRECTS,
+                format!("compare_and_swap_client failed unexpectedly: {e}"),
+            ),
+        }
+        match store.get_client(&ClientId::new("client-swap")).await {
+            Ok(None) => {}
+            Ok(Some(_)) => report.fail(
+                CLIENT_SWAP_NEVER_RESURRECTS,
+                "a swap brought back a deleted registration, with its old credential and its old \
+                 registration access token hash: deleting a compromised client is defeatable by \
+                 whoever holds the stolen token",
+            ),
+            Err(e) => report.fail(
+                CLIENT_SWAP_NEVER_RESURRECTS,
+                format!("get_client failed unexpectedly: {e}"),
+            ),
+        }
+    }
+
+    /// `compare_and_swap_authorization_code`, which is how a redemption suspended across the
+    /// host's signer finds out that a replay was detected while it slept.
+    async fn compare_and_swap_authorization_code(&self, report: &mut Report) {
+        let store = self.store().await;
+        let issued = sample_authorization_code("code-swap");
+        if report
+            .ok(
+                CODE_SWAP_APPLIES,
+                "put_authorization_code",
+                store.put_authorization_code(issued.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // Read back for the same reason the client swap does: a store that mutates the record on
+        // the way in has a round-trip defect that belongs to `round_trip/authorization_code`.
+        let Some(issued) = report.ok(
+            CODE_SWAP_APPLIES,
+            "take_authorization_code",
+            store.take_authorization_code("code-swap").await,
+        ) else {
+            return;
+        };
+        let Some(issued) = issued else {
+            report.fail(
+                CODE_SWAP_APPLIES,
+                "the authorization code written a moment ago is not there to swap against",
+            );
+            return;
+        };
+        if report
+            .ok(
+                CODE_SWAP_APPLIES,
+                "put_authorization_code",
+                store.put_authorization_code(issued.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let consumed_state = AuthorizationCodeState::Consumed {
+            access_token: Some("at-from-code".to_string()),
+            refresh_token: None,
+        };
+        let mut consumed = issued.clone();
+        consumed.state = consumed_state.clone();
+
+        match store
+            .compare_and_swap_authorization_code(&issued.state, consumed.clone())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => report.fail(
+                CODE_SWAP_APPLIES,
+                "a swap whose expected state is exactly what is stored reported that it did not \
+                 apply, so a redemption can never record what it minted",
+            ),
+            Err(e) => report.fail(
+                CODE_SWAP_APPLIES,
+                format!("compare_and_swap_authorization_code failed unexpectedly: {e}"),
+            ),
+        }
+
+        // The state has moved on: refused. This is the interleaving the method exists for, with a
+        // replay having marked the record while the redemption was signing.
+        let mut replayed = issued.clone();
+        replayed.state = AuthorizationCodeState::Replayed {
+            access_token: Some("at-from-code".to_string()),
+            refresh_token: None,
+        };
+        if report
+            .ok(
+                CODE_SWAP_HONOURS_EXPECTED,
+                "put_authorization_code",
+                store.put_authorization_code(replayed).await,
+            )
+            .is_some()
+        {
+            match store
+                .compare_and_swap_authorization_code(&consumed_state, consumed.clone())
+                .await
+            {
+                Ok(false) => {}
+                Ok(true) => report.fail(
+                    CODE_SWAP_HONOURS_EXPECTED,
+                    "a swap applied over a state that had already moved on: a redemption \
+                     suspended in the host's signer overwrites the trace a detected replay left \
+                     for it, and hands out the very tokens the replay was containing",
+                ),
+                Err(e) => report.fail(
+                    CODE_SWAP_HONOURS_EXPECTED,
+                    format!("compare_and_swap_authorization_code failed unexpectedly: {e}"),
+                ),
+            }
+        }
+
+        // ABSENT: swept, or cascaded away by delete_client or revoke_consent. Must stay gone.
+        if report
+            .ok(
+                CODE_SWAP_NEVER_RESURRECTS,
+                "take_authorization_code",
+                store.take_authorization_code("code-swap").await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        match store
+            .compare_and_swap_authorization_code(&consumed_state, consumed)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => report.fail(
+                CODE_SWAP_NEVER_RESURRECTS,
+                "a swap against an authorization code that is not there reported that it applied",
+            ),
+            Err(e) => report.fail(
+                CODE_SWAP_NEVER_RESURRECTS,
+                format!("compare_and_swap_authorization_code failed unexpectedly: {e}"),
+            ),
+        }
+        match store.take_authorization_code("code-swap").await {
+            Ok(None) => {}
+            Ok(Some(_)) => report.fail(
+                CODE_SWAP_NEVER_RESURRECTS,
+                "a swap reinstated an authorization code that had been removed: a code a \
+                 withdrawal or a client deletion cascaded away is redeemable again",
+            ),
+            Err(e) => report.fail(
+                CODE_SWAP_NEVER_RESURRECTS,
+                format!("take_authorization_code failed unexpectedly: {e}"),
+            ),
+        }
+    }
+
+    /// `compare_and_swap_consent`. The comparison is against what `find_consent` answers for the
+    /// PAIR, not against a `consent_id`, because a withdrawal removes the record the caller read.
+    #[cfg(feature = "consent")]
+    async fn compare_and_swap_consent(&self, report: &mut Report) {
+        let store = self.store().await;
+        let original = sample_consent("consent-swap", "subject-swap");
+
+        // Creating, against a pair that holds nothing.
+        match store.compare_and_swap_consent(None, original.clone()).await {
+            Ok(true) => {}
+            Ok(false) => report.fail(
+                CONSENT_SWAP_APPLIES,
+                "a create against a (client, subject) pair that holds no consent reported that it \
+                 did not apply, so a first approval can never be recorded",
+            ),
+            Err(e) => report.fail(
+                CONSENT_SWAP_APPLIES,
+                format!("compare_and_swap_consent failed unexpectedly: {e}"),
+            ),
+        }
+
+        // Read back, for the same reason as the two swaps above.
+        let original = match store
+            .find_consent(&ClientId::new("client-conformance"), "subject-swap")
+            .await
+        {
+            Ok(Some(live)) => (*live).clone(),
+            // NOT a failure of this check. A store whose `find_consent` cannot see what
+            // `compare_and_swap_consent` just wrote has a lookup defect, and `round_trip/consent`
+            // and `find_consent`'s own checks own it. Reporting it again here would give a host
+            // two names for one bug and send them looking for a second one. Same reasoning as
+            // `index_already_dirty` in the device-grant swap check.
+            Ok(None) => return,
+            Err(e) => {
+                report.fail(
+                    CONSENT_SWAP_APPLIES,
+                    format!("find_consent failed unexpectedly: {e}"),
+                );
+                return;
+            }
+        };
+
+        // WIDENING, against exactly what the store holds: it must APPLY, and the wider record must
+        // be what the next reader sees.
+        //
+        // This was the missing direction, and its absence was invisible: the three calls this
+        // check used to make were (None, create) which must apply, (None, duplicate) which must
+        // refuse, and (Some, widen-after-withdrawal) which must refuse — not one of them a `Some`
+        // that MATCHES. A store answering `Ok(false)` to every `Some(..)` passed all three while
+        // `compare_and_swap_consent/applies_when_it_matches` reported nothing, despite its name.
+        // What that costs is not an error anywhere: a widen that never lands means the record
+        // never grows, so the user is prompted again on every authorization request that asks for
+        // one more scope, forever, on a store certified clean.
+        let mut widened = original.clone();
+        widened.extend(&scopes("read write admin"), &[]);
+        match store
+            .compare_and_swap_consent(Some(&original), widened.clone())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => report.fail(
+                CONSENT_SWAP_APPLIES,
+                "a widen whose expected record is exactly what is stored reported that it did not \
+                 apply, so a consent can never be broadened in place and the user is re-prompted \
+                 on every authorization request that asks for a scope they have already approved",
+            ),
+            Err(e) => report.fail(
+                CONSENT_SWAP_APPLIES,
+                format!("compare_and_swap_consent failed unexpectedly: {e}"),
+            ),
+        }
+        // Read back rather than assumed: a swap that reports success and writes nothing is a
+        // distinct defect from one that refuses, and it fails in the same silent direction.
+        let original = match store
+            .find_consent(&ClientId::new("client-conformance"), "subject-swap")
+            .await
+        {
+            Ok(Some(live)) if live.scope == widened.scope => (*live).clone(),
+            Ok(Some(live)) => {
+                report.fail(
+                    CONSENT_SWAP_APPLIES,
+                    format!(
+                        "a widen that reported success did not change the stored record: the pair \
+                         still holds scope {:?} rather than the widened {:?}",
+                        live.scope, widened.scope
+                    ),
+                );
+                (*live).clone()
+            }
+            Ok(None) => return,
+            Err(e) => {
+                report.fail(
+                    CONSENT_SWAP_APPLIES,
+                    format!("find_consent failed unexpectedly: {e}"),
+                );
+                return;
+            }
+        };
+
+        // Creating AGAIN, against a pair that now holds one: refused. This is the half that keeps
+        // one live consent per pair, so two concurrent first approvals cannot each create a record.
+        let duplicate = sample_consent("consent-swap-duplicate", "subject-swap");
+        match store.compare_and_swap_consent(None, duplicate).await {
+            Ok(false) => {}
+            Ok(true) => report.fail(
+                CONSENT_SWAP_HONOURS_EXPECTED,
+                "a create applied against a pair that already holds a consent: the pair now has \
+                 two, and a user withdrawing one is told they revoked an application that is \
+                 still authorized by the other",
+            ),
+            Err(e) => report.fail(
+                CONSENT_SWAP_HONOURS_EXPECTED,
+                format!("compare_and_swap_consent failed unexpectedly: {e}"),
+            ),
+        }
+
+        // WITHDRAWN, then widened: refused. The direction the server's own doc used to call benign
+        // and never considered.
+        if report
+            .ok(
+                CONSENT_SWAP_NEVER_RESURRECTS,
+                "revoke_consent",
+                store.revoke_consent("consent-swap", barrier_window()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // Widened again, by a RESOURCE this time, so the record genuinely differs from the one
+        // that was withdrawn and a store answering `Ok(true)` here cannot be excused as having
+        // written what was already there.
+        let mut widened_again = original.clone();
+        widened_again.extend(
+            &scopes("read write admin"),
+            &["https://rs-three.example/".to_string()],
+        );
+        match store
+            .compare_and_swap_consent(Some(&original), widened_again)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => report.fail(
+                CONSENT_SWAP_NEVER_RESURRECTS,
+                "a widen applied against a consent that had been WITHDRAWN: the user was told \
+                 they revoked an application and every later authorization request is still \
+                 answered from the record they destroyed",
+            ),
+            Err(e) => report.fail(
+                CONSENT_SWAP_NEVER_RESURRECTS,
+                format!("compare_and_swap_consent failed unexpectedly: {e}"),
+            ),
+        }
+        match store
+            .find_consent(&ClientId::new("client-conformance"), "subject-swap")
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(_)) => report.fail(
+                CONSENT_SWAP_NEVER_RESURRECTS,
+                "a withdrawn consent is live again after a swap",
+            ),
+            Err(e) => report.fail(
+                CONSENT_SWAP_NEVER_RESURRECTS,
+                format!("find_consent failed unexpectedly: {e}"),
+            ),
+        }
+    }
+
+    // --------------------------------------------------- the swaps, RACED against themselves
+
+    /// Exactly one racer may be told its swap applied.
+    ///
+    /// More than one IS the lost update: the first write moves the record off `expected`, so every
+    /// later comparison must fail, and a store that told two callers otherwise performed the
+    /// comparison and the write as separate steps. What is lost between them is whatever the
+    /// previous winner decided. None means no swap landed at all, which is the same root failing
+    /// in the opposite direction.
+    ///
+    /// Separate from [`StorageConformance::judge_race`] rather than reusing it, because that one's
+    /// wording is about an atomic remove-and-return and a host reading "the value was lost" for a
+    /// swap would go looking for the wrong thing.
+    fn judge_swap_race(
+        &self,
+        report: &mut Report,
+        check: &'static str,
+        what: &str,
+        results: TakeResults<()>,
+    ) {
+        let winners = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+        let errors = results.iter().filter(|r| r.is_err()).count();
+        if winners > 1 {
+            report.fail(
+                check,
+                format!(
+                    "{winners} of {} concurrent swaps of {what}, every one of them naming the SAME \
+                     expected value, were each told they applied. Only the first can be right: the \
+                     first write moves the record off `expected`, so every comparison after it must \
+                     fail. This store performs the comparison and the write as separate steps, and \
+                     what is lost between them is whatever the previous writer decided",
+                    results.len()
+                ),
+            );
+        } else if winners == 0 {
+            report.fail(
+                check,
+                format!(
+                    "none of {} concurrent swaps of {what} applied, though the record was stored \
+                     with exactly the expected value beforehand: the write was lost rather than \
+                     granted to one caller, so the decision the winner made is recorded nowhere",
+                    results.len()
+                ),
+            );
+        }
+        if errors > 0 {
+            report.fail(
+                check,
+                format!(
+                    "{errors} of {} concurrent swaps of {what} failed with a StorageError. The \
+                     server maps that to server_error, so an ordinary overlap between two writers \
+                     fails a legitimate request; a store using optimistic concurrency must retry \
+                     internally rather than surface the conflict, because `Ok(false)` already says \
+                     \"somebody else got there first\" and the caller knows what to do with it. \
+                     This is the `Storage` trait's rule that contention is the store's to resolve, \
+                     not the caller's",
+                    results.len()
+                ),
+            );
+        }
+    }
+
+    /// RFC 8628 section 3.3 first-decision-wins, under the concurrency it is actually decided
+    /// under: the polling device and the verification UI are different requests on different
+    /// nodes. Every racer offers a DIFFERENT approval, so a store that lets two through has thrown
+    /// away a decision a human made rather than merely written the same bytes twice.
+    async fn compare_and_swap_device_grant_race(&self, report: &mut Report) {
+        let store = self.store().await;
+        let pending = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..sample_device_grant("dc-swap-race", "SWPR-AAAA")
+        };
+        if report
+            .ok(
+                SWAP_ATOMIC,
+                "put_device_grant",
+                store.put_device_grant(pending.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let seq = AtomicUsize::new(0);
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                let decided = DeviceGrant {
+                    state: DeviceGrantState::Approved {
+                        subject: format!("subject-racer-{}", seq.fetch_add(1, Ordering::SeqCst)),
+                    },
+                    ..pending.clone()
+                };
+                Box::pin(async move {
+                    gate.wait().await;
+                    // `Ok(true)` is the winner, exactly as a taken record is: mapped here so
+                    // `judge_swap_race` counts the same shape the `take_*` checks produce.
+                    store
+                        .compare_and_swap_device_grant(&DeviceGrantState::Pending, decided)
+                        .await
+                        .map(|applied| if applied { Some(()) } else { None })
+                })
+            })
+            .await;
+        self.judge_swap_race(report, SWAP_ATOMIC, "one Pending device grant", results);
+    }
+
+    /// The RFC 7592 section 2.2 half. Two management updates of one registration overlap; the
+    /// loser must be told it lost, or the metadata document that landed first is silently gone.
+    async fn compare_and_swap_client_race(&self, report: &mut Report) {
+        let store = self.store().await;
+        let id = ClientId::new("client-swap-race");
+        if report
+            .ok(
+                CLIENT_SWAP_ATOMIC,
+                "put_client",
+                store.put_client(sample_client(id.as_str())).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // Read back rather than reusing what was written, for the reason the sequential client
+        // swap gives: a store that mutates the record on the way in has a round-trip defect that
+        // `round_trip/client` owns, and every racer failing its comparison here would report it a
+        // second time as a lost swap.
+        let Some(Some(original)) = report.ok(
+            CLIENT_SWAP_ATOMIC,
+            "get_client",
+            store.get_client(&id).await,
+        ) else {
+            return;
+        };
+        let original = (*original).clone();
+        let seq = AtomicUsize::new(0);
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                let mut updated = original.clone();
+                updated.name = Some(format!(
+                    "renamed by racer {}",
+                    seq.fetch_add(1, Ordering::SeqCst)
+                ));
+                let expected = original.clone();
+                Box::pin(async move {
+                    gate.wait().await;
+                    store
+                        .compare_and_swap_client(&expected, updated)
+                        .await
+                        .map(|applied| if applied { Some(()) } else { None })
+                })
+            })
+            .await;
+        self.judge_swap_race(report, CLIENT_SWAP_ATOMIC, "one registration", results);
+    }
+
+    /// The interleaving this swap exists for, run as a real overlap: a redemption suspended in the
+    /// host's signer and a replay arriving behind it both write the same code record. Exactly one
+    /// may land, or the trace the replay left is overwritten by the redemption it was containing.
+    async fn compare_and_swap_authorization_code_race(&self, report: &mut Report) {
+        let store = self.store().await;
+        if report
+            .ok(
+                CODE_SWAP_ATOMIC,
+                "put_authorization_code",
+                store
+                    .put_authorization_code(sample_authorization_code("code-swap-race"))
+                    .await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // Taken and put back, so the `expected` state is what the store ACTUALLY holds; see the
+        // sequential code swap for why that read matters.
+        let Some(Some(issued)) = report.ok(
+            CODE_SWAP_ATOMIC,
+            "take_authorization_code",
+            store.take_authorization_code("code-swap-race").await,
+        ) else {
+            return;
+        };
+        if report
+            .ok(
+                CODE_SWAP_ATOMIC,
+                "put_authorization_code (put back for the race)",
+                store.put_authorization_code(issued.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let seq = AtomicUsize::new(0);
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                let mut updated = issued.clone();
+                updated.state = AuthorizationCodeState::Replayed {
+                    access_token: Some(format!("at-racer-{}", seq.fetch_add(1, Ordering::SeqCst))),
+                    refresh_token: None,
+                };
+                let expected = issued.state.clone();
+                Box::pin(async move {
+                    gate.wait().await;
+                    store
+                        .compare_and_swap_authorization_code(&expected, updated)
+                        .await
+                        .map(|applied| if applied { Some(()) } else { None })
+                })
+            })
+            .await;
+        self.judge_swap_race(
+            report,
+            CODE_SWAP_ATOMIC,
+            "one authorization code record",
+            results,
+        );
+    }
+
+    /// Two overlapping widens of one consent. The loser must be refused, or the narrower of two
+    /// concurrent decisions can land second and the user is granted a scope nobody approved last.
+    #[cfg(feature = "consent")]
+    async fn compare_and_swap_consent_race(&self, report: &mut Report) {
+        let store = self.store().await;
+        if report
+            .ok(
+                CONSENT_SWAP_ATOMIC,
+                "compare_and_swap_consent (create)",
+                store
+                    .compare_and_swap_consent(
+                        None,
+                        sample_consent("consent-swap-race", "subject-swap-race"),
+                    )
+                    .await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // NOT a failure of this check when the pair reads back empty: a store whose `find_consent`
+        // cannot see what the swap just wrote has a lookup defect that `round_trip/consent` owns.
+        let Some(Some(original)) = report.ok(
+            CONSENT_SWAP_ATOMIC,
+            "find_consent",
+            store
+                .find_consent(&ClientId::new("client-conformance"), "subject-swap-race")
+                .await,
+        ) else {
+            return;
+        };
+        let original = (*original).clone();
+        let seq = AtomicUsize::new(0);
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                let mut updated = original.clone();
+                // A DISTINCT instant per racer, so the records genuinely differ and a store that
+                // applied two of them has kept the wrong one rather than the same one twice.
+                updated.granted_at = at(seq.fetch_add(1, Ordering::SeqCst) as u64);
+                let expected = original.clone();
+                Box::pin(async move {
+                    gate.wait().await;
+                    store
+                        .compare_and_swap_consent(Some(&expected), updated)
+                        .await
+                        .map(|applied| if applied { Some(()) } else { None })
+                })
+            })
+            .await;
+        self.judge_swap_race(report, CONSENT_SWAP_ATOMIC, "one live consent", results);
+    }
+
     // ------------------------------------------------------------------ round-trip fidelity
 
     /// A store that silently drops a field passes any test that only checks the key came back.
@@ -451,9 +1857,34 @@ where
     /// RFC 9700 section 4.14.2 reuse revocation walks, and `resource` is the RFC 8707 audience
     /// restriction, so a store that loses either produces tokens that are wider than what was
     /// granted while still looking correct.
+    ///
+    /// Each of these also proves the "insert or REPLACE" half of its `put_*`, by writing the key
+    /// TWICE with different contents and requiring the second write to win. An INSERT-only store
+    /// is not a hypothetical shape: `INSERT ... ON CONFLICT DO NOTHING` is one clause away from
+    /// the upsert a host meant to write, it raises no error, and every one of these checks passed
+    /// it while each key was written exactly once.
     async fn round_trip_client(&self, report: &mut Report) {
         let store = self.store().await;
         let want = sample_client("client-round-trip");
+        // Written over a DIFFERENT registration under the same key, because `put_client` is
+        // documented as an upsert and re-provisioning a `client_id` the host chose is a legitimate
+        // thing to do after deleting it. Two fields differ, so an INSERT-only store is named by
+        // the field the violation prints rather than left to be guessed at.
+        let superseded = Client {
+            name: Some("the registration this put must REPLACE".to_string()),
+            allowed_scopes: scopes("read"),
+            ..want.clone()
+        };
+        if report
+            .ok(
+                ROUND_TRIP_CLIENT,
+                "put_client (the registration the next put must replace)",
+                store.put_client(superseded).await,
+            )
+            .is_none()
+        {
+            return;
+        }
         if report
             .ok(
                 ROUND_TRIP_CLIENT,
@@ -681,6 +2112,185 @@ where
         }
     }
 
+    /// THE USER-CODE INDEX CONTRACT, ON THE SWAP RATHER THAN ON THE PUT.
+    ///
+    /// `Storage::compare_and_swap_device_grant` restates both halves of
+    /// `Storage::put_device_grant`'s index contract in capitals rather than referring to them,
+    /// because this trait has already watched them drift: the reference implementation's own doc
+    /// claimed the swap DELEGATED to the put; it did not, it duplicated it, and the duplicate was
+    /// missing the refusal. Nothing in this harness could see that. Every other swap it makes
+    /// builds `updated` as `DeviceGrant { state: .., ..pending }`, so the user code is byte for
+    /// byte the one already indexed and neither half is ever reached.
+    ///
+    /// What that hides is a store whose swap is a plain `UPDATE ... SET user_code_normalized = $2
+    /// WHERE device_code = $1` with no unique index behind it. It certifies clean here and then
+    /// hands one RFC 8628 section 6.1 user code — the credential a human types at the verification
+    /// page — to two live grants, while the code the first device is still displaying goes on
+    /// resolving to it. A host reaches the swap on this path whenever the verification UI or a
+    /// poll rewrites a grant whose code was re-drawn.
+    async fn compare_and_swap_device_grant_user_code_index(&self, report: &mut Report) {
+        // HALF ONE: a swap that CHANGES the user code must retire the old entry, exactly as a put
+        // that changes it must (`user_code_index/retires_old_entry` owns the put).
+        let store = self.store().await;
+        let pending = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..sample_device_grant("dc-swap-idx", "SWPA-AAAA")
+        };
+        if report
+            .ok(
+                SWAP_RETIRES_OLD_USER_CODE,
+                "put_device_grant",
+                store.put_device_grant(pending.clone()).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let recoded = DeviceGrant {
+            state: DeviceGrantState::Denied,
+            user_code: "SWPB-BBBB".to_string(),
+            ..pending.clone()
+        };
+        let Some(applied) = report.ok(
+            SWAP_RETIRES_OLD_USER_CODE,
+            "compare_and_swap_device_grant (same device_code, new user code)",
+            store
+                .compare_and_swap_device_grant(&DeviceGrantState::Pending, recoded)
+                .await,
+        ) else {
+            return;
+        };
+        // A swap that answered `Ok(false)` to a matching `expected` is a defect
+        // `compare_and_swap_device_grant/applies_when_the_state_matches` owns and names; judging
+        // the index of a write the store says it never made would report that one bug a second
+        // time under a second name, and a host would chase two. Same reasoning as
+        // `index_already_dirty` in the resurrection check above.
+        if applied {
+            if let Some(found) = report.ok(
+                SWAP_RETIRES_OLD_USER_CODE,
+                "find_device_grant_by_user_code(new)",
+                store.find_device_grant_by_user_code("SWPBBBBB").await,
+            ) {
+                if found.is_none() {
+                    report.fail(
+                        SWAP_RETIRES_OLD_USER_CODE,
+                        "after a swap changed the user code, the NEW code does not resolve: the \
+                         swap wrote the grant and not the index, so the verification page cannot \
+                         reach a device that is waiting",
+                    );
+                }
+            }
+            if let Some(found) = report.ok(
+                SWAP_RETIRES_OLD_USER_CODE,
+                "find_device_grant_by_user_code(old)",
+                store.find_device_grant_by_user_code("SWPAAAAA").await,
+            ) {
+                if found.is_some() {
+                    report.fail(
+                        SWAP_RETIRES_OLD_USER_CODE,
+                        "the OLD user code still resolves after a swap changed it: a code the user \
+                         was shown and that has been superseded can still be used to approve the \
+                         grant, and the grant now answers to two codes at once",
+                    );
+                }
+            }
+        }
+
+        // HALF TWO: a swap whose user code is already indexed for a DIFFERENT `device_code` must
+        // fail with a `StorageError` and write nothing. A REFUSAL and not `Ok(false)`, because
+        // `Ok(false)` means "the state moved on", which a caller answers by giving up quietly;
+        // this is a store-level conflict the caller has to hear about, and the server's user-code
+        // collision retry loop is only meaningful because the store can answer it without a race.
+        let store = self.store().await;
+        let first = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..sample_device_grant("dc-swap-idx-first", "SWPC-CCCC")
+        };
+        let second = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..sample_device_grant("dc-swap-idx-second", "SWPD-DDDD")
+        };
+        for grant in [first.clone(), second.clone()] {
+            if report
+                .ok(
+                    SWAP_REFUSES_DUPLICATE_USER_CODE,
+                    "put_device_grant",
+                    store.put_device_grant(grant).await,
+                )
+                .is_none()
+            {
+                return;
+            }
+        }
+        let clash = DeviceGrant {
+            state: DeviceGrantState::Denied,
+            user_code: first.user_code.clone(),
+            ..second.clone()
+        };
+        if store
+            .compare_and_swap_device_grant(&DeviceGrantState::Pending, clash)
+            .await
+            .is_ok()
+        {
+            report.fail(
+                SWAP_REFUSES_DUPLICATE_USER_CODE,
+                "a swap onto a user code already indexed for another device_code did not fail: it \
+                 must answer a StorageError, not Ok(_). Repointing the index gives two devices one \
+                 identity and orphans the older grant, and the put refuses exactly this while the \
+                 swap — which the verification UI and the polling device both reach — let it \
+                 through",
+            );
+        }
+        // And the refusal wrote NOTHING. A store that writes and then errors has left the clash
+        // behind while telling the caller it did not: the code the first device is displaying now
+        // reaches the second device's grant, which is worse than either outcome on its own.
+        if let Some(found) = report.ok(
+            SWAP_REFUSES_DUPLICATE_USER_CODE,
+            "find_device_grant_by_user_code after the refused swap",
+            store.find_device_grant_by_user_code("SWPCCCCC").await,
+        ) {
+            match found {
+                Some(g) if g.device_code == first.device_code => {}
+                Some(g) => report.fail(
+                    SWAP_REFUSES_DUPLICATE_USER_CODE,
+                    format!(
+                        "the user code now resolves to device_code {:?}, not to the grant that \
+                         owned it: the index was repointed by a swap that should have written \
+                         nothing",
+                        g.device_code
+                    ),
+                ),
+                None => report.fail(
+                    SWAP_REFUSES_DUPLICATE_USER_CODE,
+                    "the user code resolves to nothing after a clashing swap: the refused write \
+                     removed the index entry belonging to the grant that already owned it",
+                ),
+            }
+        }
+        if let Some(found) = report.ok(
+            SWAP_REFUSES_DUPLICATE_USER_CODE,
+            "get_device_grant after the refused swap",
+            store.get_device_grant(&second.device_code).await,
+        ) {
+            match found {
+                Some(g) if g.user_code == second.user_code => {}
+                Some(g) => report.fail(
+                    SWAP_REFUSES_DUPLICATE_USER_CODE,
+                    format!(
+                        "the swapping grant was rewritten even though its new user code belonged \
+                         to another device_code: it now carries {:?}",
+                        g.user_code
+                    ),
+                ),
+                None => report.fail(
+                    SWAP_REFUSES_DUPLICATE_USER_CODE,
+                    "the swapping grant is gone after a refused swap: a refusal must leave the \
+                     store exactly as it was",
+                ),
+            }
+        }
+    }
+
     async fn round_trip_device_grant(&self, report: &mut Report) {
         let store = self.store().await;
         let want = sample_device_grant("dc-round-trip", "RTRT-AAAA");
@@ -769,6 +2379,19 @@ where
         report.same(c, "code", &want.code, &got.code);
         report.same(c, "client_id", &want.client_id, &got.client_id);
         report.same(c, "redirect_uri", &want.redirect_uri, &got.redirect_uri);
+        // RFC 6749 section 4.1.3 makes the token endpoint's `redirect_uri` parameter required "if
+        // the `redirect_uri` parameter was included in the authorization request", and this one
+        // boolean is the whole of what a redemption has to answer that with. `redirect_uri` above
+        // cannot stand in for it, because that field is filled in either way. A store that drops
+        // the column reads back the `true` default and refuses every client entitled by section
+        // 3.1.2.3 to omit the parameter — the ordinary shape for a client with exactly one
+        // registered URI — blaming a mismatch that never happened.
+        report.same(
+            c,
+            "redirect_uri_was_explicit",
+            &want.redirect_uri_was_explicit,
+            &got.redirect_uri_was_explicit,
+        );
         report.same(c, "scope", &want.scope, &got.scope);
         report.same(c, "subject", &want.subject, &got.subject);
         report.same(
@@ -784,6 +2407,14 @@ where
             &got.code_challenge_method,
         );
         report.same(c, "resource", &want.resource, &got.resource);
+        // When the code was authored, which is what the token minted from it carries forward as
+        // its `grant_established_at` and therefore what every barrier comparison downstream is
+        // made against. A store that fills it from `now()` on read hands the redemption a grant
+        // instant later than any revocation that has already been recorded, so the cascade the
+        // user asked for is undone by the redemption it raced; a store that reads it back as
+        // UNIX_EPOCH refuses redemptions nobody revoked. `expires_at` above cannot stand in for
+        // it: they are separate columns and this crate stamps them from separate inputs.
+        report.same(c, "issued_at", &want.issued_at, &got.issued_at);
         report.same(c, "expires_at", &want.expires_at, &got.expires_at);
         // `Consumed` carries what the code minted, which is what a replay revokes. A store that
         // flattens the state to a boolean loses the thing the remedy needs.
@@ -798,7 +2429,7 @@ where
             &want.authorization_details,
             &got.authorization_details,
         );
-        // RFC 9470 section 5: the authentication the host reported at the authorization request,
+        // RFC 9470 section 6.2: the authentication the host reported at the authorization request,
         // which is what the token minted from this code reports as `auth_time` and `acr`. Dropped,
         // a client that answered an `insufficient_user_authentication` challenge gets a token that
         // claims no step-up happened.
@@ -843,6 +2474,21 @@ where
         // every resource server that trusts this issuer.
         report.same(c, "resource", &want.resource, &got.resource);
         report.same(c, "issued_at", &want.issued_at, &got.issued_at);
+        // `grant_established_at` is the SOLE time input to the revocation barrier for this record
+        // kind, and it is NOT `issued_at` above: a rotation mints at `now` and carries the grant
+        // instant forward unchanged, which is the whole reason the two are separate columns. A
+        // store that fills it from `now()` on read, or that never wrote the column at all, is
+        // certified clean here and then ADMITS every write a `client` or `consent` barrier exists
+        // to refuse, because the barrier sees a grant established after the revocation. The mirror
+        // image — a column read back as UNIX_EPOCH — turns every refresh rotation for a client
+        // with any standing barrier into a permanent `invalid_grant`. Same argument as `pushed_at`
+        // on the pushed request, on the record kind where a lost instant costs the most.
+        report.same(
+            c,
+            "grant_established_at",
+            &want.grant_established_at,
+            &got.grant_established_at,
+        );
         report.same(c, "expires_at", &want.expires_at, &got.expires_at);
         // RFC 9700 section 4.14.2: without this, a detected reuse cannot reach the access tokens
         // the thief already minted.
@@ -854,8 +2500,9 @@ where
         // constrains a token and which is dropped by exactly the same kind of missing column. It
         // went unchecked here for longer than `jkt` did, which is the argument for checking it: a
         // store certified clean by this harness while dropping `x5t_s256` silently unbinds every
-        // certificate-bound token it holds, and a resource server that introspects gets a token
-        // with no `cnf` at all, which reads as a plain bearer token rather than as an error.
+        // certificate-bound token it holds, and the caller that introspects (through 0.9.1, the
+        // token's own client) gets a token with no `cnf` at all, which reads as a plain bearer
+        // token rather than as an error.
         #[cfg(feature = "mtls")]
         report.same(c, "x5t_s256", &want.x5t_s256, &got.x5t_s256);
         // RFC 9396 section 5: what the resource owner actually approved, beyond the scope string.
@@ -870,7 +2517,14 @@ where
             &want.authorization_details,
             &got.authorization_details,
         );
-        // RFC 9470 section 5: the `auth_time` and `acr` an introspecting resource server reads to
+        // RFC 8693 section 4.1: WHO authority was delegated to. An opaque token carries this
+        // nowhere but here, so a store that drops the column answers RFC 7662 introspection with a
+        // token that reads as the SUBJECT acting directly. A resource server then attributes to
+        // the user a request the actor made on their behalf, which is exactly the distinction
+        // section 1.1 draws between delegation and impersonation, decided by a missing column.
+        #[cfg(feature = "token-exchange")]
+        report.same(c, "act", &want.act, &got.act);
+        // RFC 9470 section 6.2: the `auth_time` and `acr` an introspecting caller reads to
         // decide whether the authentication behind this token is strong or fresh enough. Dropped,
         // every token looks like it was minted with no step-up at all.
         #[cfg(feature = "consent")]
@@ -880,6 +2534,29 @@ where
             &want.authentication,
             &got.authentication,
         );
+        // AND IT IS STILL THERE AFTERWARDS. `get_token` is a READ and not a take, and until this
+        // line nothing here could tell the difference: every other `get_*` call in this file reads
+        // a distinct key exactly once, so a store whose reads REMOVE what they return passed the
+        // whole harness. `compare_and_swap_client` happens to read a registration twice, which is
+        // the only reason `get_client` was covered; these two were not.
+        //
+        // `Storage::get_refresh_token` argues it as a security property and the same argument
+        // covers the token: RFC 7009 section 2.1 requires revocation to verify that the token was
+        // issued to the requesting client, and doing that by taking the record and putting it back
+        // is a destructive operation on a credential the caller was never entitled to touch — if
+        // the restoring write fails, the victim's credential is gone for good while the endpoint
+        // still answers 200. RFC 7662 introspection reads the same record on every introspection
+        // call, so a destructive read there empties the store one legitimate request at a time.
+        match store.get_token(&want.access_token).await {
+            Ok(Some(_)) => {}
+            Ok(None) => report.fail(
+                c,
+                "a second get_token for the same access token found nothing: the read is \
+                 DESTRUCTIVE, so every introspection or revocation that merely asked about a token \
+                 has revoked it, and the client holding it is refused with no explanation anywhere",
+            ),
+            Err(e) => report.fail(c, format!("get_token failed unexpectedly: {e}")),
+        }
     }
 
     async fn round_trip_refresh_token(&self, report: &mut Report) {
@@ -911,6 +2588,18 @@ where
         report.same(c, "subject", &want.subject, &got.subject);
         report.same(c, "scope", &want.scope, &got.scope);
         report.same(c, "resource", &want.resource, &got.resource);
+        // The barrier's time input again, and it matters MORE here than on the access token: this
+        // is the instant the chain remembers and every rotation copies forward, never restamps, so
+        // a store that loses it does not misjudge one write, it misjudges every write the chain
+        // will ever make. Lost in the fail-open direction the withdrawal a user was told about is
+        // undone by the rotation it raced; lost in the other, a client with any standing barrier
+        // can never refresh again and the failure reads as `invalid_grant`.
+        report.same(
+            c,
+            "grant_established_at",
+            &want.grant_established_at,
+            &got.grant_established_at,
+        );
         report.same(c, "expires_at", &want.expires_at, &got.expires_at);
         report.same(c, "family_id", &want.family_id, &got.family_id);
         // `Spent` is the whole basis of reuse detection: a store that reads every record back as
@@ -943,6 +2632,24 @@ where
             &want.authentication,
             &got.authentication,
         );
+        // AND IT IS STILL THERE AFTERWARDS, for the reason `Storage::get_refresh_token` states in
+        // full: this method exists SO THAT a check about a refresh token never has to be built out
+        // of a read-modify-write on it. A store that implements it as a take is the exact shape
+        // that doc refuses, and it read as correct to every check in this harness, because no
+        // other one asks the same store for the same key twice. What it costs is the victim's
+        // chain: RFC 7009 section 2.1 verification on a token that turns out to belong to another
+        // client has already destroyed it, and the endpoint answers 200 either way.
+        match store.get_refresh_token(&want.refresh_token).await {
+            Ok(Some(_)) => {}
+            Ok(None) => report.fail(
+                c,
+                "a second get_refresh_token for the same token found nothing: the read is \
+                 DESTRUCTIVE, so a revocation request that merely verified the requesting client \
+                 has ended a chain it was not entitled to touch, and the user is logged out by a \
+                 request that reported success",
+            ),
+            Err(e) => report.fail(c, format!("get_refresh_token failed unexpectedly: {e}")),
+        }
     }
 
     // ------------------------------------------------------------------ atomicity
@@ -1083,6 +2790,23 @@ where
     async fn round_trip_pushed_request(&self, report: &mut Report) {
         let store = self.store().await;
         let want = sample_pushed_request("urn:ietf:params:oauth:request_uri:round-trip");
+        // Over a DIFFERENT record under the same handle first: the method is "insert or replace",
+        // and an INSERT-only store answers the authorization endpoint with the parameters of
+        // whichever push happened to land first.
+        let superseded = crate::par::PushedAuthorizationRequest {
+            state: Some("the pushed request this put must REPLACE".to_string()),
+            ..want.clone()
+        };
+        if report
+            .ok(
+                ROUND_TRIP_PUSHED_REQUEST,
+                "put_pushed_authorization_request (the record the next put must replace)",
+                store.put_pushed_authorization_request(superseded).await,
+            )
+            .is_none()
+        {
+            return;
+        }
         if report
             .ok(
                 ROUND_TRIP_PUSHED_REQUEST,
@@ -1135,6 +2859,16 @@ where
         );
         report.same(c, "resource", &want.resource, &got.resource);
         report.same(c, "expires_at", &want.expires_at, &got.expires_at);
+        // `pushed_at` is the SOLE time input to the revocation barrier for this record kind, and
+        // it was the one field of the one record this harness never compared. A host storing the
+        // request as columns fills it with `now()` on read and is certified clean, while in
+        // production the cross-client put-back that should be barrier-refused is ADMITTED, because
+        // the barrier sees a request authored after the deletion. The mirror image — a store that
+        // writes UNIX_EPOCH — refuses every push while any client barrier stands, which is a
+        // silent, fail-closed PAR outage. The analogous instant is `grant_established_at` on a
+        // token and a refresh record, and `issued_at` on an authorization code; all three were
+        // uncompared alongside this one until round 7, so the whole family is checked now.
+        report.same(c, "pushed_at", &want.pushed_at, &got.pushed_at);
         #[cfg(feature = "rar")]
         report.same(
             c,
@@ -1226,6 +2960,24 @@ where
 
         let mine = sample_consent("consent-mine", "subject-conformance");
         let theirs = sample_consent("consent-theirs", "subject-other");
+        // Over a DIFFERENT record under the same `consent_id` first: `put_consent` is "insert or
+        // replace", and the server widens a consent in place, so an INSERT-only store keeps the
+        // approval the user gave first and answers every later authorization request from it.
+        let superseded = crate::consent::ConsentRecord {
+            scope: scopes("read"),
+            resource: Vec::new(),
+            ..mine.clone()
+        };
+        if report
+            .ok(
+                ROUND_TRIP_CONSENT,
+                "put_consent (the record the next put must replace)",
+                store.put_consent(superseded).await,
+            )
+            .is_none()
+        {
+            return;
+        }
         if report
             .ok(
                 ROUND_TRIP_CONSENT,
@@ -1280,6 +3032,45 @@ where
                     ROUND_TRIP_CONSENT,
                     "find_consent did not find a consent that get_consent can read",
                 ),
+            }
+        }
+
+        // The per-subject listing, which is the ONE consent method nothing else here reads back.
+        // It is what a host builds its "applications you have approved" screen on, and both ways
+        // of getting it wrong are silent. A predicate on the wrong column (the client rather than
+        // the subject, which is the index the AUTHORIZATION path wants and the tempting one to
+        // reuse) shows one user another user's grants. A listing that answers empty shows the user
+        // nothing to withdraw, which makes the whole withdrawal cascade the rest of this check
+        // verifies unreachable from the UI: the user cannot revoke what they are never shown.
+        //
+        // Both consents belong to the SAME client and differ only in subject, so a store filtering
+        // on the client cannot pass by coincidence.
+        if let Some(listed) = report.ok(
+            CONSENTS_FOR_SUBJECT,
+            "consents_for_subject",
+            store.consents_for_subject("subject-conformance").await,
+        ) {
+            let ids: Vec<&str> = listed.iter().map(|r| r.consent_id.as_ref()).collect();
+            if !ids.contains(&"consent-mine") {
+                report.fail(
+                    CONSENTS_FOR_SUBJECT,
+                    format!(
+                        "consents_for_subject listed {ids:?} for a subject holding consent-mine: a \
+                         user cannot withdraw what the host never shows them, so a listing that \
+                         misses a live consent makes revocation unreachable from the UI"
+                    ),
+                );
+            }
+            if ids.contains(&"consent-theirs") {
+                report.fail(
+                    CONSENTS_FOR_SUBJECT,
+                    format!(
+                        "consents_for_subject listed {ids:?}, which includes a DIFFERENT resource \
+                         owner's consent for the same client: the predicate is on the client id \
+                         rather than the subject, so one user is shown another user's grants and \
+                         can withdraw them"
+                    ),
+                );
             }
         }
 
@@ -1340,10 +3131,32 @@ where
             }
         }
 
+        // A PENDING grant of the SAME client and the SAME subject. The contract says it is left
+        // alone — "nobody has consented to it yet, so there is nothing there to withdraw" — and
+        // every grant this harness planted until now was Approved, so a store that keyed the
+        // device-grant arm of its cascade on the client alone, or that ignored the state
+        // altogether, removed it and was certified clean. What it costs is a login the user is in
+        // the middle of: they open the verification page, type the code they were shown, and are
+        // told there is no such code, because a withdrawal of a DIFFERENT grant reaped it.
+        let pending = DeviceGrant {
+            state: DeviceGrantState::Pending,
+            ..sample_device_grant("dc-pending-mine", "PEND-MINE")
+        };
+        if report
+            .ok(
+                REVOKE_CONSENT_SPARES_OTHERS,
+                "seeding a PENDING device grant the withdrawal must leave alone",
+                store.put_device_grant(pending).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
         let removed = match report.ok(
             REVOKE_CONSENT_CASCADES,
             "revoke_consent",
-            store.revoke_consent("consent-mine").await,
+            store.revoke_consent("consent-mine", barrier_window()).await,
         ) {
             Some(n) => n,
             None => return,
@@ -1373,6 +3186,21 @@ where
                 "the approved device grant",
                 matches!(
                     store.get_device_grant(&grant_mine.device_code).await,
+                    Ok(None)
+                ),
+            ),
+            // The index entry, which is not a record and is not counted, but which the contract
+            // requires to be retired WITH the grant. `delete_client`'s cascade and the sweep were
+            // both held to this and the withdrawal was not, so a store that kept the entry took
+            // that user code out of circulation for good: `put_device_grant` must refuse a code
+            // already indexed for a different `device_code`, and the server's generation loop
+            // cannot see the collision coming, because the lookup it makes resolves to nothing.
+            (
+                "the user-code index entry of the approved device grant",
+                matches!(
+                    store
+                        .find_device_grant_by_user_code(&normalize_user_code(&grant_mine.user_code))
+                        .await,
                     Ok(None)
                 ),
             ),
@@ -1412,6 +3240,38 @@ where
                     Ok(Some(_))
                 ),
             ),
+            // Their index entry too, for the reason the doomed one is checked: only the REMOVING
+            // direction was ever asserted, so a store that rebuilds the index on any bulk removal
+            // and loses a row passed. After the first withdrawal every OTHER user code in the
+            // deployment would resolve to nothing, and RFC 8628 verification would be dead with a
+            // green certification behind it.
+            (
+                "user-code index entry",
+                matches!(
+                    store
+                        .find_device_grant_by_user_code(&normalize_user_code(
+                            &grant_theirs.user_code
+                        ))
+                        .await,
+                    Ok(Some(_))
+                ),
+            ),
+            // Their authorization code. Neither cascade in this harness read one back for the
+            // party it must spare, so a store whose withdrawal dropped the `subject` predicate on
+            // the codes table killed every grant in flight for every user of that client.
+            (
+                "authorization code",
+                matches!(
+                    store.take_authorization_code(&code_theirs.code).await,
+                    Ok(Some(_))
+                ),
+            ),
+            // The PENDING grant of the withdrawing user's own pair: nobody has consented to it, so
+            // there is nothing there to withdraw.
+            (
+                "PENDING device grant of the same subject",
+                matches!(store.get_device_grant("dc-pending-mine").await, Ok(Some(_))),
+            ),
             (
                 "consent record",
                 matches!(store.get_consent("consent-theirs").await, Ok(Some(_))),
@@ -1421,8 +3281,103 @@ where
                 report.fail(
                     REVOKE_CONSENT_SPARES_OTHERS,
                     format!(
-                        "revoke_consent removed another subject's {what}, logging out a user who \
-                         withdrew nothing"
+                        "revoke_consent removed the {what} it was required to spare, ending a \
+                         grant nobody withdrew"
+                    ),
+                );
+            }
+        }
+
+        // AND THE WITHDRAWAL RECORDED A BARRIER. Everything above is about what the cascade
+        // reached; this is about the rotation and the code redemption that were already in flight
+        // for this pair when the user clicked withdraw, and that write AFTERWARDS. Nothing in this
+        // harness exercised the `Consent` barrier at all: it was required by `revoke_consent` and
+        // driven by no check, so a store that recorded the other two scopes and not this one was
+        // certified clean, and a user who is told "you have revoked this application" still has a
+        // working token — the exact failure this feature exists to prevent.
+        //
+        // A family the barrier does NOT name, so the consent scope is the only thing that can
+        // refuse these two.
+        let mut orphan = sample_token(
+            "at-issued-after-the-withdrawal",
+            "client-conformance",
+            Some("fam-after-withdrawal"),
+        );
+        orphan.subject = Some("subject-conformance".to_string());
+        match store.put_token(orphan).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                BARRIER_REFUSES_TOKEN,
+                "put_token wrote an access token for the (client, subject) pair whose consent had \
+                 just been withdrawn. The cascade only reaches what is in the store when it runs; \
+                 an authorization code redemption or a rotation already in flight for this pair \
+                 completes behind it, and the user who was told the application was stopped is \
+                 holding a live token issued after they stopped it",
+            ),
+            Err(e) => report.fail(
+                BARRIER_REFUSES_TOKEN,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+        let mut orphan_refresh = sample_refresh(
+            "rt-restored-after-the-withdrawal",
+            "client-conformance",
+            "fam-after-withdrawal",
+        );
+        orphan_refresh.subject = Some("subject-conformance".to_string());
+        match store.put_refresh_token(orphan_refresh).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
+                BARRIER_REFUSES_REFRESH,
+                "put_refresh_token restored a refresh record for a withdrawn consent. This is the \
+                 write every refusal path of a rotation makes, on a record `take_refresh_token` \
+                 has already removed, so absence proves nothing and the barrier is the only \
+                 evidence there is: without it the withdrawal is undone by the rotation it raced",
+            ),
+            Err(e) => report.fail(
+                BARRIER_REFUSES_REFRESH,
+                format!("put_refresh_token failed unexpectedly: {e}"),
+            ),
+        }
+        // And it names ONE pair. The other subject of the same client withdrew nothing.
+        let mut bystanders_token = sample_token(
+            "at-for-the-other-subject-after-the-withdrawal",
+            "client-conformance",
+            Some("fam-after-withdrawal"),
+        );
+        bystanders_token.subject = Some("subject-other".to_string());
+        match store.put_token(bystanders_token).await {
+            Ok(WriteOutcome::Applied) => {}
+            Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                BARRIER_SPARES_UNRELATED,
+                "put_token refused a token for a DIFFERENT resource owner of the same client after \
+                 one user withdrew their consent: the consent barrier is matching on the client \
+                 alone, so one person clicking withdraw stops every other user of that application \
+                 from obtaining a token until the barrier is swept",
+            ),
+            Err(e) => report.fail(
+                BARRIER_SPARES_UNRELATED,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // And the listing has to agree with the withdrawal. A store keeping a per-subject index as
+        // its own rows updates two things on a put and must update two things on a remove; the
+        // half that is forgotten is the second one, and the symptom is a screen that offers a user
+        // an application they already stopped, with a revoke button that reports success forever.
+        if let Some(listed) = report.ok(
+            CONSENTS_FOR_SUBJECT,
+            "consents_for_subject after revoke_consent",
+            store.consents_for_subject("subject-conformance").await,
+        ) {
+            let ids: Vec<&str> = listed.iter().map(|r| r.consent_id.as_ref()).collect();
+            if ids.contains(&"consent-mine") {
+                report.fail(
+                    CONSENTS_FOR_SUBJECT,
+                    format!(
+                        "consents_for_subject still listed {ids:?} after that consent was \
+                         withdrawn: the per-subject listing is a stale index, so the user is shown \
+                         an application they have already stopped"
                     ),
                 );
             }
@@ -1445,7 +3400,7 @@ where
         if let Some(second) = report.ok(
             REVOKE_CONSENT_COUNT,
             "revoke_consent (second call)",
-            store.revoke_consent("consent-mine").await,
+            store.revoke_consent("consent-mine", barrier_window()).await,
         ) {
             if second != 0 {
                 report.fail(
@@ -1494,7 +3449,9 @@ where
                     "{errors} of {} concurrent takes failed with a StorageError. The server maps \
                      that to server_error, so a legitimate redemption fails under ordinary \
                      contention; a store using optimistic concurrency must retry internally \
-                     rather than surface the conflict",
+                     rather than surface the conflict. This is the `Storage` trait's rule that \
+                     contention is the store's to resolve, not the caller's: `Ok(None)` is how a \
+                     take says the record was not there to take, and a StorageError is not",
                     results.len()
                 ),
             );
@@ -1789,6 +3746,14 @@ where
 
         let mut dead_code = sample_authorization_code("code-dead");
         dead_code.expires_at = at_before(1);
+        // ISSUED, and this is the only unredeemed code the harness plants. `sweep_expired` and
+        // `delete_client` both say codes are removed "in either state", and every fixture here was
+        // `Consumed`, so a store whose sweep carried a `WHERE state = 'consumed'` — the natural
+        // shape for a schema that stores replay evidence in its own table, or for a sweep written
+        // while thinking about replay detection — reclaimed nothing it was asked to and was
+        // certified clean. An abandoned authorization request is the ordinary case, not the rare
+        // one: every user who closes the tab leaves one, and nothing else ever removes it.
+        dead_code.state = AuthorizationCodeState::Issued;
         let mut live_code = sample_authorization_code("code-live");
         live_code.expires_at = at(600);
 
@@ -1796,6 +3761,25 @@ where
         dead_token.expires_at = at_before(1);
         let mut live_token = sample_token("at-live", "client-sweep", Some("fam-sweep"));
         live_token.expires_at = at(600);
+
+        // RFC 9126 section 4: an expired `request_uri` MUST be rejected, and once it is expired
+        // there is nothing left to recognise it for, so nothing but this sweep ever reclaims one.
+        // Planted at the boundary for the same reason the device grant is. The PAR endpoint is
+        // client authenticated, so an unswept pushed-request table is not an anonymous flood, but
+        // one chatty or compromised client grows it without bound, and a store certified by this
+        // harness with no PAR record in the fixture would be certified for a sweep it never wrote.
+        #[cfg(feature = "par")]
+        let mut dead_pushed = sample_pushed_request(PUSHED_SWEPT);
+        #[cfg(feature = "par")]
+        {
+            dead_pushed.expires_at = now;
+        }
+        #[cfg(feature = "par")]
+        let mut live_pushed = sample_pushed_request(PUSHED_KEPT);
+        #[cfg(feature = "par")]
+        {
+            live_pushed.expires_at = at(600);
+        }
 
         let mut dead_refresh = sample_refresh("rt-dead", "client-sweep", "fam-sweep");
         dead_refresh.expires_at = Some(now);
@@ -1835,6 +3819,16 @@ where
                 )
                 .is_some();
         }
+        #[cfg(feature = "par")]
+        for record in [dead_pushed, live_pushed] {
+            planted &= report
+                .ok(
+                    c,
+                    "put_pushed_authorization_request",
+                    store.put_pushed_authorization_request(record).await,
+                )
+                .is_some();
+        }
         if !planted {
             return;
         }
@@ -1843,14 +3837,22 @@ where
             return;
         };
 
-        // Exactly four records were dead: one grant, one code, one access token, one refresh.
-        if removed != 4 {
+        // One grant, one code, one access token, one refresh, and under `par` one pushed request.
+        // Derived from the fixture rather than written into the message as a literal: the count
+        // assertion is only honest while it names the records that are actually planted, and it
+        // stopped being honest the moment the PAR fixture was missing from the list above.
+        #[cfg(feature = "par")]
+        let (dead_records, planted_records) = (5u64, 11);
+        #[cfg(not(feature = "par"))]
+        let (dead_records, planted_records) = (4u64, 9);
+        if removed != dead_records {
             report.fail(
                 SWEEP_COUNT,
                 format!(
-                    "sweep_expired reported {removed} records removed, but exactly 4 of the 9 \
-                     planted records were dead at `now`. The count is what a host schedules its \
-                     sweep on, so a wrong one is a store that looks idle while it grows"
+                    "sweep_expired reported {removed} records removed, but exactly {dead_records} \
+                     of the {planted_records} planted records were dead at `now`. The count is \
+                     what a host schedules its sweep on, so a wrong one is a store that looks idle \
+                     while it grows"
                 ),
             );
         }
@@ -1898,6 +3900,26 @@ where
         ) {
             if found.is_some() {
                 report.fail(c, "an expired refresh record survived the sweep");
+            }
+        }
+        // Its own check name rather than a line in `removes_dead`, for the reason
+        // `reclaims_replay_ids` has one: this record kind exists only under a feature, so a host
+        // filtering or waiving by name can talk about it without its waiver list depending on how
+        // this crate was compiled. RFC 9126 section 4 makes the handle useless once it is expired,
+        // so a store that never reclaims one keeps a dead capability string forever.
+        #[cfg(feature = "par")]
+        if let Some(found) = report.ok(
+            SWEEP_RECLAIMS_PUSHED_REQUESTS,
+            "take_pushed_authorization_request",
+            store.take_pushed_authorization_request(PUSHED_SWEPT).await,
+        ) {
+            if found.is_some() {
+                report.fail(
+                    SWEEP_RECLAIMS_PUSHED_REQUESTS,
+                    "an expired pushed authorization request survived the sweep: nothing else in \
+                     this crate ever reclaims one, so the table grows once per pushed request that \
+                     was never redeemed, forever",
+                );
             }
         }
 
@@ -1951,6 +3973,22 @@ where
                 );
             }
         }
+        // A sweep that reaps a live handle is an authorization request the client pushed, was told
+        // was accepted, and cannot complete: RFC 9126 section 2.2 gives the handle a lifetime, and
+        // it is the AS that promised it.
+        #[cfg(feature = "par")]
+        if let Some(found) = report.ok(
+            k,
+            "take_pushed_authorization_request(live)",
+            store.take_pushed_authorization_request(PUSHED_KEPT).await,
+        ) {
+            if found.is_none() {
+                report.fail(
+                    k,
+                    "the sweep removed a pushed authorization request that had not expired",
+                );
+            }
+        }
 
         // Safe to call when there is nothing to do. The host runs this on a timer, so an error or
         // a nonzero answer on an idle store is noise a host will learn to ignore.
@@ -1966,6 +4004,173 @@ where
                     format!("sweep_expired on an empty store reported {removed} records removed"),
                 );
             }
+        }
+    }
+
+    /// THE SWEEP RUNS WHILE THE SERVER IS SERVING, which is the half of that sentence nothing
+    /// checked.
+    ///
+    /// [`Storage::sweep_expired`] requires two things of a store, in one clause: "It must be safe to
+    /// call concurrently with request handling, and safe to call when there is nothing to do
+    /// (answering 0)". `sweep_expired/empty_is_zero` owns the second. The first had no check at all,
+    /// and it is the one a host is more likely to get wrong, because the sweep is the only method in
+    /// this trait that touches EVERY table and the only one a host writes as a batch job.
+    ///
+    /// The failure shape this is aimed at is the natural way to write a sweep and not an exotic one:
+    /// read the table, decide what to keep, write the kept set back. Under a single mutex held for
+    /// the whole operation that is correct. Snapshot outside the lock, or rebuild-and-replace, and
+    /// every write that landed between the read and the write is gone. Those writes are token
+    /// issuances: the store answers `Applied`, the server hands the client a token, and the record
+    /// is not there when the client presents it. Nothing logs anything, and it happens once per
+    /// sweep interval rather than under load, so it looks like a client bug.
+    ///
+    /// The instant is chosen so that NOTHING is dead: a correct sweep answers `Ok(0)` and removes
+    /// nothing at all. That makes the sweep's expiry predicate irrelevant here (`removes_dead` and
+    /// `keeps_live` own it) and every missing record afterwards attributable to the overlap.
+    ///
+    /// What it can and cannot see is the module docs' account for every race in this harness: an
+    /// interleaving without a spawner, a genuine parallel race with
+    /// [`StorageConformance::with_spawn`], and in neither case a proof of absence.
+    async fn sweep_under_concurrent_writes(&self, report: &mut Report) {
+        let c = SWEEP_CONCURRENT_WRITES;
+        let store = self.store().await;
+        let n = self.racers;
+        // Live at `now`, and planted BEFORE the race: these are what a rebuild-and-replace sweep
+        // legitimately keeps, so their survival is not the assertion. They are here so the table the
+        // sweep reads is not empty, which is the case where a snapshot and a live read agree by
+        // accident.
+        for i in 0..n {
+            let mut planted = sample_token(
+                &format!("at-sweep-race-planted-{i}"),
+                "client-sweep-race",
+                None,
+            );
+            planted.expires_at = at(600);
+            if report
+                .ok(
+                    c,
+                    "put_token (live, before the race)",
+                    store.put_token(planted).await,
+                )
+                .is_none()
+            {
+                return;
+            }
+        }
+
+        // The sweep's own answer, carried out of the race rather than through it: `race` judges one
+        // value per racer and the sweeper is not writing a token, so it has nowhere to put a count.
+        // The sweep's own answer, and its own FAILURE, both kept out of `results`: a sweep that
+        // errors on an idle store is `sweep_expired/empty_is_zero`'s finding and must not be
+        // reported a second time here under a different name.
+        let answered: Arc<Mutex<Option<Result<u64, StorageError>>>> = Arc::new(Mutex::new(None));
+        let seq = AtomicUsize::new(0);
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                let answered = Arc::clone(&answered);
+                // `make` is called once per racer, in order, before any of them runs, so racer
+                // ZERO is the sweeper and the rest are the request handlers it has to survive.
+                let index = seq.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if index == 0 {
+                        gate.wait().await;
+                        let swept = store.sweep_expired(at(0)).await;
+                        *answered.lock().unwrap_or_else(|e| e.into_inner()) = Some(swept);
+                        return Ok(None);
+                    }
+                    let mut token = sample_token(
+                        &format!("at-sweep-race-written-{index}"),
+                        "client-sweep-race",
+                        None,
+                    );
+                    token.expires_at = at(600);
+                    gate.wait().await;
+                    // APPLIED is a promise. Whatever the sweep was doing at the time, a record the
+                    // store said it wrote has to be there afterwards.
+                    let outcome = store.put_token(token).await?;
+                    Ok(if outcome.is_applied() {
+                        Some(index)
+                    } else {
+                        None
+                    })
+                })
+            })
+            .await;
+
+        let mut errors = 0usize;
+        let mut applied = Vec::new();
+        for result in results {
+            match result {
+                Ok(Some(index)) => applied.push(index),
+                Ok(None) => {}
+                Err(_) => errors += 1,
+            }
+        }
+        if errors > 0 {
+            report.fail(
+                c,
+                format!(
+                    "{errors} of the {} concurrent put_token calls failed with a StorageError \
+                     while a sweep was in flight. An issuance may not fail because a maintenance \
+                     job is running beside it: the server maps that to server_error, so the host's \
+                     sweep schedule becomes a source of failed token requests",
+                    n - 1
+                ),
+            );
+        }
+
+        match &*answered.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(Ok(0)) => {}
+            Some(Ok(removed)) => report.fail(
+                c,
+                format!(
+                    "the sweep removed {removed} records at an instant when every record in the \
+                     store was live. It is reaping what the writes beside it were adding, so a \
+                     token this store reported as written is already gone"
+                ),
+            ),
+            // Deliberately silent: an idle sweep that errors is exactly what
+            // `sweep_expired/empty_is_zero` reports, and naming it twice would make one defect look
+            // like two to a host reading the report.
+            Some(Err(_)) => {}
+            None => report.fail(
+                c,
+                "the sweep never reported an answer, so the race never ran it".to_string(),
+            ),
+        }
+
+        let mut lost = Vec::new();
+        for index in &applied {
+            let key = format!("at-sweep-race-written-{index}");
+            match report.ok(c, "get_token", store.get_token(&key).await) {
+                Some(None) => lost.push(key),
+                Some(Some(_)) => {}
+                None => return,
+            }
+        }
+        for i in 0..n {
+            let key = format!("at-sweep-race-planted-{i}");
+            match report.ok(c, "get_token", store.get_token(&key).await) {
+                Some(None) => lost.push(key),
+                Some(Some(_)) => {}
+                None => return,
+            }
+        }
+        if !lost.is_empty() {
+            report.fail(
+                c,
+                format!(
+                    "{} live access tokens were gone after a sweep that ran alongside {} \
+                     concurrent put_token calls: {:?}. Every one of them was either already \
+                     stored or reported Applied, so this store loses writes that overlap a sweep. \
+                     The usual cause is reading the table, deciding what to keep and writing the \
+                     kept set back, with anything at all happening outside the lock in between",
+                    lost.len(),
+                    n - 1,
+                    lost
+                ),
+            );
         }
     }
 
@@ -2016,7 +4221,7 @@ where
         let Some(removed) = report.ok(
             c,
             "revoke_token_family",
-            store.revoke_token_family("fam-a").await,
+            store.revoke_token_family("fam-a", barrier_window()).await,
         ) else {
             return;
         };
@@ -2084,7 +4289,7 @@ where
 
         // It runs on evidence of compromise and must not be turned into an error by a concurrent
         // revocation that got there first.
-        match store.revoke_token_family("fam-a").await {
+        match store.revoke_token_family("fam-a", barrier_window()).await {
             Ok(0) => {}
             Ok(n) => report.fail(
                 REVOKE_FAMILY_COUNT,
@@ -2138,6 +4343,24 @@ where
                     store.put_authorization_code(code).await,
                 )
                 .is_some();
+            // AND ONE THAT HAS NOT BEEN REDEEMED. `delete_client` says codes go "in either
+            // state", and every code this harness planted was `Consumed`, so a cascade carrying a
+            // state predicate — one written while thinking about replay evidence rather than about
+            // outstanding grants — removed nothing it was asked to and certified clean. This is
+            // the state that matters most on this path: an `Issued` code is a live grant the
+            // deleted registration can still redeem, and RFC 7592 section 2.3 says deleting the
+            // registration invalidates what it holds.
+            let mut unredeemed =
+                sample_authorization_code(&format!("code-unredeemed-{}", id.as_str()));
+            unredeemed.client_id = id.clone();
+            unredeemed.state = AuthorizationCodeState::Issued;
+            planted &= report
+                .ok(
+                    c,
+                    "put_authorization_code (unredeemed)",
+                    store.put_authorization_code(unredeemed).await,
+                )
+                .is_some();
             planted &= report
                 .ok(
                     c,
@@ -2164,6 +4387,36 @@ where
                         .await,
                 )
                 .is_some();
+            // RFC 9126 section 2.2 binds a `request_uri` to the client that pushed it, so a
+            // deleted client's outstanding handles are handles nobody may ever redeem. This kind
+            // was in the trait's cascade list and in neither bundled store's check, because the
+            // harness planted none.
+            #[cfg(feature = "par")]
+            {
+                let mut pushed = sample_pushed_request(&pushed_request_uri(id));
+                pushed.client_id = id.clone();
+                planted &= report
+                    .ok(
+                        c,
+                        "put_pushed_authorization_request",
+                        store.put_pushed_authorization_request(pushed).await,
+                    )
+                    .is_some();
+            }
+            // The least obvious kind and the one that is NOT optional: `client_id` is chosen by
+            // the host, so a consent left behind is a standing approval that a client provisioned
+            // later under the same id inherits, with its scope and its resource set, without the
+            // user ever being asked. Both bundled stores removed it while the trait's enumeration
+            // did not name it, which is exactly the hole this harness could not see.
+            #[cfg(feature = "consent")]
+            {
+                let mut consent =
+                    sample_consent(&format!("consent-{}", id.as_str()), "subject-conformance");
+                consent.client_id = id.clone();
+                planted &= report
+                    .ok(c, "put_consent", store.put_consent(consent).await)
+                    .is_some();
+            }
         }
         if !planted {
             return;
@@ -2172,7 +4425,7 @@ where
         let Some(existed) = report.ok(
             DELETE_CLIENT_REPORTS,
             "delete_client",
-            store.delete_client(&doomed).await,
+            store.delete_client(&doomed, barrier_window()).await,
         ) else {
             return;
         };
@@ -2224,6 +4477,23 @@ where
         }
         if let Some(found) = report.ok(
             c,
+            "take_authorization_code (unredeemed)",
+            store
+                .take_authorization_code("code-unredeemed-client-doomed")
+                .await,
+        ) {
+            if found.is_some() {
+                report.fail(
+                    c,
+                    "an UNREDEEMED authorization code of the deleted client survived, so the \
+                     cascade is filtering on the code's state. That code is a live grant: the \
+                     deleted registration redeems it and receives an access token and a refresh \
+                     chain minutes after RFC 7592 section 2.3 said it no longer exists",
+                );
+            }
+        }
+        if let Some(found) = report.ok(
+            c,
             "get_device_grant",
             store.get_device_grant("dc-client-doomed").await,
         ) {
@@ -2241,6 +4511,70 @@ where
                     c,
                     "the user-code index entry of the deleted client's device grant survived",
                 );
+            }
+        }
+        #[cfg(feature = "par")]
+        if let Some(found) = report.ok(
+            c,
+            "take_pushed_authorization_request",
+            store
+                .take_pushed_authorization_request(&pushed_request_uri(&doomed))
+                .await,
+        ) {
+            if found.is_some() {
+                report.fail(
+                    c,
+                    "a pushed authorization request of the deleted client survived: RFC 9126 \
+                     section 2.2 binds the handle to the client that pushed it, so what is left is \
+                     a live `request_uri` nobody may ever redeem, holding authorization parameters \
+                     for a registration that no longer exists",
+                );
+            }
+        }
+        #[cfg(feature = "consent")]
+        if let Some(found) = report.ok(
+            c,
+            "get_consent",
+            store.get_consent("consent-client-doomed").await,
+        ) {
+            if found.is_some() {
+                report.fail(
+                    c,
+                    "a consent record of the deleted client survived. The user is shown an \
+                     application that no longer exists and cannot meaningfully withdraw it, and \
+                     because `client_id` is chosen by the HOST, a client provisioned later under \
+                     the same id inherits that standing approval — its scope and its resource set \
+                     — without the user ever being asked",
+                );
+            }
+        }
+
+        // AND THE BARRIER REACHES THE PUSHED REQUEST TOO. The cascade above only removes what is
+        // in the store when it runs, and this is the site the 0.9.1 enumeration missed: the
+        // cross-client refusal in `validate_pushed_authorization_request` must TAKE the record
+        // before it can read the `client_id` bound into it, so a deletion landing in that window
+        // finds nothing to cascade and the put-back restores a handle belonging to a client that
+        // no longer exists. Same shape as `put_token` and `put_refresh_token`, on the one write
+        // this trait added late.
+        #[cfg(feature = "par")]
+        {
+            let mut again = sample_pushed_request(&pushed_request_uri(&doomed));
+            again.client_id = doomed.clone();
+            match store.put_pushed_authorization_request(again).await {
+                Ok(WriteOutcome::RefusedRevoked) => {}
+                Ok(WriteOutcome::Applied) => report.fail(
+                    BARRIER_REFUSES_PUSHED_REQUEST,
+                    "put_pushed_authorization_request restored a handle for a client that had just \
+                     been deleted. The record was pushed BEFORE the deletion, so the barrier covers \
+                     it; a store that writes it anyway hands a deleted registration a live \
+                     `request_uri`, and if the host re-provisions that `client_id` — which the \
+                     trait explicitly permits — the handle resolves against the NEW registration \
+                     carrying a `code_challenge` its owner never pushed",
+                ),
+                Err(e) => report.fail(
+                    BARRIER_REFUSES_PUSHED_REQUEST,
+                    format!("put_pushed_authorization_request failed unexpectedly: {e}"),
+                ),
             }
         }
 
@@ -2282,9 +4616,126 @@ where
                 report.fail(c, "delete_client removed another client's device grant");
             }
         }
+        // The bystander's user-code INDEX, not just its grant. "Of the grants removed" has two
+        // directions and only the removal was checked: a store that rebuilds the index on any bulk
+        // removal, with the rebuild missing a row, passes every other line here and leaves the
+        // bystander's user code resolving to nothing. RFC 8628 section 6.1 makes that code the
+        // credential a human types, so it is the flow that stops, silently, for a client nobody
+        // touched.
+        if let Some(found) = report.ok(
+            c,
+            "find_device_grant_by_user_code(bystander)",
+            store.find_device_grant_by_user_code("BYSTAAAA").await,
+        ) {
+            if found.is_none() {
+                report.fail(
+                    c,
+                    "delete_client removed another client's user-code index entry: the grant is \
+                     still there and the code the user was shown no longer reaches it, so the \
+                     verification page answers \"no such code\" for a device that is waiting",
+                );
+            }
+        }
+        // The bystander's authorization CODE. Neither cascade in this harness read one back for
+        // the party it must spare, so a store whose cascade dropped the `client_id` predicate on
+        // the codes table — one missing `AND` — removed every outstanding code in the deployment
+        // on every client deletion and was certified clean. Taken rather than peeked, because
+        // there is no non-destructive read for a code; nothing after this needs it.
+        if let Some(found) = report.ok(
+            c,
+            "take_authorization_code(bystander)",
+            store.take_authorization_code("code-client-bystander").await,
+        ) {
+            if found.is_none() {
+                report.fail(
+                    c,
+                    "delete_client removed another client's authorization code: a grant that was \
+                     in flight for a client nobody deleted is gone, and the user sees a redemption \
+                     fail as `invalid_grant` with nothing anywhere explaining it",
+                );
+            }
+        }
+        if let Some(found) = report.ok(
+            c,
+            "take_authorization_code(bystander, unredeemed)",
+            store
+                .take_authorization_code("code-unredeemed-client-bystander")
+                .await,
+        ) {
+            if found.is_none() {
+                report.fail(
+                    c,
+                    "delete_client removed another client's UNREDEEMED authorization code: a user \
+                     who is mid-authorization for a client nobody deleted has their redemption \
+                     refused as `invalid_grant`",
+                );
+            }
+        }
+        #[cfg(feature = "par")]
+        if let Some(found) = report.ok(
+            c,
+            "take_pushed_authorization_request(bystander)",
+            store
+                .take_pushed_authorization_request(&pushed_request_uri(&bystander))
+                .await,
+        ) {
+            if found.is_none() {
+                report.fail(
+                    c,
+                    "delete_client removed another client's pushed authorization request",
+                );
+            }
+        }
+        // AND THE PAR BARRIER MUST NAME ONE CLIENT. Both PAR writes this harness makes while a
+        // barrier stands use the barrier's OWN `client_id`, so a store whose barrier query dropped
+        // the `client_id = $1` conjunct still compares `pushed_at`, refuses exactly the record the
+        // refusal check expects it to, and certifies clean — while every RFC 9126 push in the
+        // deployment fails for the life of any client barrier. The push below predates the
+        // deletion, exactly as the refused one above does, so identity is the only thing that can
+        // tell them apart, and the symptom of getting it wrong is `server_error` on an endpoint an
+        // administrator's single RFC 7592 s2.3 delete has just closed for everybody. Same argument
+        // as the bystander token in `barrier_admits_a_later_grant`, on the write that had none.
+        #[cfg(feature = "par")]
+        {
+            let mut bystanders_push = sample_pushed_request(
+                "urn:ietf:params:oauth:request_uri:pushed-by-a-client-nobody-deleted",
+            );
+            bystanders_push.client_id = bystander.clone();
+            match store
+                .put_pushed_authorization_request(bystanders_push)
+                .await
+            {
+                Ok(WriteOutcome::Applied) => {}
+                Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                    BARRIER_SPARES_UNRELATED,
+                    "put_pushed_authorization_request refused a push from a DIFFERENT client than \
+                     the one deleted: the client barrier is not comparing its scope against the \
+                     record's `client_id`, so one deletion has stopped every client in this \
+                     deployment pushing an authorization request until the barrier is swept",
+                ),
+                Err(e) => report.fail(
+                    BARRIER_SPARES_UNRELATED,
+                    format!("put_pushed_authorization_request failed unexpectedly: {e}"),
+                ),
+            }
+        }
+        #[cfg(feature = "consent")]
+        if let Some(found) = report.ok(
+            c,
+            "get_consent(bystander)",
+            store.get_consent("consent-client-bystander").await,
+        ) {
+            if found.is_none() {
+                report.fail(
+                    c,
+                    "delete_client removed another client's consent record, so a user is shown \
+                     that they never approved an application they did",
+                );
+            }
+        }
 
         // Removing a client that is already gone is Ok(false), not an error.
-        match store.delete_client(&doomed).await {
+        match store.delete_client(&doomed, barrier_window()).await {
             Ok(true) => report.fail(
                 DELETE_CLIENT_REPORTS,
                 "delete_client answered true for a registration that was already gone",
@@ -2642,6 +5093,29 @@ fn at_before(offset_secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS - offset_secs)
 }
 
+/// The window every revocation in this harness records.
+///
+/// `until` is comfortably beyond every other timestamp the fixtures use, so a barrier is live for
+/// the whole of any check that records one, and a store that reaps barriers too eagerly fails the
+/// checks that depend on them rather than passing by accident. The sweep checks pick their own
+/// deadline deliberately, because reaping a barrier is exactly what they are about.
+///
+/// `recorded_at` is NOW, which is AFTER the fixtures' `grant_established_at` (they use
+/// `at_before(10)`). That ordering is what makes the refusal checks below test a refusal at all: a
+/// store that compared the wrong way round, or that ignored the comparison, would still refuse
+/// these and pass. The check that a LATER grant is ADMITTED is what pins the comparison, and it is
+/// stated separately.
+fn barrier_window() -> crate::store::RevocationWindow {
+    crate::store::RevocationWindow {
+        recorded_at: at_before(0),
+        until: barrier_until(),
+    }
+}
+
+fn barrier_until() -> SystemTime {
+    at(1_000_000)
+}
+
 fn scopes(s: &str) -> ScopeSet {
     // The literals below are this module's own and are all valid RFC 6749 section 3.3 tokens.
     ScopeSet::parse(s).unwrap_or_else(|_| ScopeSet::empty())
@@ -2678,7 +5152,7 @@ fn sample_authorization_details() -> crate::rar::AuthorizationDetails {
 /// What the host reported about how it authenticated the user, on every record that carries it.
 ///
 /// `Some`, not `None`, for the reason [`sample_authorization_details`] is non-empty: `None` is the
-/// default, so a `None` fixture certifies a store that drops the field. RFC 9470 section 5 is
+/// default, so a `None` fixture certifies a store that drops the field. RFC 9470 section 6.2 is
 /// answered from this, so a store that loses it has disabled step-up authentication for the whole
 /// deployment while every request continues to succeed.
 ///
@@ -2766,11 +5240,34 @@ fn sample_consent(consent_id: &str, subject: &str) -> crate::consent::ConsentRec
     }
 }
 
+/// The two handles the sweep check plants. Named constants because each is written twice (the
+/// plant and the read-back) and a typo between the two would make the check pass by asking about a
+/// handle nobody stored.
+/// The `request_uri` the `delete_client` cascade check plants for one client. A function rather
+/// than three literals for the reason the two constants below are named: the plant, the
+/// gone-after-the-cascade read and the still-there read must agree, and a typo between them would
+/// make the check pass by asking about a handle nobody stored.
+#[cfg(feature = "par")]
+fn pushed_request_uri(client_id: &ClientId) -> String {
+    format!(
+        "urn:ietf:params:oauth:request_uri:cascade-{}",
+        client_id.as_str()
+    )
+}
+
+#[cfg(feature = "par")]
+const PUSHED_SWEPT: &str = "urn:ietf:params:oauth:request_uri:sweep-dead";
+#[cfg(feature = "par")]
+const PUSHED_KEPT: &str = "urn:ietf:params:oauth:request_uri:sweep-live";
+
 /// A pushed authorization request, complete enough that a store dropping a field on the way
 /// through is visible rather than plausible.
 #[cfg(feature = "par")]
 fn sample_pushed_request(request_uri: &str) -> crate::par::PushedAuthorizationRequest {
     crate::par::PushedAuthorizationRequest {
+        // Before any barrier this harness records, so a planted request is one a client
+        // revocation is entitled to refuse.
+        pushed_at: at_before(10),
         request_uri: request_uri.to_string(),
         client_id: ClientId::new("client-conformance"),
         response_type: Some("code".to_string()),
@@ -2802,6 +5299,14 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
         code: code.to_string(),
         client_id: ClientId::new("client-conformance"),
         redirect_uri: "https://app.example/cb".to_string(),
+        // FALSE, which is the value a store that drops the column cannot produce: the serde
+        // default is `true`, so a `true` fixture would round-trip indistinguishably from a record
+        // whose column was never written. Same rule as `sample_authorization_details` and
+        // `sample_authentication`. What a lost column costs is RFC 6749 section 4.1.3 in the
+        // fail-closed direction: the token endpoint demands a `redirect_uri` the client was
+        // entitled by section 3.1.2.3 to omit, and refuses the redemption blaming a mismatch that
+        // never happened.
+        redirect_uri_was_explicit: false,
         scope: scopes("read write"),
         subject: "subject-conformance".to_string(),
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
@@ -2812,6 +5317,9 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
         ],
         #[cfg(feature = "rar")]
         authorization_details: sample_authorization_details(),
+        // BEFORE any barrier this harness records, so a code the harness plants is one a
+        // revocation is entitled to refuse the redemption of.
+        issued_at: at_before(10),
         expires_at: at(60),
         state: AuthorizationCodeState::Consumed {
             access_token: Some("at-minted-by-this-code".to_string()),
@@ -2835,8 +5343,36 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
         #[cfg(feature = "rar")]
         authorization_details: sample_authorization_details(),
         issued_at: at_before(10),
+        // The GRANT predates any barrier the harness records, which is what makes the refusal
+        // checks below test the refusal rather than the comparison.
+        //
+        // And it is DISTINCT from `issued_at` above, by this module's fixture rule: the two are
+        // separate columns because a rotation mints at `now` and carries the grant instant
+        // forward, so a fixture that made them equal could not tell a store that persists this
+        // column from one that fills it in from the token's own issue time — which is the store
+        // that admits every write a barrier exists to refuse, because a rotation completing behind
+        // a revocation looks to it like a grant established after that revocation.
+        grant_established_at: at_before(20),
         expires_at: at(3600),
         family_id: family_id.map(str::to_string),
+        // RFC 8693 s4.1: who authority was delegated TO. DISTINCTIVE rather than `None`, per this
+        // module's fixture rule, because a store that silently drops it leaves a resource server
+        // unable to tell "A acting for B" from "B", which is the whole distinction RFC 8693 s1.1
+        // draws and the only reason a deployment chooses delegation.
+        // NESTED, one link deep, for the same reason it is not `None`: section 4.1 makes the
+        // nesting itself the ordering of the delegation, so a store that keeps the outermost actor
+        // and flattens what is inside it loses WHO acted before, and a flat fixture could not tell
+        // that store from a correct one.
+        #[cfg(feature = "token-exchange")]
+        act: Some(Box::new(crate::token_exchange::ActClaim {
+            sub: "actor-conformance".to_string(),
+            client_id: Some("client-actor-conformance".to_string()),
+            act: Some(Box::new(crate::token_exchange::ActClaim {
+                sub: "actor-conformance-prior".to_string(),
+                client_id: None,
+                act: None,
+            })),
+        })),
         // RFC 9449 s6: the key this token is bound to. A store that drops it turns a
         // sender-constrained token back into a bearer token, and nothing on the token plane
         // notices, because a token that verifies with no binding is exactly what a bearer token
@@ -2867,6 +5403,10 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
         ],
         #[cfg(feature = "rar")]
         authorization_details: sample_authorization_details(),
+        // Carried, never restamped: the chain remembers the decision that started it, and the
+        // harness plants it before any barrier it records. Distinct from every other instant this
+        // fixture carries, for the reason `sample_token` gives.
+        grant_established_at: at_before(20),
         expires_at: Some(at(86_400)),
         family_id: family_id.to_string(),
         state: RefreshTokenState::Spent,

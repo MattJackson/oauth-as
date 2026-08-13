@@ -34,20 +34,15 @@ fn challenge() -> String {
 }
 
 fn good_request(challenge: &str) -> AuthorizationRequest<'static> {
-    AuthorizationRequest {
-        response_type: Some("code".into()),
-        client_id: Some("public-app".into()),
-        redirect_uri: Some(PUBLIC_REDIRECT.into()),
-        scope: Some("read".into()),
-        state: Some("opaque-state".into()),
-        code_challenge: Some(challenge.to_string().into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-        ..Default::default()
-    }
+    AuthorizationRequest::from_pairs([
+        ("response_type", "code".to_string()),
+        ("client_id", "public-app".to_string()),
+        ("redirect_uri", PUBLIC_REDIRECT.to_string()),
+        ("scope", "read".to_string()),
+        ("state", "opaque-state".to_string()),
+        ("code_challenge", challenge.to_string()),
+        ("code_challenge_method", "S256".to_string()),
+    ])
 }
 
 /// RFC 9207 s2: an AS supporting this specification MUST include `iss` in the authorization
@@ -157,8 +152,18 @@ async fn the_iss_value_is_byte_identical_to_the_metadata_issuer() {
     // outside the RFC 3986 unreserved set.
     let encoded = metadata_issuer.replace(':', "%3A").replace('/', "%2F");
     let location = response.location(PUBLIC_REDIRECT);
-    assert!(
-        location.contains(&format!("iss={encoded}")),
+
+    // THE VALUE, NOT A SUBSTRING OF IT. `iss` is appended last and `/` percent-encodes to `%2F`,
+    // so a server that stopped trimming the configured trailing slash would emit
+    // `iss=https%3A%2F%2Fas.example%2F`, which CONTAINS `iss=https%3A%2F%2Fas.example` and would
+    // have satisfied a `contains` assertion while being a different identifier from the one the
+    // metadata document publishes. Section 2.4 has the client compare for equality, so this does.
+    let iss = location
+        .rsplit_once("iss=")
+        .map(|(_, v)| v.split('&').next().unwrap_or_default())
+        .unwrap_or_else(|| panic!("the redirect must carry an iss parameter: {location}"));
+    assert_eq!(
+        iss, encoded,
         "RFC 9207 s2.4 compares iss to the issuer identifier for equality, so the two spellings \
          must not differ: metadata says {metadata_issuer}, redirect says {location}"
     );

@@ -413,7 +413,7 @@ fn a_router_refuses_to_publish_a_path_it_would_shadow() {
 /// Gated on `jwt-p256` and NOT on `jwt`, because the fixture needs a signing KEY and since the
 /// ES256 seam `jwt` is the trait surface with no backend behind it: `EcdsaP256Key` only exists
 /// with the built-in backend compiled in. Under plain `jwt` this file did not compile at all,
-/// which is why `--features http,client_assertion` (client_assertion implies jwt, not jwt-p256)
+/// which is why `--features http,client-assertion` (client-assertion implies jwt, not jwt-p256)
 /// was a build nobody could run.
 #[cfg(feature = "jwt-p256")]
 #[test]
@@ -739,7 +739,7 @@ fn a_static_route_beats_the_dynamic_one() {
     assert!(matches!(routes.resolve("/register/other"), Some(Route::Manage(id)) if id == "other"));
 }
 
-/// RFC 3986 s3.3 puts `+` in `sub-delims`, so it is a literal in a path segment; only
+/// RFC 3986 s3.3 puts `+` in `sub-delims`, so it is a literal in a path; only
 /// `application/x-www-form-urlencoded` gives it the "space" meaning. Decoding it as a space would
 /// rewrite the `registration_client_uri` this server itself minted for a client whose id has one.
 #[test]
@@ -754,6 +754,34 @@ fn a_path_segment_decodes_percent_escapes_but_not_plus() {
         Cow::Borrowed("plain-id")
     ));
     assert!(matches!(decode_path_segment("a+b"), Cow::Borrowed("a+b")));
+}
+
+/// The ROUTE TABLE is normalised into wire form, which is what lets an issuer whose path a client
+/// must escape be reached at all WITHOUT the matcher ever touching the wire path.
+///
+/// Both legal spellings of such an issuer have to land on the same route, because a client sends
+/// the same bytes for both: the raw one (not a legal URI, but this crate accepts it) and the RFC
+/// 3986 section 3.3 percent-encoded one. The escaped spelling of an ORDINARY route must NOT land
+/// on it, which is the property that keeps this service's idea of the path the same as that of
+/// every proxy in front of it.
+#[test]
+fn the_route_table_is_normalised_to_what_a_client_sends() {
+    for issuer in ["https://as.example/\u{e9}", "https://as.example/%C3%A9"] {
+        let mut config = ServerConfig::new(issuer, "https://as.example/device");
+        config.registration = None;
+        let meta = crate::metadata::AuthorizationServerMetadata::from_config(&config);
+        let iss = meta.issuer.clone();
+        let token = endpoint_path(&iss, "token_endpoint", &meta.token_endpoint).expect("under");
+        assert_eq!(
+            token, "/%C3%A9/token",
+            "{issuer}: the table must hold the bytes a client puts on the wire"
+        );
+    }
+    // And nothing else is rewritten: an escaped spelling of an ASCII route is a different string.
+    assert_eq!(encode_route_path("/token"), "/token");
+    assert_ne!(encode_route_path("/token"), "/%74oken");
+    // An issuer that already carries escapes passes through once, not twice.
+    assert_eq!(encode_route_path("/tenant%20a/token"), "/tenant%20a/token");
 }
 
 /// RFC 9110 s15.5.6 makes `Allow` mandatory on a 405, and HEAD is listed wherever GET is because

@@ -19,6 +19,17 @@
 //! - [`an_object_naming_another_client_is_refused`]
 //! - [`a_jwt_minted_for_another_purpose_is_not_a_request_object`]
 
+// Gated on the union of what the tests below actually need. Everything in this file is either
+// `par`, or the RFC 9101 module that needs `jar` AND `jwt-p256` (because `jar` implies the
+// verification surface, not a curve, so a `jar` build with no backend cannot sign a request
+// object). A build with neither -- `dpop,jar,client-assertion`, for one -- has no live test in
+// this file at all, and an ungated import is then dead under `-D warnings`.
+#[cfg(any(
+    feature = "par",
+    all(feature = "jar", feature = "jwt-p256"),
+    feature = "consent",
+    feature = "rar"
+))]
 use super::*;
 
 // ------------------------------------------------------------------------------- RFC 9126
@@ -54,6 +65,7 @@ fn the_par_endpoint_defaults_under_the_issuer_and_honours_an_override() {
 #[test]
 fn a_stored_handle_is_not_printed_by_debug() {
     let record = PushedAuthorizationRequest {
+        pushed_at: std::time::UNIX_EPOCH,
         request_uri: "urn:ietf:params:oauth:request_uri:5ecre7".to_string(),
         client_id: ClientId::new("app"),
         response_type: Some("code".to_string()),
@@ -91,6 +103,7 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
     const RAR_DETAILS: &str = r#"[{"type":"payment_initiation","actions":["initiate"],"locations":["https://rs.example"]}]"#;
 
     let record = PushedAuthorizationRequest {
+        pushed_at: std::time::UNIX_EPOCH,
         request_uri: "urn:ietf:params:oauth:request_uri:abc".to_string(),
         client_id: ClientId::new("app"),
         response_type: Some("code".to_string()),
@@ -220,7 +233,19 @@ mod jar {
         json!({"alg": "ES256", "typ": REQUEST_OBJECT_TYP, "kid": "client-key-1"})
     }
 
+    /// The `exp` is not decoration and these fixtures did not always carry one. 0.9.1 made a
+    /// request object without a lifetime a refusal, because one that never expires authorizes its
+    /// exact request for as long as the client's key stays registered, and a request object travels
+    /// in a browser URL where anyone can read it. So a fixture with no `exp` is no longer a valid
+    /// object, and every test below that is about something ELSE needs a valid one to be testing
+    /// that something else at all.
+    ///
+    /// Sixty seconds, comfortably inside `JarConfig::max_request_object_lifetime`, so none of these
+    /// tests is accidentally about the ceiling.
     fn claims() -> serde_json::Value {
+        let exp = crate::server::unix_seconds(std::time::SystemTime::now())
+            .expect("the test clock is representable")
+            + 60;
         json!({
             "iss": "app",
             "aud": "https://as.example",
@@ -231,6 +256,7 @@ mod jar {
             "state": "opaque-state",
             "code_challenge": crate::pkce::code_challenge_s256(VERIFIER),
             "code_challenge_method": "S256",
+            "exp": exp,
         })
     }
 

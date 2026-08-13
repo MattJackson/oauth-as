@@ -70,6 +70,16 @@ struct Faults {
     /// The signer refuses. What an unreachable KMS, or one whose IAM policy was tightened under
     /// the deployment, actually looks like.
     signer_refuses: bool,
+    /// The signer PANICS in the synchronous half of `sign`, where a KMS wrapper marshals its
+    /// request: `self.client.get().unwrap()`, a `kid` parsed with `expect`, a config read that was
+    /// `None` in this environment. `Es256Signer::sign` says MUST NOT PANIC for any input ever, and
+    /// this half panics before the future is even polled.
+    signer_panics_while_building_the_request: bool,
+    /// The signer PANICS while the future is polled, which is where the KMS RESPONSE is read: the
+    /// `copy_from_slice` that assumes 64 bytes, the `unwrap` on a field the API left absent. The
+    /// two are separate faults because the harness has to catch in two places to see both, and a
+    /// harness that caught only one would report green for half of this defect.
+    signer_panics_while_awaiting_the_response: bool,
     /// The signer returns the ASN.1 DER encoding, truncated into the 64 bytes the trait demands.
     /// This is the single most likely defect in a KMS-backed signer: RFC 7518 s3.4 wants
     /// fixed-width `R || S` and almost every provider returns DER.
@@ -107,6 +117,35 @@ struct Faults {
     /// The verifier ALSO accepts the DER encoding, by converting it back before checking. Every
     /// signature then has two spellings, so a value recorded as unique is not.
     verifier_accepts_der: bool,
+    /// The verifier takes the first 64 bytes and PANICS on anything shorter. This is what an
+    /// implementor writes after reading "the signature MUST be the 64-byte fixed-width R || S":
+    /// the sentence sounds like a guarantee about the argument and is a requirement on the answer.
+    /// The signature is the third JWS segment base64url-decoded, so a proof ending in a bare `.`
+    /// makes it a zero-length slice and the panic unwinds into the host's token endpoint.
+    verifier_indexes_the_first_64_bytes: bool,
+    /// The verifier left-pads a short signature up to 64 bytes and verifies THAT. It does not
+    /// panic, so it is the quieter half of the same defect: it never says no on length, and gives
+    /// values the signer never produced a chance to be accepted.
+    ///
+    /// It rejects anything LONGER than 64 bytes, and that is deliberate rather than incidental. A
+    /// backend that pads short inputs and truncates long ones is caught by the harness's 65-byte
+    /// case, whose padded reconstruction is the A.3 signature itself, and being caught there meant
+    /// `verifier/rejects_a_wrong_length_signature` went red without the LEADING_ZERO vector ever
+    /// being consulted: the one case in the harness that only a padding verifier can fail was
+    /// satisfied by a different case, so a typo in `LEADING_ZERO_SIGNATURE` would have been
+    /// invisible and the check vacuous. Rejecting the long ones leaves the leading-zero case as
+    /// the ONLY way this fault can be seen, which is what makes those constants load bearing. The
+    /// truncating half is still driven, by `verifier_indexes_the_first_64_bytes`.
+    verifier_pads_a_short_signature: bool,
+    /// The verifier decodes the key's coordinates into a point and UNWRAPS, the way a KMS-shaped
+    /// verifier does after reading that `key` is a P-256 public key. `PublicJwk` guarantees the
+    /// coordinate WIDTH and deliberately not the curve equation, and RFC 9449 s4.3 hands the `jwk`
+    /// straight out of a DPoP proof header, so this panics on bytes an unauthenticated client
+    /// chose.
+    verifier_unwraps_an_off_curve_key: bool,
+    /// The verifier reads the first byte of the signing input before doing any arithmetic, which
+    /// panics on the empty one the contract says it may be handed.
+    verifier_reads_the_first_input_byte: bool,
 }
 
 struct FaultySigner {
@@ -143,6 +182,11 @@ impl Es256Signer for FaultySigner {
         signing_input: &[u8],
     ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
         let faults = self.faults;
+        if faults.signer_panics_while_building_the_request {
+            // Before the future exists at all: this is the half a `catch_unwind` around the
+            // AWAITED call alone would miss.
+            panic!("the KMS request builder unwrapped a None");
+        }
         let message: Vec<u8> = if faults.signer_ignores_its_argument {
             b"a buffer this signer captured once".to_vec()
         } else {
@@ -157,6 +201,11 @@ impl Es256Signer for FaultySigner {
                 out
             });
         async move {
+            if faults.signer_panics_while_awaiting_the_response {
+                // Inside the poll, where the KMS response is read: the half a `catch_unwind`
+                // around only the SYNCHRONOUS call would miss.
+                panic!("the KMS response was the wrong length and copy_from_slice said so");
+            }
             if faults.signer_refuses {
                 return Err(SignerError::new("the key service refused"));
             }
@@ -207,6 +256,22 @@ struct FaultyVerifier {
 impl Es256Verifier for FaultyVerifier {
     fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
         let real = P256Verifier;
+        if self.faults.verifier_unwraps_an_off_curve_key {
+            // Written as an implementor writes it after reading that `key` is a P-256 public key.
+            // `from_sec1_bytes` is what checks the curve equation, and `expect` is what turns a
+            // client-supplied DPoP `jwk` into a panic in the host's token endpoint.
+            let mut sec1 = [0u8; 65];
+            sec1[0] = 0x04;
+            sec1[1..33].copy_from_slice(&b64(key.x()));
+            sec1[33..].copy_from_slice(&b64(key.y()));
+            p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+                .expect("this verifier assumes the coordinates are a point, which is the defect");
+        }
+        if self.faults.verifier_reads_the_first_input_byte {
+            // A peek at the JWS header before any arithmetic. Every signing input this crate
+            // builds has a first byte; the contract says one arriving from the wire need not.
+            let _first = signing_input[0];
+        }
         if self.faults.verifier_always_false {
             return false;
         }
@@ -227,6 +292,23 @@ impl Es256Verifier for FaultyVerifier {
             if let Some(fixed) = from_der(signature) {
                 return real.verify(key, signing_input, &fixed);
             }
+        }
+        if self.faults.verifier_indexes_the_first_64_bytes {
+            // Written exactly as an implementor writes it after reading "the signature MUST be the
+            // 64-byte fixed-width R || S". It PANICS on anything shorter, and the shortest input
+            // is free: a JWS whose third segment is empty.
+            return real.verify(key, signing_input, &signature[..64]);
+        }
+        if self.faults.verifier_pads_a_short_signature {
+            if signature.len() > 64 {
+                // This backend gets the LONG ones right. See the fault's doc: catching it on a
+                // 65-byte input would let the leading-zero case, which is the only one that can
+                // catch a padding verifier, go unconsulted.
+                return false;
+            }
+            let mut fixed = [0u8; 64];
+            fixed[64 - signature.len()..].copy_from_slice(signature);
+            return real.verify(key, signing_input, &fixed);
         }
         real.verify(key, signing_input, signature)
     }
@@ -385,10 +467,72 @@ fn planted_faults() -> Vec<(&'static str, Faults)> {
                 ..Default::default()
             },
         ),
+        // TWO entries for the wrong-length obligation, because it has two natural wrong answers and
+        // catching one says nothing about the other. `assert_planted` drives EVERY entry with a
+        // matching name, so both are exercised by name and by the coverage guard.
+        (
+            "verifier/rejects_a_wrong_length_signature",
+            Faults {
+                verifier_pads_a_short_signature: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/rejects_a_wrong_length_signature",
+            Faults {
+                // The 65-byte case: this verifier reads a 64-byte PREFIX and ignores the rest.
+                verifier_indexes_the_first_64_bytes: true,
+                ..Default::default()
+            },
+        ),
+        // THREE entries, one per input the MUST NOT PANIC clause names that a natural
+        // implementation actually dies on: the short SIGNATURE, the off-curve KEY, and the empty
+        // SIGNING INPUT. Each is a different `unwrap` in a different line of a host's verifier, and
+        // a fault for one says nothing about the other two: for two rounds the harness presented
+        // only the lengths, so a verifier that unwrapped the key passed every published check while
+        // panicking on a DPoP proof anyone could send.
+        (
+            "verifier/does_not_panic",
+            Faults {
+                verifier_indexes_the_first_64_bytes: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/does_not_panic",
+            Faults {
+                verifier_unwraps_an_off_curve_key: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier/does_not_panic",
+            Faults {
+                verifier_reads_the_first_input_byte: true,
+                ..Default::default()
+            },
+        ),
         (
             "signer/signs",
             Faults {
                 signer_refuses: true,
+                ..Default::default()
+            },
+        ),
+        // TWO entries, because `sign` returns a future and so has two places to panic: the
+        // synchronous half that builds it and the poll that drives it. A harness that caught only
+        // one of them would report green for the other.
+        (
+            "signer/does_not_panic",
+            Faults {
+                signer_panics_while_building_the_request: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "signer/does_not_panic",
+            Faults {
+                signer_panics_while_awaiting_the_response: true,
                 ..Default::default()
             },
         ),
@@ -454,15 +598,25 @@ fn planted_faults() -> Vec<(&'static str, Faults)> {
     ]
 }
 
-/// Look the named check's planted fault up and drive it. The per-fault `#[test]`s below exist for
-/// GRANULARITY: a failure then names one check rather than the whole table.
+/// Look the named check's planted faults up and drive EVERY one of them.
+///
+/// Every, not the first: a check whose obligation has two distinct wrong answers gets an entry per
+/// answer (see the wrong-length pair), and finding only the first would leave the other planted and
+/// never driven, which is the exact shape of rot this file exists to prevent.
 fn assert_planted(check: &str) {
-    let faults = planted_faults()
-        .into_iter()
-        .find(|(name, _)| *name == check)
-        .unwrap_or_else(|| panic!("{check} has no entry in planted_faults()"))
-        .1;
-    assert_reports(faults, check);
+    let table = planted_faults();
+    let matching: Vec<Faults> = table
+        .iter()
+        .filter(|(name, _)| *name == check)
+        .map(|(_, faults)| *faults)
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "{check} has no entry in planted_faults()"
+    );
+    for faults in matching {
+        assert_reports(faults, check);
+    }
 }
 
 /// The guard, and it now means what it is called: for every check the harness reports, a fault is
@@ -536,6 +690,118 @@ fn a_verifier_that_says_yes_to_everything_is_caught_by_the_foreign_key_check() {
     // is the point: no signer can produce a signature that verifies under a key whose private half
     // it does not hold, so a red here always means the verifier.
     assert_planted("signer/does_not_verify_under_another_key");
+}
+
+/// The finding this check was added for. Both natural wrong answers to "the signature MUST be 64
+/// bytes" are driven here: the one that PANICS on a short slice and the one that pads it up to 64
+/// and accepts. Before the wrong-length cases existed, the harness handed the verifier nothing
+/// shorter than 64 bytes and BOTH of these passed every published check.
+#[test]
+fn a_verifier_that_does_not_reject_a_wrong_length_signature_is_caught() {
+    assert_planted("verifier/rejects_a_wrong_length_signature");
+
+    // And the PADDING verifier is caught by the LEADING-ZERO case specifically, which is the only
+    // case in the harness that can catch it and the reason those four constants exist. Asserted on
+    // the detail, not just the name: the previous shape of this fault also truncated long inputs,
+    // so the 65-byte case reported first and the check went red without the leading-zero vector
+    // being consulted at all. A typo in `LEADING_ZERO_SIGNATURE` was then invisible, which is
+    // exactly the "green run that proves nothing" this file exists to prevent.
+    let violations = run(Faults {
+        verifier_pads_a_short_signature: true,
+        ..Default::default()
+    });
+    let padding: Vec<&Violation> = violations
+        .iter()
+        .filter(|v| v.check == "verifier/rejects_a_wrong_length_signature")
+        .collect();
+    assert!(
+        padding
+            .iter()
+            .any(|v| v.detail.contains("LEADING ZERO byte removed")),
+        "a padding verifier must be caught by the case built for it: {violations:#?}"
+    );
+}
+
+/// A verifier that panics is reported as a Violation rather than ending the host's test run, which
+/// is the only reason the check above can be observed at all against `signature[..64]`.
+#[test]
+fn a_verifier_that_panics_is_reported_rather_than_aborting_the_run() {
+    assert_planted("verifier/does_not_panic");
+
+    // And it is reported ONCE, naming the first input that panicked, rather than once per call the
+    // harness makes. Six identical violations would bury the length that mattered.
+    let violations = run(Faults {
+        verifier_indexes_the_first_64_bytes: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        violations
+            .iter()
+            .filter(|v| v.check == "verifier/does_not_panic")
+            .count(),
+        1,
+        "{violations:#?}"
+    );
+
+    // The other two inputs the MUST NOT PANIC clause names, each asserted on the DETAIL rather
+    // than on the check name: the name only says that SOMETHING panicked, and what these two
+    // faults are here to prove is that the harness PRESENTS an off-curve key and an empty signing
+    // input at all. Before it did, a verifier that unwrapped its key panicked on a DPoP proof
+    // anyone could send and collected a green run from this harness.
+    for (faults, expected) in [
+        (
+            Faults {
+                verifier_unwraps_an_off_curve_key: true,
+                ..Default::default()
+            },
+            "an OFF-CURVE key",
+        ),
+        (
+            Faults {
+                verifier_reads_the_first_input_byte: true,
+                ..Default::default()
+            },
+            "an EMPTY signing input",
+        ),
+    ] {
+        let violations = run(faults);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.check == "verifier/does_not_panic" && v.detail.contains(expected)),
+            "the panic must be reported against {expected}: {violations:#?}"
+        );
+    }
+}
+
+/// A signer that panics is reported too, and both halves of `sign` are covered.
+///
+/// `Es256Signer::sign` carries the same MUST NOT PANIC clause as the verifier and, until this
+/// existed, nothing checked it: the harness wrapped every verifier call and called the signer bare.
+/// The blast radius is the larger of the two, since a panic there unwinds out of
+/// `JwtConfig::sign_access_token` and into the host's token endpoint.
+#[test]
+fn a_signer_that_panics_is_reported_rather_than_aborting_the_run() {
+    assert_planted("signer/does_not_panic");
+
+    // A panic is ALSO an `Err` for `signer/signs`: nothing below a missing signature can be
+    // checked, so the run has to stop where it stops for a signer that refused.
+    for faults in [
+        Faults {
+            signer_panics_while_building_the_request: true,
+            ..Default::default()
+        },
+        Faults {
+            signer_panics_while_awaiting_the_response: true,
+            ..Default::default()
+        },
+    ] {
+        let violations = run(faults);
+        assert!(
+            violations.iter().any(|v| v.check == "signer/signs"),
+            "a signer that panicked did not sign: {violations:#?}"
+        );
+    }
 }
 
 #[test]

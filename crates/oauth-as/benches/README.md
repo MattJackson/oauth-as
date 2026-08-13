@@ -16,8 +16,16 @@ cargo bench -p oauth-as --all-features          # everything
 cargo bench -p oauth-as                         # default features only: no http, jwt, dpop, par, rar
 cargo bench -p oauth-as --all-features --bench token
 cargo bench -p oauth-as --all-features --bench scaling -- introspection   # substring filter
-cargo bench -p oauth-as --all-features --no-run # compile only; this is what CI runs
+cargo bench -p oauth-as --all-features --no-run # compile only
 ```
+
+CI DOES NOT RUN ANY OF THOSE. No workflow mentions `cargo bench` at all, and that is deliberate:
+a timing number measured on a shared runner is noise, so gating on one would produce flakes that
+say nothing about this crate. What CI does give these targets is ROT PROTECTION, and it gives it
+incidentally: `.github/workflows/qa.yml`'s lint job runs `cargo clippy --workspace --all-targets`
+(twice, once with `--all-features`), and `--all-targets` includes benches, so a bench that no
+longer compiles against a moved signature is a red there. Nothing checks that a bench still RUNS,
+or how fast it is; the numbers below come from a workstation and are reproduced by hand.
 
 Six targets:
 
@@ -93,8 +101,8 @@ Read this before quoting any figure anywhere.
 
 ## Why there is no criterion, and no divan
 
-MEASURED, not preferred. Both break `cargo +1.75 test -p oauth-as --locked`, which is `GOAL.md`
-Gate 6's own CHECK command:
+MEASURED, not preferred. Both break `cargo +1.75 test -p oauth-as --locked`, which is this crate's
+MSRV check:
 
 - `criterion` 0.8.2 declares `rust-version = "1.86"`. Pinning back to `criterion` 0.5.1 does not
   help: it resolves `clap_lex` 1.1.0, which is edition 2024, and cargo 1.75 cannot parse that

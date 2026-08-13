@@ -18,6 +18,12 @@ pub const TOKEN_EXCHANGE_GRANT_URN: &str = "urn:ietf:params:oauth:grant-type:tok
 
 /// A grant type a client may be allowed to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `#[non_exhaustive]`: `TokenExchange` exists only under the `token-exchange` feature, and this
+/// enum is on every [`crate::client::Client`] a host stores, so a registration screen or an
+/// authorization policy that matches it is ordinary host code rather than an edge case. Adding a
+/// grant to this crate should not be a semver-major event for a deployment that does not use it,
+/// and without the attribute enabling the feature already is one.
+#[non_exhaustive]
 pub enum GrantType {
     /// RFC 6749 section 4.1 (OAuth 2.1: PKCE required; types in [`crate::authorization`]).
     #[serde(rename = "authorization_code")]

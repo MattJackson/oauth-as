@@ -44,22 +44,13 @@ async fn issue_code<S: oauth_as::Storage>(
     scope: &str,
 ) -> String {
     let challenge = oauth_as::pkce::code_challenge_s256(support::RFC7636_VERIFIER);
-    let request = oauth_as::AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".to_string().into()),
-        client_id: Some(client_id.to_string().into()),
-        redirect_uri: Some(redirect_uri.to_string().into()),
-        scope: Some(scope.to_string().into()),
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".to_string().into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let mut request = oauth_as::AuthorizationRequest::default();
+    request.response_type = Some("code".to_string().into());
+    request.client_id = Some(client_id.to_string().into());
+    request.redirect_uri = Some(redirect_uri.to_string().into());
+    request.scope = Some(scope.to_string().into());
+    request.code_challenge = Some(challenge.into());
+    request.code_challenge_method = Some("S256".to_string().into());
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     srv.issue_authorization_code(UserApproval::granted(&validated, "user-1"))
         .await
@@ -130,10 +121,7 @@ fn attacker_certificate() -> ClientCertificate<'static> {
 /// of the host-facing seam: there is no separate mutual-TLS entry point, because a certificate is
 /// a credential and credentials go in [`ClientCredential`].
 fn with_certificate<'a>(certificate: &'a ClientCertificate<'a>) -> TokenRequestContext<'a> {
-    TokenRequestContext {
-        credential: ClientCredential::certificate(certificate),
-        ..Default::default()
-    }
+    TokenRequestContext::new(ClientCredential::certificate(certificate))
 }
 
 fn cc_request(client_id: &str) -> TokenRequest {

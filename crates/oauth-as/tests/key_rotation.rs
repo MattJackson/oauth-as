@@ -62,20 +62,15 @@ fn verifies_against(jwks: &Jwks, token: &str) -> bool {
 }
 
 fn claims(jti: &str) -> AccessTokenClaims {
-    AccessTokenClaims {
-        iss: "https://as.example".to_string(),
-        exp: 1_700_003_600,
-        aud: Audience::One("https://api.example".to_string()),
-        sub: "user-1".to_string(),
-        client_id: "app".to_string(),
-        iat: 1_700_000_000,
-        jti: jti.to_string(),
-        scope: None,
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        #[cfg(any(feature = "dpop", feature = "mtls"))]
-        cnf: None,
-    }
+    AccessTokenClaims::new(
+        "https://as.example",
+        1_700_003_600,
+        Audience::One("https://api.example".to_string()),
+        "user-1",
+        "app",
+        1_700_000_000,
+        jti,
+    )
 }
 
 fn kids(jwks: &Jwks) -> Vec<String> {

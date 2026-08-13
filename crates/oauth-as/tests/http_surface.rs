@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, ServiceBuilder};
+use oauth_as::http::{ApprovalDecision, ServiceBuilder};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
 use oauth_as::store::MemoryStorage;
@@ -131,7 +131,7 @@ async fn request(
 struct Wiring {
     /// [`ServiceBuilder::with_subject_resolver`]: a logged-in user.
     subject: bool,
-    /// [`ServiceBuilder::with_consent_resolver`]: the RFC 6749 s10.12 consent step.
+    /// [`ServiceBuilder::with_approval_resolver`]: the RFC 6749 s10.12 consent step.
     consent: Consent,
     /// [`ServiceBuilder::with_csrf_tokens`]: session-bound CSRF tokens for the device form.
     csrf: bool,
@@ -203,7 +203,12 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let issuer = format!("http://{addr}");
-    let config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
+    let mut config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
+    // RFC 7662 is now advertised only where the host NAMES the endpoint (see
+    // `AuthorizationServerMetadata::introspection_endpoint`), so this fixture names it: the
+    // document-membership sweep below and the round trip through `/introspect` are both about the
+    // endpoint being published AND answering, which is the opted-in deployment.
+    config.introspection_endpoint = Some(format!("{issuer}/introspect"));
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
 
     let scopes = ScopeSet::from_tokens(["read", "write"]).expect("scopes");
@@ -254,9 +259,9 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
     }
     builder = match wiring.consent {
         Consent::Unwired => builder,
-        Consent::Approve => builder.with_consent_resolver(|_req| ConsentDecision::Approve),
-        Consent::Deny => builder.with_consent_resolver(|_req| ConsentDecision::Deny),
-        Consent::Screen => builder.with_consent_resolver(|req| {
+        Consent::Approve => builder.with_approval_resolver(|_req| ApprovalDecision::Approve),
+        Consent::Deny => builder.with_approval_resolver(|_req| ApprovalDecision::Deny),
+        Consent::Screen => builder.with_approval_resolver(|req| {
             let mut body = String::from("Allow ");
             body.push_str(req.client_id.as_str());
             body.push_str(" scope ");
@@ -266,7 +271,7 @@ async fn start_wired(wiring: Wiring) -> (SocketAddr, CsrfSessions) {
             // framework of the week.
             let mut screen = http::Response::new(oauth_as::http::Body::from(body));
             *screen.status_mut() = http::StatusCode::OK;
-            ConsentDecision::Respond(Box::new(screen))
+            ApprovalDecision::Respond(Box::new(screen))
         }),
     };
     if wiring.csrf {
@@ -364,6 +369,64 @@ async fn token_success_is_no_store() {
         "RFC 6749 s5.1 requires Pragma: no-cache"
     );
     assert_eq!(resp.json()["token_type"], "Bearer");
+}
+
+/// The verification page must refuse to be FRAMED, and must not be cached.
+///
+/// Found by the 0.9.1 audit. This is the only HTML this server renders and the only response a
+/// browser executes, and it had neither a framing refusal nor `no_store` — it was the single
+/// response constructor in `http.rs` that skipped `no_store` entirely.
+///
+/// Why framing is the serious half: the page's cross-site defence is `Sec-Fetch-Site:
+/// same-origin`, which test C1 below relies on. A document inside a cross-site iframe posting to
+/// its OWN origin sends exactly that header, so the defence is satisfied by a clickjack and stops
+/// nothing. The attacker starts a device grant for a client they control, frames the verification
+/// page invisibly over bait, and the victim's click lands on Approve — the same account takeover
+/// C1 pins, reached by a route C1 does not cover.
+///
+/// The caching half: the body carries a live single-use CSRF token and the client, scope and user
+/// code of a third party's pending grant.
+#[tokio::test]
+async fn the_verification_page_refuses_framing_and_caching() {
+    let addr = start(true).await;
+    let page = request(addr, "GET", "/device", &[("Cookie", VICTIM_SESSION)], None).await;
+    assert_eq!(page.status, 200, "body: {}", page.body);
+    assert!(
+        page.header("content-type")
+            .is_some_and(|v| v.starts_with("text/html")),
+        "this test is only meaningful on the HTML page, got {:?}",
+        page.header("content-type")
+    );
+
+    let csp = page
+        .header("content-security-policy")
+        .expect("the verification page must carry a Content-Security-Policy");
+    assert!(
+        csp.contains("frame-ancestors 'none'"),
+        "without frame-ancestors the page can be clickjacked into approving an attacker's device \
+         grant, because a framed document satisfies the Sec-Fetch-Site check: {csp:?}"
+    );
+    assert!(
+        csp.contains("form-action 'self'"),
+        "the approval form must not be redirectable off-origin: {csp:?}"
+    );
+    assert_eq!(
+        page.header("x-frame-options").map(str::to_ascii_uppercase),
+        Some("DENY".to_string()),
+        "browsers that do not enforce frame-ancestors need X-Frame-Options"
+    );
+    assert!(
+        page.header("cache-control")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("no-store")),
+        "the page carries a live CSRF token and a third party's pending grant, got {:?}",
+        page.header("cache-control")
+    );
+    assert_eq!(
+        page.header("x-content-type-options")
+            .map(str::to_ascii_lowercase),
+        Some("nosniff".to_string())
+    );
+    assert_eq!(page.header("referrer-policy"), Some("no-referrer"));
 }
 
 /// RFC 6749 s5.2: when the client authenticated via the `Authorization` header and that
@@ -592,6 +655,11 @@ async fn authorization_issues_a_code_when_a_subject_is_resolved() {
 /// With no host-supplied resolver there is no authenticated resource owner, so the request is
 /// refused DIRECTLY rather than redirected: telling the client `access_denied` at its redirect
 /// URI would claim a user refused when no user was ever asked.
+///
+/// `start(false)` leaves the subject AND the approval seam unwired, and both answer with the same
+/// status and the same `access_denied`, differing only in the description. So the description is
+/// asserted: without it this test was equally satisfied by the approval refusal one step later,
+/// and could not tell the subject seam from a subject the library invented.
 #[tokio::test]
 async fn authorization_without_a_resolver_refuses_directly() {
     let addr = start(false).await;
@@ -610,6 +678,13 @@ async fn authorization_without_a_resolver_refuses_directly() {
     assert_eq!(resp.status, 403, "body: {}", resp.body);
     assert!(resp.header("location").is_none());
     assert_eq!(resp.json()["error"], "access_denied");
+    assert!(
+        resp.json()["error_description"]
+            .as_str()
+            .is_some_and(|d| d.contains("subject resolver")),
+        "the refusal must name the seam that produced it: {}",
+        resp.body
+    );
 }
 
 /// RFC 8628 s3.1/3.2 over the wire, then the verification UI: GET renders a form, POST of
@@ -845,6 +920,13 @@ async fn verification_form(addr: SocketAddr, query: &str) -> (Resp, String) {
 /// and to ensure a malicious client cannot obtain authorization without the resource owner's
 /// awareness and explicit consent. RFC 8628 s3.3 leaves the interaction shape to the
 /// implementation but does not license removing that.
+///
+/// THE ATTACKER IS GIVEN A VALID CSRF TOKEN HERE, which no real attacker could read across
+/// origins. That is deliberate, and it is what the 0.9.1 audit found missing: until then this
+/// test posted no `csrf_token` at all, so the token check refused it one step later and deleting
+/// the origin check entirely left the test green. Handing the attacker the victim's real token
+/// leaves the ORIGIN check as the only thing standing between the request and the approval, so
+/// the refusal this asserts can only have come from that check.
 #[tokio::test]
 async fn c1_cross_origin_form_post_must_not_approve_a_device_grant() {
     // FULLY wired: this attack must fail against a host that did everything right, not only
@@ -852,9 +934,13 @@ async fn c1_cross_origin_form_post_must_not_approve_a_device_grant() {
     let (addr, _sessions) = start_wired(Wiring::full()).await;
     let (device_code, user_code) = begin_device_grant(addr).await;
 
-    // Exactly what a browser sends for a cross-origin <form method="post"> submission: the
-    // victim's cookie rides along, and the attacker cannot read the CSRF token from another
-    // origin, so there is none.
+    // The victim's own browser loaded the verification page, so the host has a token outstanding
+    // for that session, and it is the one the next POST on that cookie will be checked against.
+    let (_page, csrf) = verification_form(addr, "").await;
+
+    // Exactly what a browser sends for a cross-origin <form method="post"> submission, except for
+    // the token: the victim's cookie rides along, and the request carries the token the host would
+    // accept, so nothing but the origin can refuse it.
     let forced = request(
         addr,
         "POST",
@@ -866,15 +952,19 @@ async fn c1_cross_origin_form_post_must_not_approve_a_device_grant() {
             ("Referer", "https://attacker.example/setup-your-tv"),
         ],
         Some(&format!(
-            "user_code={}&action=approve",
+            "user_code={}&csrf_token={csrf}&action=approve",
             user_code.replace('-', "%2D")
         )),
     )
     .await;
-    assert!(
-        forced.status >= 400,
+    assert_eq!(
+        forced.status, 403,
         "a cross-origin form POST must be refused, got {} {}",
-        forced.status,
+        forced.status, forced.body
+    );
+    assert!(
+        forced.body.contains("did not come from this site"),
+        "the refusal must be the ORIGIN check, not the token check the attacker just satisfied: {}",
         forced.body
     );
 

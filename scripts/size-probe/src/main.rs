@@ -58,7 +58,7 @@ mod exercise;
     feature = "f-jar",
     feature = "f-rar",
     feature = "f-dpop",
-    feature = "f-client_assertion",
+    feature = "f-client-assertion",
     feature = "f-consent",
     feature = "f-token-exchange",
     feature = "f-resource-metadata",

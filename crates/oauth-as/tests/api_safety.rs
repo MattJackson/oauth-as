@@ -64,8 +64,23 @@ fn client_auth_failure_is_a_std_error() {
         seen.push(oauth_as::ClientAuthFailure::NoCertificatePresented.to_string());
         seen.push(oauth_as::ClientAuthFailure::CertificateMismatch.to_string());
     }
-    #[cfg(feature = "client_assertion")]
-    seen.push(oauth_as::ClientAuthFailure::AssertionInvalid.to_string());
+    // One per REASON, because the variant carries one as of 0.9.1 and the whole point of that is
+    // that an operator can tell them apart: two reasons that rendered the same sentence would be
+    // the collapse this test exists to forbid, moved one level in.
+    #[cfg(feature = "client-assertion")]
+    for reason in [
+        oauth_as::client_assertion::AssertionFailure::Malformed,
+        oauth_as::client_assertion::AssertionFailure::AlgorithmMismatch,
+        oauth_as::client_assertion::AssertionFailure::BadSignature,
+        oauth_as::client_assertion::AssertionFailure::WrongPrincipal,
+        oauth_as::client_assertion::AssertionFailure::WrongAudience,
+        oauth_as::client_assertion::AssertionFailure::Expired,
+        oauth_as::client_assertion::AssertionFailure::NotYetValid,
+        oauth_as::client_assertion::AssertionFailure::MissingJti,
+        oauth_as::client_assertion::AssertionFailure::Replayed,
+    ] {
+        seen.push(oauth_as::ClientAuthFailure::AssertionInvalid { reason }.to_string());
+    }
     let distinct = seen.iter().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         distinct.len(),
@@ -105,7 +120,7 @@ fn an_empty_certificate_registration_is_refused_by_every_constructor() {
 /// MAC, so an attacker who sees one assertion can grind the key without ever talking to this
 /// server again. RFC 6749 s10.10 sets the bar at 128 bits of entropy for a server-generated
 /// credential, which is 22 characters at base64url's 6 bits per character.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[test]
 fn a_client_secret_jwt_key_below_the_entropy_floor_is_refused() {
     use oauth_as::client_assertion::{
@@ -114,6 +129,14 @@ fn a_client_secret_jwt_key_below_the_entropy_floor_is_refused() {
 
     assert_eq!(MIN_CLIENT_SECRET_JWT_KEY_LENGTH, 22);
     assert_eq!(ClientSecretKey::new("s3cr3t!!"), Err(WeakClientSecret));
+    // ONE SHORT OF THE FLOOR, which is the only key that pins where the floor actually is. An
+    // 8-character refusal is consistent with a floor anywhere between 9 and 22, so a comparison
+    // relaxed by one — `< MIN - 1`, which is a mutation cargo-mutants generates here — would keep
+    // refusing `s3cr3t!!` while admitting this: 21 base64url characters, 126 bits, and offline
+    // grindable from a single captured assertion exactly as the paragraph above describes.
+    let one_short = "012345678901234567890";
+    assert_eq!(one_short.len(), MIN_CLIENT_SECRET_JWT_KEY_LENGTH - 1);
+    assert_eq!(ClientSecretKey::new(one_short), Err(WeakClientSecret));
     let long_enough = "0123456789012345678901";
     assert_eq!(long_enough.len(), MIN_CLIENT_SECRET_JWT_KEY_LENGTH);
     let key = ClientSecretKey::new(long_enough).expect("22 characters clears the floor");
@@ -123,7 +146,7 @@ fn a_client_secret_jwt_key_below_the_entropy_floor_is_refused() {
 /// The floor holds on the way back OUT of a host's store too. `AssertionKeys` is `Deserialize`, so
 /// a registration written before the floor existed (or by hand) would otherwise walk straight past
 /// it, exactly the route `PublicJwk`'s hand-written `Deserialize` exists to close.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[test]
 fn a_weak_client_secret_does_not_survive_deserialization() {
     use oauth_as::client_assertion::AssertionKeys;

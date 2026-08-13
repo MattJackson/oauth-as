@@ -87,8 +87,14 @@ fn is_error_description_charset(s: &str) -> bool {
         .all(|c| matches!(c, '\x20'..='\x21' | '\x23'..='\x5b' | '\x5d'..='\x7e'))
 }
 
-/// The RFC 6749 s5.2 token-endpoint error codes, plus the four RFC 8628 s3.5 device-grant codes.
-/// A code outside this set is not registered and no client is obliged to understand it.
+/// The RFC 6749 s5.2 token-endpoint error codes, plus the four RFC 8628 s3.5 device-grant codes,
+/// plus the registered extension codes this server's token endpoint really emits. A code outside
+/// this set is not registered and no client is obliged to understand it.
+///
+/// The extension codes are gated exactly as the `ErrorCode` variants behind them are, so a build
+/// without a feature admits exactly the set it admitted before that feature existed. Leaving them
+/// out entirely was not "strict": it made this validator reject bodies the server produces, which
+/// would have turned the first test to drive one through here into a false failure.
 const TOKEN_ERROR_CODES: &[&str] = &[
     // RFC 6749 s5.2
     "invalid_request",
@@ -102,6 +108,17 @@ const TOKEN_ERROR_CODES: &[&str] = &[
     "slow_down",
     "access_denied",
     "expired_token",
+    // RFC 8693 s2.2.2 registers the code; RFC 8707 s2 is what directs an AS to use it for a
+    // `resource` indicator it will not issue a token for. Not feature gated, because
+    // `ErrorCode::InvalidTarget` is not either.
+    "invalid_target",
+    // RFC 9449 s5, registered by s12.3: the DPoP proof is missing, malformed, unbound or replayed.
+    #[cfg(feature = "dpop")]
+    "invalid_dpop_proof",
+    // RFC 9396 s5: the `authorization_details` parameter is unparseable, names an unsupported
+    // `type`, or asks for more than the underlying grant allows.
+    #[cfg(feature = "rar")]
+    "invalid_authorization_details",
 ];
 
 /// The whole point of `additionalProperties: false`, which this replaces: an accidentally added
@@ -190,14 +207,32 @@ fn as_object<'a>(
     }
 }
 
+/// The exact spellings `token_type` may take, which is the whole registered set this server can
+/// issue and not one value more.
+///
+/// The comparison against these is CASE EXACT on purpose. RFC 6749 s5.1 calls `token_type` case
+/// insensitive for a RECIPIENT, but this assertion is about what this server EMITS, and emitting
+/// `bearer` or `dpop` would be a silent change to the wire form that some strict third-party
+/// clients reject. Pinning the spellings here is what makes such a change fail a test rather than
+/// fail a user.
+///
+/// `DPoP` is gated exactly as `TokenType::Dpop` is. RFC 9449 s5 requires it on a token issued
+/// against a proof, and s7.1 makes the spelling the HTTP authentication scheme name the client
+/// will present the token under, so the capitalisation is load bearing rather than cosmetic.
+const TOKEN_TYPES: &[&str] = &[
+    // RFC 6750 s4.
+    "Bearer",
+    // RFC 9449 s5 / s7.1.
+    #[cfg(feature = "dpop")]
+    "DPoP",
+];
+
 /// RFC 6749 s5.1: `access_token` and `token_type` REQUIRED; `expires_in` a number; `scope` and
 /// `refresh_token` strings. Parameter values are limited to VSCHAR on the wire; `token_type` is
-/// pinned to the exact string `Bearer` because that is the only type this server issues
-/// (RFC 6750 s4). The comparison is CASE EXACT on purpose. RFC 6749 s5.1 calls token_type
-/// case insensitive for a RECIPIENT, but this assertion is about what this server EMITS, and
-/// emitting `bearer` or `BEARER` would be a silent change to the wire form that some strict
-/// third-party clients reject. Pinning it here is what makes such a change fail a test rather
-/// than fail a user.
+/// pinned to the exact registered spellings in [`TOKEN_TYPES`]. Under the `rar` feature the body
+/// also carries the RFC 9396 s7 `authorization_details` member, which section 7 makes a MUST on a
+/// response to a request that carried them; it is gated here exactly as the struct member is, so a
+/// build without `rar` still refuses it as undeclared.
 fn validate_token_success(body: &Value) -> Violations {
     let cite = "RFC 6749 s5.1";
     let mut v = Violations::new();
@@ -207,7 +242,14 @@ fn validate_token_success(body: &Value) -> Violations {
     check_member_set(
         obj,
         &["access_token", "token_type"],
-        &["expires_in", "refresh_token", "scope"],
+        &[
+            "expires_in",
+            "refresh_token",
+            "scope",
+            // RFC 9396 s7.
+            #[cfg(feature = "rar")]
+            "authorization_details",
+        ],
         cite,
         &mut v,
     );
@@ -220,10 +262,10 @@ fn validate_token_success(body: &Value) -> Violations {
         }
     }
     if let Some(t) = string_member(obj, "token_type", cite, &mut v) {
-        if t != "Bearer" {
+        if !TOKEN_TYPES.contains(&t) {
             v.push(format!(
-                "token_type is {t:?}; this server issues only the RFC 6750 bearer type and emits \
-                 it as the exact string \"Bearer\""
+                "token_type is {t:?}; this server issues only {TOKEN_TYPES:?} and emits the \
+                 spelling exactly as registered"
             ));
         }
     }
@@ -569,7 +611,14 @@ fn the_token_success_clauses_reject_spec_illegal_bodies() {
     );
     reject(
         json!({ "access_token": "at-1", "token_type": "MAC" }),
-        "token_type must be Bearer, not a foreign token type",
+        "token_type must be a registered type, not a foreign one",
+    );
+    // RFC 9449 s7.1 makes the spelling the authentication scheme name, so the capitalisation is
+    // part of the wire contract in exactly the way "Bearer" is.
+    #[cfg(feature = "dpop")]
+    reject(
+        json!({ "access_token": "at-1", "token_type": "dpop" }),
+        "token_type must be the exact string DPoP, not dpop (RFC 9449 s7.1)",
     );
 
     // expires_in: a number, not the string some broken servers emit, and at least 1.
@@ -739,6 +788,237 @@ fn the_device_authorization_clauses_reject_spec_illegal_bodies() {
                 "expires_in": 600, "interval": -1 }),
         "interval is a wait in seconds and cannot be negative (RFC 8628 s3.2)",
     );
+}
+
+/// THE SHAPES THE DEVICE FLOW CANNOT REACH, part one: RFC 9449 s5's `token_type: "DPoP"`.
+///
+/// `every_emitted_body_matches_the_rfc_schemas` above drives the device-code grant, which carries
+/// no proof, so until this existed no test had ever put a DPoP success body in front of these
+/// validators and the file's claim to check "every body this AS emits" was a claim about bodies it
+/// had never seen. A validator that rejects a body the server really emits is not a strict gate,
+/// it is a gate pointed the wrong way: the first deployment to turn `dpop` on would have found the
+/// conformance suite calling its conforming responses nonconformant.
+#[tokio::test]
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
+async fn a_dpop_bound_token_response_matches_the_rfc_schemas() {
+    // The system clock, not the manual one: an RFC 9449 s4.2 proof carries an `iat` the server
+    // checks against ITS clock, and a proof issued at 2023-11-14 for a server that thinks it is
+    // now would be refused for freshness rather than validated for shape.
+    let srv = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        MemoryStorage::new(),
+    );
+    srv.register_client(Client {
+        client_id: ClientId::new("c"),
+        auth: ClientAuth::ConfidentialSecret {
+            secret: "conformance-secret-for-tests".to_string(),
+        },
+        grant_types: vec![GrantType::ClientCredentials],
+        redirect_uris: vec![],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    })
+    .await
+    .unwrap();
+
+    let key = oauth_as::jwt::EcdsaP256Key::generate("conformance");
+    let iat = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let header = json!({
+        "typ": "dpop+jwt",
+        "alg": "ES256",
+        "jwk": serde_json::to_value(key.to_public_jwk()).unwrap(),
+    });
+    let claims = json!({
+        "jti": "conformance-proof-1",
+        "htm": "POST",
+        "htu": "https://as.example/token",
+        "iat": iat,
+    });
+    let proof = oauth_as::jwt::compact_jws(
+        &serde_json::to_vec(&header).unwrap(),
+        &serde_json::to_vec(&claims).unwrap(),
+        |input| key.sign_signing_input(input).unwrap(),
+    );
+    let token = srv
+        .token_with_context(
+            TokenRequest::ClientCredentials {
+                client_id: ClientId::new("c"),
+                client_secret: Some("conformance-secret-for-tests".to_string()),
+                scope: None,
+            },
+            oauth_as::TokenRequestContext::default().with_dpop_proof(&proof),
+        )
+        .await
+        .expect("a conforming proof yields a token");
+
+    let body = serde_json::to_value(&token).unwrap();
+    assert_eq!(
+        body.get("token_type").and_then(Value::as_str),
+        Some("DPoP"),
+        "the fixture must actually have produced the shape under test, or this proves nothing"
+    );
+    assert_valid(
+        validate_token_success,
+        &body,
+        "DPoP-bound token success body",
+    );
+}
+
+/// THE SHAPES THE DEVICE FLOW CANNOT REACH, part two: RFC 9396 s7's `authorization_details`.
+///
+/// Section 7 makes returning the details AS GRANTED a MUST on a response to a request that carried
+/// them, so this sixth success member is not an extension a deployment opts into at the wire level:
+/// it is what a conforming AS emits the moment a client uses the parameter. The validator declared
+/// five members, so it would have reported the required one as an undeclared leak.
+#[tokio::test]
+#[cfg(feature = "rar")]
+async fn a_rich_authorization_token_response_matches_the_rfc_schemas() {
+    const DETAILS: &str = r#"[{"type":"payment_initiation","actions":["initiate"],"locations":["https://rs.example/payments"],"identifier":"acct-1"}]"#;
+    const REDIRECT: &str = "https://rar.example/cb";
+    const SECRET: &str = "conformance-rar-secret-for-tests";
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+    cfg.authorization_details_types_supported = Some(vec!["payment_initiation".to_string()]);
+    let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), ManualClock::new());
+    srv.register_client(Client {
+        client_id: ClientId::new("c"),
+        auth: ClientAuth::ConfidentialSecret {
+            secret: SECRET.to_string(),
+        },
+        grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+        redirect_uris: vec![REDIRECT.to_string()],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    })
+    .await
+    .unwrap();
+
+    let challenge = oauth_as::pkce::code_challenge_s256(VERIFIER);
+    let req = oauth_as::AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", "c"),
+        ("redirect_uri", REDIRECT),
+        ("scope", "read"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+        ("authorization_details", DETAILS),
+    ]);
+    let validated = srv.validate_authorization_request(&req).await.unwrap();
+    let issued = srv
+        .issue_authorization_code(oauth_as::server::UserApproval::granted(&validated, "u"))
+        .await
+        .unwrap();
+    let token = srv
+        .token(TokenRequest::AuthorizationCode {
+            client_id: ClientId::new("c"),
+            client_secret: Some(SECRET.to_string()),
+            code: issued.code,
+            redirect_uri: Some(REDIRECT.to_string()),
+            code_verifier: Some(VERIFIER.to_string()),
+        })
+        .await
+        .expect("the redemption must succeed");
+
+    let body = serde_json::to_value(&token).unwrap();
+    assert!(
+        body.get("authorization_details").is_some(),
+        "the fixture must actually have produced the shape under test, or this proves nothing: \
+         {body}"
+    );
+    assert_valid(validate_token_success, &body, "RFC 9396 token success body");
+}
+
+/// The token endpoint's registered EXTENSION error codes, driven end to end rather than asserted
+/// as literals, because the point of this file is what comes off the wire. Each of these was
+/// outside `TOKEN_ERROR_CODES` while the endpoint really emitted it, which the device-code-only
+/// walk above could never have discovered.
+#[tokio::test]
+async fn the_extension_error_bodies_match_the_rfc_schemas() {
+    let srv = AuthorizationServer::with_clock(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        MemoryStorage::new(),
+        ManualClock::new(),
+    );
+    srv.register_client(Client {
+        client_id: ClientId::new("c"),
+        auth: ClientAuth::ConfidentialSecret {
+            secret: "extension-secret-for-tests".to_string(),
+        },
+        grant_types: vec![GrantType::ClientCredentials],
+        redirect_uris: vec![],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    })
+    .await
+    .unwrap();
+
+    let request = || TokenRequest::ClientCredentials {
+        client_id: ClientId::new("c"),
+        client_secret: Some("extension-secret-for-tests".to_string()),
+        scope: None,
+    };
+
+    // RFC 8707 s2: a `resource` that is not an absolute URI without a fragment.
+    let resources = vec!["not-a-uri".to_string()];
+    let bad_target = srv
+        .token_with_context(
+            request(),
+            oauth_as::TokenRequestContext::default().with_resources(&resources),
+        )
+        .await
+        .expect_err("RFC 8707 s2 refuses a malformed resource indicator");
+    assert_eq!(bad_target.error, ErrorCode::InvalidTarget);
+    assert_valid(
+        validate_error_body,
+        &serde_json::to_value(&bad_target).unwrap(),
+        "invalid_target body",
+    );
+
+    // RFC 9449 s5: a proof that is not even a JWS.
+    #[cfg(feature = "dpop")]
+    {
+        let bad_proof = srv
+            .token_with_context(
+                request(),
+                oauth_as::TokenRequestContext::default().with_dpop_proof("not-a-proof"),
+            )
+            .await
+            .expect_err("RFC 9449 s5 refuses a malformed proof");
+        assert_eq!(bad_proof.error, ErrorCode::InvalidDpopProof);
+        assert_valid(
+            validate_error_body,
+            &serde_json::to_value(&bad_proof).unwrap(),
+            "invalid_dpop_proof body",
+        );
+    }
+
+    // RFC 9396 s5: `authorization_details` that is not even JSON.
+    #[cfg(feature = "rar")]
+    {
+        let bad_details = srv
+            .token_with_context(
+                request(),
+                oauth_as::TokenRequestContext::default().with_authorization_details("{"),
+            )
+            .await
+            .expect_err("RFC 9396 s5 refuses unparseable authorization_details");
+        assert_eq!(bad_details.error, ErrorCode::InvalidAuthorizationDetails);
+        assert_valid(
+            validate_error_body,
+            &serde_json::to_value(&bad_details).unwrap(),
+            "invalid_authorization_details body",
+        );
+    }
 }
 
 /// The ErrorResponse type itself cannot serialize an unregistered code (the enum is closed), so

@@ -29,6 +29,13 @@
 //! comparable to each other and to their own history, which is what a gate needs; they are a FLOOR
 //! on what a deployment pays, not an estimate of its resident set.
 //!
+//! # What the budgets catch
+//!
+//! Each is its observed figure plus sixteen bytes, which is below what one new `Option<String>`
+//! field costs on the cheapest kind of stored record and above one word of incidental drift. See
+//! the comment above the budget constants for the arithmetic and for what to do when a toolchain
+//! change moves the observations.
+//!
 //! # Why this is a separate test binary from `tests/allocation.rs`
 //!
 //! A `#[global_allocator]` is process-wide and each integration test file is its own binary, so
@@ -168,22 +175,15 @@ fn check(name: &str, resident: usize, budget: usize) {
 
 /// A PKCE-verified authorization request for the fixture client, ready to be approved.
 fn authorization_request(challenge: &str) -> AuthorizationRequest<'_> {
-    AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some("app".into()),
-        redirect_uri: Some("https://app.example/cb".into()),
-        scope: Some("read write".into()),
-        state: Some("s".into()),
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    }
+    AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", "app"),
+        ("redirect_uri", "https://app.example/cb"),
+        ("scope", "read write"),
+        ("state", "s"),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+    ])
 }
 
 // -------------------------------------------------------------------------------- the gates
@@ -275,30 +275,23 @@ fn access_token_resident_bytes() {
 fn refresh_token_resident_bytes() {
     let rt = current_thread_runtime();
     let store = MemoryStorage::new();
-    let record = |n: usize| oauth_as::RefreshTokenRecord {
-        refresh_token: format!("{n:064x}"),
-        client_id: ClientId::new("app"),
-        subject: Some("user-1".to_string()),
-        scope: ScopeSet::parse("read write").unwrap(),
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000)),
-        #[cfg(feature = "dpop")]
-        jkt: None,
-        #[cfg(feature = "mtls")]
-        x5t_s256: None,
-        family_id: format!("{n:032x}"),
-        state: oauth_as::RefreshTokenState::Active,
-        #[cfg(feature = "consent")]
-        authentication: None,
+    let record = |n: usize| {
+        let mut record = oauth_as::RefreshTokenRecord::new(
+            format!("{n:064x}"),
+            ClientId::new("app"),
+            Some("user-1".to_string()),
+            ScopeSet::parse("read write").unwrap(),
+            format!("{n:032x}"),
+        );
+        record.expires_at = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000));
+        record
     };
-    rt.block_on(store.put_refresh_token(record(0))).unwrap();
+    let _ = rt.block_on(store.put_refresh_token(record(0))).unwrap();
 
     let ((), d) = measure(|| {
         rt.block_on(async {
             for n in 1..=RECORDS {
-                store.put_refresh_token(record(n)).await.unwrap();
+                let _ = store.put_refresh_token(record(n)).await.unwrap();
             }
         })
     });
@@ -379,7 +372,7 @@ fn pushed_request_resident_bytes() {}
 /// one that decides how much memory a flood of distinct assertions can pin until the next sweep.
 /// It is deliberately the cheapest record in the store: a `String` key and a `SystemTime`, with no
 /// value struct at all.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 fn replay_id_resident_bytes() {
     let rt = current_thread_runtime();
     let store = MemoryStorage::new();
@@ -399,7 +392,7 @@ fn replay_id_resident_bytes() {
     check("replay id", d.resident(), REPLAY_ID_BUDGET);
 }
 
-#[cfg(not(any(feature = "client_assertion", feature = "dpop")))]
+#[cfg(not(any(feature = "client-assertion", feature = "dpop")))]
 fn replay_id_resident_bytes() {}
 
 /// The crate doc's "nothing is allocated until the host constructs an `AuthorizationServer`" claim,
@@ -421,50 +414,86 @@ fn empty_store_is_free() {
 // OBSERVED figures are recorded beside each budget so a failing run can be compared against what
 // this file was written against, rather than against a number with no provenance.
 //
-// Every figure below is DETERMINISTIC: each record's strings are fixed-length hex minted from the
-// same entropy budget on every run, and `RECORDS` is a constant, so the same feature set produces
-// the same byte count every time (verified by repeated runs). The margin is therefore roughly 12
-// percent and not the 25 an averaged measurement would need. That is deliberately tight enough
-// that ONE new `String` field on a stored record fails the gate.
+// EVERY BUDGET IS ITS OBSERVED FIGURE PLUS SIXTEEN BYTES, and that number is the whole point of
+// the gate. Every figure here is DETERMINISTIC: each record's strings are fixed-length hex minted
+// from the same entropy budget on every run, `RECORDS` is a constant, and the counting allocator
+// records the size REQUESTED rather than whatever a size class rounds it up to, so the same
+// feature set produces the same byte count every time. There is nothing for a margin to absorb,
+// and a margin that absorbs nothing should be as small as the property being defended allows.
+//
+// The property is that ONE new `String` field on a stored record fails the gate. The cheapest
+// shape such a field can take is an `Option<String>` on an `Arc`-stored record with the value
+// `None`: 24 bytes of struct, paid once, content aside. Sixteen is below that and above one word
+// of incidental layout drift, so the claim in this paragraph is now true of all seven gates.
+//
+// It was not true before the 0.9.1 audit. The margins then were roughly 12 percent: 119 bytes on
+// the device grant, 54 on the authorization code, 64 on the access token (56 with every feature
+// on), 69 on the refresh token, 67 on the consent record and 81 on the pushed request, against 18
+// on the replay id. A new `Option<String>` costs 24 on the three `Arc`-stored records and 48 on the
+// three stored by value, so it passed on six of the seven gates and only the replay id caught it.
+// The header of this file claimed the opposite in so many words.
+//
+// That the per-feature cost is paid ONE FOR ONE in resident bytes on an `Arc`-stored record is
+// measured, not assumed, and it is what makes sixteen a safe bound rather than a guess: `mtls`'s
+// 8-byte field moves the access token observation by exactly 8 (688 to 696), `dpop`'s 16-byte field
+// by exactly 16, and `rar`'s 24-byte field by exactly 24. A 24-byte `Option<String>` therefore
+// moves it by 24, which is more than 16.
+//
+// WHEN THIS GOES RED WITHOUT A FIELD BEING ADDED, which a change to `HashMap`'s growth policy or
+// to struct layout can do, the answer is to re-derive the observed figures (they are printed by
+// every passing run under `--nocapture`) and restate them here plus sixteen. It is NOT to widen
+// the margin: a margin wide enough to survive a toolchain bump is wide enough to hide the field.
 //
 // A feature's cost is stated ADDITIVELY, exactly as `tests/allocation.rs` does for the size gate
 // and for the same reason: a deployment that does not enable a feature must not be charged for it,
 // and a budget widened to the all-features shape would silently absorb a new default-build field.
+// The per-feature deltas below are MEASURED one feature at a time, and they sum exactly to the
+// all-features observation for every record, which is what makes an untested combination safe to
+// bound this tightly.
 //
 // Note what a `#[cfg]` field costs depends on HOW the record is stored:
 //
 // - `DeviceGrant`, `AuthorizationCodeRecord` and `PushedAuthorizationRequest` are stored BY VALUE
-//   in their `HashMap`, so a new field is paid TWICE: once in the record and once in the bucket
-//   table's value slot. Measured: `rar` plus `consent` add 32 bytes of struct to
-//   `AuthorizationCodeRecord` and 64 bytes of resident heap.
+//   in their `HashMap`, so a new field is paid TWICE: the bucket table is grown to about twice the
+//   live record count, so every byte of the value slot is charged about twice. Measured: `rar`
+//   plus `consent` add 32 bytes of struct to `AuthorizationCodeRecord` and 64 bytes of resident
+//   heap.
 // - `IssuedToken`, `RefreshTokenRecord` and `ConsentRecord` are stored behind an `Arc`, so the map
-//   holds an 8-byte pointer and a new field is paid ONCE. Measured: the same four optional fields
-//   add 56 bytes of struct to `IssuedToken` and 56 bytes of resident heap.
+//   holds an 8-byte pointer and a new field is paid ONCE, in the `Arc`'s own allocation. Measured:
+//   `rar` 24, `dpop` 16, `mtls` 8, `consent` 8 and `token-exchange` 8 add 64 bytes of struct to
+//   `IssuedToken` and 64 bytes of resident heap.
 //
 // That difference is itself worth knowing, and it is the argument for `Arc` in the store beyond
 // the read-path allocation saving it was introduced for.
 
 /// Observed 1009 on EVERY feature set: `DeviceGrant` has no `#[cfg]` field.
-const DEVICE_GRANT_BUDGET: usize = 1128;
+const DEVICE_GRANT_BUDGET: usize = 1025;
 
-/// Observed 1002 default, 1066 all-features. Stored by value, so each optional field counts twice:
+/// Observed 1066 default, 1130 all-features. Stored by value, so each optional field counts twice:
 /// `rar`'s `AuthorizationDetails` (a `Vec`, 24) and `consent`'s `Option<Box<Authentication>>` (8).
-const AUTHORIZATION_CODE_BUDGET: usize = 1120
+const AUTHORIZATION_CODE_BUDGET: usize = 1082
     + if cfg!(feature = "rar") { 48 } else { 0 }
     + if cfg!(feature = "consent") { 16 } else { 0 };
 
-/// Observed 672 default, 728 all-features. Stored behind an `Arc`, so each optional field counts
+/// Observed 688 default, 752 all-features. Stored behind an `Arc`, so each optional field counts
 /// once: `rar` 24, `dpop`'s `Option<Box<str>>` 16, `mtls`'s `Option<Box<CertificateThumbprint>>` 8,
-/// `consent` 8.
-const ACCESS_TOKEN_BUDGET: usize = 752
+/// `consent` 8, and `token-exchange`'s `Option<Box<ActClaim>>` 8. Those five sum to 64, which is
+/// exactly the gap between the two observations, so no combination is bounded by more than sixteen.
+const ACCESS_TOKEN_BUDGET: usize = 704
     + if cfg!(feature = "rar") { 24 } else { 0 }
     + if cfg!(feature = "dpop") { 16 } else { 0 }
     + if cfg!(feature = "mtls") { 8 } else { 0 }
-    + if cfg!(feature = "consent") { 8 } else { 0 };
+    + if cfg!(feature = "consent") { 8 } else { 0 }
+    + if cfg!(feature = "token-exchange") {
+        8
+    } else {
+        0
+    };
 
-/// Observed 707 default, 763 all-features. The same four optional fields as `IssuedToken`, in the
-/// same shapes, and stored behind an `Arc` the same way.
-const REFRESH_TOKEN_BUDGET: usize = 792
+/// Observed 723 default, 779 all-features. The same four optional fields as `IssuedToken`, in the
+/// same shapes, and stored behind an `Arc` the same way. No `act`: a refresh record belongs to a
+/// chain and RFC 8693 issues no refresh token, so there is no delegation to carry.
+const REFRESH_TOKEN_BUDGET: usize = 739
     + if cfg!(feature = "rar") { 24 } else { 0 }
     + if cfg!(feature = "dpop") { 16 } else { 0 }
     + if cfg!(feature = "mtls") { 8 } else { 0 }
@@ -473,17 +502,17 @@ const REFRESH_TOKEN_BUDGET: usize = 792
 /// Observed 573. `ConsentRecord` has no `#[cfg]` field of its own (the whole module is behind
 /// `consent`), so this is one number and not a sum.
 #[cfg(feature = "consent")]
-const CONSENT_RECORD_BUDGET: usize = 640;
+const CONSENT_RECORD_BUDGET: usize = 589;
 
-/// Observed 943 with `rar` and `consent` also on, which is the record's WIDEST shape: it is stored
-/// by value, and `rar` and `consent` add one `Option<String>` each (24 bytes of struct, 48 of
-/// resident heap apiece). With `par` alone the record is smaller and this bound is loose, which is
-/// the correct direction for an upper bound.
+/// Observed 831 with `par` alone and 975 with `rar` and `consent` also on. It is stored by value,
+/// so `rar`'s one `Option<String>` costs 48 and `consent`'s two cost 96.
 #[cfg(feature = "par")]
-const PUSHED_REQUEST_BUDGET: usize = 1056;
+const PUSHED_REQUEST_BUDGET: usize = 847
+    + if cfg!(feature = "rar") { 48 } else { 0 }
+    + if cfg!(feature = "consent") { 96 } else { 0 };
 
 /// Observed 134, and it is the cheapest record in the store by a factor of five: a `String` key and
 /// a `SystemTime`, with no value struct at all. It is also the only one an attacker can grow
 /// without holding a grant, which is why it is worth pinning even though it is small.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
-const REPLAY_ID_BUDGET: usize = 152;
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
+const REPLAY_ID_BUDGET: usize = 150;

@@ -2,7 +2,7 @@
 -- Copyright (C) 2026 Matthew Jackson
 --
 -- Claimed single-use identifiers: RFC 7523 s3 assertion `jti`s and RFC 9449 s4.3 DPoP proof
--- `jti`s. Applied only when `client_assertion` or `dpop` is on.
+-- `jti`s. Applied only when `client-assertion` or `dpop` is on.
 
 CREATE TABLE IF NOT EXISTS oauth_as_replay_ids (
     -- The PRIMARY KEY is the whole mechanism. `claim_replay_id` is an

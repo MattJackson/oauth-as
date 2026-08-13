@@ -90,7 +90,7 @@ f-rar = ["lib", "oauth-as/rar"]
 # `f-jwt-p256`, not `f-jwt`: the probe has to PRODUCE the credential it verifies.
 f-dpop = ["lib", "f-jwt-p256", "oauth-as/dpop"]
 # `f-jwt-p256`, not `f-jwt`: the probe has to PRODUCE the credential it verifies.
-f-client_assertion = ["lib", "f-jwt-p256", "oauth-as/client_assertion"]
+f-client-assertion = ["lib", "f-jwt-p256", "oauth-as/client-assertion"]
 f-consent = ["lib", "oauth-as/consent"]
 f-token-exchange = ["lib", "oauth-as/token-exchange"]
 f-resource-metadata = ["lib", "oauth-as/resource-metadata"]

@@ -62,6 +62,26 @@ use crate::store::Storage;
 
 // --------------------------------------------------------------------------- RFC 9126 PAR
 
+/// The `pushed_at` a record written before 0.9.1 gets when it is read back.
+///
+/// The epoch, because it is the fail-closed answer: every barrier is recorded after it, so a
+/// record with no stated push instant is REFUSED by a standing revocation rather than admitted by
+/// one. See the field's own documentation.
+#[cfg(feature = "par")]
+fn pushed_at_default() -> std::time::SystemTime {
+    std::time::SystemTime::UNIX_EPOCH
+}
+
+/// The shortest handle lifetime this server will offer, whatever the host configured.
+///
+/// RFC 9126 section 2.2 makes `expires_in` a POSITIVE integer, and a sub-second
+/// [`ParConfig::request_uri_ttl`] reports zero — a handle a conforming client abandons without
+/// using. One second is the smallest value that can be reported truthfully. It is a clamp rather
+/// than a rejection for the reason [`crate::server::ServerConfig::user_code_length`] clamps: a
+/// misconfiguration must not become a runtime failure in front of a user.
+#[cfg(feature = "par")]
+pub const MIN_REQUEST_URI_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The URN prefix RFC 9126 section 2.2 offers for a minted `request_uri`, registered in its
 /// section 9.3. The RFC leaves the format to the server, so this is a choice rather than a
 /// requirement; it is the choice every interoperability profile in practice expects, and it names
@@ -80,6 +100,13 @@ const REQUEST_URI_ENTROPY_BYTES: usize = 32;
 /// endpoint is advertised and [`AuthorizationServer::pushed_authorization_request`] refuses.
 #[cfg(feature = "par")]
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`, for the reason [`crate::server::ServerConfig`] carries it, and stated
+/// plainly because this type is the exception to that finding rather than an instance of it: no
+/// field here is feature gated TODAY. It is a configuration struct hanging off `ServerConfig`, it
+/// is where every future RFC 9126 policy knob will land, and a host that learns the rule from the
+/// parent config is entitled to it from the child. Construct with [`ParConfig::new`] and override
+/// what the deployment needs.
+#[non_exhaustive]
 pub struct ParConfig {
     /// RFC 9126 section 5 `pushed_authorization_request_endpoint`. `None` derives
     /// `{issuer}/par`.
@@ -163,6 +190,12 @@ impl PushedAuthorizationResponse {
 /// must not reach a host's logs through `{:?}`.
 #[cfg(feature = "par")]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `#[non_exhaustive]`: `rar` adds one field and `consent` adds two, and the doc above commits this
+/// record to gaining a field for every parameter the authorization request gains, which makes it
+/// the type in this crate most certain to keep changing shape. It round-trips through a
+/// `Storage` implementor by serde exactly as the token records do, so persisting it is unaffected;
+/// [`PushedAuthorizationRequest::new`] is the path for building one directly.
+#[non_exhaustive]
 pub struct PushedAuthorizationRequest {
     /// The handle, and the storage key.
     pub request_uri: String,
@@ -208,6 +241,26 @@ pub struct PushedAuthorizationRequest {
     /// the session it was told to replace.
     #[cfg(feature = "consent")]
     pub max_age: Option<String>,
+    /// The instant this request was PUSHED.
+    ///
+    /// A pushed request is not yet a grant, but it is a thing a client authored, and a
+    /// [`crate::store::RevocationBarrier::Client`] is compared against this so that a request
+    /// pushed before an RFC 7592 deletion is refused while one pushed by a re-provisioned client
+    /// is served. `expires_at` cannot stand in for it: the TTL is short but non-zero, so a request
+    /// pushed just before the deletion still has a deadline in the future and would be admitted.
+    ///
+    /// `#[serde(default)]`, and the default is the epoch, which is the FAIL-CLOSED direction.
+    /// This field is new in 0.9.1, so a record a 0.9.0 node wrote — or is still writing, during a
+    /// rolling upgrade — carries no such key, and without a default the read fails outright and
+    /// the endpoint answers `server_error`. With it, the record deserializes and dates from before
+    /// every barrier, so a standing revocation REFUSES it rather than admitting it. A far-future
+    /// default would deserialize just as happily and admit every one of them, which is the
+    /// resurrection this field exists to stop. There is deliberately NO backfill migration: a
+    /// backfill cannot reach a 0.9.0 node still writing field-less payloads during a rolling
+    /// upgrade, which is the window that matters, so the serde default covers strictly more than
+    /// one would.
+    #[serde(default = "pushed_at_default")]
+    pub pushed_at: std::time::SystemTime,
     /// When the handle dies. RFC 9126 section 4: an expired `request_uri` MUST be rejected.
     pub expires_at: std::time::SystemTime,
 }
@@ -216,7 +269,14 @@ pub struct PushedAuthorizationRequest {
 impl std::fmt::Debug for PushedAuthorizationRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = f.debug_struct("PushedAuthorizationRequest");
+        // `pushed_at` prints for the reason `PushedAuthorizationRequest::new` spells out below: it
+        // is the instant a `crate::store::RevocationBarrier::Client` is compared against, a record
+        // left at the epoch is refused for as long as any client barrier stands, and the endpoint
+        // then blames a client deletion that never happened. That is "a silent per-client outage if
+        // nobody says so", and an operator diagnosing it reaches for `{:?}` first. It is not a
+        // credential; `request_uri` is the credential here and stays redacted.
         out.field("request_uri", &"[redacted]")
+            .field("pushed_at", &self.pushed_at)
             .field("client_id", &self.client_id)
             .field("response_type", &self.response_type)
             .field("redirect_uri", &self.redirect_uri)
@@ -236,6 +296,54 @@ impl std::fmt::Debug for PushedAuthorizationRequest {
 
 #[cfg(feature = "par")]
 impl PushedAuthorizationRequest {
+    /// The record with nothing pushed but three of the four things that are not authorization
+    /// parameters at all: the handle, the client RFC 9126 section 2.2 binds it to, and the
+    /// section 4 expiry that makes it die.
+    ///
+    /// THE FOURTH IS `pushed_at`, AND A CALLER USING THIS CONSTRUCTOR MUST SET IT. It is not an
+    /// argument here because it is not a parameter a client sends; it is the instant a
+    /// [`crate::store::RevocationBarrier::Client`] compares this record against, and this
+    /// constructor leaves it at the epoch, which predates every barrier that could ever be
+    /// recorded. A record left that way is REFUSED by `put_pushed_authorization_request` for as
+    /// long as any client barrier stands, and the endpoint answers "this client was deleted while
+    /// its request was being pushed" about a client that was not deleted. That is the fail-closed
+    /// direction and it is the right default, but it is a silent per-client outage if nobody says
+    /// so — which nothing did until the 0.9.1 audit, in the doc that is the manual for exactly
+    /// this.
+    ///
+    /// Every OTHER field is a pushed parameter, every one of them is legitimately absent from a
+    /// real request, and they are all public, so a caller assigns exactly what the client sent and
+    /// leaves the rest as the `None` that says the client sent nothing. Filling them from arguments
+    /// instead would mean a positional list of ten parameters, nine of them `Option` (`resource` is
+    /// a `Vec`), which is how a `redirect_uri` ends up in the `scope` slot.
+    pub fn new(
+        request_uri: impl Into<String>,
+        client_id: ClientId,
+        expires_at: std::time::SystemTime,
+    ) -> Self {
+        PushedAuthorizationRequest {
+            // FAIL-CLOSED, as the other hand-built records are: a request assembled without
+            // saying when it was pushed must not outrank a standing revocation.
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            request_uri: request_uri.into(),
+            client_id,
+            response_type: None,
+            redirect_uri: None,
+            scope: None,
+            state: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            resource: Vec::new(),
+            #[cfg(feature = "rar")]
+            authorization_details: None,
+            #[cfg(feature = "consent")]
+            acr_values: None,
+            #[cfg(feature = "consent")]
+            max_age: None,
+            expires_at,
+        }
+    }
+
     /// The stored parameters as an authorization request, borrowing rather than copying: this is
     /// what the authorization endpoint validates, and it should cost no more than reading the
     /// record already did.
@@ -251,6 +359,12 @@ impl PushedAuthorizationRequest {
             resource: self.resource.iter().map(|r| r.as_str().into()).collect(),
             #[cfg(feature = "rar")]
             authorization_details: self.authorization_details.as_deref().map(Into::into),
+            // The FIELD is not feature gated (see `AuthorizationRequest`, which states why: a
+            // build without `rar` has to see the parameter in order to refuse it). This RECORD's
+            // member still is, because such a build never stores one: the push that carried it
+            // was refused before a handle existed.
+            #[cfg(not(feature = "rar"))]
+            authorization_details: None,
             #[cfg(feature = "consent")]
             acr_values: self.acr_values.as_deref().map(Into::into),
             #[cfg(feature = "consent")]
@@ -278,20 +392,58 @@ pub const REQUEST_OBJECT_TYP: &str = "oauth-authz-req+jwt";
 /// RFC 9101 configuration. `None` on [`crate::server::ServerConfig::jar`] means signed request
 /// objects are OFF: nothing is advertised and a `request` parameter is refused.
 #[cfg(feature = "jar")]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]` on the same argument as [`ParConfig`] next door, and with the same
+/// admission: nothing here is feature gated today, and this is the config family being made
+/// uniform rather than a variance being contained. It grew a second field within one release of
+/// that note being written, which is the argument making itself. [`JarConfig::new`] and `Default`
+/// both give the accepted-not-required policy with the default lifetime ceiling.
+#[non_exhaustive]
 pub struct JarConfig {
     /// RFC 9101 section 10.5 `require_signed_request_object`. When true, this server refuses any
     /// authorization request that is not a signed request object, which is what stops an attacker
     /// stripping the signature and falling back to a plain RFC 6749 request (the downgrade that
     /// section names).
     pub require_signed_request_object: bool,
+    /// The longest remaining life this server will honour on a request object, measured from now to
+    /// its `exp`. Default five minutes.
+    ///
+    /// A request object is a BEARER CREDENTIAL that travels in a browser query string, so it lands
+    /// in history, in `Referer`, and in every proxy log on the path. Anyone who reads one can
+    /// re-drive `/authorize` with it until it dies, which makes "when does it die" the only thing
+    /// standing between a captured URL and an indefinite replay.
+    ///
+    /// RFC 9101 does not set this. It does not require `exp` at all, and section 9.1 registers it
+    /// without a requirement level, so the lifetime is implementer discretion. What the RFC does
+    /// say, in section 10.2(d) about request object URIs, is that "a general guidance for the
+    /// validity time would be less than a minute", which is the spec's own view of how long one of
+    /// these should live. Five minutes is that guidance loosened to survive ordinary clock skew and
+    /// a user who is slow to land on the page, and it is a ceiling rather than a lifetime: an
+    /// object asking for less gets less.
+    ///
+    /// Set it larger if a deployment genuinely needs it, and know what is being bought with it.
+    pub max_request_object_lifetime: std::time::Duration,
 }
 
 #[cfg(feature = "jar")]
 impl JarConfig {
-    /// Signed request objects accepted, not required.
+    /// Signed request objects accepted, not required, with the default lifetime ceiling.
     pub fn new() -> Self {
         JarConfig::default()
+    }
+}
+
+/// Written out rather than derived, and the reason is the whole point of the field: a derived
+/// `Default` gives `Duration::ZERO` for the ceiling, and a zero ceiling refuses every request
+/// object ever presented. A default that silently turns the feature off would be discovered by a
+/// host at runtime, on a flow that used to work.
+#[cfg(feature = "jar")]
+impl Default for JarConfig {
+    fn default() -> Self {
+        JarConfig {
+            require_signed_request_object: false,
+            max_request_object_lifetime: std::time::Duration::from_secs(300),
+        }
     }
 }
 
@@ -523,6 +675,12 @@ impl RequestObjectClaims {
             resource: self.resource.iter().map(|r| r.as_str().into()).collect(),
             #[cfg(feature = "rar")]
             authorization_details: self.authorization_details.as_deref().map(Into::into),
+            // The FIELD is not feature gated (see `AuthorizationRequest`, which states why: a
+            // build without `rar` has to see the parameter in order to refuse it). This CLAIM SET
+            // still is, and never carries one in such a build: `verified_request_object` refuses
+            // an object whose claims contain `authorization_details` before it builds this.
+            #[cfg(not(feature = "rar"))]
+            authorization_details: None,
             #[cfg(feature = "consent")]
             acr_values: self.acr_values.as_deref().map(Into::into),
             #[cfg(feature = "consent")]
@@ -649,6 +807,23 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .with_description("this server does not offer pushed authorization requests"));
         }
 
+        // STAMPED BEFORE THE REGISTRATION IS READ, and that ordering is the whole point.
+        //
+        // `pushed_at` is what a [`crate::store::RevocationBarrier::Client`] is compared against,
+        // so it must date from BEFORE the read the write derives from. Taking it after
+        // `authenticate_client` — one `get_client` round trip, a secret verification, and on the
+        // RFC 7523 path a JWT verify plus a `claim_replay_id` write, followed by a SECOND
+        // `get_client` inside `validate_direct_authorization_request` — would date the push later
+        // than a `delete_client` landing in that window, so the comparison would ADMIT the write
+        // and mint a handle for a registration that no longer exists. The refusal below would
+        // then fire only for the sliver between building the record and taking the store lock,
+        // rather than for the window its own comment names.
+        //
+        // Same defect, same fix, as `client_credentials_token`: found by auditing the 0.9.1 fix
+        // that made barriers compare instants at all. Refusing on identity alone had closed it
+        // for free.
+        let pushed_at = self.now();
+
         // 1. Client authentication, "in the same way as at the token endpoint" (section 2.1).
         let client = self.authenticate_client(client_id, credential).await?;
 
@@ -667,12 +842,31 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         if let Some((_, object)) = parameters.iter().find(|(name, _)| *name == "request") {
             let claims = self.verified_request_object(&client.client_id, object)?;
             return self
-                .store_pushed_request(&client.client_id, &claims.as_request())
+                .store_pushed_request(&client.client_id, &claims.as_request(), pushed_at)
                 .await;
         }
 
+        // RFC 9101 SECTION 10.5, ON THE PUSHED PATH TOO. `require_signed_request_object` says this
+        // server will not act on an authorization request that is not signed, and a request pushed
+        // as plain form parameters is exactly that. Enforcing it only at the authorization endpoint
+        // would leave PAR as the door the policy does not cover, which is the same shape as the
+        // RFC 9126 gate this file just gained one level up: a policy that holds on one entry point
+        // and not the other is a policy the deployment does not have.
+        //
+        // Refused HERE rather than when the handle is redeemed, because a handle minted from an
+        // unsigned request is a handle that can never be spent, and answering that at push time
+        // tells the client which request was wrong while it still has it in hand.
+        #[cfg(feature = "jar")]
+        if matches!(&self.config().jar, Some(jar) if jar.require_signed_request_object) {
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                "this server acts only on signed request objects (RFC 9101 s10.5), and this push \
+                 carried none",
+            ));
+        }
+
         let request = AuthorizationRequest::from_pairs(parameters.iter().copied());
-        self.store_pushed_request(&client.client_id, &request).await
+        self.store_pushed_request(&client.client_id, &request, pushed_at)
+            .await
     }
 
     /// Validate a pushed request and mint its handle. Split out so that the form-body path and the
@@ -682,6 +876,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         authenticated: &ClientId,
         request: &AuthorizationRequest<'_>,
+        pushed_at: std::time::SystemTime,
     ) -> Result<PushedAuthorizationResponse, ErrorResponse> {
         // A client may push only its OWN request. RFC 9126 section 2.1 makes `client_id` a
         // required parameter here with its ordinary meaning, and section 3 step 3 states the rule
@@ -717,8 +912,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 AuthorizationError::Redirect(redirect) => redirect.error,
             })?;
 
+        // CLAMPED, not trusted. `request_uri_ttl` is a plain public field with no validating
+        // constructor, and RFC 9126 section 2.2 says `expires_in` is a POSITIVE integer — which a
+        // sub-second `Duration` is not: it reports `0`, a handle a conforming client treats as
+        // already dead. `Duration::ZERO` is worse, because `expires_at` then equals `now` and the
+        // handle is refused on its first presentation while the push itself answered `201`. The
+        // host sees a successful push and a flow that cannot proceed, with nothing pointing at the
+        // TTL.
+        //
+        // Clamped rather than rejected, for the same reason `ServerConfig::user_code_length`
+        // clamps: a misconfiguration must not become a runtime failure at the one moment a user is
+        // standing in front of a device.
         let ttl = match &self.config().par {
-            Some(par) => par.request_uri_ttl,
+            Some(par) => par.request_uri_ttl.max(MIN_REQUEST_URI_TTL),
             // Unreachable through the public endpoint, which checks this first; answered rather
             // than panicked because a library must not take a host's process down over its own
             // configuration.
@@ -728,11 +934,26 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
         let now = self.now();
-        let request_uri = format!(
-            "{REQUEST_URI_PREFIX}{}",
-            crate::server::random_hex(REQUEST_URI_ENTROPY_BYTES)
-        );
+        // FALLIBLE, not `expect`. This draw is reachable from an ordinary PAR request, and every
+        // other fallible step on this path — the store write below, the client authentication
+        // above — answers `server_error` rather than taking the host's process down. A library
+        // that panics inside a host's request handler is worse than one that refuses: under
+        // `panic = "abort"` the whole server dies, and the diagnostic is a panic message rather
+        // than the host's own error channel. `getrandom` fails for reasons a deployment really
+        // meets — fd exhaustion, a seccomp filter without `getrandom(2)`, an uninitialised
+        // early-boot pool.
+        let request_uri = match crate::server::try_random_hex(REQUEST_URI_ENTROPY_BYTES) {
+            Some(hex) => format!("{REQUEST_URI_PREFIX}{hex}"),
+            None => return Err(ErrorResponse::new(ErrorCode::ServerError)),
+        };
+        let expires_at = crate::server::saturating_deadline(now, ttl);
         let record = PushedAuthorizationRequest {
+            // Read at request ENTRY, above `authenticate_client`, not here. See the comment there:
+            // a barrier recorded between the two must refuse this write, and it can only do so if
+            // the instant predates the read the write is derived from. `expires_at` below is
+            // deliberately still measured from the write, because the TTL is a promise about how
+            // long the handle lives, not about when the client authored it.
+            pushed_at,
             request_uri: request_uri.clone(),
             client_id: authenticated.clone(),
             response_type: request.response_type.as_deref().map(str::to_string),
@@ -748,18 +969,35 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             acr_values: request.acr_values.as_deref().map(str::to_string),
             #[cfg(feature = "consent")]
             max_age: request.max_age.as_deref().map(str::to_string),
-            expires_at: now + ttl,
+            expires_at,
         };
-        self.store()
+        // A REFUSAL HERE IS NOT AN ERROR TO REPORT AS ONE. `authenticate_client` succeeded a
+        // moment ago, so reaching this line with a barrier in the way means the registration was
+        // deleted between that check and this write. The client genuinely no longer exists, and
+        // `invalid_client` is the truthful answer rather than the `server_error` a storage failure
+        // would deserve.
+        let stored = self
+            .store()
             .put_pushed_authorization_request(record)
             .await
             .map_err(|e| {
                 let _ = e;
                 ErrorResponse::new(ErrorCode::ServerError)
             })?;
+        if stored.is_refused() {
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
+                .with_description("this client was deleted while its request was being pushed"));
+        }
         Ok(PushedAuthorizationResponse {
             request_uri,
-            expires_in: ttl.as_secs(),
+            // Derived from the deadline actually recorded, not from the configured TTL. The two
+            // can disagree: `saturating_deadline` clamps near the platform ceiling, and a client
+            // told a lifetime longer than the record's would hold a handle it believes is live
+            // after the store has stopped honouring it.
+            expires_in: expires_at
+                .duration_since(now)
+                .unwrap_or(MIN_REQUEST_URI_TTL)
+                .as_secs(),
         })
     }
 
@@ -826,7 +1064,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // It reveals nothing a probe can use: reaching this branch at all requires a real
             // handle, and the difference between the two answers is a store failure the caller
             // cannot provoke.
-            self.store()
+            // A REFUSAL IS THE RIGHT OUTCOME AND NOT AN ERROR. It means `delete_client` cascaded
+            // this client away while the record was out of the store, so the handle SHOULD stay
+            // gone: putting it back would resurrect a pushed request belonging to a registration
+            // that no longer exists, which is the rule in `oauth_as::store`'s module docs. The
+            // stranger in front of us is answered `invalid_request_uri` either way, so there is
+            // nothing to report differently on the wire.
+            let _restored = self
+                .store()
                 .put_pushed_authorization_request(record)
                 .await
                 .map_err(|e| {
@@ -869,6 +1114,31 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client_id: &str,
         request_object: &str,
     ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {
+        // RFC 9126 SECTION 5, AND THE GATE THAT WAS NOT HERE.
+        //
+        // `require_pushed_authorization_requests` means this server "accepts authorization request
+        // data only via PAR". The gate lived solely in `validate_authorization_request`, whose
+        // comment explained that it is the query-parameter door and that `par.rs` reaches
+        // validation directly "having already established that the request was pushed or signed".
+        // That conflated two switches which buy different things:
+        //
+        //   `require_signed_request_object` buys INTEGRITY for a request that travels the browser.
+        //   `require_pushed_authorization_requests` buys that the request NEVER TRAVELS THE BROWSER,
+        //   and that it was lodged by an AUTHENTICATED client behind an atomically single-use,
+        //   expiring handle.
+        //
+        // A signed request object has the first property and neither of the other two. So a
+        // deployment that set the PAR flag, and also enabled JAR for a client, still accepted
+        // authorization request data through the browser: it was refused at the plain-query door
+        // and waved through this one. Refused here on the same terms as there.
+        #[cfg(feature = "par")]
+        if matches!(&self.config().par, Some(par) if par.require_pushed_authorization_requests) {
+            return Err(AuthorizationError::Direct(
+                ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                    "this server accepts authorization request data only via PAR (RFC 9126 s4)",
+                ),
+            ));
+        }
         let claims = self
             .verified_request_object(&ClientId::new(client_id), request_object)
             .map_err(AuthorizationError::Direct)?;
@@ -942,6 +1212,43 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 ErrorResponse::new(ErrorCode::InvalidRequestObject)
                     .with_description("the header has no alg")
             })?;
+
+        // RFC 7515 section 4.1.11 `crit`. Same rule as `CompactJws::reject_unknown_crit`, spelled
+        // out here because this path parses the header by hand (it must read `alg` and `kid`
+        // BEFORE choosing a verifier, so it cannot go through `CompactJws::parse` first). The two
+        // must stay in agreement; if this path ever moves onto `CompactJws`, delete this and call
+        // that.
+        //
+        // A JWS whose header names an extension the recipient does
+        // not understand is INVALID, unconditionally: the point of the member is that the producer
+        // is saying "this one changes the meaning, refuse me if you cannot process it". This
+        // verifier implements NO extensions, so any `crit` at all is a refusal, and the empty
+        // array is a refusal too because the section forbids it ("MUST NOT be used ... with an
+        // empty list").
+        //
+        // Checked BEFORE `alg`, and before any signature work, for the same reason `alg` is checked
+        // before the signature: a header that says the recipient cannot process this object is
+        // answered without spending an ECDSA verification on it.
+        match header.get("crit") {
+            None => {}
+            Some(serde_json::Value::Array(names)) => {
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(
+                        if names.is_empty() {
+                            "the header has an empty crit, which RFC 7515 s4.1.11 forbids"
+                                .to_string()
+                        } else {
+                            "the header's crit names an extension this server does not implement"
+                                .to_string()
+                        },
+                    ),
+                )
+            }
+            Some(_) => {
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the header's crit is not an array"))
+            }
+        }
 
         // THE algorithm check. The registration decides; the header only gets to agree with it.
         // This is what makes `alg: none` and every other substitution (RFC 8725 sections 3.1 and
@@ -1045,20 +1352,97 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         }
 
-        // RFC 7519 section 4.1.4 / 4.1.5: a request object that carries a lifetime is honoured. An
-        // expired object is a captured object being replayed.
-        let now_secs = crate::server::unix_seconds(self.now());
-        if let (Some(now), Some(exp)) = (now_secs, payload.get("exp").and_then(|v| v.as_u64())) {
-            if now >= exp {
-                return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
-                    .with_description("the request object has expired"));
+        // RFC 7519 section 4.1.4 / 4.1.5, AND THE THREE WAYS THIS USED TO FAIL OPEN.
+        //
+        // A request object is a bearer credential that travels in a browser query string, so it
+        // lands in history, in `Referer` and in proxy logs. Its `exp` is the only thing between a
+        // captured URL and an indefinite replay, and all three of the following let that check be
+        // skipped rather than failed:
+        //
+        //   1. NO `exp` AT ALL. The old code honoured a lifetime "if one was carried", so an object
+        //      without one authorized its exact request forever. RFC 9101 does not require `exp`
+        //      and section 9.1 registers it with no requirement level, so this is implementer
+        //      discretion rather than a rule to follow; the discretion is exercised the same way
+        //      `client-assertion` already exercises it for a missing `jti`, and for the reason
+        //      written there: an untrackable bearer credential is one anybody who saw the request
+        //      can send again. Section 10.2(d)'s own guidance for a request object URI is "less
+        //      than a minute", so a spec-shaped object is short lived by intent.
+        //   2. A MALFORMED `exp`, which was WORSE than a missing one and is the reason this block
+        //      was rewritten. The old code read the claim with `as_u64()` inside an `if let`, so a
+        //      string, a fraction, a negative or exponent notation all produced `None` and the
+        //      branch simply did not run. The client wrote an expiry, a reviewer reading the object
+        //      sees an expiry, and the server ignored it. "We could not check this" must never read
+        //      as "checked out".
+        //   3. AN UNBOUNDED `exp`. An object may not name its own replay window: a year out is an
+        //      immortal credential with a lifetime claim stapled to it. `max_request_object_lifetime`
+        //      is the ceiling and the object gets the lesser of the two.
+        //
+        // The claim is a NumericDate per RFC 7519 section 2: "a JSON numeric value", and the
+        // section says it "intentionally allows non-integer values". So 1.5 and 1.7e9 are LEGAL
+        // spellings that must be honoured, and only a NON-NUMBER is malformed. The old code read
+        // these with `as_u64`, which answers `None` for every legal non-integer spelling and every
+        // illegal one alike, and then treated both as "the claim is absent".
+        let numeric_date = |name: &str| -> Result<Option<f64>, ErrorResponse> {
+            match payload.get(name) {
+                None => Ok(None),
+                Some(v) => v.as_f64().map(Some).ok_or_else(|| {
+                    ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(format!(
+                        "the request object's {name} is not a NumericDate (RFC 7519 s2)"
+                    ))
+                }),
             }
+        };
+        let now_secs = crate::server::unix_seconds(self.now()).ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::ServerError)
+                .with_description("the server clock is outside the representable range")
+        })? as f64;
+        let exp = numeric_date("exp")?.ok_or_else(|| {
+            ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(
+                "the request object has no exp, so it would authorize its request for as long as \
+                 the client's key stays registered",
+            )
+        })?;
+        if now_secs >= exp {
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("the request object has expired"));
         }
-        if let (Some(now), Some(nbf)) = (now_secs, payload.get("nbf").and_then(|v| v.as_u64())) {
-            if now < nbf {
+        let ceiling = self
+            .config()
+            .jar
+            .as_ref()
+            .map(|j| j.max_request_object_lifetime)
+            .unwrap_or_else(|| std::time::Duration::from_secs(300));
+        if exp - now_secs > ceiling.as_secs() as f64 {
+            return Err(
+                ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(
+                    "the request object's remaining lifetime exceeds what this server accepts",
+                ),
+            );
+        }
+        // `nbf` reads the same way. It can only ever REFUSE an object that is otherwise fine, so a
+        // malformed one failing closed costs a legitimate client nothing that sending a valid claim
+        // would not have cost it. The leeway is the crate's single definition of clock skew rather
+        // than a second one invented here, which is the drift `skew.rs` exists to have ended.
+        if let Some(nbf) = numeric_date("nbf")? {
+            if now_secs + crate::skew::CLOCK_SKEW_LEEWAY.as_secs() as f64 <= nbf {
                 return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
                     .with_description("the request object is not yet valid"));
             }
+        }
+
+        // RFC 9396 section 5, in the build that supports NO authorization detail type at all: the
+        // parameter is REFUSED rather than ignored. Without `rar` the claim below does not exist,
+        // so the object's `authorization_details` would be dropped on the floor and the client
+        // would receive a code, and then a token, that says nothing about the permission it asked
+        // for and believes it obtained. Section 5 makes refusing that a MUST, and a REQUEST OBJECT
+        // is the worst place to ignore it: the client SIGNED these parameters, and RFC 9101
+        // section 6.3 requires this server to use the object's parameters and no others. Same
+        // posture as `request_not_supported` above for an object this server will not process at
+        // all: say so, rather than proceed as though the parameter had not been sent.
+        #[cfg(not(feature = "rar"))]
+        if claims.contains_key("authorization_details") {
+            return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                .with_description("this server does not support authorization_details"));
         }
 
         // RFC 8707 section 2 allows `resource` more than once, which in a JSON claim set is an

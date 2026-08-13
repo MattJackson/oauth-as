@@ -411,6 +411,14 @@ async fn a_token_request_cannot_introduce_a_resource_the_grant_never_had() {
 
 /// RFC 8707 s2's URI rules apply wherever the parameter appears, not only at the authorization
 /// endpoint. A malformed indicator at the token endpoint is `invalid_target` too.
+///
+/// THE CODE ALONE CANNOT SAY WHICH RULE ANSWERED. A fragmented URI reaches this endpoint carrying
+/// two faults at once: it is not a legal indicator (`validate_resources`), and it is not in the
+/// set the grant was issued for (`narrow_resources`). Both answer `invalid_target`, so a test that
+/// asserted only the code would stay green with the SYNTAX rule deleted outright — the narrowing
+/// rule would quietly cover for it, and it would go on covering for it right up until a client
+/// asked for a fragmented form of a resource it really had been granted. The description is the
+/// only thing that separates the two.
 #[tokio::test]
 async fn a_malformed_resource_at_the_token_endpoint_is_invalid_target() {
     let srv = server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
@@ -422,6 +430,13 @@ async fn a_malformed_resource_at_the_token_endpoint_is_invalid_target() {
         .await
         .expect_err("a fragment is forbidden by RFC 8707 s2 at either endpoint");
     assert_eq!(err.error, ErrorCode::InvalidTarget);
+    assert!(
+        err.error_description
+            .unwrap_or_default()
+            .contains("absolute URI with no fragment"),
+        "the SYNTAX rule has to be what refused, not the narrowing rule that would refuse this \
+         value anyway for never having been granted"
+    );
 }
 
 /// RFC 6749 s6 refresh under RFC 8707 s2: the rotated token inherits the chain's resources by

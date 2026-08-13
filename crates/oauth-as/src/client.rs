@@ -161,9 +161,85 @@ impl SecretHash {
 /// comparison that returns early on the first differing byte leaks, through its own timing, how
 /// much of a guess was right, which turns an offline search into an online one an attacker can
 /// run a byte at a time. Every serious password-hashing crate already does this.
+///
+/// # MUST NOT PANIC
+///
+/// [`SecretVerifier::verify`] MUST answer `false` for every input it cannot make sense of: a
+/// stored encoding it does not recognise, a truncated hash, a parameter block with a length it did
+/// not expect, a presented secret that is empty or enormous. `false` is the fail-closed answer and
+/// it is always available; this trait has no error channel precisely because there is nothing a
+/// verifier could report that is not "this does not verify".
+///
+/// This crate catches no unwind anywhere on a request path, so a panic here is not turned into
+/// `invalid_client`. It unwinds out of `AuthorizationServer::authenticate_client` and out of the
+/// token request the host is driving. NAMING THE CONSEQUENCE: this seam is reachable by a caller
+/// with NO valid credential at all. [`SecretVerifier::dummy_hash`] is consulted on the
+/// UNKNOWN-CLIENT path, deliberately, so an unauthenticated request with an invented `client_id`
+/// runs this verifier over host-controlled bytes. A verifier that panics on a malformed encoding
+/// is therefore a remotely reachable panic on the token endpoint, and on a host that treats a
+/// panicking task as fatal it is a remotely reachable process abort.
+///
+/// # `verify` runs on the CALLER'S EXECUTOR THREAD, and it is not async
+///
+/// This method is synchronous and is called inline inside an `async fn`, so the KDF runs on
+/// whichever executor thread is polling the token request. Nothing here yields, and a host cannot
+/// interpose `spawn_blocking` from outside: there is no async variant of this seam in 0.9.
+///
+/// The cost is not hypothetical, and this trait's own docs price it: argon2id at ordinary
+/// parameters is roughly 200 ms (see [`SecretVerifier::dummy_hash`]). On a CURRENT-THREAD runtime
+/// that is 200 ms during which the reactor polls nothing else, per token request, and the
+/// unknown-client path pays it too. What a host should do about it:
+///
+/// - budget for it as request LATENCY, not as background work,
+/// - run the server on a multi-threaded runtime, so one stalled worker is not the whole reactor,
+/// - keep the [`crate::events::RateLimiter`] installed. It runs BEFORE this seam, so a host can
+///   bound how many of these an unauthenticated caller can start,
+/// - or hand off internally: a verifier may keep its own blocking pool and block on the result,
+///   which moves the KDF off the executor thread at the cost of a hop.
+///
+/// An ASYNC variant of this method would remove the need for all four, and it is not in 0.9: it
+/// would be a breaking change to a trait hosts already implement, so it belongs to 1.0.
 pub trait SecretVerifier: Send + Sync {
     /// Whether `presented` is the secret behind `stored`.
     fn verify(&self, stored: &SecretHash, presented: &str) -> bool;
+
+    /// A stored verifier in THIS verifier's scheme, over a secret nobody knows, used to make an
+    /// unknown `client_id` cost the same wall time as a known one.
+    ///
+    /// # What it is for
+    ///
+    /// RFC 6749 section 5.2 has an unknown client and a wrong secret collapse into one
+    /// `invalid_client`, and this crate keeps that collapse on the wire. TIMING breaks it anyway
+    /// when verification is expensive: the token endpoint cannot verify a secret for a
+    /// registration it did not find, so it answers immediately, while a real id pays the whole
+    /// KDF. With argon2id at ordinary parameters that is roughly 200 ms against 2 ms — a
+    /// single-request oracle over the entire client registry, which per-id throttling does not
+    /// touch because the attacker sends exactly one request per id.
+    ///
+    /// So the server performs a DUMMY verification on the unknown-id path, through this seam,
+    /// against whatever this method returns. It is this method rather than a constant in this
+    /// crate because only the host knows its own scheme: a hash in a scheme the verifier does not
+    /// recognise would be rejected on inspection, in microseconds, which is the leak again.
+    ///
+    /// # What to return
+    ///
+    /// A [`SecretHash`] in the same scheme and with the same cost parameters as the registrations
+    /// this verifier actually checks, over a secret that was drawn at random and thrown away (or,
+    /// equivalently, over a value no client will ever present). It may be a constant compiled into
+    /// the host: it authenticates nothing, because no registration names it, and it is only ever
+    /// compared against.
+    ///
+    /// # The default, and why it is `None` rather than something
+    ///
+    /// A verifier that supplies nothing here leaves the crate's own fallback in place, which
+    /// equalises the built-in `sha256-hex` scheme and cannot equalise a scheme it does not
+    /// implement. That is a real residual and it is stated on
+    /// `AuthorizationServer::authenticate_client` rather than papered over: this crate cannot
+    /// invent a well-formed argon2id encoding, and a required method here would break every
+    /// existing implementation of this trait to fix a leak most of them do not have.
+    fn dummy_hash(&self) -> Option<SecretHash> {
+        None
+    }
 }
 
 /// How the client authenticates to the token endpoint (RFC 6749 section 2.3).
@@ -172,6 +248,12 @@ pub trait SecretVerifier: Send + Sync {
 /// never appears in a debug format. `Client` derives `Debug` and holds a `ClientAuth`, so this
 /// also keeps `{:?}` on a whole `Client` safe, without needing a hand-written `Debug` there too.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `#[non_exhaustive]`: `client-assertion` and `mtls` each add a variant, independently, so this
+/// enum has four possible variant sets. A host matches this to render "how does this client
+/// authenticate" in an admin UI, or to decide what its own registration endpoint will accept, and
+/// neither of those should stop compiling because an unrelated crate in the graph wanted mutual
+/// TLS. Registering a client is unaffected: naming a variant is still just naming it.
+#[non_exhaustive]
 pub enum ClientAuth {
     /// A public client (native app, browser app, device): no secret exists, so possession of the
     /// `client_id` proves nothing and the flows compensate (PKCE, device-code user interaction).
@@ -204,7 +286,7 @@ pub enum ClientAuth {
     /// [`crate::client_assertion::AssertionKeys`] is narrower than that, so `ClientAuth` does not
     /// grow by a byte. Boxing would have ADDED an allocation at registration time to save a struct
     /// size that was already paid for.
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     ConfidentialAssertion {
         /// What the registration expects the assertion to be signed with. This, and never the
         /// token's own header, is what decides the algorithm: see
@@ -249,7 +331,7 @@ impl fmt::Debug for ClientAuth {
                 .finish(),
             // `AssertionKeys`'s own Debug redacts a `client_secret_jwt` secret and prints the
             // PUBLIC keys of a `private_key_jwt` registration, which are public.
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             ClientAuth::ConfidentialAssertion { keys } => f
                 .debug_struct("ConfidentialAssertion")
                 .field("keys", keys)
@@ -298,12 +380,13 @@ impl ClientAuth {
     /// verifier can only ADD registrations that authenticate, never change the answer for one the
     /// crate could already decide.
     ///
-    /// What this does NOT cover: if the caller (see `server.rs`) returns early for an unknown
-    /// `client_id` before ever calling this, an unknown client and a known client with a wrong
-    /// secret are distinguishable by timing even though this function leaks nothing. Making those
-    /// two paths cost the same wall time is the caller's responsibility, not this function's; a
-    /// caller that cares should verify against some registered client (or an equivalent-cost
-    /// dummy) on the unknown-client path too.
+    /// What this does NOT cover, and who does: if the caller returned early for an unknown
+    /// `client_id` without calling this at all, an unknown client and a known client with a wrong
+    /// secret would be distinguishable by timing even though this function leaks nothing. That is
+    /// the caller's responsibility rather than this function's, and
+    /// `AuthorizationServer::authenticate_client` discharges it by running a DUMMY verification
+    /// through this same function on the unknown-id path. See [`SecretVerifier::dummy_hash`] for
+    /// the part of it only the host can supply.
     pub fn verify_with(
         &self,
         presented: Option<&str>,
@@ -325,7 +408,7 @@ impl ClientAuth {
             // registered for `private_key_jwt` be authenticated by the `client_secret_post` path
             // instead, which is the downgrade the registration exists to forbid; the assertion path
             // is `AuthorizationServer::authenticate_client` and it does not come through here.
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             ClientAuth::ConfidentialAssertion { .. } => false,
             // NEVER, and for the same reason as the assertion arm above. A mutual-TLS
             // registration has no secret to compare against, so there is no presented string

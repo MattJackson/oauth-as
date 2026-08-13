@@ -53,9 +53,15 @@ fn exchanger() -> Client {
         auth: ClientAuth::ConfidentialSecret {
             secret: EXCHANGER_SECRET.into(),
         },
+        // `RefreshToken` is registered so that the "no refresh token" rule under test in
+        // `the_response_carries_every_required_member_and_no_refresh_token` is the EXCHANGE
+        // grant's and not the registration's: without it `issue` would decline to mint a rotating
+        // credential for this client whatever the exchange asked for, and the assertion would hold
+        // for a reason that has nothing to do with RFC 8693 s2.2.1.
         grant_types: vec![
             GrantType::AuthorizationCode,
             GrantType::ClientCredentials,
+            GrantType::RefreshToken,
             GrantType::TokenExchange,
         ],
         redirect_uris: vec![EXCHANGER_REDIRECT.to_string()],
@@ -132,6 +138,26 @@ fn holder() -> Client {
     }
 }
 
+/// A SECOND exchanging client, so a delegation chain can have two DISTINCT actors in it. RFC 8693
+/// s4.1's nested `act` is an ordering of prior actors, and a chain whose links are all the same
+/// party cannot show that the ordering is right.
+const SECOND_SECRET: &str = "second-exchanger-secret-for-tests";
+
+fn second_exchanger() -> Client {
+    Client {
+        client_id: ClientId::new("second-exchanger"),
+        auth: ClientAuth::ConfidentialSecret {
+            secret: SECOND_SECRET.into(),
+        },
+        grant_types: vec![GrantType::ClientCredentials, GrantType::TokenExchange],
+        redirect_uris: vec![],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: Some("Downstream service".into()),
+        registration: None,
+    }
+}
+
 async fn fixture() -> AuthorizationServer<MemoryStorage, ManualClock> {
     server_with(
         ManualClock::at_epoch(),
@@ -141,6 +167,7 @@ async fn fixture() -> AuthorizationServer<MemoryStorage, ManualClock> {
             unregistered_exchanger(),
             public_exchanger(),
             holder(),
+            second_exchanger(),
         ],
     )
     .await
@@ -204,6 +231,18 @@ fn exchange_request<'a>(
 /// reused its RFC 6749 s5.1 response type would silently omit. s2.2.1 also says a refresh token
 /// will typically not be issued for an exchange of one temporary credential for another, which
 /// this server takes as never.
+///
+/// THE "NO REFRESH TOKEN" HALF IS CHECKED AT THE RECORD, not in the response, because the response
+/// cannot see it. `TokenExchange`'s response literal sets `refresh_token: None` and discards what
+/// `issue` returned, so a server that asked `issue` for a rotating credential would MINT one, WRITE
+/// it to the store, and still serialize a response byte for byte identical to this one. The
+/// observable difference is [`oauth_as::IssuedToken::family_id`]: it is `Some` exactly when an
+/// issuance opened a refresh family (RFC 9700 s4.14.2 needs the access token reachable from the
+/// grant), so `None` on the exchanged token is the proof that no chain was created and nothing was
+/// persisted to rotate. The exchanging client is registered for `refresh_token`, and the control at
+/// the end of the test drives the same client through an ordinary grant and gets both a
+/// `refresh_token` and a family, so the absence above is this grant's refusal and not the
+/// registration's.
 #[tokio::test]
 async fn the_response_carries_every_required_member_and_no_refresh_token() {
     let srv = fixture().await;
@@ -245,6 +284,44 @@ async fn the_response_carries_every_required_member_and_no_refresh_token() {
     assert!(
         body.get("refresh_token").is_none(),
         "an absent optional member is omitted, never null"
+    );
+
+    // What the response cannot show: that nothing rotatable was WRITTEN.
+    let record = srv
+        .introspect(&exchanged.response.access_token)
+        .await
+        .expect("the store answers")
+        .expect("the exchanged token is live");
+    assert_eq!(
+        record.family_id, None,
+        "RFC 8693 s2.2.1: an exchange opens no refresh family, so there is no persisted \
+         credential the response merely declined to print"
+    );
+
+    // THE CONTROL, so the assertion above cannot pass because this client could never have one.
+    // Same client, same server, ordinary authorization code grant.
+    let ordinary = subject_token(
+        &srv,
+        "exchanger",
+        EXCHANGER_SECRET,
+        EXCHANGER_REDIRECT,
+        "read",
+        "user-1",
+        &[],
+    )
+    .await;
+    assert!(
+        ordinary.refresh_token.is_some(),
+        "the exchanging client IS registered for refresh_token, so an ordinary grant rotates"
+    );
+    assert!(
+        srv.introspect(&ordinary.access_token)
+            .await
+            .expect("the store answers")
+            .expect("live")
+            .family_id
+            .is_some(),
+        "and that grant's access token names the family the exchange refused to open"
     );
 }
 
@@ -308,6 +385,126 @@ async fn an_actor_token_makes_the_exchange_delegation_and_names_the_actor() {
     assert_eq!(act.sub, "exchanger");
     assert_eq!(act.client_id.as_deref(), Some("exchanger"));
     assert_eq!(act.act, None, "there is no prior actor to nest");
+}
+
+/// THE DELEGATION MUST SURVIVE THE TOKEN, and be visible to a resource server.
+///
+/// Reporting `act` in the exchange RESPONSE tells the HOST who acted. It tells the resource server
+/// nothing, and the resource server is the party the distinction exists for. This crate's default
+/// access token is OPAQUE, so RFC 7662 introspection is the only channel it has: a delegation
+/// introspection cannot see is one an RS has to take on trust, which collapses RFC 8693 section
+/// 1.1 delegation back into impersonation from the only viewpoint that matters.
+///
+/// Through 0.9.0 the claim reached the host and stopped there. `token_exchange.rs`'s own module
+/// docs called it a GAP rather than a design, and named what stood in the way: `IssuedToken` is
+/// the record every host's `Storage` writes, so adding a field is a migration in stores this crate
+/// does not own. 0.9.1 is the release that breaks that trait, which is why it lands now.
+#[tokio::test]
+async fn a_delegated_token_reports_its_actor_at_introspection() {
+    let srv = fixture().await;
+    let subject = subject_token(
+        &srv,
+        "holder",
+        HOLDER_SECRET,
+        HOLDER_REDIRECT,
+        "read",
+        "user-1",
+        &[],
+    )
+    .await;
+    let actor = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("exchanger"),
+            client_secret: Some(EXCHANGER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .unwrap();
+
+    let client_id = ClientId::new("exchanger");
+    let mut req = exchange_request(&subject.access_token, &client_id);
+    req.actor_token = Some(&actor.access_token);
+    req.actor_token_type = Some(TokenTypeIdentifier::AccessToken);
+    let exchanged = srv.exchange_token(&req).await.unwrap();
+
+    let introspected = srv
+        .introspection_response(
+            &client_id,
+            Some(EXCHANGER_SECRET),
+            &exchanged.response.access_token,
+        )
+        .await
+        .expect("the exchanging client may introspect its own token");
+    assert!(introspected.active);
+    let act = introspected
+        .act
+        .expect("an opaque delegated token has nowhere else to carry the actor");
+    assert_eq!(act.sub, "exchanger");
+    assert_eq!(act.client_id.as_deref(), Some("exchanger"));
+    // The SUBJECT is still the user: delegation says "A acting for B", not "A instead of B".
+    assert_eq!(introspected.sub.as_deref(), Some("user-1"));
+}
+
+/// The other half, and the one that stops `act` becoming noise: an IMPERSONATION exchange names no
+/// actor, so introspection must not report one. RFC 8693 section 1.1 makes the two shapes
+/// different on purpose, and a server that reported an actor for both would have erased the
+/// difference it just went to the trouble of recording.
+#[tokio::test]
+async fn an_impersonated_token_reports_no_actor_at_introspection() {
+    let srv = fixture().await;
+    let subject = subject_token(
+        &srv,
+        "holder",
+        HOLDER_SECRET,
+        HOLDER_REDIRECT,
+        "read",
+        "user-1",
+        &[],
+    )
+    .await;
+    let client_id = ClientId::new("exchanger");
+    let req = exchange_request(&subject.access_token, &client_id);
+    let exchanged = srv.exchange_token(&req).await.unwrap();
+    assert_eq!(exchanged.semantics, ExchangeSemantics::Impersonation);
+
+    let introspected = srv
+        .introspection_response(
+            &client_id,
+            Some(EXCHANGER_SECRET),
+            &exchanged.response.access_token,
+        )
+        .await
+        .unwrap();
+    assert!(introspected.active);
+    assert!(
+        introspected.act.is_none(),
+        "an impersonation exchange names no actor, so introspection must not invent one"
+    );
+}
+
+/// A token from an ORDINARY grant carries no actor either. This is the regression guard for the
+/// field itself: it costs every other grant nothing and must stay empty on all of them.
+#[tokio::test]
+async fn an_ordinary_grant_reports_no_actor_at_introspection() {
+    let srv = fixture().await;
+    let issued = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("exchanger"),
+            client_secret: Some(EXCHANGER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    let introspected = srv
+        .introspection_response(
+            &ClientId::new("exchanger"),
+            Some(EXCHANGER_SECRET),
+            &issued.access_token,
+        )
+        .await
+        .unwrap();
+    assert!(introspected.active);
+    assert!(introspected.act.is_none());
 }
 
 // ------------------------------------------------------------------------------- the ATTACKS
@@ -576,6 +773,69 @@ async fn an_actor_token_issued_to_another_client_is_refused() {
     assert_eq!(error.error, ErrorCode::InvalidRequest);
 }
 
+/// ATTACK, and the one the refusal above used to answer. "actor_token was not issued to the
+/// authenticated client" and "actor_token is not a live access token" are two different answers to
+/// two strings the caller does not own, and the difference is a live-token oracle: any client
+/// holding the exchange grant could feed this endpoint arbitrary strings and learn which ones are
+/// live access tokens belonging to somebody else.
+///
+/// That is precisely the question `introspection_response` refuses to answer ("unknown, expired, or
+/// somebody else's. All three are one answer on purpose"), and precisely what the SUBJECT token
+/// check seventy lines earlier in `token_exchange.rs` already collapses. RFC 8693 s2.2.2 gives
+/// `invalid_request` for both, and nothing in it requires a distinguishing description.
+///
+/// The comparison includes `error_description`, because the code was already identical and the
+/// description was the whole leak.
+#[tokio::test]
+async fn a_third_partys_live_actor_token_is_refused_in_the_words_garbage_is_refused_in() {
+    let srv = fixture().await;
+    let subject = subject_token(
+        &srv,
+        "holder",
+        HOLDER_SECRET,
+        HOLDER_REDIRECT,
+        "read",
+        "user-1",
+        &[],
+    )
+    .await;
+    let someone_elses = subject_token(
+        &srv,
+        "holder",
+        HOLDER_SECRET,
+        HOLDER_REDIRECT,
+        "read",
+        "user-2",
+        &[],
+    )
+    .await;
+    let client_id = ClientId::new("exchanger");
+
+    let refusal_for = |actor: &str| {
+        let subject = subject.access_token.clone();
+        let client_id = client_id.clone();
+        let actor = actor.to_string();
+        let srv = &srv;
+        async move {
+            let mut req = exchange_request(&subject, &client_id);
+            req.actor_token = Some(&actor);
+            req.actor_token_type = Some(TokenTypeIdentifier::AccessToken);
+            srv.exchange_token(&req)
+                .await
+                .expect_err("neither actor token may be accepted")
+        }
+    };
+
+    let live_but_anothers = refusal_for(&someone_elses.access_token).await;
+    let never_existed = refusal_for("not-a-token-this-server-ever-issued").await;
+
+    assert_eq!(
+        live_but_anothers, never_existed,
+        "a live token belonging to another client and a string that was never a token must be one \
+         answer: {live_but_anothers:?} against {never_existed:?}"
+    );
+}
+
 // ------------------------------------------------------------------------ who may exchange at all
 
 /// A public client identifier is a string anyone may claim, so "authenticated as a public client"
@@ -634,6 +894,14 @@ async fn a_client_not_registered_for_the_grant_is_refused() {
 
 /// RFC 8693 s2.1 makes `actor_token_type` REQUIRED when `actor_token` is present. A server that
 /// defaulted it would be guessing how to check a credential.
+///
+/// THE ACTOR TOKEN IS LIVE, and it is the exchanging client's own, which is exactly the token the
+/// delegation test above presents WITH the type and gets a 200 for. A fabricated string would prove
+/// nothing: an actor token this server cannot introspect is refused with the same
+/// `invalid_request`, so a server that quietly defaulted the missing type would fall through to
+/// "actor_token is not a live access token" and the test would stay green through the defect it
+/// exists to catch. With a live token the defaulting server SUCCEEDS instead, and the description
+/// is asserted because `invalid_request` alone is the answer to five different faults on this path.
 #[tokio::test]
 async fn an_actor_token_without_its_type_is_refused() {
     let srv = fixture().await;
@@ -647,11 +915,27 @@ async fn an_actor_token_without_its_type_is_refused() {
         &[],
     )
     .await;
+    let actor = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("exchanger"),
+            client_secret: Some(EXCHANGER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .expect("the exchanging client must be able to mint its own actor token");
     let client_id = ClientId::new("exchanger");
     let mut req = exchange_request(&subject.access_token, &client_id);
-    req.actor_token = Some("some-actor-token");
+    req.actor_token = Some(&actor.access_token);
     let error = srv.exchange_token(&req).await.unwrap_err();
     assert_eq!(error.error, ErrorCode::InvalidRequest);
+    assert!(
+        error
+            .error_description
+            .unwrap_or_default()
+            .contains("actor_token_type is required"),
+        "the refusal must name the missing parameter, or it is indistinguishable from the \
+         refusal of an actor token this server simply does not know"
+    );
 }
 
 /// An expired subject token is not a token. RFC 8693 s2.2.2 folds "invalid for any reason" into
@@ -809,4 +1093,179 @@ async fn the_exchanged_token_is_a_first_class_token_at_this_server() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// RFC 8693 s4.1: "the consumer of a token MUST only consider the token's top-level claims and the
+/// party identified as the current actor by the act claim", and a NESTED `act` is a prior actor
+/// kept for audit. So A -> B -> C is `{sub: C, act: {sub: B}}`: the outermost is who is acting now,
+/// and what is inside is who acted before.
+///
+/// Through 0.9.1 the chain was truncated to one link — `act: None` was written unconditionally, on
+/// the strength of a comment saying "this server does not yet carry `act` inside its own tokens",
+/// which the same release had made false by persisting the claim on `IssuedToken` and reporting it
+/// at introspection. The result was `{sub: C}` with no `act` inside, which does not say "C acting
+/// for the user having received the delegation from B"; it says the delegation started at C. A
+/// resource server auditing the chain, which is the ONE thing s4.1's nesting exists for, was told
+/// something untrue rather than something incomplete.
+#[tokio::test]
+async fn a_second_delegation_nests_the_prior_actor_rather_than_replacing_it() {
+    let srv = fixture().await;
+    let user_token = subject_token(
+        &srv,
+        "holder",
+        HOLDER_SECRET,
+        HOLDER_REDIRECT,
+        "read",
+        "user-1",
+        &[],
+    )
+    .await;
+
+    // HOP ONE: the gateway `exchanger` receives the user's token and delegates to itself.
+    let first_actor = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("exchanger"),
+            client_secret: Some(EXCHANGER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    let exchanger_id = ClientId::new("exchanger");
+    let mut first = exchange_request(&user_token.access_token, &exchanger_id);
+    first.actor_token = Some(&first_actor.access_token);
+    first.actor_token_type = Some(TokenTypeIdentifier::AccessToken);
+    let first = srv.exchange_token(&first).await.unwrap();
+
+    // HOP TWO: the gateway calls a downstream service, which exchanges again for its own call.
+    let second_actor = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("second-exchanger"),
+            client_secret: Some(SECOND_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    let second_id = ClientId::new("second-exchanger");
+    let mut second = TokenExchangeRequest::new(
+        &second_id,
+        &first.response.access_token,
+        TokenTypeIdentifier::AccessToken,
+    );
+    second.client_secret = Some(SECOND_SECRET);
+    second.actor_token = Some(&second_actor.access_token);
+    second.actor_token_type = Some(TokenTypeIdentifier::AccessToken);
+    let second = srv.exchange_token(&second).await.unwrap();
+
+    let act = second.act.expect("delegation must carry an act claim");
+    assert_eq!(
+        act.sub, "second-exchanger",
+        "the CURRENT actor is outermost"
+    );
+    let prior = act
+        .act
+        .expect("RFC 8693 s4.1: the party that delegated earlier is nested, not discarded");
+    assert_eq!(prior.sub, "exchanger");
+    assert_eq!(prior.client_id.as_deref(), Some("exchanger"));
+    assert_eq!(prior.act, None, "and the chain ends where it started");
+
+    // The chain has to reach a RESOURCE SERVER, which for an opaque token means introspection: a
+    // claim that exists only in the exchange response is a claim the party who has to act on it
+    // never sees.
+    let introspected = srv
+        .introspect(&second.response.access_token)
+        .await
+        .unwrap()
+        .expect("the exchanged token must be live");
+    let stored = introspected
+        .act
+        .as_ref()
+        .expect("the persisted record carries the chain");
+    assert_eq!(stored.sub, "second-exchanger");
+    assert_eq!(
+        stored.act.as_ref().map(|a| a.sub.as_str()),
+        Some("exchanger"),
+        "what introspection reports must be the same chain the response described"
+    );
+    // Delegation, not impersonation: the subject is still the user throughout.
+    assert_eq!(introspected.subject.as_deref(), Some("user-1"));
+}
+
+/// The bound that makes the nesting above safe to persist. Exchanging one's own token is permitted,
+/// so without a limit an authenticated client can loop — exchange, then exchange the result — and
+/// each hop adds a link that every later store read and every RFC 9068 token has to carry. That is
+/// a client choosing how much storage the server spends, which is the same shape as the
+/// repeatable-parameter caps this file already pins.
+///
+/// A chain AT the bound is refused rather than truncated, because truncation would silently discard
+/// exactly the audit history the nesting exists to keep.
+#[tokio::test]
+async fn a_delegation_chain_stops_at_the_depth_bound_rather_than_growing_without_limit() {
+    let srv = fixture().await;
+    let user_token = subject_token(
+        &srv,
+        "holder",
+        HOLDER_SECRET,
+        HOLDER_REDIRECT,
+        "read",
+        "user-1",
+        &[],
+    )
+    .await;
+    let actor = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("exchanger"),
+            client_secret: Some(EXCHANGER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    let exchanger_id = ClientId::new("exchanger");
+
+    let mut held = user_token.access_token;
+    let mut depth = 0usize;
+    let refusal = loop {
+        let mut req = exchange_request(&held, &exchanger_id);
+        req.actor_token = Some(&actor.access_token);
+        req.actor_token_type = Some(TokenTypeIdentifier::AccessToken);
+        match srv.exchange_token(&req).await {
+            Ok(exchanged) => {
+                depth += 1;
+                assert!(
+                    depth <= oauth_as::token_exchange::MAX_ACT_CHAIN_DEPTH,
+                    "the chain grew past the bound: nothing is limiting it"
+                );
+                held = exchanged.response.access_token;
+            }
+            Err(e) => break e,
+        }
+        // No second bound check here: the `Ok` arm above is the only path that reaches this point
+        // and it has already asserted the same predicate on the same unmodified `depth`, so a
+        // copy of it could never fail. What stops the loop running forever is that assertion,
+        // which panics on the first exchange past the bound.
+    };
+
+    assert_eq!(
+        depth,
+        oauth_as::token_exchange::MAX_ACT_CHAIN_DEPTH,
+        "the bound is reached exactly, not short of it"
+    );
+    assert_eq!(refusal.error, ErrorCode::InvalidRequest);
+    assert!(
+        refusal
+            .error_description
+            .unwrap_or_default()
+            .contains("delegation depth"),
+        "a legitimate client hitting this needs to be told what it hit"
+    );
+
+    // And the deepest token this server WOULD mint carries exactly the bound, so the refusal is a
+    // cap on what is stored rather than a cap on what is reported.
+    let deepest = srv.introspect(&held).await.unwrap().expect("live");
+    let mut links = 0usize;
+    let mut cursor = deepest.act.as_deref();
+    while let Some(a) = cursor {
+        links += 1;
+        cursor = a.act.as_deref();
+    }
+    assert_eq!(links, oauth_as::token_exchange::MAX_ACT_CHAIN_DEPTH);
 }

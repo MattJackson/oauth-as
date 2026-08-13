@@ -182,8 +182,15 @@ impl EventSink for Recorder {
 /// cannot start an incident response.
 fn an_installed_sink_sees_every_event_it_is_handed() {
     let recorder = std::sync::Arc::new(Recorder::default());
-    let mut hooks = Hooks::new();
-    hooks.install_event_sink(Box::new(RecorderHandle(recorder.clone())));
+    // INSTALLED through the server's builder, which as of 0.9.1 is the crate's one installation
+    // verb, and READ back through `hooks()`. The seam under test is the emit path, not an
+    // endpoint, so the server exists only to own the slot.
+    let server = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        MemoryStorage::new(),
+    )
+    .with_event_sink(Box::new(RecorderHandle(recorder.clone())));
+    let hooks = server.hooks();
 
     let scope = ScopeSet::parse("read").unwrap();
     hooks.emit(|| Event::ClientAuthenticationFailed {
@@ -218,6 +225,7 @@ fn an_installed_sink_sees_every_event_it_is_handed() {
         client_id: "c",
         family_id: "f00d",
         records_revoked: 3,
+        containment_failed: false,
     });
     hooks.emit(|| Event::TokenRevoked {
         client_id: "c",
@@ -550,7 +558,7 @@ fn client_authentication_failures_are_distinguished_for_the_host_only() {
 /// asked after a device turns out to belong to somebody else.
 fn device_approval_and_denial_reach_the_sink() {
     let (rt, transcript, srv) = transcript_server();
-    rt.block_on(async {
+    let (approved_code, denied_code) = rt.block_on(async {
         let first = srv
             .device_authorization(
                 &ClientId::new("device-only"),
@@ -571,6 +579,7 @@ fn device_approval_and_denial_reach_the_sink() {
             .await
             .expect("device authorization");
         srv.deny_device(&second.user_code).await.expect("denial");
+        (first.user_code, second.user_code)
     });
 
     let seen = lines(&transcript);
@@ -583,10 +592,16 @@ fn device_approval_and_denial_reach_the_sink() {
         seen.iter().any(|l| l.starts_with("DeviceGrantDenied")),
         "{seen:?}"
     );
-    assert!(
-        !seen.iter().any(|l| l.contains("user_code")),
-        "no event may carry the user code: {seen:?}"
-    );
+    // The VALUES, not the field name. RFC 8628 section 5.1 makes the user code a short guessable
+    // secret for the length of the grant, so a code in a log line is a code an operator with log
+    // access can approve. Until the 0.9.1 audit this scanned for the string "user_code", which a
+    // variant field named anything else would have carried straight past.
+    for code in [&approved_code, &denied_code] {
+        assert!(
+            !seen.iter().any(|l| l.contains(code.as_str())),
+            "no event may carry the user code {code}: {seen:?}"
+        );
+    }
 }
 
 /// RFC 7009: revocation is reported, with which kind of token it was. A revocation the host cannot

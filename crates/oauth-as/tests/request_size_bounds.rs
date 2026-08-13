@@ -33,22 +33,16 @@ fn authorization_request<'a>(
 ) -> AuthorizationRequest<'a>
 where
 {
-    AuthorizationRequest {
-        resource: resource.iter().map(|r| r.as_str().into()).collect(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some("public-app".into()),
-        redirect_uri: Some(PUBLIC_REDIRECT.into()),
-        scope: Some("read".into()),
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    }
+    let mut req = AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", "public-app"),
+        ("redirect_uri", PUBLIC_REDIRECT),
+        ("scope", "read"),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+    ]);
+    req.resource = resource.iter().map(|r| r.as_str().into()).collect();
+    req
 }
 
 /// THE FINDING. RFC 8707 section 2 makes `resource` repeatable, the authorization endpoint takes no

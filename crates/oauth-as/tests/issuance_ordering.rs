@@ -75,22 +75,14 @@ async fn issue_code<S: Storage>(
     subject: &str,
 ) -> String {
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
-    let req = AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".to_string().into()),
-        client_id: Some(client_id.to_string().into()),
-        redirect_uri: Some(redirect_uri.to_string().into()),
-        scope: Some("read".to_string().into()),
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".to_string().into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let req = AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("scope", "read"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
     let validated = srv
         .validate_authorization_request(&req)
         .await

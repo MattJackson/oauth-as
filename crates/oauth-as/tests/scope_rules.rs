@@ -4,11 +4,14 @@
 //! RFC 6749 section 3.3 scope rules: the scope-token grammar, set semantics (dedup, ordering,
 //! subset), and the space-delimited wire form.
 //!
-//! Why the grammar matters beyond parsing: RFC 6749 section 5.2 restricts `error_description` to
-//! printable ASCII EXCLUDING double quote and backslash. `crate::server` interpolates a rejected
-//! scope's text into `error_description` (see the `resolve_scope` comment in `src/server.rs`), so
-//! if the scope grammar ever let a double quote or backslash through, a crafted scope value could
-//! break out of that description's charset. These tests pin the grammar that guarantees it cannot.
+//! Why the grammar matters beyond parsing: it bounds what a `Scope` can hold anywhere the value
+//! travels, and a scope value is caller-controlled text that reaches storage keys, event payloads
+//! and comparison. RFC 6749 section 5.2 restricts `error_description` to printable ASCII EXCLUDING
+//! double quote and backslash, and this server does NOT interpolate a rejected scope into that
+//! field — `resolve_scope` answers with the borrowed constant "requested scope exceeds the client
+//! registration", and `tests/request_size_bounds.rs` asserts the refusal does not echo the
+//! caller's own string back at them. So the charset argument is no longer the reason to pin the
+//! grammar; the reason is that every other consumer of a `Scope` is entitled to assume it.
 
 use oauth_as::{Scope, ScopeSet};
 

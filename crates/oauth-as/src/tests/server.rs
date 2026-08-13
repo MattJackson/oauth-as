@@ -8,7 +8,7 @@ use super::*;
 
 #[test]
 fn user_codes_use_the_alphabet_and_are_unbiased_in_shape() {
-    let code = random_user_code(8);
+    let code = random_user_code(8).expect("the OS provides randomness in a test process");
     assert_eq!(code.len(), 8);
     assert!(code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)));
 }
@@ -82,7 +82,7 @@ fn the_user_code_symbol_draw_is_exactly_uniform_over_the_alphabet() {
 #[test]
 fn random_user_code_redraws_rejections_rather_than_shortening_the_code() {
     for len in [MIN_USER_CODE_LENGTH, 9, 16] {
-        let code = random_user_code(len);
+        let code = random_user_code(len).expect("the OS provides randomness in a test process");
         assert_eq!(code.len(), len, "a rejected byte must cost a redraw");
         assert!(code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)));
     }
@@ -90,10 +90,10 @@ fn random_user_code_redraws_rejections_rather_than_shortening_the_code() {
 
 #[test]
 fn random_hex_has_the_stated_entropy_width() {
-    let h = random_hex(32);
+    let h = try_random_hex(32).expect("the OS provides randomness in a test process");
     assert_eq!(h.len(), 64);
     assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
-    assert_ne!(random_hex(32), random_hex(32));
+    assert_ne!(h, try_random_hex(32).unwrap());
 }
 
 /// C13: every credential a token request carries is a credential in the RFC's own terms
@@ -210,7 +210,7 @@ fn c13_token_request_debug_still_names_the_grant() {
 /// both caller-chosen and neither is restricted to a charset that excludes the separator. The
 /// length prefix is what makes the split unambiguous whatever they contain. See `replay_key` for
 /// the argument, and `tests/replay_key_collision.rs` for the attack the old encoding admitted.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 #[test]
 fn a_replay_key_separates_its_three_parts() {
     assert_eq!(replay_key("ca", "client-1", "jti-1"), "ca:8:client-1jti-1");
@@ -237,7 +237,7 @@ fn a_replay_key_separates_its_three_parts() {
 /// The decimal width the capacity arithmetic depends on. Off by one here is a reallocation on
 /// every DPoP-carrying token request, which is exactly what the exactness test below would catch,
 /// so this pins the boundaries it would otherwise only catch by accident.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 #[test]
 fn the_decimal_width_is_the_number_of_digits() {
     for (n, width) in [
@@ -262,7 +262,7 @@ fn the_decimal_width_is_the_number_of_digits() {
 /// too large asks the allocator for bytes that are never written. `String::with_capacity` allocates
 /// exactly what it is asked for, so both are visible as the pair of facts below: the capacity is
 /// what the arithmetic in `replay_key` computes, and the string ends up exactly full.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 #[test]
 fn a_replay_key_is_built_in_exactly_one_correctly_sized_allocation() {
     for (kind, owner, jti) in [
@@ -284,4 +284,222 @@ fn a_replay_key_is_built_in_exactly_one_correctly_sized_allocation() {
             "the hint must be exactly the final length: smaller reallocates, larger over-asks"
         );
     }
+}
+
+/// The three request-reachable randomness draws are FALLIBLE, not panicking.
+///
+/// `getrandom` failing is a real runtime condition — an exhausted descriptor table on the platforms
+/// where it opens `/dev/urandom`, a seccomp policy, a container without the syscall — and every
+/// other fallible step on these paths becomes `ErrorCode::ServerError` and returns. Panicking makes
+/// a library abort its host's request handler, and in a host built with `panic = "abort"` it
+/// takes the whole process with it: an authorization server that stops serving the requests it
+/// could still serve because one of them could not be given thirty-two bytes.
+///
+/// This is a TYPE-LEVEL guard rather than a behavioural one, deliberately, and it is the only kind
+/// available: a test cannot make the OS refuse randomness, so what can be pinned is that the
+/// signature admits the refusal at all. It does not compile against the `expect`-ing forms these
+/// replaced, which is exactly the regression worth catching.
+#[test]
+fn the_request_reachable_randomness_draws_report_failure_rather_than_panicking() {
+    let hex: Option<String> = try_random_hex(32);
+    assert_eq!(
+        hex.expect("the OS provides randomness in a test process")
+            .len(),
+        64
+    );
+    let code: Option<String> = random_user_code(MIN_USER_CODE_LENGTH);
+    assert_eq!(
+        code.expect("the OS provides randomness in a test process")
+            .len(),
+        MIN_USER_CODE_LENGTH
+    );
+    // And the refusal they map to is the same opaque `server_error` a storage failure becomes, so
+    // a caller cannot tell which internal thing went wrong.
+    assert_eq!(randomness_error().error, ErrorCode::ServerError);
+    assert!(randomness_error().error_description.is_none());
+}
+
+// ------------------------------------------------- what the installed RateLimiter is told, exactly
+
+/// A limiter that ALLOWS the first `allow` checks and denies everything after, keeping every
+/// `record` it is handed. The two halves are what the tests below read: which attempt was refused,
+/// and what the limiter was subsequently told about it.
+#[cfg(test)]
+struct CountingLimiter {
+    allow: usize,
+    checks: std::sync::Mutex<usize>,
+    records: std::sync::Mutex<Vec<AttemptOutcome>>,
+}
+
+impl RateLimiter for std::sync::Arc<CountingLimiter> {
+    fn check(&self, _attempt: Attempt<'_>) -> RateLimitDecision {
+        let mut checks = self.checks.lock().expect("no panic while held");
+        *checks += 1;
+        if *checks <= self.allow {
+            RateLimitDecision::Allow
+        } else {
+            RateLimitDecision::Deny
+        }
+    }
+
+    fn record(&self, _attempt: Attempt<'_>, outcome: AttemptOutcome) {
+        self.records
+            .lock()
+            .expect("no panic while held")
+            .push(outcome);
+    }
+}
+
+fn limited_server(
+    limiter: std::sync::Arc<CountingLimiter>,
+) -> AuthorizationServer<crate::store::MemoryStorage> {
+    AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        crate::store::MemoryStorage::new(),
+    )
+    .with_rate_limiter(Box::new(limiter))
+}
+
+fn limited_client() -> Client {
+    Client {
+        client_id: ClientId::new("app"),
+        auth: crate::client::ClientAuth::Public,
+        grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+        redirect_uris: vec!["https://app.example/cb".to_string()],
+        allowed_scopes: ScopeSet::parse("read").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    }
+}
+
+/// RFC 7636 appendix B's worked example verifier, which is 43 characters: the minimum the RFC
+/// permits, and what this crate's integration suite uses.
+#[cfg(test)]
+const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+fn limited_request(challenge: &str) -> AuthorizationRequest<'static> {
+    AuthorizationRequest::from_pairs([
+        ("response_type", "code".to_string()),
+        ("client_id", "app".to_string()),
+        ("redirect_uri", "https://app.example/cb".to_string()),
+        ("scope", "read".to_string()),
+        ("code_challenge", challenge.to_string()),
+        ("code_challenge_method", "S256".to_string()),
+    ])
+}
+
+/// [`RateLimiter::record`] is documented as reporting "how an ALLOWED attempt turned out", and a
+/// denied one never became an attempt at all. Reporting the deny back as
+/// [`AttemptOutcome::Failed`] drives the failure count with traffic the limiter itself refused,
+/// which is a feedback loop: a client that merely exceeded its ceiling then reads, to a host
+/// alerting on failure rate (which this crate tells hosts to do), exactly like a caller walking
+/// the redirect-URI space.
+///
+/// Every other classification site in this crate returns after a `Deny` WITHOUT recording —
+/// `authenticate_client`, `validate_direct_authorization_request`, `pending_grant_by_user_code`,
+/// `register_dynamic_client` — and says so in a comment. The second charge on the issuance path
+/// was the one that did not.
+#[tokio::test]
+async fn a_denied_authorization_request_is_never_reported_back_as_a_failure() {
+    // One allowance: the validation's charge. The issuance's second charge is the one denied.
+    let limiter = std::sync::Arc::new(CountingLimiter {
+        allow: 1,
+        checks: std::sync::Mutex::new(0),
+        records: std::sync::Mutex::new(Vec::new()),
+    });
+    let srv = limited_server(limiter.clone());
+    srv.register_client(limited_client()).await.unwrap();
+
+    let challenge = crate::pkce::code_challenge_s256(RFC7636_VERIFIER);
+    let validated = srv
+        .validate_authorization_request(&limited_request(&challenge))
+        .await
+        .expect("the first charge is allowed");
+    let refused = srv
+        .issue_authorization_code(crate::server::UserApproval::granted(&validated, "user-1"))
+        .await
+        .expect_err("the second charge is denied");
+    assert!(
+        matches!(refused, AuthorizationError::Redirect(_)),
+        "the refusal shape is unchanged: RFC 6749 s4.1.2.1 sends it to the validated redirect URI"
+    );
+
+    let records = limiter.records.lock().expect("no panic while held").clone();
+    assert_eq!(
+        records,
+        vec![AttemptOutcome::Succeeded],
+        "the only outcome is the ALLOWED validation's; a deny must be reported to nobody"
+    );
+}
+
+/// `SystemTime + Duration` PANICS on overflow, and [`ServerConfig::refresh_reuse_window`] is a
+/// plain public field with no validating constructor, so an absurd value from a host's config file
+/// is a panic inside the host's request handler rather than a startup failure. Every other TTL
+/// addition on a request path goes through [`saturating_deadline`]; the spent marker written by a
+/// refresh rotation was the one that did not.
+///
+/// The branch is the DEFAULT configuration's: `refresh_token_ttl` is `None`, so the chain has no
+/// absolute expiry and every rotation takes the `or_else`.
+#[tokio::test]
+async fn a_rotation_survives_an_absurd_reuse_window_rather_than_panicking() {
+    let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
+    // The shape a config file holding a nonsense number produces. `refresh_token_ttl` stays at its
+    // default `None`, which is what makes the rotation read this field at all.
+    config.refresh_reuse_window = Duration::MAX;
+    assert!(config.refresh_token_ttl.is_none());
+    let srv = AuthorizationServer::new(config, crate::store::MemoryStorage::new());
+    srv.register_client(limited_client()).await.unwrap();
+
+    let verifier = RFC7636_VERIFIER;
+    let challenge = crate::pkce::code_challenge_s256(verifier);
+    let validated = srv
+        .validate_authorization_request(&limited_request(&challenge))
+        .await
+        .unwrap();
+    let code = srv
+        .issue_authorization_code(crate::server::UserApproval::granted(&validated, "user-1"))
+        .await
+        .unwrap();
+    let issued = srv
+        .token(TokenRequest::AuthorizationCode {
+            client_id: ClientId::new("app"),
+            client_secret: None,
+            code: code.code,
+            redirect_uri: Some("https://app.example/cb".to_string()),
+            code_verifier: Some(verifier.to_string()),
+        })
+        .await
+        .unwrap();
+
+    let rotated = srv
+        .token(TokenRequest::RefreshToken {
+            client_id: ClientId::new("app"),
+            client_secret: None,
+            refresh_token: issued.refresh_token.expect("the grant mints one"),
+            scope: None,
+        })
+        .await
+        .expect("a rotation must not panic on a host-configured duration");
+    assert!(rotated.refresh_token.is_some(), "the chain continues");
+}
+
+/// The dummy assertion verification must be a COMPLETE one, or it does not cost what it is there
+/// to cost. A signature that is malformed, or a public key whose coordinates are not a point on
+/// P-256, is refused in the parse for a fraction of the work of a real verification, which is the
+/// timing leak `dummy_assertion_verify` exists to close, reintroduced at half the size and much
+/// harder to see. Checked against the crate's own backend: the constants verify, so the operation
+/// runs to the end.
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
+#[test]
+fn the_dummy_assertion_material_costs_a_complete_es256_verification() {
+    use crate::jwt::Es256Verifier as _;
+    assert!(
+        crate::jwt::P256Verifier.verify(
+            &dummy_assertion_key(),
+            DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
+            &DUMMY_ASSERTION_SIGNATURE,
+        ),
+        "the dummy signature must verify under the dummy key, or the verification short-circuits"
+    );
 }

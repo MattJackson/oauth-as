@@ -66,14 +66,20 @@ is):
   library and does not open sockets, terminate TLS, or count requests. RFC 8628 section 5.1 makes
   device user-code entropy adequate only in combination with rate limiting, and providing that is
   the host's job.
-- **Reuse detection does not contain a token minted during the signing window (0.9.0, HIGH).**
-  Refresh-token reuse and authorization-code replay both revoke a family, and both can be raced by
-  an issuance already in flight across the `await` inside ES256 signing: the revocation removes the
-  tombstone, then the in-flight issuance stores a live access token behind it. The window scales
-  with signing latency, so it is effectively closed for the built-in `jwt-p256` backend and OPEN
-  for a host `Es256Signer` that calls a remote KMS or HSM. This is CONFIRMED and reproduced; see
-  the known-defects section of `CHANGELOG.md` for the test names and the planned fix. Reported
-  already, so not a new finding, but an exploit that widens it or evades the planned fix is.
+- **Reuse detection during the signing window: FIXED in 0.9.1, kept here as the record.** In
+  0.9.0 both refresh-token reuse and authorization-code replay revoked a family and both could be
+  raced by an issuance already in flight across the `await` inside ES256 signing: the revocation
+  removed what was there, then the in-flight issuance stored a live access token behind it. The
+  window scaled with signing latency, so it was effectively closed for the built-in `jwt-p256`
+  backend and OPEN for a host `Es256Signer` calling a remote KMS or HSM.
+  0.9.1 closes it with the breaking `Storage` change: a revocation records a durable barrier, and
+  the writes that would resurrect what it removed are refused. The code-replay half needed a
+  second mechanism (a durable `Replayed` state plus a compare-and-swap), because a replayer races
+  an issuance that has not chosen a family yet and so has no family to record a barrier for. Both
+  reproductions shipped `#[ignore]`d in 0.9.0 and are green and un-ignored now.
+  A NEW FINDING HERE IS STILL A FINDING: an interleaving that gets past the barrier, or a
+  `Storage` implementation that satisfies the trait's wording while allowing one, is worth
+  reporting.
 
 - **The `Storage` trait's `take_*` operations must be genuinely atomic.** A host that implements
   them as read-then-delete on a multi-node deployment reintroduces double-spend. This is documented
@@ -99,9 +105,9 @@ newest version rather than being backported.
   library's source, drives the server as a black box.
 - The project runs adversarial security review, and mutation testing to check that the tests
   actually constrain the code rather than merely accompanying it. Mutation coverage is NOT yet
-  complete: `GOAL.md` gate 4 is open, and `MUTANTS.md` names every surviving mutant individually
-  rather than reporting a percentage. Read that file before assuming a green test run means the
-  tests would have caught a given change.
+  complete: surviving mutants are tracked individually rather than as a percentage, and the ones
+  not killed by a test are argued in writing beside the code they mutate. Do not assume a green
+  test run means the tests would have caught a given change.
 
 None of that makes the crate correct. It makes the claims checkable, which is the most any project
 can honestly offer.

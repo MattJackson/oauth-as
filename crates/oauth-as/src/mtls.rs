@@ -624,7 +624,9 @@ impl Confirmation {
     /// RESOURCE SERVER side of RFC 8705 section 3: whether the certificate on the connection the
     /// token was presented over is the one the token is bound to.
     ///
-    /// A resource server that has introspected a token (section 3.2) or verified a JWT (section
+    /// A resource server that has introspected a token (section 3.2 — a channel this server opens
+    /// to resource servers in 0.9.2; through 0.9.1 introspection answers only the token's own
+    /// client) or verified a JWT (section
     /// 3.1) calls this with the DER of the client certificate ITS OWN TLS layer verified. The two
     /// halves are equally load bearing, and this method can only do the second one: a certificate
     /// the resource server did not verify proves nothing, exactly as set out in this module's docs.
@@ -667,10 +669,9 @@ impl Confirmation {
 /// rather than on what the request happened to present. That direction is the security argument:
 ///
 /// - a [`ClientAuth::Mtls`] registration is decided here and ONLY here. It has no secret, so there
-///   is no string that could be the right one, and it never reaches the secret comparison. Note
-///   this holds even with this module compiled out: [`ClientAuth::verify_with`] answers `false`
-///   for the variant, so an mTLS registration in a build without the feature authenticates nobody
-///   rather than everybody.
+///   is no string that could be the right one, and it never reaches the secret comparison:
+///   [`ClientAuth::verify_with`] answers `false` for the variant, so no presented secret can
+///   authenticate an mTLS client by that route either.
 /// - every other registration is decided exactly as it was before, and a certificate presented
 ///   alongside is NOT an authentication credential there. It is used only for RFC 8705 section 3
 ///   token binding, which section 4 makes available to clients that authenticate some other way,

@@ -7,7 +7,7 @@
 #
 # ITS OWN WORKSPACE, deliberately. The root manifest carries the full argument (see the
 # `exclude = ["fuzz"]` block there); the short version is that this crate must enable `par`,
-# `jar`, `dpop`, `client_assertion` and the rest in order to fuzz the parsers behind them, and
+# `jar`, `dpop`, `client-assertion` and the rest in order to fuzz the parsers behind them, and
 # under resolver 2 a member's features are unified into every other member's build. Membership
 # therefore turned those features on for `oauth-as-postgres` and for `oauth-as`'s own test
 # targets and broke both. Excluded, this manifest resolves alone and cannot reach them.
@@ -56,7 +56,7 @@ default-features = false
 # `jwt-p256` rather than `jwt`: every one of these targets has to PRODUCE the credential it then
 # corrupts, and since the ES256 seam landed `jwt` is the trait surface and carries no curve. A
 # fuzzer that cannot sign cannot reach the verifier it exists to fuzz.
-features = ["http", "jwt-p256", "rar", "par", "jar", "dpop", "client_assertion", "mtls"]
+features = ["http", "jwt-p256", "rar", "par", "jar", "dpop", "client-assertion", "mtls"]
 
 # The shared fixtures (the server under test, the JWS builders, the RFC charset predicates). A
 # `lib` rather than an `#[path]` include in each target, so there is ONE definition of "the

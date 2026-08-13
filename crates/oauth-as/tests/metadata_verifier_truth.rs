@@ -10,9 +10,9 @@
 //! The two RFC 7523 methods do NOT have the same requirements, which is the whole of this file:
 //!
 //! - `client_secret_jwt` is HS256 over the registered secret. It needs no elliptic curve, so it
-//!   is honest in every build that has the `client_assertion` feature.
+//!   is honest in every build that has the `client-assertion` feature.
 //! - `private_key_jwt` is ES256. It needs a verifier, and since the signing seam landed there are
-//!   builds that have `client_assertion` and no verifier at all (`client_assertion = ["jwt"]`,
+//!   builds that have `client-assertion` and no verifier at all (`client-assertion = ["jwt"]`,
 //!   which does not pull `jwt-p256`, and no host verifier installed).
 //!
 //! So there are three states and the document has to be right in each:
@@ -26,7 +26,7 @@
 //! `tests/wire_reachability.rs` is the other half: it proves every value the document DOES name
 //! works over HTTP. This file is what stops the answer to that being "advertise nothing".
 
-#![cfg(feature = "client_assertion")]
+#![cfg(feature = "client-assertion")]
 
 use oauth_as::client_assertion::{CLIENT_SECRET_JWT, PRIVATE_KEY_JWT};
 use oauth_as::{AuthorizationServer, MemoryStorage, ServerConfig};
@@ -47,7 +47,7 @@ fn client_secret_jwt_is_advertised_whenever_the_feature_is_on() {
             .iter()
             .any(|m| m == CLIENT_SECRET_JWT),
         "client_secret_jwt is an HMAC over the registered secret and works in every \
-         client_assertion build: {:?}",
+         client-assertion build: {:?}",
         meta.token_endpoint_auth_methods_supported
     );
     let algs = meta
@@ -74,7 +74,7 @@ mod with_the_built_in_backend {
         );
         let algs = meta
             .token_endpoint_auth_signing_alg_values_supported
-            .expect("present under client_assertion");
+            .expect("present under client-assertion");
         assert!(algs.iter().any(|a| a == "ES256"), "{algs:?}");
     }
 }
@@ -138,7 +138,7 @@ mod without_the_built_in_backend {
         );
         let algs = meta
             .token_endpoint_auth_signing_alg_values_supported
-            .expect("present under client_assertion");
+            .expect("present under client-assertion");
         assert!(algs.iter().any(|a| a == "ES256"), "{algs:?}");
     }
 }

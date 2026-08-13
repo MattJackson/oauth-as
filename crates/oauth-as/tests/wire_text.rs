@@ -24,31 +24,94 @@ use oauth_as::{
 
 // --------------------------------------------------------------------- registered wire tokens
 
+/// EVERY `ErrorCode` variant with the one spelling the registries give it, gated exactly as the
+/// variants are so the table is complete in whatever configuration it is compiled in.
+///
+/// Completeness is the property that matters, and it is why the extension codes belong here rather
+/// than being left to whichever suite happens to assert one as a literal. `ErrorCode::as_str` is
+/// what writes the `error=` parameter of an authorization ERROR REDIRECT (see
+/// `AuthorizationErrorRedirect::location`), which is a code path serde never touches, so a wrong
+/// arm there — `InvalidTarget => "invalid_scope"` is the plausible one, since the two are adjacent
+/// in the same match — reaches a browser as a real answer while every serde-based assertion in the
+/// suite stays green.
+const REGISTERED_ERROR_CODES: &[(ErrorCode, &str)] = &[
+    // RFC 6749 section 5.2 (token endpoint).
+    (ErrorCode::InvalidRequest, "invalid_request"),
+    (ErrorCode::InvalidClient, "invalid_client"),
+    (ErrorCode::InvalidGrant, "invalid_grant"),
+    (ErrorCode::UnauthorizedClient, "unauthorized_client"),
+    (ErrorCode::UnsupportedGrantType, "unsupported_grant_type"),
+    (ErrorCode::InvalidScope, "invalid_scope"),
+    // RFC 6749 section 4.1.2.1 (authorization endpoint).
+    (ErrorCode::AccessDenied, "access_denied"),
+    (
+        ErrorCode::UnsupportedResponseType,
+        "unsupported_response_type",
+    ),
+    (ErrorCode::ServerError, "server_error"),
+    (ErrorCode::TemporarilyUnavailable, "temporarily_unavailable"),
+    // RFC 8628 section 3.5 (device access token request).
+    (ErrorCode::AuthorizationPending, "authorization_pending"),
+    (ErrorCode::SlowDown, "slow_down"),
+    (ErrorCode::ExpiredToken, "expired_token"),
+    // RFC 9396 section 5.
+    #[cfg(feature = "rar")]
+    (
+        ErrorCode::InvalidAuthorizationDetails,
+        "invalid_authorization_details",
+    ),
+    // RFC 8693 section 2.2.2 registers it; RFC 8707 section 2 directs an AS to use it for a
+    // `resource` indicator. This one reaches the authorization endpoint's error redirect.
+    (ErrorCode::InvalidTarget, "invalid_target"),
+    // RFC 9470 section 3.
+    #[cfg(feature = "consent")]
+    (
+        ErrorCode::InsufficientUserAuthentication,
+        "insufficient_user_authentication",
+    ),
+    // RFC 9449 section 5, registered by section 12.3.
+    #[cfg(feature = "dpop")]
+    (ErrorCode::InvalidDpopProof, "invalid_dpop_proof"),
+    // RFC 9101 section 7.
+    #[cfg(feature = "par")]
+    (ErrorCode::InvalidRequestUri, "invalid_request_uri"),
+    #[cfg(feature = "jar")]
+    (ErrorCode::InvalidRequestObject, "invalid_request_object"),
+    #[cfg(feature = "jar")]
+    (ErrorCode::RequestNotSupported, "request_not_supported"),
+];
+
 /// RFC 6749 section 5.2 and RFC 8628 section 3.5: each `error` code has ONE registered spelling,
 /// and `Display` must produce exactly it. A host that logs or renders `{err}` is looking at the
 /// same token the wire carries, so this pins `Display` to `as_str` rather than letting the two
 /// drift (or letting `Display` write nothing at all).
 #[test]
 fn error_code_display_is_the_registered_wire_token() {
-    for (code, wire) in [
-        (ErrorCode::InvalidRequest, "invalid_request"),
-        (ErrorCode::InvalidClient, "invalid_client"),
-        (ErrorCode::InvalidGrant, "invalid_grant"),
-        (ErrorCode::UnauthorizedClient, "unauthorized_client"),
-        (ErrorCode::UnsupportedGrantType, "unsupported_grant_type"),
-        (ErrorCode::InvalidScope, "invalid_scope"),
-        (ErrorCode::AccessDenied, "access_denied"),
-        (
-            ErrorCode::UnsupportedResponseType,
-            "unsupported_response_type",
-        ),
-        (ErrorCode::ServerError, "server_error"),
-        (ErrorCode::TemporarilyUnavailable, "temporarily_unavailable"),
-        (ErrorCode::AuthorizationPending, "authorization_pending"),
-        (ErrorCode::SlowDown, "slow_down"),
-        (ErrorCode::ExpiredToken, "expired_token"),
-    ] {
-        assert_eq!(format!("{code}"), wire);
+    for (code, wire) in REGISTERED_ERROR_CODES {
+        assert_eq!(&format!("{code}"), wire);
+        assert_eq!(&code.as_str(), wire);
+    }
+}
+
+/// THE TWO PATHS MUST NOT DRIFT. A code reaches the wire two entirely separate ways: through
+/// `serde`'s `rename_all = "snake_case"` when a JSON body is serialized, and through
+/// `ErrorCode::as_str` (which `Display` calls) when the authorization endpoint percent-encodes it
+/// into an error redirect's `error=` parameter. Nothing in the type system ties the two together,
+/// so a hand-written `as_str` arm can name a different registered code than serde does and only
+/// the redirect is wrong — which is the half no JSON schema assertion in this repo inspects.
+///
+/// Asserting the equality for every variant is what makes the `as_str` match arms falsifiable
+/// without writing the spelling out a third time.
+#[test]
+fn the_display_spelling_and_the_serde_spelling_are_the_same_string() {
+    for (code, _) in REGISTERED_ERROR_CODES {
+        let serialized = serde_json::to_value(code).expect("ErrorCode serializes to a JSON string");
+        assert_eq!(
+            serialized.as_str().expect("a JSON string"),
+            format!("{code}"),
+            "the serde spelling and the Display/as_str spelling of {code:?} have drifted; one of \
+             the two wire paths is now emitting a different registered code"
+        );
     }
 }
 
@@ -433,7 +496,7 @@ fn authorization_error_redirect_location_carries_every_present_member() {
 /// RFC 7523 section 3: every one of these refusals collapses to `invalid_client` on the wire, so
 /// the ONLY place the distinction survives is the host's audit channel, and that channel is this
 /// `Display`. An empty one turns a diagnosable `private_key_jwt` failure into a blank line.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[test]
 fn client_assertion_failure_display_names_the_check_that_refused() {
     use oauth_as::AssertionFailure;
@@ -483,7 +546,7 @@ fn client_assertion_failure_display_names_the_check_that_refused() {
 /// RFC 7591 section 2 and RFC 8414 `token_endpoint_auth_methods_supported`: these two names are
 /// registered spellings that a metadata document advertises and a client matches on, so the
 /// accessor has to produce exactly them and has to tell the two variants apart.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[test]
 fn assertion_keys_report_the_registered_auth_method_and_never_print_the_secret() {
     use oauth_as::client_assertion::ClientSecretKey;

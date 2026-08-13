@@ -22,6 +22,8 @@
 
 mod support;
 
+use support::far_future_window;
+
 // Ungated: the RFC 8628 device-grant tests below need every one of these and are themselves
 // ungated, so a narrower gate here would only be a second place to get the feature set wrong.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,7 +41,7 @@ fn scope() -> ScopeSet {
 
 // ---------------------------------------------------------------------- delete_client
 
-/// SURVIVOR: `crates/oauth-as/src/store.rs:535:45: replace != with == in delete_client`.
+/// SURVIVOR: `store.rs replace != with == in delete_client`.
 ///
 /// The line is the RFC 9126 half of the cascade,
 /// `g.pushed.retain(|_, p| &p.client_id != client_id)`. Flipped, `delete_client` keeps exactly the
@@ -59,38 +61,30 @@ async fn delete_client_takes_only_its_own_pushed_authorization_requests() {
     use oauth_as::par::PushedAuthorizationRequest;
 
     fn pushed(uri: &str, client: &str) -> PushedAuthorizationRequest {
-        PushedAuthorizationRequest {
-            request_uri: uri.to_string(),
-            client_id: ClientId::new(client),
-            response_type: Some("code".into()),
-            redirect_uri: Some("https://app.example/cb".into()),
-            scope: None,
-            state: None,
-            code_challenge: Some("x".repeat(43)),
-            code_challenge_method: Some("S256".into()),
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: None,
-            #[cfg(feature = "consent")]
-            acr_values: None,
-            #[cfg(feature = "consent")]
-            max_age: None,
-            expires_at: now() + Duration::from_secs(60),
-        }
+        let mut request = PushedAuthorizationRequest::new(
+            uri,
+            ClientId::new(client),
+            now() + Duration::from_secs(60),
+        );
+        request.response_type = Some("code".into());
+        request.redirect_uri = Some("https://app.example/cb".into());
+        request.code_challenge = Some("x".repeat(43));
+        request.code_challenge_method = Some("S256".into());
+        request
     }
 
     let store = MemoryStorage::new();
-    store
+    let _ = store
         .put_pushed_authorization_request(pushed("urn:doomed", "client-doomed"))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_pushed_authorization_request(pushed("urn:bystander", "client-bystander"))
         .await
         .unwrap();
 
     store
-        .delete_client(&ClientId::new("client-doomed"))
+        .delete_client(&ClientId::new("client-doomed"), far_future_window())
         .await
         .unwrap();
 
@@ -115,7 +109,7 @@ async fn delete_client_takes_only_its_own_pushed_authorization_requests() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/store.rs:548:31: delete ! in delete_client`.
+/// SURVIVOR: `store.rs delete ! in delete_client`.
 ///
 /// The line filters the user-code index down to the entries that no longer name a live grant,
 /// `.filter(|(_, dc)| !live.contains_key(*dc))`, so the cascade can drop them. Without the `!` the
@@ -159,7 +153,7 @@ async fn delete_client_keeps_the_user_code_index_of_the_grants_it_spared() {
         .unwrap();
 
     store
-        .delete_client(&ClientId::new("client-doomed"))
+        .delete_client(&ClientId::new("client-doomed"), far_future_window())
         .await
         .unwrap();
 
@@ -204,8 +198,8 @@ async fn delete_client_keeps_the_user_code_index_of_the_grants_it_spared() {
 #[tokio::test]
 async fn revoke_consent_counts_what_it_removed_even_when_the_kinds_are_uneven() {
     use oauth_as::{
-        AuthorizationCodeRecord, AuthorizationCodeState, CodeChallengeMethod, ConsentRecord,
-        DeviceGrant, DeviceGrantState, IssuedToken, RefreshTokenRecord, RefreshTokenState,
+        AuthorizationCodeRecord, ConsentRecord, DeviceGrant, DeviceGrantState, IssuedToken,
+        RefreshTokenRecord,
     };
 
     const CLIENT: &str = "client-uneven";
@@ -228,63 +222,38 @@ async fn revoke_consent_counts_what_it_removed_even_when_the_kinds_are_uneven() 
     // THREE access tokens, and one each of the other three kinds. Three is the smallest count that
     // makes the sum and the product of the four map lengths differ.
     for token in ["at-1", "at-2", "at-3"] {
-        store
-            .put_token(IssuedToken {
-                #[cfg(feature = "dpop")]
-                jkt: None,
-                #[cfg(feature = "mtls")]
-                x5t_s256: None,
-                resource: Vec::new(),
-                #[cfg(feature = "rar")]
-                authorization_details: Default::default(),
-                access_token: token.into(),
-                client_id: ClientId::new(CLIENT),
-                subject: Some(SUBJECT.into()),
-                scope: scope(),
-                issued_at: now(),
-                expires_at: now() + Duration::from_secs(3600),
-                family_id: None,
-                authentication: None,
-            })
+        let _ = store
+            .put_token(IssuedToken::new(
+                token,
+                ClientId::new(CLIENT),
+                Some(SUBJECT.into()),
+                scope(),
+                now(),
+                now() + Duration::from_secs(3600),
+            ))
             .await
             .unwrap();
     }
-    store
-        .put_refresh_token(RefreshTokenRecord {
-            #[cfg(feature = "dpop")]
-            jkt: None,
-            #[cfg(feature = "mtls")]
-            x5t_s256: None,
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: Default::default(),
-            refresh_token: "rt-1".into(),
-            client_id: ClientId::new(CLIENT),
-            subject: Some(SUBJECT.into()),
-            scope: scope(),
-            expires_at: None,
-            family_id: "fam-1".into(),
-            state: RefreshTokenState::Active,
-            authentication: None,
-        })
+    let _ = store
+        .put_refresh_token(RefreshTokenRecord::new(
+            "rt-1",
+            ClientId::new(CLIENT),
+            Some(SUBJECT.into()),
+            scope(),
+            "fam-1",
+        ))
         .await
         .unwrap();
     store
-        .put_authorization_code(AuthorizationCodeRecord {
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: Default::default(),
-            code: "code-1".into(),
-            client_id: ClientId::new(CLIENT),
-            redirect_uri: "https://app.example/cb".into(),
-            scope: scope(),
-            subject: SUBJECT.into(),
-            code_challenge: "x".repeat(43),
-            code_challenge_method: CodeChallengeMethod::S256,
-            expires_at: now() + Duration::from_secs(60),
-            state: AuthorizationCodeState::Issued,
-            authentication: None,
-        })
+        .put_authorization_code(AuthorizationCodeRecord::new(
+            "code-1",
+            ClientId::new(CLIENT),
+            "https://app.example/cb",
+            scope(),
+            SUBJECT,
+            "x".repeat(43),
+            now() + Duration::from_secs(60),
+        ))
         .await
         .unwrap();
     store
@@ -304,7 +273,10 @@ async fn revoke_consent_counts_what_it_removed_even_when_the_kinds_are_uneven() 
         .await
         .unwrap();
 
-    let removed = store.revoke_consent("consent-uneven").await.unwrap();
+    let removed = store
+        .revoke_consent("consent-uneven", far_future_window())
+        .await
+        .unwrap();
     assert_eq!(
         removed, 6,
         "revoke_consent removed 3 access tokens, 1 refresh record, 1 authorization code and 1 \
@@ -314,7 +286,7 @@ async fn revoke_consent_counts_what_it_removed_even_when_the_kinds_are_uneven() 
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/store.rs:796:31: delete ! in revoke_consent`.
+/// SURVIVOR: `store.rs delete ! in revoke_consent`.
 ///
 /// The same user-code index pass as `delete_client`'s, with the same inversion and the same
 /// consequence one level narrower: withdrawing ONE user's consent unindexes the device grants of
@@ -368,7 +340,10 @@ async fn revoke_consent_keeps_the_user_code_index_of_the_grants_it_spared() {
         .await
         .unwrap();
 
-    store.revoke_consent("consent-mine").await.unwrap();
+    store
+        .revoke_consent("consent-mine", far_future_window())
+        .await
+        .unwrap();
 
     assert!(
         store
@@ -391,7 +366,7 @@ async fn revoke_consent_keeps_the_user_code_index_of_the_grants_it_spared() {
 
 // ---------------------------------------------------------------------- sweep_expired
 
-/// SURVIVOR: `crates/oauth-as/src/store.rs:855:40: replace < with <= in sweep_expired`.
+/// SURVIVOR: `store.rs replace < with <= in sweep_expired`.
 ///
 /// The RFC 9126 pushed-request line, `g.pushed.retain(|_, p| now < p.expires_at)`. Relaxed to
 /// `<=`, a handle whose `expires_at` is exactly `now` is retained.
@@ -407,26 +382,15 @@ async fn sweep_expired_reaps_a_pushed_request_at_the_instant_it_expires() {
     use oauth_as::par::PushedAuthorizationRequest;
 
     let store = MemoryStorage::new();
-    store
-        .put_pushed_authorization_request(PushedAuthorizationRequest {
-            request_uri: "urn:boundary".into(),
-            client_id: ClientId::new("client-boundary"),
-            response_type: Some("code".into()),
-            redirect_uri: Some("https://app.example/cb".into()),
-            scope: None,
-            state: None,
-            code_challenge: Some("x".repeat(43)),
-            code_challenge_method: Some("S256".into()),
-            resource: Vec::new(),
-            #[cfg(feature = "rar")]
-            authorization_details: None,
-            #[cfg(feature = "consent")]
-            acr_values: None,
-            #[cfg(feature = "consent")]
-            max_age: None,
-            // Exactly `now`: the contract says `expires_at <= now` is dead, so this is dead.
-            expires_at: now(),
-        })
+    // Exactly `now`: the contract says `expires_at <= now` is dead, so this is dead.
+    let mut boundary =
+        PushedAuthorizationRequest::new("urn:boundary", ClientId::new("client-boundary"), now());
+    boundary.response_type = Some("code".into());
+    boundary.redirect_uri = Some("https://app.example/cb".into());
+    boundary.code_challenge = Some("x".repeat(43));
+    boundary.code_challenge_method = Some("S256".into());
+    let _ = store
+        .put_pushed_authorization_request(boundary)
         .await
         .unwrap();
 
@@ -447,7 +411,7 @@ async fn sweep_expired_reaps_a_pushed_request_at_the_instant_it_expires() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/store.rs:880:46: replace < with > in sweep_expired`.
+/// SURVIVOR: `store.rs replace < with > in sweep_expired`.
 ///
 /// The replay-claim line, `g.replay_ids.retain(|_, exp| now < *exp)`. Reversed, the sweep keeps
 /// exactly the claims that are already dead and REMOVES the ones that are still live.
@@ -462,7 +426,7 @@ async fn sweep_expired_reaps_a_pushed_request_at_the_instant_it_expires() {
 /// sweep instant, and `now < exp` and `now > exp` are both false at the boundary, so the mutant
 /// and the original reap it identically. This test claims a comfortably LIVE id, which is the only
 /// shape that separates them.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 #[tokio::test]
 async fn sweep_expired_leaves_replay_claims_that_are_still_live_claimed() {
     use oauth_as::{MemoryStorage, Storage};
@@ -490,7 +454,7 @@ async fn sweep_expired_leaves_replay_claims_that_are_still_live_claimed() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/store.rs:881:32: replace - with + in sweep_expired`.
+/// SURVIVOR: `store.rs replace - with + in sweep_expired`.
 ///
 /// The replay-claim tally, `removed += (before - g.replay_ids.len())`, becomes an ADDITION, so the
 /// sweep reports the number of claims it started with plus the number it kept.
@@ -500,7 +464,7 @@ async fn sweep_expired_leaves_replay_claims_that_are_still_live_claimed() {
 /// dead claim and one live one, which is the smallest fixture where the two disagree, and the
 /// difference is visible to the host: the sweep interval is tuned on this number, and a store that
 /// over-reports looks like it is reclaiming steadily while the table grows.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 #[tokio::test]
 async fn sweep_expired_counts_only_the_replay_claims_it_actually_reclaimed() {
     use oauth_as::{MemoryStorage, Storage};

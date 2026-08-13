@@ -91,6 +91,7 @@ fn ungated_path_allocation_gates() {
         ("rar_parse_bound", rar_parse_bound),
         ("rar_narrowing_bound", rar_narrowing_bound),
         ("consent_lookup_bound", consent_lookup_bound),
+        ("acr_values_refusal_bound", acr_values_refusal_bound),
         // `jwt-p256`, not `jwt`: both fixtures need a key that can actually sign, and after the
         // `Es256Signer` seam landed `jwt` carries the trait and no curve.
         #[cfg(feature = "jwt-p256")]
@@ -465,10 +466,7 @@ fn dpop_proof_verification_bound() {
             client_secret: Some(SECRET.to_string()),
             scope: None,
         },
-        oauth_as::TokenRequestContext {
-            dpop_proof: Some(&dpop_proof(&key, "warm")),
-            ..Default::default()
-        },
+        oauth_as::TokenRequestContext::default().with_dpop_proof(&dpop_proof(&key, "warm")),
     ))
     .unwrap();
 
@@ -483,10 +481,7 @@ fn dpop_proof_verification_bound() {
     let (response, d) = measure(|| {
         rt.block_on(srv.token_with_context(
             request,
-            oauth_as::TokenRequestContext {
-                dpop_proof: Some(&proof),
-                ..Default::default()
-            },
+            oauth_as::TokenRequestContext::default().with_dpop_proof(&proof),
         ))
     });
     assert_eq!(response.unwrap().token_type, oauth_as::TokenType::Dpop);
@@ -507,7 +502,7 @@ fn dpop_proof_verification_bound() {
 /// check were ever short-circuited: a DPoP verification that allocated the same as no verification
 /// at all would be doing no work.
 // `jwt-p256` as well as the feature itself: the fixture has to SIGN, and after the
-// `Es256Signer` seam landed neither `dpop` nor `client_assertion` implies a curve.
+// `Es256Signer` seam landed neither `dpop` nor `client-assertion` implies a curve.
 #[cfg(all(feature = "dpop", feature = "jwt-p256"))]
 fn token_request_with_no_dpop_proof_bound() {
     let rt = current_thread_runtime();
@@ -534,10 +529,7 @@ fn token_request_with_no_dpop_proof_bound() {
         let (_, d) = measure(|| {
             rt.block_on(srv.token_with_context(
                 request,
-                oauth_as::TokenRequestContext {
-                    dpop_proof: Some(&proof),
-                    ..Default::default()
-                },
+                oauth_as::TokenRequestContext::default().with_dpop_proof(&proof),
             ))
         });
         d.allocs
@@ -563,8 +555,8 @@ fn token_request_with_no_dpop_proof_bound() {}
 /// Dominated by the same JWS machinery DPoP uses plus the single-use `jti` claim, and it had no
 /// gate.
 // `jwt-p256` as well as the feature itself: the fixture has to SIGN, and after the
-// `Es256Signer` seam landed neither `dpop` nor `client_assertion` implies a curve.
-#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+// `Es256Signer` seam landed neither `dpop` nor `client-assertion` implies a curve.
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 fn client_assertion_verification_bound() {
     use oauth_as::client_assertion::{AssertionKeys, CLIENT_ASSERTION_TYPE};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -612,10 +604,10 @@ fn client_assertion_verification_bound() {
         scope: None,
     };
     fn context(a: &str) -> oauth_as::TokenRequestContext<'_> {
-        oauth_as::TokenRequestContext {
-            credential: oauth_as::ClientCredential::assertion(Some(CLIENT_ASSERTION_TYPE), a),
-            ..Default::default()
-        }
+        oauth_as::TokenRequestContext::new(oauth_as::ClientCredential::assertion(
+            Some(CLIENT_ASSERTION_TYPE),
+            a,
+        ))
     }
     let warm = assertion("warm");
     rt.block_on(srv.token_with_context(request(), context(&warm)))
@@ -629,7 +621,7 @@ fn client_assertion_verification_bound() {
     check("client assertion verification", d, CLIENT_ASSERTION);
 }
 
-#[cfg(not(all(feature = "client_assertion", feature = "jwt-p256")))]
+#[cfg(not(all(feature = "client-assertion", feature = "jwt-p256")))]
 fn client_assertion_verification_bound() {}
 
 // ------------------------------------------------------------------- RFC 8693 token exchange
@@ -738,6 +730,48 @@ fn consent_lookup_bound() {
 #[cfg(not(feature = "consent"))]
 fn consent_lookup_bound() {}
 
+/// RFC 9470 s4 `acr_values`, which is ONE parameter carrying a space-delimited list, arriving
+/// unauthenticated at `GET /authorize` and at the RFC 9126 push.
+///
+/// This is a denial-of-service budget and not a tidiness gate. Parsing stores one `Box<str>`, which
+/// is one heap allocation, per non-empty segment. The cheapest input is `"a a a ..."` at two bytes
+/// a token, so before `MAX_ACR_VALUES` existed a 64 KiB body (`MAX_BODY_BYTES`) bought about 32,768
+/// allocations from a single parameter, and a URL is not bounded by that constant at all. MEASURED
+/// on the 20,000-class input below by putting the pre-cap parse back and running this gate,
+/// `--all-features`: 20,010 allocations and 1,067,552 bytes of traffic, of which 523,264 was freed
+/// again as the `Vec` grew through the buffers it doubled out of. One parameter.
+///
+/// The bound is EXACTLY ZERO because zero is the claim: an oversized parameter is refused after a
+/// counting pass that allocates nothing, and the refusal's own description is a `&'static str`. The
+/// refusal is asserted alongside it, so the gate cannot pass by the parse having been deleted.
+#[cfg(feature = "consent")]
+fn acr_values_refusal_bound() {
+    use oauth_as::consent::{AuthenticationRequirement, MAX_ACR_VALUES};
+
+    // Built OUTSIDE the window: the attacker's bytes are the wire's allocation, not the parse's.
+    let oversized = "a ".repeat(20_000);
+    let (refused, d) =
+        measure(|| AuthenticationRequirement::from_pairs([("acr_values", &oversized)]));
+    // The allocation gate is asserted FIRST so that a regression reports the figure rather than
+    // `Debug`-printing twenty thousand parsed classes.
+    check("acr_values refusal", d, ACR_REFUSAL);
+    assert!(
+        refused.is_err(),
+        "acr_values past the cap is refused, not truncated: it parsed {} classes",
+        refused.map(|r| r.acr_values.len()).unwrap_or(0)
+    );
+
+    // The cap REFUSES rather than truncates, so the largest accepted list is stored whole. Anything
+    // else would answer a step-up challenge with a class the user never satisfied.
+    let at_cap = vec!["urn:acr:phr"; MAX_ACR_VALUES].join(" ");
+    let accepted = AuthenticationRequirement::from_pairs([("acr_values", &at_cap)])
+        .expect("a list AT the cap is accepted");
+    assert_eq!(accepted.acr_values.len(), MAX_ACR_VALUES);
+}
+
+#[cfg(not(feature = "consent"))]
+fn acr_values_refusal_bound() {}
+
 // -------------------------------------------------------------------------- RFC 7517 JWKS
 
 /// RFC 7517: building the JWKS document a resource server fetches to verify RFC 9068 tokens
@@ -835,9 +869,17 @@ const AUTHZ_ISSUE: (usize, usize) = (17, 800);
 /// this is a read-modify-write, so the grant is cloned out of the map and the old copy dropped.
 const DEVICE_APPROVE: (usize, usize) = (14, 672);
 
-/// Observed 7 / 394 on every feature set, and it FREES 1798: revocation is the one endpoint whose
-/// job is to give memory back, and the family cascade is why it gives back four times what it takes.
-const REVOKE: (usize, usize) = (10, 512);
+/// Observed 9 / 662 on every feature set, and it FREES 1798: revocation is the one endpoint whose
+/// job is to give memory back, and the family cascade is why it gives back nearly three times what
+/// it takes.
+///
+/// It was 7 / 394 through 0.9.0. The two extra allocations and 268 extra bytes are the
+/// [`oauth_as::store::RevocationBarrier`] this path now records: the `Box<str>` holding the
+/// `family_id`, and the barrier map's first bucket table, which is a one-time store cost the way
+/// every other map's is. That is what a revocation which a concurrent rotation cannot undo costs,
+/// on the endpoint whose entire purpose is to revoke, and it is paid once per revocation rather
+/// than per request.
+const REVOKE: (usize, usize) = (12, 800);
 
 /// EXACTLY ZERO, on every feature set, and the bound is zero rather than a budget because zero is
 /// the claim. RFC 7009 s2.2 makes an unknown token a 200, which means any authenticated client can
@@ -878,7 +920,7 @@ const DPOP_ABSENT: (usize, usize) = (16, 2224);
 /// `Box::pin` coming off, one from the DPoP one, and one more from the token endpoint URL being
 /// precomputed on the server rather than formatted per verification. For a `private_key_jwt`
 /// deployment this is every token request it makes.
-#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 const CLIENT_ASSERTION: (usize, usize) = (49, 4448);
 
 /// Observed 11 / 1051: reading and type-checking the subject token, then a full issuance. Cheaper
@@ -903,6 +945,12 @@ const RAR_NARROW: (usize, usize) = (7, 210);
 /// instead, deliberately, and that trade is only sound while this stays at zero.
 #[cfg(feature = "consent")]
 const CONSENT_LOOKUP: (usize, usize) = (0, 0);
+
+/// EXACTLY ZERO, and zero is the claim: refusing an oversized `acr_values` costs a counting pass
+/// over borrowed bytes and a `&'static str` description. Observed 20,010 allocs / 1,067,552 bytes
+/// with the cap taken back out, on the same input, all of it chosen by an unauthenticated request.
+#[cfg(feature = "consent")]
+const ACR_REFUSAL: (usize, usize) = (0, 0);
 
 /// Observed 19 allocs / 3255 bytes `--all-features`, against 11 / 1683 for the same issuance with
 /// opaque tokens: the RFC 9068 profile costs roughly 8 allocations and 1.6 KB of transient traffic

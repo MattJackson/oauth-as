@@ -223,3 +223,90 @@ async fn another_clients_refresh_token_is_refused_without_being_destroyed() {
     .await
     .expect("the owner's chain must have survived another client's failed presentation");
 }
+
+/// THE ORDER of the two judgements above, which is a security property in its own right and is the
+/// exact counterpart of `tests/code_replay_ordering.rs` on the authorization-code path.
+///
+/// Reuse detection is DESTRUCTIVE: it revokes the whole grant, by design (RFC 9700 section
+/// 4.14.2). That makes it a capability, and a capability must be reachable only by the client the
+/// token was issued to. The ownership check therefore has to run FIRST. If it is evaluated after
+/// the reuse branch, then any registered client that gets hold of ONE superseded refresh token of
+/// somebody else's — a value that is, by construction, already dead and therefore treated
+/// carelessly — can post it under its own credentials and destroy the victim's entire grant: a
+/// remote kill switch that costs the attacker nothing and that the victim experiences as an
+/// unexplained logout.
+///
+/// The refusal is identical either way, so the wire answer proves nothing. What discriminates is
+/// what SURVIVES the stranger's request.
+#[tokio::test]
+async fn a_stranger_presenting_a_rotated_refresh_token_cannot_revoke_the_victims_grant() {
+    let clock = ManualClock::at_epoch();
+    let srv = server_with(
+        clock,
+        vec![confidential_client(), other_confidential_client()],
+    )
+    .await;
+    let issued = mint_code_token(
+        &srv,
+        "confidential-app",
+        Some(CONFIDENTIAL_SECRET),
+        CONFIDENTIAL_REDIRECT,
+        "read",
+        "user-1",
+    )
+    .await;
+    let rt1 = issued.refresh_token.expect("the code grant issues a chain");
+
+    // The owner rotates normally, which leaves rt1 RETAINED AND SPENT: the state the destructive
+    // branch keys on, and the state the cross-client test above never reaches because it presents
+    // a live token.
+    let rotated = srv
+        .token(TokenRequest::RefreshToken {
+            client_id: ClientId::new("confidential-app"),
+            client_secret: Some(CONFIDENTIAL_SECRET.to_string()),
+            refresh_token: rt1.clone(),
+            scope: None,
+        })
+        .await
+        .expect("the owner's own rotation succeeds");
+    let rt2 = rotated
+        .refresh_token
+        .expect("rotation issues a replacement");
+
+    // The stranger: someone else's superseded token, its own client id, its own secret.
+    let err = srv
+        .token(TokenRequest::RefreshToken {
+            client_id: ClientId::new("other-app"),
+            client_secret: Some(OTHER_CONFIDENTIAL_SECRET.to_string()),
+            refresh_token: rt1,
+            scope: None,
+        })
+        .await
+        .expect_err("a refresh token is bound to the client it was issued to, spent or not");
+    assert_eq!(err.error, ErrorCode::InvalidGrant);
+
+    // THE ASSERTION THAT DECIDES IT. If the reuse branch ran before the ownership check, the
+    // stranger's request has just revoked the family and this rotation is dead.
+    srv.token(TokenRequest::RefreshToken {
+        client_id: ClientId::new("confidential-app"),
+        client_secret: Some(CONFIDENTIAL_SECRET.to_string()),
+        refresh_token: rt2,
+        scope: None,
+    })
+    .await
+    .expect("a stranger's presentation must not revoke the victim's live refresh chain");
+
+    // And the access tokens of the grant, which the family revocation would have taken with it.
+    let resp = srv
+        .introspection_response(
+            &ClientId::new("confidential-app"),
+            Some(CONFIDENTIAL_SECRET),
+            &rotated.access_token,
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.active,
+        "a stranger's presentation must not revoke the victim's access tokens either"
+    );
+}

@@ -61,6 +61,7 @@
 #![deny(missing_docs)]
 
 use sqlx::postgres::{PgPoolOptions, Postgres};
+use sqlx::Executor;
 use sqlx::{Pool, Transaction};
 
 mod error;
@@ -89,6 +90,53 @@ pub use time::{from_nanos, to_nanos};
 /// it to be has a different problem (a sweep interval too long for its issuance rate), and a knob
 /// would let that problem be tuned around rather than found.
 pub const SWEEP_BATCH_ROWS: usize = 5_000;
+
+/// The advisory-lock key [`PostgresStorage::migrate`] serialises on.
+///
+/// Advisory locks live in ONE cluster-wide space that every application sharing the database draws
+/// from, so the value matters: it is the ASCII bytes of `oauth_as`, read as a big-endian integer,
+/// which is as close to a namespace as that space offers and is stable for as long as this crate
+/// is called what it is. It is deliberately not derived from a schema name, because two nodes
+/// migrating the SAME database is exactly the case it exists for.
+const MIGRATION_LOCK_KEY: i64 = 0x6f61_7574_685f_6173;
+
+/// Every checked-in migration this build needs, on one connection, in order.
+///
+/// The advisory lock is taken FIRST and the whole thing runs in one transaction, which is what
+/// makes concurrent callers safe: see [`PostgresStorage::migrate`].
+async fn apply_migrations(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    // Transaction scoped, so a node that dies mid-migration releases it by disconnecting rather
+    // than leaving every other node waiting for a lock nothing will ever free. DDL is transactional
+    // in PostgreSQL, so the rollback that goes with it leaves no half-applied schema behind either.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
+    // A bare `&str` with no bound parameters runs over the SIMPLE query protocol, which is what
+    // lets one call carry a whole multi-statement script — which is what a migration file is. It
+    // binds nothing, so there is no parameter to inject into. (`sqlx::raw_sql` says the same thing
+    // more explicitly and was what this used before the lock; on a `&mut PgConnection` its
+    // higher-ranked bounds are what make the enclosing future stop being `Send`, and `migrate()`
+    // being spawnable matters more than the extra word.)
+    conn.execute(include_str!("../migrations/0001_core.sql"))
+        .await?;
+    #[cfg(feature = "par")]
+    conn.execute(include_str!("../migrations/0002_par.sql"))
+        .await?;
+    #[cfg(feature = "consent")]
+    conn.execute(include_str!("../migrations/0003_consent.sql"))
+        .await?;
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
+    conn.execute(include_str!("../migrations/0004_replay.sql"))
+        .await?;
+    // NOT feature gated, unlike the three above, and the asymmetry is deliberate: only the
+    // `consent` build ever WRITES a consent-scoped barrier, but every build READS this table on
+    // every issuance, because `put_token` consults it unconditionally. A feature gate here would
+    // turn a default-features deployment's first token into a missing-table error.
+    conn.execute(include_str!("../migrations/0005_revocation_barriers.sql"))
+        .await?;
+    Ok(())
+}
 
 /// A [`oauth_as::store::Storage`] backed by a PostgreSQL connection pool.
 ///
@@ -150,30 +198,40 @@ impl PostgresStorage {
 
     /// Apply the checked-in schema for the features this crate was compiled with.
     ///
-    /// Every statement is `CREATE ... IF NOT EXISTS`, so this is safe to run on every boot, and
-    /// safe to run concurrently from several nodes starting at once.
+    /// Every statement is `CREATE ... IF NOT EXISTS`, so this is safe to run on every boot. It is
+    /// also safe to run concurrently from several nodes starting at once, and THAT part is not
+    /// something `IF NOT EXISTS` provides: in PostgreSQL the existence check and the catalogue
+    /// insert are not one atomic step, so two sessions running the same `CREATE TABLE IF NOT
+    /// EXISTS` can both pass the check and the loser gets `23505 duplicate key value violates
+    /// unique constraint "pg_type_typname_nsp_index"`. A replica set rolling out against a fresh
+    /// database would crash-loop on that until one node's DDL committed. What makes the claim true
+    /// is [`MIGRATION_LOCK_KEY`] below: the whole migration runs in ONE transaction holding one
+    /// advisory lock, so the second node waits and then finds everything already there.
     ///
     /// FEATURE-SHAPED, deliberately: a build without `par` never creates the pushed-request
     /// table, because nothing in that build could write to it. Turning a feature on later and
     /// re-running this adds the table it needs.
+    ///
+    /// SCHEMA ONLY. Nothing here rewrites a stored `payload`, and 0.9.1 briefly shipped a
+    /// migration that did: it backfilled the four grant instants this release added to records a
+    /// 0.9.0 node had already written. That is no longer needed, because the core gives all four
+    /// fields a `#[serde(default)]` of `UNIX_EPOCH`, which covers strictly more — including the
+    /// 0.9.0 node still WRITING during a rolling upgrade, which no migration can reach. It was
+    /// also the wrong shape for this crate: an unbounded single-statement rewrite of every live
+    /// credential row, holding a lock on each one, which is exactly what [`SWEEP_BATCH_ROWS`]
+    /// exists to avoid on the sweep — and here it would have run inside the transaction holding
+    /// the lock every other node is waiting on to boot.
     pub async fn migrate(&self) -> Result<(), SetupError> {
-        // `raw_sql` runs a multi-statement script over the simple query protocol, which is what a
-        // migration file is. It binds nothing, so there is no parameter to inject into.
-        sqlx::raw_sql(include_str!("../migrations/0001_core.sql"))
-            .execute(&self.pool)
-            .await?;
-        #[cfg(feature = "par")]
-        sqlx::raw_sql(include_str!("../migrations/0002_par.sql"))
-            .execute(&self.pool)
-            .await?;
-        #[cfg(feature = "consent")]
-        sqlx::raw_sql(include_str!("../migrations/0003_consent.sql"))
-            .execute(&self.pool)
-            .await?;
-        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
-        sqlx::raw_sql(include_str!("../migrations/0004_replay.sql"))
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        // The body is a free function taking `&mut PgConnection` rather than statements written
+        // inline here, and that is not a style choice: running the scripts on a CONNECTION rather
+        // than on the pool is what the advisory lock requires, and doing it inline made the future
+        // this returns depend on a higher-ranked `Executor` bound that rustc cannot prove is
+        // `Send`, so `migrate()` stopped being something a host could `tokio::spawn` — which is
+        // exactly what a host does at startup. `tests/revocation_races.rs` spawns it, so that
+        // cannot regress unnoticed.
+        apply_migrations(&mut tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -186,7 +244,7 @@ impl PostgresStorage {
     ///
     /// One `TRUNCATE` over every table, so a caller cannot observe a half-emptied store.
     pub async fn truncate_all(&self) -> Result<(), SetupError> {
-        // `mut` only when a feature below pushes onto it; a default build has five tables.
+        // `mut` only when a feature below pushes onto it; a default build has six tables.
         #[allow(unused_mut)]
         let mut tables: Vec<&str> = vec![
             "oauth_as_clients",
@@ -194,12 +252,18 @@ impl PostgresStorage {
             "oauth_as_authorization_codes",
             "oauth_as_access_tokens",
             "oauth_as_refresh_tokens",
+            // NOT feature gated, for the same reason its migration is not: every build records
+            // client and family barriers. Leaving it out made this method's own promise false, and
+            // the harness caught it: barriers survived a truncate, so a check that revoked one
+            // family saw a LATER check's unrelated token refused, which reads as "the barrier
+            // matches too widely" when the real fault is a store that was never emptied.
+            "oauth_as_revocation_barriers",
         ];
         #[cfg(feature = "par")]
         tables.push("oauth_as_pushed_requests");
         #[cfg(feature = "consent")]
         tables.push("oauth_as_consents");
-        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        #[cfg(any(feature = "client-assertion", feature = "dpop"))]
         tables.push("oauth_as_replay_ids");
         // The table names are this crate's own literals, not caller data, so the join cannot be
         // an injection point; `TRUNCATE` takes no bind parameters, so there is no alternative.

@@ -11,7 +11,7 @@
 //!
 //! Each test asserts the REFUSAL rather than `should_panic`: the property is that no panic happens,
 //! and that the refusal is the one the module already had for a time claim it will not accept.
-#![cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+#![cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 // Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
 // signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
 // all, so in that build there is nothing here that could run.

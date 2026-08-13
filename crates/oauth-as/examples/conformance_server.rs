@@ -39,7 +39,7 @@
 //! have: the RFC 6749 s10.12 consent step, and the CSRF protection on the RFC 8628 verification
 //! form. They are off because the harness is not a browser, and they are spelled out by name at
 //! the wiring site below so that copying them is a deliberate act rather than an accident. Do not
-//! copy them. See `ServiceBuilder::with_consent_resolver` and `ServiceBuilder::with_csrf_tokens`
+//! copy them. See `ServiceBuilder::with_approval_resolver` and `ServiceBuilder::with_csrf_tokens`
 //! for what a production host wires instead.
 //!
 //! It also signs with a key whose private half is printed in an RFC and therefore known to
@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, ServiceBuilder};
+use oauth_as::http::{ApprovalDecision, ServiceBuilder};
 use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
@@ -103,7 +103,30 @@ const SEEDED_KID: &str = "conformance-es256-1";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("OAUTH_AS_ADDR").unwrap_or_else(|_| "127.0.0.1:8914".to_string());
     let issuer = std::env::var("OAUTH_AS_ISSUER").unwrap_or_else(|_| format!("http://{addr}"));
-    let seed = std::env::var("OAUTH_AS_CONFORMANCE_SEED").as_deref() == Ok("1");
+    // TWO conditions, not one, and for the reason `production_server.rs` gives for its dev login:
+    // a flag alone survives being copied into a deployment's environment file, and everything this
+    // flag arms is a fixture (a hard-coded client secret, an RFC-PUBLISHED signing key,
+    // auto-approval of every authorization request, and the device form's verification protections
+    // turned off by a method whose name begins `dangerously_`). The second condition costs this
+    // example nothing, because every way it is driven binds loopback already, and it cannot be
+    // satisfied by accident anywhere else.
+    let seed = match (
+        std::env::var("OAUTH_AS_CONFORMANCE_SEED").as_deref() == Ok("1"),
+        issuer.starts_with("http://127.0.0.1")
+            || issuer.starts_with("http://[::1]")
+            || issuer.starts_with("http://localhost"),
+    ) {
+        (true, true) => true,
+        (true, false) => {
+            return Err(
+                "OAUTH_AS_CONFORMANCE_SEED refuses to arm for a non-loopback issuer: it \
+                        turns on a published signing key, a hard-coded client secret, \
+                        auto-approval and the device form's dangerous verification override"
+                    .into(),
+            )
+        }
+        (false, _) => false,
+    };
 
     // RFC 8628 s3.2: the device page the user is sent to. Under the issuer, so the router serves
     // it; a real host would put its own branded page here instead.
@@ -157,16 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         // * `with_subject_resolver` returning a constant: every request is the same user. Real
         //   hosts read their own session.
-        // * `with_consent_resolver` returning `Approve`: RFC 6749 s10.12 consent, deleted. Any
+        // * `with_approval_resolver` returning `Approve`: RFC 6749 s10.12 consent, deleted. Any
         //   cross-site navigation would silently issue a code for a logged-in user. A real host
-        //   returns `ConsentDecision::Respond` with a consent screen and approves only after the
+        //   returns `ApprovalDecision::Respond` with a consent screen and approves only after the
         //   user has answered it.
         // * `dangerously_disable_verification_protections`: RFC 6749 s10.12 CSRF protection on
         //   the device verification form, deleted. On a browser-reachable endpoint that is the
         //   complete cross-site forced-approval chain, which is account takeover.
         builder = builder
             .with_subject_resolver(|_headers| Some(SEEDED_SUBJECT.to_string()))
-            .with_consent_resolver(|_request| ConsentDecision::Approve)
+            .with_approval_resolver(|_request| ApprovalDecision::Approve)
             .dangerously_disable_verification_protections();
     }
     // The library hands back a framework-free service; the adapter is what puts it on axum.

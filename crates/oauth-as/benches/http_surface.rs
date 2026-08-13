@@ -25,7 +25,7 @@ use std::sync::Arc;
 use oauth_as::http::Body;
 #[cfg(feature = "http")]
 use oauth_as::{
-    AuthorizationServer, Client, ClientAuth, ClientId, ConsentDecision, GrantType, MemoryStorage,
+    ApprovalDecision, AuthorizationServer, Client, ClientAuth, ClientId, GrantType, MemoryStorage,
     ScopeSet, ServerConfig, ServiceBuilder,
 };
 
@@ -96,7 +96,7 @@ fn main() {
         // a benchmark: a real consent resolver reads the host's session store, and the cost of that
         // belongs to the host, not to this crate. Measuring it here would be measuring the fixture.
         .with_subject_resolver(|_headers| Some("user-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("service");
 

@@ -172,6 +172,12 @@ async fn the_policy_seam_decides_who_may_register() {
 /// The policy sees the metadata BEFORE anything is written, so a host can refuse on content (a
 /// redirect URI on a domain it will not serve, a `client_name` impersonating the deployment) and
 /// nothing reaches the store.
+///
+/// The assertion that carries the name is the STORE: this runs over `NoWrites`, which panics on
+/// `put_client`, so a policy refusal that wrote the row first would abort here rather than pass.
+/// Until the 0.9.1 audit this test held a `MemoryStorage` it never read again, and the only sister
+/// test that installed `NoWrites` was refused by the limiter one step EARLIER, so no test drove
+/// the policy-deny path against a store that objected to being written to.
 #[tokio::test]
 async fn a_policy_refusal_writes_nothing() {
     struct RefuseByName;
@@ -183,11 +189,11 @@ async fn a_policy_refusal_writes_nothing() {
             }
         }
     }
-    let srv = AuthorizationServer::new(
-        server_config(Some(registration_config())),
-        MemoryStorage::new(),
-    )
-    .with_registration_policy(Box::new(RefuseByName));
+    let store = NoWrites {
+        inner: MemoryStorage::new(),
+    };
+    let srv = AuthorizationServer::new(server_config(Some(registration_config())), store)
+        .with_registration_policy(Box::new(RefuseByName));
 
     let mut metadata = code_client_metadata();
     metadata.client_name = Some("Sign in with as.example".to_string());
@@ -196,6 +202,232 @@ async fn a_policy_refusal_writes_nothing() {
         .await
         .expect_err("the host refused this one");
     assert!(matches!(failure, RegistrationFailure::Unauthorized));
+}
+
+// -------------------------------------------------------------------------------- throttle
+
+/// A limiter that refuses registration and allows everything else, plus a record of what it was
+/// asked and told. A policy decides on CONTENT; this decides on VOLUME, and the two are different
+/// instruments for different attacks.
+#[derive(Default)]
+struct RegistrationThrottle {
+    deny: bool,
+    seen: Mutex<Vec<String>>,
+}
+
+impl oauth_as::RateLimiter for RegistrationThrottle {
+    fn check(&self, attempt: oauth_as::Attempt<'_>) -> oauth_as::RateLimitDecision {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("check {attempt:?}"));
+        match attempt {
+            oauth_as::Attempt::ClientRegistration if self.deny => oauth_as::RateLimitDecision::Deny,
+            _ => oauth_as::RateLimitDecision::Allow,
+        }
+    }
+
+    fn record(&self, attempt: oauth_as::Attempt<'_>, outcome: oauth_as::AttemptOutcome) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("record {attempt:?} {outcome:?}"));
+    }
+}
+
+/// THE ATTACK: a loop over the registration endpoint of a deployment that opened it.
+///
+/// This is the one endpoint whose records are PERMANENT. A `Client` carries no expiry and
+/// `Storage::sweep_expired` reclaims none of them, so where an unthrottled token endpoint is a
+/// burst a deployment rides out, an unthrottled registration endpoint is growth that never comes
+/// back. RFC 7591 section 5 describes the endpoint as available to anyone on the internet, and a
+/// `RegistrationPolicy` cannot be the answer: it is handed the metadata document, which says
+/// nothing about how many of them have arrived.
+///
+/// The assertion is the STORE, not the return value: the property being bought is that no row was
+/// written, so the store this runs against refuses to write one at all.
+#[tokio::test]
+async fn a_registration_the_hosts_limiter_refuses_writes_no_client() {
+    let throttle = std::sync::Arc::new(RegistrationThrottle {
+        deny: true,
+        seen: Mutex::default(),
+    });
+    let store = NoWrites {
+        inner: MemoryStorage::new(),
+    };
+    let srv = AuthorizationServer::new(server_config(Some(registration_config())), store)
+        .with_registration_policy(Box::new(OpenPolicy))
+        .with_rate_limiter(Box::new(ThrottleHandle(throttle.clone())));
+
+    let failure = srv
+        .register_dynamic_client(&code_client_metadata(), None)
+        .await
+        .expect_err("the host's limiter refused this one");
+
+    // The same answer the policy refusal gives, and deliberately: a caller must not learn from the
+    // wire whether it was the content or the rate that stopped them.
+    assert!(
+        matches!(failure, RegistrationFailure::Unauthorized),
+        "expected Unauthorized, got {failure:?}"
+    );
+    assert_eq!(failure.http_status(), 401);
+
+    // The limiter was asked BEFORE the policy: the policy is host code that may do arbitrary work,
+    // and a throttle consulted after it has not throttled the expensive part.
+    let seen = throttle
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        seen,
+        vec!["check ClientRegistration".to_string()],
+        "the limiter must be asked once, and a refused registration must report no outcome for \
+         work that never happened"
+    );
+}
+
+/// The other side: with the limiter allowing, a registration goes through and the outcome is
+/// reported, so a limiter counting abuse rather than traffic has something to count.
+#[tokio::test]
+async fn an_allowed_registration_reports_its_outcome_to_the_limiter() {
+    let throttle = std::sync::Arc::new(RegistrationThrottle::default());
+    let srv = AuthorizationServer::new(
+        server_config(Some(registration_config())),
+        MemoryStorage::new(),
+    )
+    .with_registration_policy(Box::new(OpenPolicy))
+    .with_rate_limiter(Box::new(ThrottleHandle(throttle.clone())));
+
+    let info = srv
+        .register_dynamic_client(&code_client_metadata(), None)
+        .await
+        .expect("the limiter allowed it");
+    assert!(!info.client_id.is_empty());
+
+    let seen = throttle
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        seen,
+        vec![
+            "check ClientRegistration".to_string(),
+            "record ClientRegistration Succeeded".to_string(),
+        ],
+        "an allowed registration is checked once and its outcome reported once"
+    );
+}
+
+/// A registration the VALIDATOR refuses is reported as a failure, which is the shape of somebody
+/// probing for what a deployment's ceilings will accept. Without it a caller could hold a
+/// failure-weighted limiter open indefinitely by sending documents that never register.
+#[tokio::test]
+async fn a_registration_refused_by_validation_is_reported_as_a_failure() {
+    let throttle = std::sync::Arc::new(RegistrationThrottle::default());
+    let srv = AuthorizationServer::new(
+        server_config(Some(registration_config())),
+        MemoryStorage::new(),
+    )
+    .with_registration_policy(Box::new(OpenPolicy))
+    .with_rate_limiter(Box::new(ThrottleHandle(throttle.clone())));
+
+    // A scope outside the registration ceiling: refused by `validate`, past both the limiter check
+    // and the policy.
+    let mut metadata = code_client_metadata();
+    metadata.scope = Some("read admin".to_string());
+    srv.register_dynamic_client(&metadata, None)
+        .await
+        .expect_err("admin is outside the registration ceiling");
+
+    let seen = throttle
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        seen,
+        vec![
+            "check ClientRegistration".to_string(),
+            "record ClientRegistration Failed".to_string(),
+        ],
+        "a refused document is what a limiter counting abuse needs to count"
+    );
+}
+
+/// A refusal by the host's POLICY is reported the same way, for the same reason: it is the shape
+/// of somebody trying documents until one is accepted.
+#[tokio::test]
+async fn a_registration_refused_by_policy_is_reported_as_a_failure() {
+    let throttle = std::sync::Arc::new(RegistrationThrottle::default());
+    let srv = AuthorizationServer::new(
+        server_config(Some(registration_config())),
+        MemoryStorage::new(),
+    )
+    .with_registration_policy(Box::new(InitialAccessToken("the-real-one")))
+    .with_rate_limiter(Box::new(ThrottleHandle(throttle.clone())));
+
+    srv.register_dynamic_client(&code_client_metadata(), Some("a-guess"))
+        .await
+        .expect_err("the policy refuses a wrong initial access token");
+
+    let seen = throttle
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        seen,
+        vec![
+            "check ClientRegistration".to_string(),
+            "record ClientRegistration Failed".to_string(),
+        ],
+        "a refused initial access token is exactly what a failure-weighted budget is for"
+    );
+}
+
+/// A store that PANICS if a client is ever written to it, so "the registration was refused" is
+/// proven by the absence of the write rather than by the error the caller happened to get back.
+struct NoWrites {
+    inner: MemoryStorage,
+}
+
+impl Storage for NoWrites {
+    async fn put_client(&self, client: oauth_as::Client) -> Result<(), oauth_as::StorageError> {
+        panic!(
+            "a refused registration wrote a permanent client row: {:?}",
+            client.client_id
+        );
+    }
+
+    oauth_as::delegate_storage! {
+        to inner;
+        get_client, compare_and_swap_client, delete_client,
+        put_device_grant, get_device_grant, find_device_grant_by_user_code,
+        take_device_grant, compare_and_swap_device_grant,
+        put_authorization_code, compare_and_swap_authorization_code, take_authorization_code,
+        put_pushed_authorization_request, take_pushed_authorization_request,
+        put_token, get_token, delete_token,
+        put_refresh_token, get_refresh_token, take_refresh_token, revoke_token_family,
+        put_consent, compare_and_swap_consent, get_consent, find_consent,
+        consents_for_subject, revoke_consent,
+        claim_replay_id,
+        sweep_expired,
+    }
+}
+
+/// A shared handle, so the test can read what the installed limiter was asked.
+struct ThrottleHandle(std::sync::Arc<RegistrationThrottle>);
+
+impl oauth_as::RateLimiter for ThrottleHandle {
+    fn check(&self, attempt: oauth_as::Attempt<'_>) -> oauth_as::RateLimitDecision {
+        self.0.check(attempt)
+    }
+
+    fn record(&self, attempt: oauth_as::Attempt<'_>, outcome: oauth_as::AttemptOutcome) {
+        self.0.record(attempt, outcome)
+    }
 }
 
 // ------------------------------------------------------------------------------ wire shape

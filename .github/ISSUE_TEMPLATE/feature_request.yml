@@ -6,11 +6,11 @@ body:
   - type: markdown
     attributes:
       value: |
-        Before filing, check ROADMAP.md. It is an honest inventory of what a mature third-party
-        authorization server does that this crate does not do yet, ordered into releases, and
-        each item says what it BUYS. If your request is already there, comment on this repository
-        instead of filing a duplicate. If it is not, this project's rule is: nothing goes on the
-        roadmap because a competitor has it. Say what a real deployment cannot do without it.
+        Before filing, check the open issues and `README.md`'s "What is not claimed" section: what
+        this crate deliberately does not do is written down rather than left to be discovered. If
+        your request is already filed, comment there instead of opening a duplicate. If it is not,
+        this project's rule is that nothing is added because a competitor has it. Say what a real
+        deployment cannot do without it.
 
   - type: textarea
     id: problem

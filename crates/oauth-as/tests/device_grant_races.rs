@@ -109,8 +109,20 @@ impl Storage for RacyStorage {
         self.inner.put_client(client).await
     }
 
-    async fn delete_client(&self, client_id: &ClientId) -> Result<bool, StorageError> {
-        self.inner.delete_client(client_id).await
+    async fn compare_and_swap_client(
+        &self,
+        expected: &Client,
+        updated: Client,
+    ) -> Result<bool, StorageError> {
+        self.inner.compare_and_swap_client(expected, updated).await
+    }
+
+    async fn delete_client(
+        &self,
+        client_id: &ClientId,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<bool, StorageError> {
+        self.inner.delete_client(client_id, window).await
     }
 
     async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
@@ -169,6 +181,16 @@ impl Storage for RacyStorage {
         self.inner.put_authorization_code(record).await
     }
 
+    async fn compare_and_swap_authorization_code(
+        &self,
+        expected: &oauth_as::authorization::AuthorizationCodeState,
+        updated: AuthorizationCodeRecord,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .compare_and_swap_authorization_code(expected, updated)
+            .await
+    }
+
     async fn take_authorization_code(
         &self,
         code: &str,
@@ -180,7 +202,7 @@ impl Storage for RacyStorage {
     async fn put_pushed_authorization_request(
         &self,
         record: oauth_as::PushedAuthorizationRequest,
-    ) -> Result<(), StorageError> {
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         self.inner.put_pushed_authorization_request(record).await
     }
 
@@ -194,7 +216,10 @@ impl Storage for RacyStorage {
             .await
     }
 
-    async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
+    async fn put_token(
+        &self,
+        token: IssuedToken,
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         self.inner.put_token(token).await
     }
 
@@ -209,7 +234,10 @@ impl Storage for RacyStorage {
         self.inner.delete_token(access_token).await
     }
 
-    async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {
+    async fn put_refresh_token(
+        &self,
+        record: RefreshTokenRecord,
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         self.inner.put_refresh_token(record).await
     }
 
@@ -227,8 +255,12 @@ impl Storage for RacyStorage {
         self.inner.take_refresh_token(refresh_token).await
     }
 
-    async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
-        self.inner.revoke_token_family(family_id).await
+    async fn revoke_token_family(
+        &self,
+        family_id: &str,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<u64, StorageError> {
+        self.inner.revoke_token_family(family_id, window).await
     }
 
     #[cfg(feature = "consent")]
@@ -262,11 +294,24 @@ impl Storage for RacyStorage {
     }
 
     #[cfg(feature = "consent")]
-    async fn revoke_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
-        self.inner.revoke_consent(consent_id).await
+    async fn compare_and_swap_consent(
+        &self,
+        expected: Option<&oauth_as::ConsentRecord>,
+        updated: oauth_as::ConsentRecord,
+    ) -> Result<bool, StorageError> {
+        self.inner.compare_and_swap_consent(expected, updated).await
     }
 
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(feature = "consent")]
+    async fn revoke_consent(
+        &self,
+        consent_id: &str,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<u64, StorageError> {
+        self.inner.revoke_consent(consent_id, window).await
+    }
+
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     async fn claim_replay_id(
         &self,
         id: &str,

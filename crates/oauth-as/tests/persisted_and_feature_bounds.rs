@@ -14,7 +14,7 @@ mod support;
 
 #[cfg(feature = "consent")]
 mod consent_bounds {
-    use oauth_as::consent::{ConsentRecord, MAX_CONSENT_RESOURCES};
+    use oauth_as::consent::{ConsentRecord, RequestedDetails, MAX_CONSENT_RESOURCES};
     use oauth_as::{ClientId, ScopeSet};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -65,7 +65,7 @@ mod consent_bounds {
         let extra = resources(9000, 1);
         r.extend(&ScopeSet::empty(), &extra);
         assert!(
-            !r.covers(&ScopeSet::empty(), &extra),
+            !r.covers(&ScopeSet::empty(), &extra, RequestedDetails::none()),
             "an unrecorded resource must read as not covered, so the user is asked again"
         );
     }
@@ -80,7 +80,7 @@ mod consent_bounds {
         r.extend(&ScopeSet::empty(), &first);
         r.extend(&ScopeSet::empty(), &resources(1000, 50));
         assert!(
-            r.covers(&ScopeSet::empty(), &first),
+            r.covers(&ScopeSet::empty(), &first, RequestedDetails::none()),
             "everything approved before the cap was reached stays approved"
         );
     }

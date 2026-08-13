@@ -3,11 +3,11 @@
 
 //! `CLOCK_SKEW_LEEWAY` is ONE constant, defined once.
 //!
-//! It is public from two modules, `client_assertion` (RFC 7523 `iat`/`nbf`) and `dpop`
+//! It is public from two modules, `client-assertion` (RFC 7523 `iat`/`nbf`) and `dpop`
 //! (RFC 9449 `iat`), because the same allowance answers the same question for both: how far a
 //! client's clock may be AHEAD of this server's before a credential minted in the near future is
 //! refused. Through 0.9.0 each module declared its own `pub const ... = Duration::from_secs(60)`,
-//! and `dpop`'s doc comment pointed at `client_assertion`'s "for the same reason", which is a
+//! and `dpop`'s doc comment pointed at `client-assertion`'s "for the same reason", which is a
 //! comment admitting that two numbers have to be kept equal by hand. This file makes the source
 //! answer for it: there is exactly one DEFINITION in the crate, and the other module re-exports it.
 //!
@@ -16,7 +16,7 @@
 
 /// The values agree. This is the property a host cares about, and it is the one that held even
 /// while there were two definitions, which is exactly why it is not sufficient on its own.
-#[cfg(all(feature = "client_assertion", feature = "dpop"))]
+#[cfg(all(feature = "client-assertion", feature = "dpop"))]
 #[test]
 fn both_modules_publish_the_same_leeway() {
     use std::time::Duration;

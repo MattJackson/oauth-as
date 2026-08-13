@@ -128,11 +128,23 @@ async fn replay_detection_is_not_one_shot() {
         .await
         .unwrap()
         .expect("the consumed code must be retained until its own expiry");
+    // `Replayed` rather than `Consumed`, and this is a STRONGER assertion than the one it
+    // replaced rather than an accommodation of a behaviour change. The property the old assertion
+    // was about is unchanged and is checked on the line below: the record is retained and still
+    // names what the code minted, which is what makes a second replay a recognised replay.
+    //
+    // What is new is that the state now records that a replay HAPPENED, durably. A redemption
+    // suspended on the host's signer reads exactly this to discover that the grant it is halfway
+    // through issuing was contained while it slept. See `AuthorizationCodeState::Replayed`.
     assert!(
         matches!(
             retained.state,
-            oauth_as::AuthorizationCodeState::Consumed { .. }
+            oauth_as::AuthorizationCodeState::Replayed { .. }
         ),
+        "a detected replay must leave a durable trace, not put the record back unchanged"
+    );
+    assert!(
+        retained.state.minted().is_some(),
         "the retained record must still say what the code minted"
     );
 }
@@ -146,22 +158,14 @@ async fn a_wrong_client_presentation_leaves_an_unredeemed_code_usable() {
     let srv = server_with(clock, vec![confidential_client(), public_client()]).await;
 
     let challenge = oauth_as::pkce::code_challenge_s256(support::RFC7636_VERIFIER);
-    let req = oauth_as::AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".to_string().into()),
-        client_id: Some("confidential-app".to_string().into()),
-        redirect_uri: Some(CONFIDENTIAL_REDIRECT.to_string().into()),
-        scope: Some("read".to_string().into()),
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".to_string().into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let req = oauth_as::AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", "confidential-app"),
+        ("redirect_uri", CONFIDENTIAL_REDIRECT),
+        ("scope", "read"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
     let validated = srv.validate_authorization_request(&req).await.unwrap();
     let response = srv
         .issue_authorization_code(UserApproval::granted(&validated, "user-1"))

@@ -154,6 +154,27 @@ pub const MAX_ASSERTION_LIFETIME: Duration = Duration::from_secs(600);
 /// duplicated: see `src/skew.rs` for why one definition rather than two equal ones.
 pub use crate::skew::CLOCK_SKEW_LEEWAY;
 
+/// The largest client assertion [`verify_assertion`] and [`unverified_subject`] will look at, in
+/// bytes, checked BEFORE either parses anything.
+///
+/// THE SAME ARGUMENT [`crate::dpop::MAX_PROOF_BYTES`] MAKES, word for word, and it applies here for
+/// the same reasons. Both functions are PUBLIC, so a host may hand either one a string from
+/// anywhere; both hand it straight to [`crate::jwt::CompactJws::parse`], which base64-decodes it and
+/// runs two JSON parses over the result; and both run before anything about the caller has been
+/// established — [`unverified_subject`] runs before the registration has even been LOOKED UP, which
+/// is the whole of its purpose. This crate's `MAX_BODY_BYTES` is in the optional `http` module,
+/// which `client-assertion` does not depend on, so a host that assembles its own request parsing
+/// (the arrangement this library is built for) has never had a bound on this string.
+///
+/// WHY 4 KiB, from what an assertion actually contains. RFC 7523 section 3 fixes the claim set:
+/// `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, over a header carrying `alg` and at most `typ`
+/// and `kid`, with either a 32-byte HMAC or a 64-byte ECDSA signature. Base64url encoded that is a
+/// few hundred bytes in practice, and 4096 leaves generous room for a long issuer URL, a verbose
+/// `kid` and claims a deployment adds, while refusing a megabyte of `client_assertion` parameter
+/// before any of it is decoded. An assertion this cap refuses is not one any conforming client
+/// sends.
+pub const MAX_ASSERTION_BYTES: usize = 4096;
+
 /// What a registration expects a client assertion to be signed with.
 ///
 /// The variants are the two RFC 7523 methods, and the choice between them is the choice of
@@ -234,10 +255,12 @@ impl AssertionKeys {
 /// same reason `authenticate_client` collapses "unknown client" and "wrong secret": telling a
 /// caller WHICH check it failed is telling an attacker how to get closer. The distinction exists
 /// for the host's audit channel, where the reader is not the attacker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Hash` because `crate::events::ClientAuthFailure` derives it and now carries one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AssertionFailure {
-    /// Not a compact JWS, or its `typ` says it is some other kind of JWT.
+    /// Not a compact JWS, or longer than [`MAX_ASSERTION_BYTES`] and so refused on size before
+    /// anything is decoded, or its `typ` says it is some other kind of JWT.
     Malformed,
     /// The header's `alg` is not the one this registration signs with.
     AlgorithmMismatch,
@@ -255,6 +278,19 @@ pub enum AssertionFailure {
     MissingJti,
     /// This `jti` has been seen before within the assertion's own validity window.
     Replayed,
+    /// The single-use claim could not be RECORDED, so this assertion was refused without ever
+    /// being judged: the storage seam behind [`crate::store::Storage::claim_replay_id`] failed.
+    ///
+    /// The wire answer is the same `invalid_client` every other variant collapses to, and the
+    /// refusal is deliberate — a claim that could not be recorded is a claim that did not happen,
+    /// and treating a storage outage as "probably fine" would make every assertion replayable for
+    /// the duration of it. What this variant exists for is the AUDIT channel: through 0.9.0 the
+    /// outage was reported as [`AssertionFailure::Replayed`], which
+    /// [`crate::events::ClientAuthFailure::AssertionInvalid`] documents as "somebody who has
+    /// captured a client's traffic, which is a different incident and a much worse one". An outage
+    /// fails every `private_key_jwt` client at once, so that mislabel turned a store alarm into a
+    /// burst of this crate's worst-incident signal.
+    ReplayCheckUnavailable,
 }
 
 impl fmt::Display for AssertionFailure {
@@ -271,6 +307,9 @@ impl fmt::Display for AssertionFailure {
             AssertionFailure::NotYetValid => "the client assertion is not yet valid",
             AssertionFailure::MissingJti => "the client assertion carries no jti",
             AssertionFailure::Replayed => "the client assertion jti has already been used",
+            AssertionFailure::ReplayCheckUnavailable => {
+                "the client assertion jti could not be recorded as spent"
+            }
         })
     }
 }
@@ -324,7 +363,7 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 /// than verify it leniently. `client_secret_jwt` is HS256 over the registered secret (RFC 7518
 /// section 3.2), and there is no elliptic curve on that path, no key for a verifier to check and
 /// nothing for a backend to contribute. Taking a verifier by value here made a build with
-/// `client_assertion` and no ES256 backend refuse a perfectly valid HMAC, which is a refusal no
+/// `client-assertion` and no ES256 backend refuse a perfectly valid HMAC, which is a refusal no
 /// RFC asks for.
 ///
 /// PUBLIC because [`VerifiedAssertion`] and [`AssertionFailure`] are, and a type no consumer can
@@ -339,6 +378,13 @@ pub fn verify_assertion(
     audiences: &[&str],
     now: SystemTime,
 ) -> Result<VerifiedAssertion, AssertionFailure> {
+    // (0) SIZE, before the parse and therefore before any base64 decoding or JSON parsing happens.
+    // See [`MAX_ASSERTION_BYTES`]: nothing about this caller has been established yet, so whatever
+    // work this function does on a hostile string, it does for whoever sent it.
+    if assertion.len() > MAX_ASSERTION_BYTES {
+        return Err(AssertionFailure::Malformed);
+    }
+
     let jws = CompactJws::parse(assertion).map_err(|_| AssertionFailure::Malformed)?;
 
     if let Some(typ) = jws.header_str("typ") {
@@ -352,6 +398,12 @@ pub fn verify_assertion(
     // something this server has to guess about.
     if jws.header_str("alg") != Some(keys.signing_alg()) {
         return Err(AssertionFailure::AlgorithmMismatch);
+    }
+
+    // (1b) RFC 7515 s4.1.11 `crit`, on the same parser every other JWS verifier here uses. See
+    // `CompactJws::reject_unknown_crit` for why this is not per-call-site.
+    if jws.reject_unknown_crit().is_err() {
+        return Err(AssertionFailure::Malformed);
     }
 
     // (2) The signature, over the bytes that arrived.
@@ -467,6 +519,14 @@ pub fn verify_assertion(
 /// result for anything else, an audit record naming the client, a rate limit bucket, an
 /// authorization decision, would be trusting an unsigned string an attacker wrote.
 pub fn unverified_subject(assertion: &str) -> Option<String> {
+    // (0) SIZE, on the same terms and for the same reason as in [`verify_assertion`], and if
+    // anything more urgently: this is the EARLIER of the two, called to find the registration that
+    // will decide the key, so it runs on a string nothing at all is yet known about. A bound
+    // enforced only by the verifier would leave the lookup that precedes it unbounded.
+    if assertion.len() > MAX_ASSERTION_BYTES {
+        return None;
+    }
+
     let jws = CompactJws::parse(assertion).ok()?;
     jws.claim_str("sub").map(str::to_string)
 }

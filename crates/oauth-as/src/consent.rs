@@ -91,6 +91,41 @@ use crate::scope::ScopeSet;
 /// makes visible rather than a limit it creates.
 pub const MAX_CONSENT_RESOURCES: usize = 32;
 
+/// The largest number of authentication context classes one `acr_values` parameter may name
+/// (RFC 9470 section 4, OpenID Connect Core section 3.1.2.1).
+///
+/// # Why a cap at all
+///
+/// `acr_values` is ONE parameter carrying a space-delimited list, and it arrives unauthenticated,
+/// before any user interaction, at `GET /authorize` and at the RFC 9126 push. Parsing it stores one
+/// `Box<str>` per non-empty segment, which is one heap allocation per segment, so without a bound
+/// the segment count is whatever the request line or the body allowed. The cheapest input is
+/// `"a a a ..."` at two bytes a token: 64 KiB of body, which is
+/// `crate::http::MAX_BODY_BYTES`, is about 32,768 allocations from a single parameter, and the
+/// GET form is worse because a URL is not bounded by that constant at all.
+///
+/// That is the exact shape `crate::http::MAX_FORM_PARAMETERS` exists to refuse, and it slipped
+/// past because it is one parameter rather than many: that constant's own arithmetic puts 64 KiB of
+/// `&a=b` pairs at about 2,300 parameters, so this one parameter bought an order of magnitude more
+/// work than the case the parameter cap was introduced for.
+///
+/// # Why 16
+///
+/// `acr_values` is an ORDERED PREFERENCE list, not a set to enumerate: OpenID Connect Core section
+/// 3.1.2.1 has the AS satisfy the first class it can, so the entries past the first few are already
+/// alternatives nobody expects to be reached. No published profile lists more than a handful. It is
+/// also the number [`crate::server::MAX_RESOURCE_INDICATORS`] and
+/// `rar::MAX_AUTHORIZATION_DETAILS_ELEMENTS` use for the other repeatable things one request can
+/// carry, so a reader does not have to hold a third number.
+///
+/// # It refuses, it does not truncate
+///
+/// Truncating would answer a resource server's step-up challenge with a class the user never
+/// satisfied, or drop the one class the client could actually meet, and tell nobody. That is the
+/// same failure [`crate::server::MAX_RESOURCE_INDICATORS`] refuses for RFC 8707 and
+/// [`crate::rar`] refuses for unknown members. `invalid_request` is the honest answer.
+pub const MAX_ACR_VALUES: usize = 16;
+
 /// What the HOST says about how, and when, it authenticated the resource owner.
 ///
 /// This is a REPORT, not a proof. See the module docs: this crate cannot authenticate anyone and
@@ -98,7 +133,7 @@ pub const MAX_CONSENT_RESOURCES: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authentication {
     /// When the user actually authenticated. OpenID Connect Core section 2 defines `auth_time` as
-    /// the "time when the End-User authentication occurred", and RFC 9470 section 5 is what makes
+    /// the "time when the End-User authentication occurred", and RFC 9470 section 6.2 is what makes
     /// it worth carrying: `max_age` is meaningless without an instant to measure from.
     ///
     /// NOT "when this request arrived". A host that conflates the two makes every request look
@@ -196,22 +231,113 @@ pub struct ConsentRecord {
     pub authentication: Option<Box<Authentication>>,
 }
 
+/// The RFC 9396 `authorization_details` an authorization request is ASKING FOR, in a shape that
+/// exists in every feature configuration.
+///
+/// A WRAPPER rather than the details themselves, and the reason is structural, the same one
+/// `crate::server`'s `GrantedDetails` records about `issue`: an argument can carry a `cfg`, but the
+/// ARGUMENT AT A CALL SITE cannot, so a gated parameter on [`ConsentRecord::covers`] would make
+/// every host's approval resolver — the one place this crate asks a host to write a comparison —
+/// duplicate that call under a `cfg` of its own. A host that writes one call site cannot get it
+/// wrong in the configuration it does not build.
+///
+/// Without `rar` this type has no fields, so it is zero sized, [`RequestedDetails::none`] compiles
+/// to nothing, and a deployment that never enabled RFC 9396 pays for none of it.
+///
+/// `#[non_exhaustive]` because its field set varies with a feature, which is the rule
+/// `tests/host_api_shape.rs` gates for every public type in this crate. Both fields are private
+/// already, so the attribute costs a host nothing: the two constructors below are the only way to
+/// make one in any build.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestedDetails<'a> {
+    /// `None` for an empty request as well as an absent one: "asked for no detail" and "asked for
+    /// an empty array" are the same request, and collapsing them here means
+    /// [`ConsentRecord::covers`] has one case to reason about rather than two.
+    #[cfg(feature = "rar")]
+    details: Option<&'a crate::rar::AuthorizationDetails>,
+    /// Without `rar` there is nothing to borrow, and the lifetime parameter still has to be used.
+    #[cfg(not(feature = "rar"))]
+    borrow: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> RequestedDetails<'a> {
+    /// The request asks for no rich authorization detail. What a deployment without RFC 9396
+    /// always passes, and what a request that sent no `authorization_details` means.
+    pub fn none() -> Self {
+        RequestedDetails::default()
+    }
+
+    /// What the request in hand is asking for: the `http` feature hands a host exactly this value
+    /// as `ApprovalRequest::authorization_details`.
+    #[cfg(feature = "rar")]
+    pub fn of(details: &'a crate::rar::AuthorizationDetails) -> Self {
+        RequestedDetails {
+            details: (!details.is_empty()).then_some(details),
+        }
+    }
+
+    /// Whether the request asked for any detail at all.
+    fn is_empty(&self) -> bool {
+        #[cfg(feature = "rar")]
+        {
+            self.details.is_none()
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            let _ = self.borrow;
+            true
+        }
+    }
+}
+
 impl ConsentRecord {
-    /// Whether this record already covers a request for `scope` and `resource`.
+    /// Whether this record already covers a request for `scope`, `resource` and `details`.
     ///
     /// This is the whole of what "remembered consent" means in this crate, and it ANSWERS a
     /// question rather than making a decision: the `http` feature's
-    /// `ServiceBuilder::with_consent_resolver` is where the answer is turned into one. Nothing in
+    /// `ServiceBuilder::with_approval_resolver` is where the answer is turned into one. Nothing in
     /// this crate approves an authorization request on the strength of a `true` here.
     ///
-    /// Both halves are SUBSET tests against what was approved, never equality and never a widening:
-    /// a request for less than was granted is covered, and a request for one token more is not.
-    /// Requesting a resource that was never approved is not covered either, because RFC 8707
-    /// section 2 makes the resource the audience the token will be good at, so treating "approved
-    /// for no particular resource" as "approved for that one" would let a remembered consent grow
-    /// an audience the user never saw.
-    pub fn covers(&self, scope: &ScopeSet, resource: &[String]) -> bool {
-        scope.is_subset(&self.scope) && resource.iter().all(|r| self.resource.contains(r))
+    /// The first two halves are SUBSET tests against what was approved, never equality and never a
+    /// widening: a request for less than was granted is covered, and a request for one token more
+    /// is not. Requesting a resource that was never approved is not covered either, because RFC
+    /// 8707 section 2 makes the resource the audience the token will be good at, so treating
+    /// "approved for no particular resource" as "approved for that one" would let a remembered
+    /// consent grow an audience the user never saw.
+    ///
+    /// # A request carrying `authorization_details` is NEVER covered
+    ///
+    /// Whatever this record holds. A [`ConsentRecord`] records a scope and a resource list and
+    /// nothing else, so there is no approved element for a requested one to be compared against,
+    /// and the only two answers available are "not covered" and "covered because the SCOPE
+    /// matched". The second is the direction this method may not fail in: it would wave through an
+    /// RFC 9396 element — an amount, a creditor account, an `identifier` — that the resource owner
+    /// was never shown, on the strength of a scope string that RFC 9396 exists precisely because it
+    /// cannot express such a thing. That is the same failure the resource half above refuses, one
+    /// level more specific, and it is worse there because the element is the transaction.
+    ///
+    /// This is a REFUSAL and not a limitation to be worked around, and the reason is that the two
+    /// answers are nearly the same answer. The widest comparison this crate could ever soundly make
+    /// is [`crate::rar::AuthorizationDetail::is_narrowing_of`]: a requested element is covered only
+    /// when an approved one is identical to it in every type-defined member, since section 6.1 says
+    /// the AS cannot know what any of those members mean. For a payment that is the SAME payment
+    /// again. So the coverage a details field would buy is "ask me once per distinct transaction,
+    /// not once per request", and a remembered approval of one transaction is not an approval of
+    /// the next one anyway.
+    ///
+    /// A host that wants a user asked about a detail exactly once therefore does it at the seam
+    /// that can: the approval resolver is handed the parsed elements as
+    /// `ApprovalRequest::authorization_details`, alongside this answer, and decides.
+    pub fn covers(
+        &self,
+        scope: &ScopeSet,
+        resource: &[String],
+        details: RequestedDetails<'_>,
+    ) -> bool {
+        scope.is_subset(&self.scope)
+            && resource.iter().all(|r| self.resource.contains(r))
+            && details.is_empty()
     }
 
     /// Widen this record to also cover `scope` and `resource`.
@@ -222,6 +348,11 @@ impl ConsentRecord {
     /// way to take something back is [`crate::server::AuthorizationServer::withdraw_consent`],
     /// which also revokes what the grant issued, and a silent narrowing that left live tokens
     /// holding the removed scope would be the same lie this module exists to avoid.
+    ///
+    /// RFC 9396 `authorization_details` are NOT accumulated here, because they are not recorded at
+    /// all: see [`ConsentRecord::covers`] for why a remembered consent never covers a request that
+    /// carries any, and why the coverage a details field would buy is one repeat of an identical
+    /// transaction rather than a class of them.
     pub fn extend(&mut self, scope: &ScopeSet, resource: &[String]) {
         if !scope.is_subset(&self.scope) {
             let merged = self
@@ -271,7 +402,7 @@ impl ConsentRecord {
 /// RFC 9470 section 4 carries exactly two parameters, both defined by OpenID Connect Core section
 /// 3.1.2.1, and this crate implements only those two. Reading two of OpenID Connect's parameters
 /// does not make this OpenID Connect: there is no `id_token`, no UserInfo endpoint and no claims
-/// model here, and ROADMAP.md keeps all three off the list on purpose.
+/// model here, and all three are off this crate's list on purpose.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthenticationRequirement {
     /// Requested authentication context classes, in order of preference, from the space-delimited
@@ -282,6 +413,11 @@ pub struct AuthenticationRequirement {
     /// entry is legal; RFC 9470 section 4 is what turns it into a requirement here, because the
     /// whole point of the exchange is that a resource server has already refused the token the
     /// previous `acr` produced.
+    ///
+    /// Bounded by [`MAX_ACR_VALUES`] when it comes off the wire: a parameter naming more classes
+    /// than that is REFUSED rather than truncated. A requirement a host builds itself is its own
+    /// data and is not bounded here, for the reason `rar::AuthorizationDetails::from_elements`
+    /// gives: these bounds defend against an unauthenticated stranger, not against the deployment.
     pub acr_values: Vec<Box<str>>,
     /// The RFC 9470 section 4 / OpenID Connect Core section 3.1.2.1 `max_age`: how old the user's
     /// authentication may be. `None` means the client did not constrain it.
@@ -350,10 +486,30 @@ impl AuthenticationRequirement {
     fn from_raw(acr_values: Option<&str>, max_age: Option<&str>) -> Result<Self, ErrorResponse> {
         let mut out = AuthenticationRequirement::none();
         if let Some(raw) = acr_values {
-            // One pass to size the list and one to fill it: `acr_values` is a short
-            // space-delimited list, and counting separators is cheaper than the reallocation
-            // a growing `Vec` would do on the way to the same answer.
-            out.acr_values = Vec::with_capacity(raw.bytes().filter(|b| *b == b' ').count() + 1);
+            // One pass to COUNT and one to fill: `acr_values` is a short space-delimited list, and
+            // a counting pass allocates nothing, so the second pass can reserve exactly what it
+            // stores instead of reallocating its way there.
+            //
+            // The count is over NON-EMPTY segments, which is what the fill stores, so a parameter
+            // of nothing but spaces counts zero rather than one per space.
+            //
+            // `take(MAX_ACR_VALUES + 1)` is what makes the refusal cheap: it stops reading at the
+            // seventeenth class, so an oversized parameter is neither counted in full nor stored at
+            // all. This bounds the STORED count and not merely a reservation. A cap on the
+            // reservation alone bounds nothing: the `extend` below stores one `Box<str>`, which is
+            // one heap allocation, per segment, so it is the segment count that a request gets to
+            // choose and therefore the segment count that has to be refused. See [`MAX_ACR_VALUES`].
+            let count = raw
+                .split(' ')
+                .filter(|s| !s.is_empty())
+                .take(MAX_ACR_VALUES + 1)
+                .count();
+            if count > MAX_ACR_VALUES {
+                return Err(ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                    "acr_values names more authentication context classes than this server accepts",
+                ));
+            }
+            out.acr_values = Vec::with_capacity(count);
             out.acr_values.extend(
                 raw.split(' ')
                     .filter(|s| !s.is_empty())
@@ -511,12 +667,36 @@ impl From<StepUpFailure> for ErrorResponse {
 /// `acr_values` and `max_age` in the challenge; `acr_values` is omitted when empty rather than sent
 /// blank, because an empty list reads as "no class is acceptable".
 ///
+/// # What this does to the values, and why it is not only escaping
+///
 /// The values are emitted inside quoted strings, so a `"` or a `\` in an `acr` value would forge the
 /// parameter that follows it. Both are ESCAPED, per the `quoted-string` rule of RFC 9110 section
 /// 5.6.4, rather than the value being rejected: this crate does not own the host's `acr` vocabulary
 /// and has no business refusing a value it merely has to transmit.
 ///
-/// One allocation: the buffer is sized up front from the parts that go into it.
+/// Escaping is not enough on its own, and reading section 5.6.4 as though it were is the defect the
+/// 0.9.1 audit found here. `qdtext` is `HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text`, and
+/// `quoted-pair` is `"\" ( HTAB / SP / VCHAR / obs-text )`: NEITHER production admits a control
+/// character, so a CR, an LF or a DEL cannot be escaped into a legal `quoted-string` at all. It can
+/// only be removed, and until this was fixed it was passed through verbatim, which is a header
+/// break emitted out of a value this doc called escaped. Reachability is not theoretical: the
+/// parameter type is exactly [`AuthenticationRequirement::acr_values`], which
+/// [`AuthenticationRequirement::from_pairs`] fills from the client's own query parameter, and the
+/// whole point of this helper is that those classes come back out in a header.
+///
+/// So anything outside `HTAB`, `SP`, `%x21..=%x7E` and `%x80..=%xFF` is DROPPED. Dropping rather
+/// than refusing keeps the signature total, and the two are the same answer in practice: a value
+/// with a control character in it is not a class name any host defined, so there is nothing to
+/// preserve. Every byte a `quoted-string` does admit survives, non-ASCII included.
+///
+/// `scheme` is written outside any quoted string, where no escaping exists at all, so it is filtered
+/// to the RFC 9110 section 5.6.2 `tchar` set for the same reason. `Bearer` and `DPoP` pass through
+/// untouched; anything that would forge the rest of the header does not survive to do it.
+///
+/// One allocation for every value this crate can produce: the buffer is sized up front from the
+/// parts that go into it, and filtering only ever shortens what goes in. A value that is nothing but
+/// quotes and backslashes escapes to twice its length and would grow the buffer once; that is a
+/// `String`'s ordinary behaviour and not a bound anyone relies on.
 pub fn step_up_challenge(
     scheme: &str,
     acr_values: &[Box<str>],
@@ -532,7 +712,7 @@ pub fn step_up_challenge(
     let mut out = String::with_capacity(
         scheme.len() + ERROR.len() + DESCRIPTION.len() + acr_len + max_age.map_or(0, |_| 32),
     );
-    out.push_str(scheme);
+    out.extend(scheme.chars().filter(|c| is_tchar(*c)));
     out.push_str(ERROR);
     out.push_str(DESCRIPTION);
     if !acr_values.is_empty() {
@@ -553,15 +733,52 @@ pub fn step_up_challenge(
     out
 }
 
-/// Append `value`, backslash-escaping the two characters RFC 9110 section 5.6.4 requires escaping
-/// inside a `quoted-string`.
+/// Append `value` as the inside of an RFC 9110 section 5.6.4 `quoted-string`: `"` and `\` escaped,
+/// and everything the grammar cannot carry dropped.
+///
+/// The two rules are not alternatives, and treating them as one was the bug. `quoted-string` is
+/// `DQUOTE *( qdtext / quoted-pair ) DQUOTE` with
+///
+/// ```text
+/// qdtext      = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+/// quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+/// obs-text    = %x80-FF
+/// ```
+///
+/// so `"` (%x22) and `\` (%x5C) are the two characters that are legal only as the second half of a
+/// `quoted-pair`, which is what the escape below produces. A control character is in NEITHER
+/// production: it is not `qdtext`, and it is not `VCHAR`, so a backslash in front of it produces an
+/// illegal `quoted-pair` rather than a legal escape. There is no spelling of CR, LF or DEL inside a
+/// `quoted-string`, so the only conformant thing to do with one is to not emit it. See
+/// [`step_up_challenge`] for why the value can contain one in the first place.
+///
+/// [`char::is_control`] is not the test used here: it is true for the Unicode `Cc` category, which
+/// includes `%x80..=%x9F`, and those are `obs-text` and therefore legal. The ranges are written out
+/// instead, and every scalar value above `%x7F` is kept.
 fn push_quoted(out: &mut String, value: &str) {
     for c in value.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\t' | ' ' | '\u{21}'..='\u{7e}' | '\u{80}'.. => out.push(c),
+            // Everything else is %x00-%x08, %x0A-%x1F or %x7F, none of which a `quoted-string` can
+            // carry escaped or otherwise.
+            _ => {}
         }
-        out.push(c);
     }
+}
+
+/// RFC 9110 section 5.6.2 `tchar`, the character set an auth scheme (section 11.1 `auth-scheme`,
+/// which is a `token`) is made of.
+///
+/// Used to filter [`step_up_challenge`]'s `scheme`, which is written outside every quoted string in
+/// the challenge and so has no escape available to it at all: one space in it and everything after
+/// it reads as the auth parameters of a different scheme, one `"` and the quoting is off by one for
+/// the rest of the header.
+fn is_tchar(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
 }
 
 #[cfg(test)]

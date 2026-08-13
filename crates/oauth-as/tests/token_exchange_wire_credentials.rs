@@ -9,7 +9,7 @@
 //!    authenticates the client "as described in Section 2.3 of [RFC6749]", which is a reference to
 //!    every method the server offers, and this server offers `private_key_jwt` and
 //!    `client_secret_jwt` and advertises them in its RFC 8414 document. An assertion arrives in
-//!    `client_assertion`, not in `client_secret`, so an assertion-authenticated confidential
+//!    `client-assertion`, not in `client_secret`, so an assertion-authenticated confidential
 //!    client was answered `invalid_client` on a grant the metadata document promises it. The first
 //!    repair of this arm restored the SECRET only, so half the defect survived the fix for the
 //!    other half.
@@ -58,6 +58,15 @@ impl Wire {
     fn error(&self) -> Option<String> {
         self.json()
             .get("error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// RFC 6749 s5.2's `error_description`, which on this endpoint is the only thing that says
+    /// WHICH of several checks answering with the same code and status actually fired.
+    fn description(&self) -> Option<String> {
+        self.json()
+            .get("error_description")
             .and_then(|v| v.as_str())
             .map(str::to_string)
     }
@@ -125,7 +134,7 @@ async fn fixture() -> Fixture {
         ))
         .await
         .expect("register the shared-secret client");
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     {
         use oauth_as::client_assertion::{AssertionKeys, ClientSecretKey};
         server
@@ -175,7 +184,7 @@ async fn subject_token(service: &Service) -> String {
 /// This is the assertion that was failing. It answered `invalid_client`, because the arm forwarded
 /// `client_secret` (which is `None` for this client) and nothing else, and `exchange_token`
 /// refuses a client it could not authenticate as confidential.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[tokio::test]
 async fn an_assertion_authenticated_client_may_exchange_a_token_over_http() {
     let fx = fixture().await;
@@ -280,6 +289,14 @@ async fn a_dpop_proof_on_a_token_exchange_is_refused_rather_than_silently_droppe
 
 /// The duplicate-header rule of RFC 9449 s4.3 (1) reaches this grant too, which it could not while
 /// the check sat after the dispatch.
+///
+/// THE STATUS CODE CANNOT SAY WHICH RULE ANSWERED, and that is the whole difficulty of testing an
+/// ordering. Two things refuse this request: the duplicate-header check, and the blanket refusal
+/// of any `DPoP` header on a token exchange. Both are `invalid_dpop_proof` and both are 400, and
+/// the sibling above proves a SINGLE garbage proof on this same grant already answers 400 — so a
+/// duplicate-header check that had slipped back behind the dispatch would leave this test green
+/// while the property it is named for was gone. Only the description distinguishes them, so the
+/// description is what is asserted.
 #[cfg(feature = "dpop")]
 #[tokio::test]
 async fn two_dpop_headers_are_refused_on_a_token_exchange_as_on_every_other_grant() {
@@ -311,6 +328,16 @@ async fn two_dpop_headers_are_refused_on_a_token_exchange_as_on_every_other_gran
         http::StatusCode::BAD_REQUEST,
         "RFC 9449 s4.3 (1): exactly one DPoP header, on every grant this endpoint serves: {body}"
     );
+    let wire = Wire { status, body };
+    assert_eq!(wire.error().as_deref(), Some("invalid_dpop_proof"));
+    assert!(
+        wire.description()
+            .unwrap_or_default()
+            .contains("more than one DPoP header"),
+        "the DUPLICATE-header rule has to be what refused, not the token-exchange blanket refusal \
+         that would answer this request identically: {}",
+        wire.body
+    );
 }
 
 /// The shared-secret path, kept alongside the two above so that a change that made the DPoP
@@ -341,8 +368,8 @@ async fn a_shared_secret_client_still_exchanges_with_no_dpop_header() {
 
 /// An RFC 7523 s3 claim set naming this server's token endpoint as the audience, signed with the
 /// registered client secret (`client_secret_jwt`, HS256). No ES256 backend is needed, so this
-/// proof runs on every build that has `client_assertion` at all.
-#[cfg(feature = "client_assertion")]
+/// proof runs on every build that has `client-assertion` at all.
+#[cfg(feature = "client-assertion")]
 fn client_secret_jwt(jti: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

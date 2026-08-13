@@ -26,7 +26,7 @@ use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::device::{DeviceGrant, DeviceGrantState};
 use oauth_as::events::{Attempt, RateLimitDecision, RateLimiter};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{ConsentDecision, ServiceBuilder};
+use oauth_as::http::{ApprovalDecision, ServiceBuilder};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig, SystemClock};
 use oauth_as::store::{MemoryStorage, Storage, StorageError};
@@ -141,11 +141,19 @@ impl Storage for LookupFails {
     fn put_client(&self, client: Client) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.0.put_client(client)
     }
+    fn compare_and_swap_client(
+        &self,
+        expected: &Client,
+        updated: Client,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        self.0.compare_and_swap_client(expected, updated)
+    }
     fn delete_client(
         &self,
         client_id: &ClientId,
+        window: oauth_as::store::RevocationWindow,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send {
-        self.0.delete_client(client_id)
+        self.0.delete_client(client_id, window)
     }
     fn put_device_grant(
         &self,
@@ -186,7 +194,7 @@ impl Storage for LookupFails {
     fn put_pushed_authorization_request(
         &self,
         record: oauth_as::PushedAuthorizationRequest,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    ) -> impl Future<Output = Result<oauth_as::store::WriteOutcome, StorageError>> + Send {
         self.0.put_pushed_authorization_request(record)
     }
     #[cfg(feature = "par")]
@@ -203,6 +211,14 @@ impl Storage for LookupFails {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.0.put_authorization_code(record)
     }
+    fn compare_and_swap_authorization_code(
+        &self,
+        expected: &oauth_as::authorization::AuthorizationCodeState,
+        updated: AuthorizationCodeRecord,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        self.0
+            .compare_and_swap_authorization_code(expected, updated)
+    }
     fn take_authorization_code(
         &self,
         code: &str,
@@ -212,7 +228,7 @@ impl Storage for LookupFails {
     fn put_token(
         &self,
         token: IssuedToken,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    ) -> impl Future<Output = Result<oauth_as::store::WriteOutcome, StorageError>> + Send {
         self.0.put_token(token)
     }
     fn get_token(
@@ -230,7 +246,7 @@ impl Storage for LookupFails {
     fn put_refresh_token(
         &self,
         record: RefreshTokenRecord,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+    ) -> impl Future<Output = Result<oauth_as::store::WriteOutcome, StorageError>> + Send {
         self.0.put_refresh_token(record)
     }
     fn get_refresh_token(
@@ -248,8 +264,9 @@ impl Storage for LookupFails {
     fn revoke_token_family(
         &self,
         family_id: &str,
+        window: oauth_as::store::RevocationWindow,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send {
-        self.0.revoke_token_family(family_id)
+        self.0.revoke_token_family(family_id, window)
     }
     // Delegated like everything else: the one behaviour this fixture breaks is the user-code
     // lookup, and a store that also lost its consents would be testing two failures at once.
@@ -285,13 +302,23 @@ impl Storage for LookupFails {
         self.0.consents_for_subject(subject)
     }
     #[cfg(feature = "consent")]
+    #[cfg(feature = "consent")]
+    fn compare_and_swap_consent(
+        &self,
+        expected: Option<&oauth_as::ConsentRecord>,
+        updated: oauth_as::ConsentRecord,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        self.0.compare_and_swap_consent(expected, updated)
+    }
+    #[cfg(feature = "consent")]
     fn revoke_consent(
         &self,
         consent_id: &str,
+        window: oauth_as::store::RevocationWindow,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send {
-        self.0.revoke_consent(consent_id)
+        self.0.revoke_consent(consent_id, window)
     }
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     fn claim_replay_id(
         &self,
         id: &str,
@@ -371,7 +398,7 @@ async fn serve<S: Storage + 'static>(
         builder = builder.with_subject_resolver(|_headers| Some(SUBJECT.to_string()));
     }
     if wiring.consent {
-        builder = builder.with_consent_resolver(|_req| ConsentDecision::Approve);
+        builder = builder.with_approval_resolver(|_req| ApprovalDecision::Approve);
     }
     if wiring.csrf {
         // A host session store: one outstanding token per session, and `consume` REMOVES.
@@ -753,5 +780,168 @@ async fn a_throttled_code_entry_is_a_429_that_reveals_nothing() {
         !resp.body.contains("not recognised"),
         "a throttled attempt must not report whether the code existed: {}",
         resp.body
+    );
+}
+
+/// A host limiter that ALLOWS everything and counts what it was asked, so a test can assert how
+/// much of a budget one user-code entry actually spends.
+///
+/// `check` and `record` are counted separately because a real limiter charges for both: the
+/// shipped `FixedWindowRateLimiter` weights an attempt at one unit for the check and nine more
+/// for a failed outcome, so a doubled charge is a halved budget for the host, not a rounding
+/// error.
+#[derive(Default)]
+struct CountCodeEntries {
+    checks: std::sync::atomic::AtomicUsize,
+    records: std::sync::atomic::AtomicUsize,
+}
+
+impl RateLimiter for CountCodeEntries {
+    fn check(&self, attempt: Attempt<'_>) -> RateLimitDecision {
+        if matches!(attempt, Attempt::DeviceUserCodeEntry) {
+            self.checks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        RateLimitDecision::Allow
+    }
+
+    fn record(&self, attempt: Attempt<'_>, _outcome: oauth_as::events::AttemptOutcome) {
+        if matches!(attempt, Attempt::DeviceUserCodeEntry) {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// RFC 8628 s5.1: ONE user-code entry is ONE charge against the host's throttle, however many
+/// times the request that carries it resolves the code.
+///
+/// A POST of a wrong code with `action=approve` resolves it twice: `approve_device` looks it up
+/// (and charges), and then the error arm re-renders the page for the same code. Charging that
+/// second lookup too doubled what every entry costs, which halves the budget the host thought it
+/// configured — a limiter set to allow twenty wrong entries a minute allowed ten. It is
+/// fail-CLOSED, which is exactly why it survived: nothing is let through that should not be, so
+/// no test about refusals could see it. This one counts instead.
+#[tokio::test]
+async fn one_wrong_code_entry_is_charged_to_the_throttle_exactly_once() {
+    let counter = Arc::new(CountCodeEntries::default());
+    /// The limiter the server installs, forwarding to the counter the test still holds.
+    struct Shared(Arc<CountCodeEntries>);
+    impl RateLimiter for Shared {
+        fn check(&self, attempt: Attempt<'_>) -> RateLimitDecision {
+            self.0.check(attempt)
+        }
+        fn record(&self, attempt: Attempt<'_>, outcome: oauth_as::events::AttemptOutcome) {
+            self.0.record(attempt, outcome)
+        }
+    }
+
+    let (addr, _server) = serve(
+        MemoryStorage::new(),
+        Wiring {
+            subject: true,
+            consent: true,
+            csrf: true,
+        },
+        Some(Box::new(Shared(Arc::clone(&counter)))),
+    )
+    .await;
+    let (_page, csrf) = get_form(addr, "").await;
+    let headers = browser_headers(addr);
+    // Nothing was charged by rendering the empty form: there was no code on it to resolve.
+    assert_eq!(
+        counter.checks.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the empty form charged the throttle, so the counts below would mean nothing"
+    );
+
+    // A code that matches nothing pending, which is what a guess looks like.
+    let resp = request(
+        addr,
+        "POST",
+        "/device",
+        &[
+            (headers[0].0, headers[0].1.as_str()),
+            (headers[1].0, headers[1].1.as_str()),
+        ],
+        Some(&format!(
+            "user_code=WXYZ%2D1234&csrf_token={csrf}&action=approve"
+        )),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert!(
+        resp.body.contains("not recognised"),
+        "this test is about the cost of a WRONG code, so it has to have been wrong: {}",
+        resp.body
+    );
+
+    assert_eq!(
+        counter.checks.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one entered code was checked against the throttle more than once, so every host's \
+         configured budget is divided by that many"
+    );
+    assert_eq!(
+        counter.records.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one entered code was reported to the throttle more than once, and the failed-outcome \
+         weight is the larger half of what an attempt costs"
+    );
+}
+
+/// The GET half of the throttle's answer, which used to contradict the POST half.
+///
+/// `a_throttled_code_entry_is_a_429_that_reveals_nothing` pins the POST path. The deep link (RFC
+/// 8628 s3.3.1, the one s5.4 names as the higher-risk entry point) took the same refusal from the
+/// same limiter and rendered "That code was not recognised." at HTTP 200 — telling a user with a
+/// perfectly good code that it was wrong, and telling an attacker "not recognised" for the code
+/// that WAS recognised only by the accident of the two answers happening to coincide. The two
+/// paths owe the same answer.
+#[tokio::test]
+async fn a_throttled_deep_link_says_the_same_thing_the_throttled_post_says() {
+    let (addr, _server) = serve(
+        MemoryStorage::new(),
+        Wiring {
+            subject: true,
+            consent: true,
+            csrf: true,
+        },
+        Some(Box::new(RefuseCodeEntry)),
+    )
+    .await;
+    // A REAL, live, pending code, so the page would have rendered the client and the scope if the
+    // throttle had not refused. Without that this test could pass on a code that was genuinely
+    // unknown.
+    let (_device_code, user_code) = begin_device_grant(addr).await;
+
+    let page = request(
+        addr,
+        "GET",
+        &format!("/device?user_code={}", user_code.replace('-', "%2D")),
+        &[("Cookie", SESSION)],
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        page.status, 429,
+        "a refused code entry is a refusal, not an answer about the code: {}",
+        page.body
+    );
+    assert!(
+        page.body.contains("Too many attempts. Wait and try again."),
+        "the deep link must give the same answer the POST path gives: {}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("not recognised"),
+        "a live code was reported as unrecognised because the throttle refused to look: {}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("Test Device"),
+        "a refused lookup rendered the client anyway, which is the oracle the refusal removes: {}",
+        page.body
     );
 }

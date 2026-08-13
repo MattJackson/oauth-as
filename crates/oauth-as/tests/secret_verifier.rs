@@ -6,8 +6,8 @@
 //! WHY THIS SEAM EXISTS. Before 0.2.0 the only confidential registration this crate could express
 //! was `ClientAuth::ConfidentialSecret { secret }`, which is the secret ITSELF, so the host was
 //! pushed toward keeping plaintext credentials in whatever it persists a `Client` into. A library
-//! that makes the insecure thing the easy thing is doing harm, and ROADMAP.md's 0.2.0 slice names
-//! this ("client secret verifier seam, so hosts can store a hash rather than a secret").
+//! that makes the insecure thing the easy thing is doing harm, so 0.2.0 added this seam: hosts can
+//! store a hash rather than a secret, and the plaintext variant is no longer the only way in.
 //!
 //! Two paths are pinned here:
 //!
@@ -22,12 +22,23 @@
 mod support;
 
 use oauth_as::{
-    Client, ClientAuth, ClientId, ErrorCode, GrantType, Hooks, ScopeSet, SecretHash,
-    SecretVerifier, TokenRequest,
+    Client, ClientAuth, ClientId, ErrorCode, GrantType, ScopeSet, SecretHash, SecretVerifier,
+    TokenRequest,
 };
 use support::{server_with, ManualClock};
 
 const SECRET: &str = "a-high-entropy-host-generated-secret";
+
+/// The verifier is READ through `Hooks` and INSTALLED through the server's builder, which as of
+/// 0.9.1 is the crate's one installation verb. These tests exercise the seam rather than an
+/// endpoint, so they build a server only to borrow its `&Hooks`.
+async fn server_with_verifier(
+    verifier: Box<dyn SecretVerifier>,
+) -> oauth_as::AuthorizationServer<oauth_as::MemoryStorage, ManualClock> {
+    server_with(ManualClock::at_epoch(), Vec::new())
+        .await
+        .with_secret_verifier(verifier)
+}
 
 fn hashed_client(auth: ClientAuth) -> Client {
     Client {
@@ -164,8 +175,8 @@ async fn an_installed_verifier_decides_a_host_scheme() {
         }
     }
 
-    let mut hooks = Hooks::new();
-    hooks.install_secret_verifier(Box::new(FakeArgon));
+    let server = server_with_verifier(Box::new(FakeArgon)).await;
+    let hooks = server.hooks();
 
     let auth = ClientAuth::ConfidentialSecretHash {
         hash: SecretHash::custom("argon2id", "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA"),
@@ -188,8 +199,8 @@ async fn an_installed_verifier_cannot_weaken_the_built_in_scheme() {
         }
     }
 
-    let mut hooks = Hooks::new();
-    hooks.install_secret_verifier(Box::new(AlwaysYes));
+    let server = server_with_verifier(Box::new(AlwaysYes)).await;
+    let hooks = server.hooks();
 
     let auth = ClientAuth::ConfidentialSecretHash {
         hash: SecretHash::sha256(SECRET),
@@ -297,4 +308,141 @@ async fn the_same_registration_authenticates_nobody_without_the_verifier() {
         .await
         .expect_err("a scheme nobody can verify must not authenticate");
     assert_eq!(err.error, ErrorCode::InvalidClient);
+}
+
+/// THE COLLAPSE IS A TIMING PROPERTY TOO, and this is the seam half of it.
+///
+/// RFC 6749 section 5.2 has an unknown `client_id` and a wrong secret answer the same
+/// `invalid_client`, and `AuthorizationServer::authenticate_client` says in as many words that this
+/// is so "an attacker cannot probe which ids exist". A server that cannot verify a secret for a
+/// registration it did not find answers in the time of one store read, while a real id additionally
+/// pays a whole verification — which for the argon2id-shaped registration this very seam exists to
+/// support is roughly two milliseconds against two hundred. That is a single-request oracle over
+/// the entire client registry, and per-`client_id` throttling cannot see it, because the attacker
+/// sends exactly one request per candidate and never repeats one.
+///
+/// So the unknown-id path performs a DUMMY verification through this seam. What is asserted is that
+/// the host's verifier is CALLED, with the dummy it supplied, on a request naming a client that
+/// does not exist — and that the wire answer is unchanged. A wall-clock assertion would be the
+/// property itself and would also be flaky on shared CI; the call is what the wall clock is made
+/// of.
+#[tokio::test]
+async fn an_unknown_client_id_still_costs_a_verification_through_the_host_seam() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Counting {
+        calls: AtomicUsize,
+        schemes: std::sync::Mutex<Vec<String>>,
+    }
+    struct Installed(Arc<Counting>);
+    impl SecretVerifier for Installed {
+        fn verify(&self, stored: &SecretHash, presented: &str) -> bool {
+            self.0.calls.fetch_add(1, Ordering::SeqCst);
+            self.0
+                .schemes
+                .lock()
+                .unwrap()
+                .push(stored.scheme().to_string());
+            // The dummy must never AUTHENTICATE anything, whatever is presented: no registration
+            // names it, and a verifier that said yes would be answering about nobody.
+            stored.encoded() == "the-real-registration" && presented == SECRET
+        }
+
+        /// The half only the host can write: a stored verifier in ITS scheme, over a secret nobody
+        /// holds. A real implementation would use its own KDF parameters so the dummy costs what a
+        /// real registration costs.
+        fn dummy_hash(&self) -> Option<SecretHash> {
+            Some(SecretHash::custom(
+                "argon2id",
+                "a-dummy-nobody-holds-the-secret-for",
+            ))
+        }
+    }
+
+    let seen = Arc::new(Counting::default());
+    let srv = server_with(ManualClock::at_epoch(), Vec::new())
+        .await
+        .with_secret_verifier(Box::new(Installed(seen.clone())));
+    srv.register_client(hashed_client(ClientAuth::ConfidentialSecretHash {
+        hash: SecretHash::custom("argon2id", "the-real-registration"),
+    }))
+    .await
+    .unwrap();
+
+    // A KNOWN id: one verification, and it succeeds. This is the cost the unknown path has to
+    // match, and pinning it is what makes the comparison below mean something.
+    srv.token(TokenRequest::ClientCredentials {
+        client_id: ClientId::new("hashed-app"),
+        client_secret: Some(SECRET.to_string()),
+        scope: None,
+    })
+    .await
+    .expect("the registered client authenticates through the host seam");
+    assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+
+    // AN UNKNOWN id, with a secret presented. Same wire answer, and the same one verification.
+    let refused = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("no-such-client-was-ever-registered"),
+            client_secret: Some(SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .expect_err("an unknown client is invalid_client, as RFC 6749 s5.2 requires");
+    assert_eq!(refused.error, ErrorCode::InvalidClient);
+    assert_eq!(
+        seen.calls.load(Ordering::SeqCst),
+        2,
+        "an unknown client_id must cost a verification through the same seam, or the wire's \
+         collapse is undone by the wall clock"
+    );
+    let schemes = seen.schemes.lock().unwrap().clone();
+    assert_eq!(
+        schemes,
+        vec!["argon2id".to_string(), "argon2id".to_string()],
+        "the dummy has to be in the HOST's scheme; one in a scheme the verifier does not \
+         recognise is rejected on inspection, in microseconds, which is the leak again"
+    );
+}
+
+/// The half only the host can supply, and what happens when it does not. `dummy_hash` defaults to
+/// `None` because a required method would break every existing implementation of this trait; the
+/// crate then falls back to its own `sha256-hex`, which prices the BUILT-IN scheme exactly and a
+/// host scheme not at all. That residual is documented on `authenticate_client`, and it is pinned
+/// here so that a later change to the default is a deliberate one.
+#[tokio::test]
+async fn without_a_dummy_the_fallback_never_reaches_the_host_verifier() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct NoDummy(Arc<AtomicUsize>);
+    impl SecretVerifier for NoDummy {
+        fn verify(&self, _stored: &SecretHash, _presented: &str) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let srv = server_with(ManualClock::at_epoch(), Vec::new())
+        .await
+        .with_secret_verifier(Box::new(NoDummy(calls.clone())));
+
+    let refused = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("no-such-client-was-ever-registered"),
+            client_secret: Some(SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .expect_err("still invalid_client");
+    assert_eq!(refused.error, ErrorCode::InvalidClient);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the crate's own sha256-hex dummy is decided by the crate, so a verifier offering no \
+         dummy is never consulted: that is the stated limitation, not a silent one"
+    );
 }

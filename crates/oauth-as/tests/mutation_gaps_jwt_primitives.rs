@@ -28,24 +28,17 @@ const AUDIENCE: &str = "https://rs.example";
 /// A minimal RFC 9068 claim set. The claims are irrelevant to every assertion in this file: what
 /// is under test is the PROTECTED HEADER, which is a function of the `kid` alone.
 fn claims() -> AccessTokenClaims {
-    AccessTokenClaims {
-        iss: "https://as.example".to_string(),
-        exp: 4_000_000_000,
-        aud: Audience::One(AUDIENCE.to_string()),
-        sub: "app".to_string(),
-        client_id: "app".to_string(),
-        iat: 1_700_000_000,
-        jti: "jti".to_string(),
-        scope: None,
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        // The cfg MATCHES THE FIELD's, which is `any(dpop, mtls)` (see `AccessTokenClaims`), and
-        // not `mtls` alone: `cnf` carries the RFC 9449 s6 DPoP thumbprint as well as the RFC 8705
-        // s3.1 certificate one. Gated on `mtls` alone, this file did not compile at all in a
-        // `dpop`-without-`mtls` build.
-        #[cfg(any(feature = "dpop", feature = "mtls"))]
-        cnf: None,
-    }
+    // `AccessTokenClaims::new` fills `scope: None`, empty `authorization_details` and `cnf: None`,
+    // which is exactly what this fixture set explicitly before the type became non_exhaustive.
+    AccessTokenClaims::new(
+        "https://as.example",
+        4_000_000_000,
+        Audience::One(AUDIENCE.to_string()),
+        "app",
+        "app",
+        1_700_000_000,
+        "jti",
+    )
 }
 
 /// The decoded protected header of an access token signed under `kid`, as bytes, exactly as they
@@ -205,8 +198,9 @@ fn the_rfc_2104_key_block_rule_switches_above_the_block_size_not_at_it() {
 ///
 /// That argument is only as good as the seal, and this is the seal: either coordinate, either
 /// constructor, refused. If someone adds a third constructor that skips the width check, this test
-/// keeps passing and the equivalence claim becomes false, so `MUTANTS.md` says explicitly that the
-/// check inside `verify_es256` is retained as defence in depth for exactly that day.
+/// keeps passing and the equivalence claim becomes false. That is why the check inside
+/// `verify_es256` is retained as defence in depth rather than removed as provably dead: it costs a
+/// comparison and it is the thing still standing on the day the seal is broken.
 #[test]
 fn a_jwk_coordinate_that_is_not_thirty_two_bytes_cannot_be_constructed() {
     // A well-formed P-256 point, so that only the width under test differs between the cases.

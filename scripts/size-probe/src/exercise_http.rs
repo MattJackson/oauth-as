@@ -9,7 +9,7 @@
 //! feature on and calls it pays for the router, the form and query parsers, the body reader, and
 //! one response serializer per endpoint.
 
-use oauth_as::http::{Body, ConsentDecision, ServiceBuilder};
+use oauth_as::http::{ApprovalDecision, Body, ServiceBuilder};
 
 use crate::blockon::block_on;
 use crate::exercise::ISSUER;
@@ -40,7 +40,7 @@ pub fn plane() -> u64 {
         // A constant subject and a blanket approval: a probe, never a template. See the banner in
         // examples/conformance_server.rs for what each of these deletes in production.
         .with_subject_resolver(|_headers| Some("probe-subject".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .dangerously_disable_verification_protections()
         .build()
         .expect("the probe config routes to distinct paths");

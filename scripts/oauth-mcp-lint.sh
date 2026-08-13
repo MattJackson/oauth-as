@@ -48,7 +48,7 @@
 #      docs as a fixture that validates no token and serves no data.
 #   2. The document is TRUE. A resource at http://127.0.0.1:8915 whose authorization server is
 #      http://127.0.0.1:8914 is an accurate statement about the deployment under test. That is the
-#      difference between this and the OIDC bolt-on KICKOFF.md refuses: that would add real
+#      difference between this and the OIDC bolt-on this project refuses: that would add real
 #      protocol surface to the published crate to earn a badge asserting a capability the design
 #      deliberately rejects. This asserts nothing about the crate at all.
 #   3. It earns its keep independently. `ProtectedResourceMetadata` had no worked consumer in the

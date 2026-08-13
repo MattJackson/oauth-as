@@ -21,6 +21,21 @@ use std::sync::Mutex;
 
 use oauth_as::{Attempt, AttemptOutcome, Hooks, RateLimitDecision, RateLimiter};
 
+/// The seam is READ through [`Hooks`] and INSTALLED through the server's builder, which is the
+/// only installation verb this crate publishes as of 0.9.1. These tests exercise the seam itself
+/// rather than an endpoint, so they take the shortest route to a `&Hooks`: build a server, install
+/// through `with_rate_limiter`, and borrow. Constructing a bare `Hooks` and calling an
+/// `install_...` method on it was the second, unreachable installation API that 0.9.1 removed.
+fn hooks_with(
+    limiter: Box<dyn RateLimiter>,
+) -> oauth_as::AuthorizationServer<oauth_as::MemoryStorage> {
+    oauth_as::AuthorizationServer::new(
+        oauth_as::ServerConfig::new("https://as.example", "https://as.example/device"),
+        oauth_as::MemoryStorage::new(),
+    )
+    .with_rate_limiter(limiter)
+}
+
 /// A limiter that refuses after `allow_first` attempts, recording every call it is handed.
 #[derive(Default)]
 struct CountingLimiter {
@@ -84,8 +99,8 @@ fn an_unconfigured_hook_allows_every_attempt() {
 /// `Deny` is what the server turns into `DeviceApprovalError::RateLimited`.
 #[test]
 fn an_installed_limiter_can_deny_device_user_code_entry() {
-    let mut hooks = Hooks::new();
-    hooks.install_rate_limiter(Box::new(CountingLimiter::new(3)));
+    let server = hooks_with(Box::new(CountingLimiter::new(3)));
+    let hooks = server.hooks();
 
     for _ in 0..3 {
         assert_eq!(
@@ -100,30 +115,14 @@ fn an_installed_limiter_can_deny_device_user_code_entry() {
     );
 }
 
-/// Client authentication is the other place a bounded credential is guessed at (RFC 9700 section
-/// 4.13 treats credential stuffing at the token endpoint as a first-class threat), and the attempt
-/// carries the `client_id` because RFC 6749 section 2.2 makes it explicitly NOT a secret, so a
-/// limiter may key on it. Nothing else about the request is available to the library.
-#[test]
-fn client_authentication_attempts_name_the_client() {
-    let mut hooks = Hooks::new();
-    hooks.install_rate_limiter(Box::new(CountingLimiter::new(0)));
-    assert_eq!(
-        hooks.check(Attempt::ClientAuthentication {
-            client_id: "some-app"
-        }),
-        RateLimitDecision::Deny
-    );
-}
-
 /// A limiter counts FAILURES, so the outcome has to come back to it: `check` before the work,
 /// `record` after. Without `record` a host could only throttle traffic, not wrong guesses, which
 /// is the wrong axis for a guessing attack against a short code.
 #[test]
 fn outcomes_are_reported_back_to_the_limiter() {
     let limiter = std::sync::Arc::new(CountingLimiter::new(usize::MAX));
-    let mut hooks = Hooks::new();
-    hooks.install_rate_limiter(Box::new(LimiterHandle(limiter.clone())));
+    let server = hooks_with(Box::new(LimiterHandle(limiter.clone())));
+    let hooks = server.hooks();
 
     hooks.record(Attempt::DeviceUserCodeEntry, AttemptOutcome::Failed);
     hooks.record(
@@ -157,8 +156,8 @@ fn recording_is_optional_for_a_limiter_implementation() {
             RateLimitDecision::Deny
         }
     }
-    let mut hooks = Hooks::new();
-    hooks.install_rate_limiter(Box::new(CeilingOnly));
+    let server = hooks_with(Box::new(CeilingOnly));
+    let hooks = server.hooks();
     hooks.record(Attempt::DeviceUserCodeEntry, AttemptOutcome::Failed);
     assert_eq!(
         hooks.check(Attempt::DeviceUserCodeEntry),
@@ -382,13 +381,53 @@ async fn user_code_outcomes_are_reported_to_the_limiter() {
     );
 }
 
+/// Client authentication is the other place a bounded credential is guessed at (RFC 9700 section
+/// 4.13 treats credential stuffing at the token endpoint as a first-class threat), and the attempt
+/// carries the `client_id` because RFC 6749 section 2.2 makes it explicitly NOT a secret, so a
+/// limiter may key on it. Nothing else about the request is available to the library.
+///
+/// The assertion is the LABEL the limiter was handed, character for character. Until the 0.9.1
+/// audit this test handed a `client_id` to a limiter whose `check` discarded its argument and
+/// asserted only that the answer was `Deny`, which it was for any input at all: replacing the
+/// server's `client_id.as_str()` with `""` changed nothing it looked at.
+#[tokio::test]
+async fn client_authentication_attempts_name_the_client() {
+    let limiter = std::sync::Arc::new(DenyOnly::new("client:"));
+    let srv = device_server(Box::new(DenyHandle(limiter.clone()))).await;
+    let _ = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("confidential-app"),
+            client_secret: Some(support::CONFIDENTIAL_SECRET.to_string()),
+            scope: None,
+        })
+        .await;
+
+    let asked = limiter
+        .asked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        asked,
+        vec!["client:confidential-app".to_string()],
+        "the limiter must be told WHICH client is authenticating, or it can only throttle the \
+         endpoint as a whole"
+    );
+}
+
 /// RFC 9700 section 4.13: credential stuffing at the token endpoint. A throttled client
 /// authentication is refused with the SAME `invalid_client` a wrong secret gets, so the throttle
 /// does not become an oracle telling an attacker they had found a live registration.
+///
+/// The comparison is the whole `ErrorResponse`, not just its code, for the reason
+/// `tests/client_auth.rs` compares whole values too: a description attached on one path and not
+/// the other is the oracle, in a field the code alone does not cover. Until the 0.9.1 audit this
+/// asserted `ErrorCode::InvalidClient` and nothing else, and adding a `.with_description("rate
+/// limited")` to the throttle's refusal left it green.
 #[tokio::test]
 async fn a_denying_limiter_refuses_client_authentication() {
     let srv = device_server(Box::new(DenyOnly::new("client:"))).await;
-    let err = srv
+    let throttled = srv
         .token(TokenRequest::ClientCredentials {
             client_id: ClientId::new("confidential-app"),
             client_secret: Some(support::CONFIDENTIAL_SECRET.to_string()),
@@ -396,5 +435,21 @@ async fn a_denying_limiter_refuses_client_authentication() {
         })
         .await
         .expect_err("a throttled client must not authenticate, right secret or not");
-    assert_eq!(err.error, ErrorCode::InvalidClient);
+    assert_eq!(throttled.error, ErrorCode::InvalidClient);
+
+    // The same request against an unthrottled server, with the secret wrong instead: what an
+    // attacker probing for live registrations would otherwise be comparing against.
+    let open = device_server(Box::new(CountingLimiter::new(usize::MAX))).await;
+    let wrong_secret = open
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("confidential-app"),
+            client_secret: Some("not-the-secret".to_string()),
+            scope: None,
+        })
+        .await
+        .expect_err("a wrong secret must not authenticate");
+    assert_eq!(
+        throttled, wrong_secret,
+        "the throttle must be indistinguishable from a wrong secret, description and all"
+    );
 }

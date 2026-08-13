@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::GrantType;
-use oauth_as::http::{Body, ConsentDecision, MAX_FORM_PARAMETERS};
+use oauth_as::http::{ApprovalDecision, Body, MAX_FORM_PARAMETERS};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig, SystemClock};
 use oauth_as::store::MemoryStorage;
@@ -49,7 +49,7 @@ async fn service() -> oauth_as::http::AuthorizationService<MemoryStorage, System
     .unwrap();
     oauth_as::http::ServiceBuilder::new(Arc::new(srv))
         .with_subject_resolver(|_headers| Some("user-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("service")
 }
@@ -105,6 +105,32 @@ async fn a_token_request_at_the_parameter_cap_is_answered() {
         http::StatusCode::OK,
         "a request at the cap must still be served: the cap is a ceiling on abuse, not a change \
          to what a conforming client may send"
+    );
+}
+
+/// ONE PAST THE CAP, which is the only request that distinguishes the boundary this file claims
+/// to hold from the two either side of it.
+///
+/// The enforcement is `separators >= MAX_FORM_PARAMETERS`, so the smallest refused request carries
+/// exactly `MAX_FORM_PARAMETERS` separators: three real parameters and `MAX_FORM_PARAMETERS - 2`
+/// junk ones. The at-cap test above sends one fewer and the over-cap test above sends two more, so
+/// relaxing the comparison to `>` — the off-by-one anybody rewriting this loop could make, and one
+/// cargo-mutants generates — leaves both of them green while every deployment silently accepts a
+/// request one parameter over its stated ceiling.
+#[tokio::test]
+async fn a_token_request_one_past_the_parameter_cap_is_refused() {
+    let service = service().await;
+    let base =
+        format!("grant_type=client_credentials&client_id=confidential-app&client_secret={SECRET}");
+    // Three real parameters (two separators) plus MAX - 2 junk ones: MAX separators exactly, which
+    // is the FIRST count the cap refuses.
+    let body = with_extras(&base, MAX_FORM_PARAMETERS - 2);
+    let response = service.handle(post("/token", body)).await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::PAYLOAD_TOO_LARGE,
+        "the cap is `separators >= MAX_FORM_PARAMETERS`, so this is the smallest request it \
+         refuses; a test that only ever sends two past the cap cannot see it move by one"
     );
 }
 

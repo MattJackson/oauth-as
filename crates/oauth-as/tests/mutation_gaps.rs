@@ -6,10 +6,10 @@
 //! Each test here corresponds to a surviving mutant: a change that could be made to the source
 //! with the whole suite still green. A survivor in a serialization helper or a registration parser
 //! is not a curiosity, it is a behaviour the tests do not actually constrain, and this crate's
-//! standard is that such a thing is either killed by a test or argued in MUTANTS.md as
-//! indistinguishable. These are the killings.
+//! standard is that such a thing is either killed by a test or argued, in writing beside the code,
+//! to be indistinguishable from the original. These are the killings.
 
-#![cfg(any(feature = "rar", feature = "mtls", feature = "client_assertion"))]
+#![cfg(any(feature = "rar", feature = "mtls", feature = "client-assertion"))]
 
 /// SURVIVOR: `rar::is_empty_list` could return a constant and nothing failed.
 ///

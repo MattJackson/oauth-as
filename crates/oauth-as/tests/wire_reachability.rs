@@ -60,7 +60,7 @@ use std::time::Duration;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::grant::{GrantType, DEVICE_CODE_GRANT_URN};
-use oauth_as::http::{AuthorizationService, Body, ConsentDecision, ServiceBuilder};
+use oauth_as::http::{ApprovalDecision, AuthorizationService, Body, ServiceBuilder};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig, SystemClock};
 use oauth_as::store::MemoryStorage;
@@ -70,6 +70,14 @@ const ISSUER: &str = "https://as.example";
 const VERIFICATION_URI: &str = "https://as.example/device";
 /// The audience an RFC 7523 assertion has to name. Spelled out rather than derived so that a
 /// change to the default endpoint layout shows up here as a failing assertion.
+///
+/// Cfg'd rather than `#[allow(dead_code)]` because it is read in exactly two places, both gated:
+/// the RFC 7523 assertion claim set and the RFC 9449 s4.2 proof's `htu`. Naming those builds keeps
+/// the constant dead-code-checked in every OTHER build, which an `allow` would not.
+#[cfg(any(
+    feature = "client-assertion",
+    all(feature = "dpop", feature = "jwt-p256")
+))]
 const TOKEN_ENDPOINT: &str = "https://as.example/token";
 
 const CONFIDENTIAL: &str = "confidential-app";
@@ -78,6 +86,10 @@ const SECRET: &str = "a-high-entropy-registered-client-secret";
 const REDIRECT: &str = "https://app.example/cb";
 /// RFC 7636 appendix B's verifier, so the challenge derived from it is a real S256 challenge.
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+/// The label [`service_variants`] gives the RFC 9068 signing configuration, named once so the
+/// sweeps that treat it differently (only a signing server advertises `jwks_uri`) agree on it.
+const SIGNING_VARIANT: &str = "signed access tokens";
 
 // ---------------------------------------------------------------------------------------------
 // The wire, and nothing above it
@@ -184,6 +196,29 @@ fn urlencode(raw: &str) -> String {
     out
 }
 
+/// The inverse of [`urlencode`] for the `%XX` triples this server actually emits. A redirect
+/// parameter is percent-encoded on the way out (`AuthorizationResponse` encodes the issuer like
+/// every other value), so a test that wants to COMPARE one against a constant has to decode it
+/// first; the alternative is comparing against a pre-encoded string, which asserts the encoding
+/// rather than the value.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                out.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Read one query parameter out of a redirect `Location`. No URL parser, for the reason above:
 /// the values this server puts there are `code`, `state` and `iss`, none of which is escaped in a
 /// way a split on `&` and `=` gets wrong.
@@ -249,6 +284,13 @@ fn public_client() -> Client {
 
 fn base_config() -> ServerConfig {
     let mut config = ServerConfig::new(ISSUER, VERIFICATION_URI);
+    // OPTED IN, because as of 0.9.1 `introspection_endpoint` is advertised only when the host
+    // names it. The endpoint is still ROUTED unconditionally; what changed is the promise in the
+    // discovery document, since a resource server -- RFC 7662's primary caller -- cannot use this
+    // endpoint until the capability lands in 0.9.2, and advertising it said otherwise. Setting it
+    // here keeps this sweep covering the endpoint AND exercises the opt-in, which is the half a
+    // host actually chooses.
+    config.introspection_endpoint = Some(format!("{ISSUER}/introspect"));
     // RFC 8628 s3.5's `slow_down` is correct behaviour and is tested elsewhere; here it would
     // turn the device grant's SUCCESS proof into a timing race, and a wire suite that has to
     // sleep is a wire suite people disable. Zero spacing removes the race without removing the
@@ -297,7 +339,7 @@ async fn fixture() -> Fixture {
         .register_client(public_client())
         .await
         .expect("register the public client");
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     register_assertion_clients(&server).await;
     #[cfg(feature = "mtls")]
     register_mtls_clients(&server).await;
@@ -305,7 +347,7 @@ async fn fixture() -> Fixture {
     let server = Arc::new(server);
     let service = ServiceBuilder::new(Arc::clone(&server))
         .with_subject_resolver(|_headers| Some("resource-owner-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         // The device verification form's CSRF protection is a BROWSER countermeasure, and this
         // file drives the endpoint with no browser and no session, exactly as the black-box
         // conformance harness does. tests/http_surface.rs owns the proof that the protection
@@ -397,10 +439,18 @@ async fn authorization_code(service: &Service, client_id: &str) -> String {
     );
     // RFC 9207 s2, and the document advertises
     // `authorization_response_iss_parameter_supported: true`, so a client is entitled to REQUIRE
-    // it. Compared percent-decoded rather than by string, because the issuer is a URL.
-    assert!(
-        query_param(&location, "iss").is_some(),
-        "RFC 9207 s2: the iss parameter must be present: {location}"
+    // it AND to compare it. Presence alone was asserted until the 0.9.1 audit, which an empty
+    // `iss=` satisfies: RFC 9207 s2.4 has the client REJECT a response whose issuer is not the one
+    // it started the flow with, so an issuer it cannot compare is an issuer that buys nothing. The
+    // value is percent-decoded first, because the server encodes it like every other redirect
+    // parameter and comparing the encoded form would assert the encoding rather than the issuer.
+    assert_eq!(
+        query_param(&location, "iss")
+            .as_deref()
+            .map(percent_decode)
+            .as_deref(),
+        Some(ISSUER),
+        "RFC 9207 s2: the iss parameter must name this server: {location}"
     );
     query_param(&location, "code").unwrap_or_else(|| panic!("no code in the redirect: {location}"))
 }
@@ -629,25 +679,25 @@ async fn prove_auth_method(fx: &Fixture, method: &str) {
                 .await
                 .access_token("a public client (auth method none) over HTTP");
         }
-        #[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+        #[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
         oauth_as::client_assertion::PRIVATE_KEY_JWT => {
             assertion_token(&fx.service, PRIVATE_KEY_JWT_CLIENT, &private_key_jwt())
                 .await
                 .access_token("RFC 7523 private_key_jwt over HTTP");
         }
-        // A build with `client_assertion` and no ES256 BACKEND cannot check an ES256 signature, so
+        // A build with `client-assertion` and no ES256 BACKEND cannot check an ES256 signature, so
         // it refuses every `private_key_jwt` assertion, so it must not name the method. This arm
         // used to be empty, which recorded the gap honestly but left the advertisement unchecked;
         // it is a panic now because the document is derived from the server's installed seams
         // (`AuthorizationServer::metadata`) and this is the build where that has to be true. The
         // fixture installs no verifier, so reaching this arm means the document is inviting
         // clients to use a method that is refused every time.
-        #[cfg(all(feature = "client_assertion", not(feature = "jwt-p256")))]
+        #[cfg(all(feature = "client-assertion", not(feature = "jwt-p256")))]
         oauth_as::client_assertion::PRIVATE_KEY_JWT => panic!(
             "this build has no ES256 backend and no host verifier is installed, so every ES256 \
              assertion is refused. The RFC 8414 document must not advertise private_key_jwt here."
         ),
-        #[cfg(feature = "client_assertion")]
+        #[cfg(feature = "client-assertion")]
         oauth_as::client_assertion::CLIENT_SECRET_JWT => {
             assertion_token(&fx.service, CLIENT_SECRET_JWT_CLIENT, &client_secret_jwt())
                 .await
@@ -655,11 +705,11 @@ async fn prove_auth_method(fx: &Fixture, method: &str) {
         }
         #[cfg(feature = "mtls")]
         oauth_as::mtls::TLS_CLIENT_AUTH => {
-            mtls_is_refused_through_this_service(&fx.service, TLS_CLIENT_AUTH_CLIENT).await;
+            mtls_is_refused_through_this_service(fx, TLS_CLIENT_AUTH_CLIENT, method).await;
         }
         #[cfg(feature = "mtls")]
         oauth_as::mtls::SELF_SIGNED_TLS_CLIENT_AUTH => {
-            mtls_is_refused_through_this_service(&fx.service, SELF_SIGNED_TLS_CLIENT).await;
+            mtls_is_refused_through_this_service(fx, SELF_SIGNED_TLS_CLIENT, method).await;
         }
         other => panic!(
             "token_endpoint_auth_methods_supported advertises {other:?}, and nothing in this file \
@@ -738,7 +788,7 @@ async fn every_advertised_endpoint_is_routed() {
     for (label, service) in service_variants().await {
         let doc = metadata(&service).await;
         let object = doc.as_object().expect("the document is a JSON object");
-        let mut probed = 0usize;
+        let mut probed: Vec<&str> = Vec::new();
         for (member, value) in object {
             let is_endpoint = member.ends_with("_endpoint") || member == "jwks_uri";
             if !is_endpoint {
@@ -758,12 +808,37 @@ async fn every_advertised_endpoint_is_routed() {
                  {path} for both GET and POST. An advertised endpoint that does not answer is a \
                  promise a client cannot recover from."
             );
-            probed += 1;
+            probed.push(member);
         }
-        assert!(
-            probed >= 5,
-            "{label}: expected at least authorization, token, device, introspection and \
-             revocation to be advertised, swept {probed}"
+        // THE SET, not a count. A count of five was asserted until the 0.9.1 audit while the
+        // document advertised seven or eight, so the document could have dropped `revocation` and
+        // `registration` and this sweep would still have passed on the five that remained: a
+        // capability silently withdrawn is exactly as invisible to a count as a capability
+        // silently added. The list is derived from `AuthorizationServerMetadata::from_config`,
+        // which advertises the first five unconditionally, `registration_endpoint` when a
+        // registration configuration is present (this fixture supplies one), the PAR endpoint
+        // under `par`, and `jwks_uri` only where this server signs its own access tokens.
+        probed.sort_unstable();
+        let mut expected = vec![
+            "authorization_endpoint",
+            "device_authorization_endpoint",
+            "introspection_endpoint",
+            "registration_endpoint",
+            "revocation_endpoint",
+            "token_endpoint",
+        ];
+        #[cfg(feature = "par")]
+        expected.push("pushed_authorization_request_endpoint");
+        if label == SIGNING_VARIANT {
+            expected.push("jwks_uri");
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            probed, expected,
+            "{label}: the set of advertised endpoints changed. Every member here is probed for a \
+             non-404 above, so adding one without adding it here is a routed endpoint nobody \
+             checked, and removing one is a capability withdrawn from every client that reads the \
+             document."
         );
     }
 }
@@ -777,7 +852,7 @@ async fn every_advertised_endpoint_is_routed() {
 /// The checklists above cover four of the document's capability lists (grant types, auth methods,
 /// response types, PKCE methods). The signing-algorithm lists were not among them, and they are
 /// the family where the advertisement became able to lie: they were each derived from FEATURE
-/// PRESENCE, and since the ES256 seam a feature no longer implies a backend. `client_assertion`
+/// PRESENCE, and since the ES256 seam a feature no longer implies a backend. `client-assertion`
 /// compiles the `Es256Verifier` SEAM in; `jwt-p256` is what compiles an implementation of it, and
 /// a host may install its own instead. So a build could advertise ES256 with nothing anywhere in
 /// the process able to check an ES256 signature.
@@ -795,17 +870,30 @@ async fn every_advertised_endpoint_is_routed() {
 /// algorithm added to any of these lists, or a whole new `*_alg_values_supported` member added to
 /// the document, fails here on the next run rather than shipping as an unproven promise.
 ///
-/// The advertisement is then tied back to something driven over the wire: an algorithm named in
+/// # Why the ES256 arm PERFORMS the algorithm instead of reading a cfg
+///
+/// Until the 0.9.1 audit this test computed `let es256_is_checkable = cfg!(feature = "jwt-p256")`
+/// and then asserted that value inside the ES256 arm. `from_config` emits ES256 into any of these
+/// members only under that same cfg (or when a host verifier is installed, and no fixture here
+/// installs one), so REACHING the arm already implied the thing being asserted: the whole test
+/// reduced to `assert!(cfg!(feature = "jwt-p256"))`, which is true by construction in every build
+/// where it runs. It could not have caught the defect in its own doc comment, a document derived
+/// from a feature rather than from an installed backend, because it was derived from the same
+/// feature.
+///
+/// Now the value is a WIRE PROBE, one per member and each performing that member's own use of the
+/// algorithm: a `private_key_jwt` assertion signed ES256 and redeemed to a 200 for the token
+/// endpoint's member, and an RFC 9449 s4.2 proof signed ES256 and answered with a `DPoP` token for
+/// `dpop_signing_alg_values_supported`. The second is also the only DPoP proof this file sends;
+/// that member was swept with no tie to anything driven over the wire at all, so a build that
+/// advertised it and refused every proof read exactly like a build that honoured them.
+///
+/// The advertisement is tied back to the auth-method list as well: an algorithm named in
 /// `token_endpoint_auth_signing_alg_values_supported` must have its RFC 7523 method named in
 /// `token_endpoint_auth_methods_supported` too, and every entry in THAT list is redeemed to a
 /// real `access_token` by `every_advertised_token_endpoint_auth_method_is_exercised_over_http`.
-/// Without that tie this test would only be comparing the document against a cfg.
 #[tokio::test]
 async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
-    // TRUE exactly when an ES256 signature can be checked in this process. No fixture in this
-    // file installs a host verifier, so the built-in backend is the only source of one.
-    let es256_is_checkable = cfg!(feature = "jwt-p256");
-
     for (label, service) in service_variants().await {
         let doc = metadata(&service).await;
         let object = doc.as_object().expect("the document is a JSON object");
@@ -843,12 +931,12 @@ async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
                     }
                     "ES256" => {
                         assert!(
-                            es256_is_checkable,
-                            "{label}: {member} advertises ES256 and this build has no ES256 \
-                             backend and no installed host verifier, so every credential a \
-                             client signs under it is refused. This is the exact advertisement \
-                             that must be derived from the installed verifier and not from a \
-                             cargo feature."
+                            es256_is_performed_over_the_wire(&service, member, label).await,
+                            "{label}: {member} advertises ES256 and a credential signed ES256 for \
+                             that member's own purpose was REFUSED over the wire, so every client \
+                             that believes the document is refused too. This is the exact \
+                             advertisement that must be derived from the installed verifier and \
+                             not from a cargo feature."
                         );
                         if member == "token_endpoint_auth_signing_alg_values_supported" {
                             assert!(
@@ -869,18 +957,119 @@ async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
             swept += 1;
         }
 
-        // The converse, so the sweep cannot pass by finding nothing. `client_assertion` always
+        // The converse, so the sweep cannot pass by finding nothing. `client-assertion` always
         // produces `token_endpoint_auth_signing_alg_values_supported` (HS256 at minimum, because
         // `client_secret_jwt` needs no backend), so in that build there is at least one member to
         // sweep and a document that dropped the family entirely is caught.
-        #[cfg(feature = "client_assertion")]
+        #[cfg(feature = "client-assertion")]
         assert!(
             swept >= 1,
-            "{label}: this build has client_assertion, so the document must carry \
+            "{label}: this build has client-assertion, so the document must carry \
              token_endpoint_auth_signing_alg_values_supported: {doc}"
         );
         let _ = swept;
     }
+}
+
+/// PERFORM the ES256 signature this member is advertising, over the wire, and report whether the
+/// service accepted it.
+///
+/// Each member of the `*_alg_values_supported` family is a promise about a DIFFERENT credential, so
+/// each gets its own probe rather than one shared "can this process do ES256" answer: the token
+/// endpoint's member promises RFC 7523 assertions and the DPoP member promises RFC 9449 proofs, and
+/// those are checked by different code on different paths. A member added to the family with no
+/// probe PANICS here, for the same reason every other catch-all in this file does.
+async fn es256_is_performed_over_the_wire(service: &Service, member: &str, label: &str) -> bool {
+    let nonce = format!("{label}-{member}");
+    match member {
+        "token_endpoint_auth_signing_alg_values_supported" => {
+            es256_client_assertion_is_accepted(service, &nonce).await
+        }
+        "dpop_signing_alg_values_supported" => es256_dpop_proof_is_accepted(service, &nonce).await,
+        other => panic!(
+            "{label}: {other} advertises ES256 and nothing here signs the credential that member \
+             is a promise about. Add the wire probe; a cfg is not a probe, because the document is \
+             derived from cfgs too."
+        ),
+    }
+}
+
+/// RFC 7523 s2.2 `private_key_jwt`: an assertion signed ES256, redeemed to a 200 at `/token`.
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
+async fn es256_client_assertion_is_accepted(service: &Service, nonce: &str) -> bool {
+    let response = assertion_token(
+        service,
+        PRIVATE_KEY_JWT_CLIENT,
+        &private_key_jwt_with_jti(nonce),
+    )
+    .await;
+    response.status == http::StatusCode::OK && response.json().get("access_token").is_some()
+}
+
+#[cfg(not(all(feature = "client-assertion", feature = "jwt-p256")))]
+async fn es256_client_assertion_is_accepted(_service: &Service, _nonce: &str) -> bool {
+    // Nothing in this build can SIGN one, so nothing here can distinguish a service that would
+    // have checked it from one that would not. A build in this shape must not advertise ES256 for
+    // client authentication, and returning false is what says so.
+    false
+}
+
+/// RFC 9449 s4.2: a proof signed ES256, answered with an RFC 9449 s5 `DPoP` token.
+///
+/// The `token_type` is checked as well as the status, because a server that ignored the header
+/// entirely would answer 200 with a `Bearer` token and a probe that looked only at the status could
+/// not tell that apart from a proof that was verified.
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
+async fn es256_dpop_proof_is_accepted(service: &Service, nonce: &str) -> bool {
+    let response = post_form_with(
+        service,
+        "/token",
+        format!(
+            "grant_type=client_credentials&client_id={CONFIDENTIAL}&client_secret={SECRET}\
+             &scope=read"
+        ),
+        &[(oauth_as::dpop::DPOP_HEADER, dpop_proof(nonce))],
+    )
+    .await;
+    let body = response.json();
+    response.status == http::StatusCode::OK
+        && body.get("access_token").is_some()
+        && body.get("token_type").and_then(|v| v.as_str()) == Some(oauth_as::dpop::DPOP_TOKEN_TYPE)
+}
+
+#[cfg(not(all(feature = "dpop", feature = "jwt-p256")))]
+async fn es256_dpop_proof_is_accepted(_service: &Service, _nonce: &str) -> bool {
+    false
+}
+
+/// One RFC 9449 s4.2 proof for `POST {TOKEN_ENDPOINT}`. The key is generated per call and travels
+/// in the header's own `jwk`, which is what RFC 9449 s4.2 specifies and what makes a proof
+/// self-contained: nothing about this probe depends on a registration.
+#[cfg(all(feature = "dpop", feature = "jwt-p256"))]
+fn dpop_proof(jti: &str) -> String {
+    use oauth_as::jwt::{compact_jws, EcdsaP256Key};
+
+    let key = EcdsaP256Key::generate("wire-dpop-key");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let header = serde_json::json!({
+        "typ": oauth_as::dpop::DPOP_PROOF_TYP,
+        "alg": "ES256",
+        "jwk": serde_json::to_value(key.to_public_jwk()).expect("a serializable JWK"),
+    });
+    let claims = serde_json::json!({
+        "jti": jti,
+        "htm": "POST",
+        "htu": TOKEN_ENDPOINT,
+        "iat": now,
+    });
+    compact_jws(
+        &serde_json::to_vec(&header).expect("serializable header"),
+        &serde_json::to_vec(&claims).expect("serializable claims"),
+        |input| key.sign_signing_input(input).expect("the proof key signs"),
+    )
 }
 
 /// The service variants worth sweeping. The signing one exists so that `jwks_uri`, which is
@@ -895,7 +1084,7 @@ async fn service_variants() -> Vec<(&'static str, Service)> {
     let mut variants = vec![("opaque tokens", fixture().await.service)];
     #[cfg(feature = "jwt-p256")]
     {
-        variants.push(("signed access tokens", signing_service().await));
+        variants.push((SIGNING_VARIANT, signing_service().await));
     }
     variants
 }
@@ -915,9 +1104,16 @@ async fn signing_service() -> Service {
         .register_client(confidential_client())
         .await
         .expect("register the confidential client");
+    // The signing variant is swept by
+    // `every_advertised_signing_algorithm_can_be_performed_by_this_build`, whose ES256 arm now
+    // REDEEMS an RFC 7523 assertion rather than reading a cfg, so this variant needs the same
+    // assertion registrations the default fixture has. Without them the probe would fail as an
+    // unknown client and be read as an ES256 backend that is not there.
+    #[cfg(feature = "client-assertion")]
+    register_assertion_clients(&server).await;
     ServiceBuilder::new(Arc::new(server))
         .with_subject_resolver(|_headers| Some("resource-owner-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("a signing service builds")
 }
@@ -1240,22 +1436,22 @@ async fn the_rfc_9728_resource_document_is_the_resources_to_serve_not_this_serve
 // RFC 7523 client assertions, over the wire
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 const CLIENT_SECRET_JWT_CLIENT: &str = "csjwt-app";
-#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 const PRIVATE_KEY_JWT_CLIENT: &str = "pkjwt-app";
 
 /// The ES256 key the `private_key_jwt` fixture signs with. Generated ONCE so the registration and
 /// the assertion agree; a per-call key would make every assertion fail for the right reason and
 /// prove nothing.
-#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 fn assertion_key() -> &'static oauth_as::jwt::EcdsaP256Key {
     use std::sync::OnceLock;
     static KEY: OnceLock<oauth_as::jwt::EcdsaP256Key> = OnceLock::new();
     KEY.get_or_init(|| oauth_as::jwt::EcdsaP256Key::generate("wire-assertion-key"))
 }
 
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 async fn register_assertion_clients(server: &AuthorizationServer<MemoryStorage, SystemClock>) {
     use oauth_as::client_assertion::{AssertionKeys, ClientSecretKey};
 
@@ -1288,7 +1484,7 @@ async fn register_assertion_clients(server: &AuthorizationServer<MemoryStorage, 
 }
 
 /// An RFC 7523 s3 claim set naming this server's token endpoint as the audience.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 fn assertion_claims(client_id: &str, jti: &str) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1304,14 +1500,14 @@ fn assertion_claims(client_id: &str, jti: &str) -> Value {
     })
 }
 
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 fn client_secret_jwt() -> String {
     client_secret_jwt_with_jti("wire-cs-1")
 }
 
 /// The same, with the caller's own `jti`. RFC 7523 s3 makes it single use, so a test that
 /// authenticates twice needs two of them; reusing one would be refused as the replay it is.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 fn client_secret_jwt_with_jti(jti: &str) -> String {
     oauth_as::jwt::compact_jws(
         br#"{"alg":"HS256","typ":"JWT"}"#,
@@ -1334,7 +1530,7 @@ fn client_secret_jwt_with_jti(jti: &str) -> String {
 ///
 /// Both endpoints are asserted together on purpose: one authenticates and the other does too, and
 /// a fix that reached only the endpoint somebody happened to test is how the first one survived.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[tokio::test]
 async fn an_assertion_authenticated_client_may_introspect_and_revoke_over_http() {
     let fx = fixture().await;
@@ -1392,7 +1588,7 @@ async fn an_assertion_authenticated_client_may_introspect_and_revoke_over_http()
 
 /// One form body carrying the RFC 7521 s4.2 assertion parameters plus whatever the endpoint's own
 /// parameters are.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 fn assertion_form(endpoint_parameters: &str, assertion: &str) -> String {
     format!(
         "{endpoint_parameters}&client_id={CLIENT_SECRET_JWT_CLIENT}\
@@ -1401,11 +1597,18 @@ fn assertion_form(endpoint_parameters: &str, assertion: &str) -> String {
     )
 }
 
-#[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 fn private_key_jwt() -> String {
+    private_key_jwt_with_jti("wire-pk-1")
+}
+
+/// The same, with the caller's own `jti`, for the same RFC 7523 s3 single-use reason
+/// [`client_secret_jwt_with_jti`] has one.
+#[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
+fn private_key_jwt_with_jti(jti: &str) -> String {
     oauth_as::jwt::compact_jws(
         br#"{"alg":"ES256","typ":"JWT"}"#,
-        &serde_json::to_vec(&assertion_claims(PRIVATE_KEY_JWT_CLIENT, "wire-pk-1"))
+        &serde_json::to_vec(&assertion_claims(PRIVATE_KEY_JWT_CLIENT, jti))
             .expect("serializable claims"),
         |input| {
             assertion_key()
@@ -1416,7 +1619,7 @@ fn private_key_jwt() -> String {
 }
 
 /// Post an RFC 7523 assertion at the token endpoint, exactly as RFC 7521 s4.2 spells it.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 async fn assertion_token(service: &Service, client_id: &str, assertion: &str) -> Wire {
     post_form(
         service,
@@ -1470,10 +1673,46 @@ async fn register_mtls_clients(server: &AuthorizationServer<MemoryStorage, Syste
 }
 
 /// A shared assertion so the two RFC 8705 arms of [`prove_auth_method`] say the same thing.
+///
+/// THE REGISTRATION IS ASSERTED FIRST, and that half is what makes the refusal mean anything.
+/// `authenticate_client` answers an unknown `client_id` with a BARE `invalid_client` and no
+/// description, deliberately (RFC 6749 s5.2 collapses the refusals so a caller cannot probe a
+/// registration), which is byte for byte what an mTLS client that this service cannot see a
+/// certificate for gets. So until the 0.9.1 audit `register_mtls_clients` could be deleted outright
+/// and both arms stayed green: they would have been asserting that a client that did not exist
+/// could not authenticate, while [`prove_auth_method`] counted them as this file's proof for two
+/// advertised `token_endpoint_auth_methods_supported` values.
+///
+/// Reading the registration back out of the store is the only oracle available, precisely because
+/// the wire is not allowed to be one.
 #[cfg(feature = "mtls")]
-async fn mtls_is_refused_through_this_service(service: &Service, client_id: &str) {
+async fn mtls_is_refused_through_this_service(fx: &Fixture, client_id: &str, method: &str) {
+    use oauth_as::store::Storage as _;
+
+    let registered = fx
+        .server
+        .store()
+        .get_client(&ClientId::new(client_id))
+        .await
+        .expect("the store answers")
+        .unwrap_or_else(|| {
+            panic!(
+                "{client_id} is not registered, so the refusal below would be the refusal of an \
+                 unknown client and would say nothing about RFC 8705 {method}"
+            )
+        });
+    match &registered.auth {
+        ClientAuth::Mtls { registration } => assert_eq!(
+            registration.method_name(),
+            method,
+            "{client_id} is registered for a different RFC 8705 method than the one this arm \
+             claims to prove"
+        ),
+        other => panic!("{client_id} must be registered for mTLS, found {other:?}"),
+    }
+
     let response = post_form(
-        service,
+        &fx.service,
         "/token",
         format!("grant_type=client_credentials&scope=read&client_id={client_id}"),
     )
@@ -1514,15 +1753,35 @@ async fn the_advertised_mtls_methods_cannot_authenticate_through_this_service() 
     let fx = fixture().await;
     let doc = metadata(&fx.service).await;
     let methods = advertised(&doc, "token_endpoint_auth_methods_supported");
+    // INVERTED at 0.9.1, and the name of this test is why. It used to assert that an `mtls` build
+    // ADVERTISES both RFC 8705 methods, and then proved that this router refuses them both -- which
+    // is a document promising a capability the code cannot deliver, the exact defect
+    // `crate::metadata`'s module docs say that module exists to prevent. `ServiceBuilder::build`
+    // now strips both methods from the document IT serves, because `Credentials::credential`
+    // passes `certificate: None` on every credential this router builds, so no certificate can
+    // ever reach `verify_with`. `AuthorizationServer::metadata()` is unchanged: a host that
+    // terminates TLS itself and drives the server through its own handler still advertises them
+    // truthfully.
     assert!(
-        methods.iter().any(|m| m == oauth_as::mtls::TLS_CLIENT_AUTH)
-            && methods
+        !methods.iter().any(|m| m == oauth_as::mtls::TLS_CLIENT_AUTH)
+            && !methods
                 .iter()
                 .any(|m| m == oauth_as::mtls::SELF_SIGNED_TLS_CLIENT_AUTH),
-        "an mtls build advertises both RFC 8705 methods: {methods:?}"
+        "the bundled router cannot honour either RFC 8705 method, so its document must not \
+         advertise them: {methods:?}"
     );
-    mtls_is_refused_through_this_service(&fx.service, TLS_CLIENT_AUTH_CLIENT).await;
-    mtls_is_refused_through_this_service(&fx.service, SELF_SIGNED_TLS_CLIENT).await;
+    mtls_is_refused_through_this_service(
+        &fx,
+        TLS_CLIENT_AUTH_CLIENT,
+        oauth_as::mtls::TLS_CLIENT_AUTH,
+    )
+    .await;
+    mtls_is_refused_through_this_service(
+        &fx,
+        SELF_SIGNED_TLS_CLIENT,
+        oauth_as::mtls::SELF_SIGNED_TLS_CLIENT_AUTH,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------------------------

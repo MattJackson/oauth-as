@@ -23,9 +23,15 @@
 mod support;
 
 use oauth_as::{
-    Client, ClientAuth, ClientId, ErrorCode, GrantType, ScopeSet, TokenExchange,
-    TokenExchangeRequest, TokenRequest, TokenRequestContext, TokenTypeIdentifier,
+    Client, ClientAuth, ClientId, GrantType, ScopeSet, TokenExchange, TokenExchangeRequest,
+    TokenRequest, TokenTypeIdentifier,
 };
+// Used only by the two sender-constraining tests below, each behind its own feature. Imported
+// under the union of those features rather than unconditionally, because an unused import is a
+// warning and CI builds this crate with `-D warnings` under feature sets a local `--all-features`
+// run never exercises.
+#[cfg(any(all(feature = "dpop", feature = "jwt-p256"), feature = "mtls"))]
+use oauth_as::{ErrorCode, TokenRequestContext};
 use support::{server_with, ManualClock};
 
 const VICTIM_SECRET: &str = "victim-client-secret-for-tests";
@@ -118,10 +124,7 @@ async fn a_dpop_bound_subject_token_cannot_be_exchanged_into_a_bearer_token() {
     let bound = srv
         .token_with_context(
             victim_request(),
-            TokenRequestContext {
-                dpop_proof: Some(&proof),
-                ..Default::default()
-            },
+            TokenRequestContext::default().with_dpop_proof(&proof),
         )
         .await
         .expect("the victim's own request is conforming");
@@ -154,10 +157,7 @@ async fn a_certificate_bound_subject_token_cannot_be_exchanged_into_a_bearer_tok
     let bound = srv
         .token_with_context(
             victim_request(),
-            TokenRequestContext {
-                credential: ClientCredential::certificate(&certificate),
-                ..Default::default()
-            },
+            TokenRequestContext::new(ClientCredential::certificate(&certificate)),
         )
         .await
         .expect("the victim's own request is conforming");

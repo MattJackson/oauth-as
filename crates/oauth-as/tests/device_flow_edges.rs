@@ -430,6 +430,49 @@ async fn verification_uri_complete_is_present_and_contains_the_user_code_when_co
     assert!(complete.starts_with(&auth.verification_uri));
 }
 
+/// The same deep link, for a host whose `verification_uri` ALREADY CARRIES A QUERY.
+///
+/// The test above cannot see this: its `verification_uri` has no query, so appending `?` happens
+/// to be right and `contains(user_code)` passes either way. With a query already present the `?`
+/// makes the code part of the PREVIOUS parameter's value — `tenant=a?user_code=WDJB-MJHT` is one
+/// pair, not two — so the page this link exists to prefill reads no user code and renders an empty
+/// form. The whole point of RFC 8628 s3.3.1 is skipping manual entry, so a link that silently
+/// stops prefilling defeats the feature while still looking correct in a log.
+#[tokio::test]
+async fn verification_uri_complete_appends_to_a_uri_that_already_has_a_query() {
+    let clock = ManualClock::at_epoch();
+    let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device?tenant=a");
+    cfg.include_verification_uri_complete = true;
+    let srv = server_with_config(clock, cfg, vec![device_client()]).await;
+
+    let auth = srv
+        .device_authorization(&ClientId::new("device-client"), None, None)
+        .await
+        .unwrap();
+    let complete = auth
+        .verification_uri_complete
+        .as_deref()
+        .expect("must be present when configured on");
+
+    // Parsed the way the receiving page parses it, rather than asserted as a substring: the
+    // substring is exactly what stays true while the link stops working.
+    let query = complete
+        .split_once('?')
+        .expect("the deep link must carry a query")
+        .1;
+    let user_code = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == "user_code")
+        .map(|(_, value)| value);
+    assert_eq!(
+        user_code,
+        Some(auth.user_code.as_str()),
+        "user_code must be its OWN query parameter in {complete:?}, not folded into the value of \
+         the one before it"
+    );
+}
+
 /// The other half: when the host configures it off, the field is genuinely absent (not present
 /// with an empty string), matching RFC 8628 section 3.2's "OPTIONAL" and this server's `serde`
 /// contract of omitting rather than nulling absent optional fields.

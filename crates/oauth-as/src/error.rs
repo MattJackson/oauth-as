@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 /// from the RFCs.
 ///
 /// `#[non_exhaustive]`, and for this enum that is not the usual forward-compatibility hedge. The
-/// VARIANT SET here depends on cargo features: `rar`, `consent`, `dpop`, `par` and `jar` each add
-/// one. Without the attribute, a host's exhaustive `match` compiles or fails depending on which
-/// features something ELSE in its dependency graph turned on, which is a build break with no
-/// release behind it. This is also the most widely matched type this crate publishes, so a host
+/// VARIANT SET here depends on cargo features: `consent`, `dpop`, `par` and `jar` each add one
+/// (`rar` used to, and no longer does: see `InvalidAuthorizationDetails`). Without the attribute,
+/// a host's exhaustive `match` compiles or fails depending on which features something ELSE in
+/// its dependency graph turned on, which is a build break with no release behind it. This is also the most widely matched type this crate publishes, so a host
 /// that wants a total match should write one with a `_` arm and decide what an unknown code means
 /// to it (`ErrorCode::as_str` still gives it the wire spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +93,12 @@ pub enum ErrorCode {
     ///
     /// Distinct from `invalid_request` for the reason `invalid_target` is: the parameter was
     /// well formed AS A PARAMETER, so a client conflating the two would retry unchanged.
-    #[cfg(feature = "rar")]
+    ///
+    /// NOT FEATURE GATED, for the same reason `invalid_target` is not: the build that has the
+    /// most to refuse is the build WITHOUT `rar`, which supports no authorization detail type
+    /// whatsoever and therefore meets section 5's condition on every request that carries the
+    /// parameter. Gating the code on `rar` left exactly that build with nothing to answer with,
+    /// so the parameter was accepted and ignored, which is the one outcome section 5 forbids.
     InvalidAuthorizationDetails,
     /// RFC 8707 section 2: the `resource` parameter names a target this server will not issue a
     /// token for, because the value is malformed, is not an absolute URI, or was never granted.
@@ -157,7 +162,6 @@ impl ErrorCode {
             ErrorCode::AuthorizationPending => "authorization_pending",
             ErrorCode::SlowDown => "slow_down",
             ErrorCode::ExpiredToken => "expired_token",
-            #[cfg(feature = "rar")]
             ErrorCode::InvalidAuthorizationDetails => "invalid_authorization_details",
             ErrorCode::InvalidTarget => "invalid_target",
             #[cfg(feature = "consent")]
@@ -204,7 +208,6 @@ impl ErrorCode {
             ErrorCode::SlowDown => 400,
             ErrorCode::ExpiredToken => 400,
             ErrorCode::InvalidTarget => 400,
-            #[cfg(feature = "rar")]
             ErrorCode::InvalidAuthorizationDetails => 400,
             // RFC 9470 section 3 gives 401 to the RESOURCE server's challenge; this is the
             // AUTHORIZATION server's token-endpoint refusal of a grant whose authentication was

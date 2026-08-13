@@ -123,20 +123,17 @@ impl Es256Signer for BrokenSigner {
 }
 
 fn claims(jti: &str) -> AccessTokenClaims {
-    AccessTokenClaims {
-        iss: "https://as.example".to_string(),
-        exp: 4_000_000_000,
-        aud: Audience::One("https://rs.example".to_string()),
-        sub: "alice".to_string(),
-        client_id: "app".to_string(),
-        iat: 1_700_000_000,
-        jti: jti.to_string(),
-        scope: Some("read".to_string()),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        #[cfg(any(feature = "dpop", feature = "mtls"))]
-        cnf: None,
-    }
+    let mut claims = AccessTokenClaims::new(
+        "https://as.example",
+        4_000_000_000,
+        Audience::One("https://rs.example".to_string()),
+        "alice",
+        "app",
+        1_700_000_000,
+        jti,
+    );
+    claims.scope = Some("read".to_string());
+    claims
 }
 
 /// The seam's whole contract, in one token: the signer sees the JWS Signing Input and nothing

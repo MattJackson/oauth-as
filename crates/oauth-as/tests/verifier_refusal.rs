@@ -30,7 +30,7 @@
 
 #![cfg(all(
     not(feature = "jwt-p256"),
-    any(feature = "dpop", feature = "jar", feature = "client_assertion")
+    any(feature = "dpop", feature = "jar", feature = "client-assertion")
 ))]
 
 use std::sync::Arc;
@@ -46,6 +46,11 @@ fn coordinate(fill: u8) -> String {
     URL_SAFE_NO_PAD.encode([fill; 32])
 }
 
+// Called only from the `dpop` and `client-assertion` modules below. `coordinate` above is NOT
+// gated, because the `jar` module uses it directly. A build with `jar` but neither of those two --
+// `http,jwt,par,jar`, for one -- leaves this function with no caller, and `-D warnings` makes dead
+// code an error.
+#[cfg(any(feature = "dpop", feature = "client-assertion"))]
 fn a_public_jwk() -> PublicJwk {
     PublicJwk::from_coordinates(&coordinate(0x11), &coordinate(0x22))
         .expect("32 byte coordinates are a well formed JWK")
@@ -149,10 +154,7 @@ mod dpop {
         let error = srv
             .token_with_context(
                 request(),
-                TokenRequestContext {
-                    dpop_proof: Some(&proof),
-                    ..Default::default()
-                },
+                TokenRequestContext::default().with_dpop_proof(&proof),
             )
             .await
             .expect_err("a proof no verifier can check must not be honoured");
@@ -168,10 +170,7 @@ mod dpop {
         let response = srv
             .token_with_context(
                 request(),
-                TokenRequestContext {
-                    dpop_proof: Some(&proof),
-                    ..Default::default()
-                },
+                TokenRequestContext::default().with_dpop_proof(&proof),
             )
             .await
             .expect("an installed verifier is what makes the proof checkable");
@@ -201,7 +200,16 @@ mod jar {
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
+    /// Carries an `exp` because 0.9.1 refuses a request object without one: an object that never
+    /// expires authorizes its exact request for as long as the client's key stays registered, and
+    /// this one travels in a browser URL. These tests are about whether a VERIFIER is installed, so
+    /// the object has to be otherwise valid or they would pass for the wrong reason.
     fn request_object() -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test clock is after the epoch")
+            .as_secs()
+            + 60;
         signed_shaped(
             &serde_json::json!({ "alg": "ES256", "typ": "oauth-authz-req+jwt" }),
             &serde_json::json!({
@@ -213,6 +221,7 @@ mod jar {
                 "scope": "read",
                 "code_challenge": oauth_as::pkce::code_challenge_s256(VERIFIER),
                 "code_challenge_method": "S256",
+                "exp": exp,
             }),
         )
     }
@@ -272,7 +281,7 @@ mod jar {
 
 // ------------------------------------------------------------------ RFC 7523 client assertions
 
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 mod client_assertion {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -341,14 +350,10 @@ mod client_assertion {
     }
 
     fn context(assertion: &str) -> TokenRequestContext<'_> {
-        TokenRequestContext {
-            credential: ClientCredential {
-                client_assertion: Some(assertion),
-                client_assertion_type: Some(CLIENT_ASSERTION_TYPE),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        TokenRequestContext::new(ClientCredential::assertion(
+            Some(CLIENT_ASSERTION_TYPE),
+            assertion,
+        ))
     }
 
     /// RFC 7523 section 3 (2): an assertion authenticates only because its signature does. With no

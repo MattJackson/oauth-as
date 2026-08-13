@@ -11,7 +11,7 @@
 
 /// The crate's built-in ES256 backend. Verification goes through the `Es256Verifier` seam, so a
 /// verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets.
-#[cfg(any(feature = "f-dpop", feature = "f-client_assertion"))]
+#[cfg(any(feature = "f-dpop", feature = "f-client-assertion"))]
 const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
 
 #[cfg(feature = "f-mtls")]
@@ -172,7 +172,7 @@ pub fn dpop() -> u64 {
     std::hint::black_box(acc)
 }
 
-#[cfg(feature = "f-client_assertion")]
+#[cfg(feature = "f-client-assertion")]
 pub fn client_assertion() -> u64 {
     use oauth_as::client_assertion::{
         unverified_subject, verify_assertion, AssertionKeys, ClientSecretKey,
@@ -218,7 +218,9 @@ pub fn client_assertion() -> u64 {
 #[cfg(feature = "f-consent")]
 pub fn consent() -> u64 {
     use oauth_as::client::ClientId;
-    use oauth_as::consent::{step_up_challenge, Authentication, AuthenticationRequirement};
+    use oauth_as::consent::{
+        step_up_challenge, Authentication, AuthenticationRequirement, RequestedDetails,
+    };
     use oauth_as::scope::ScopeSet;
 
     use crate::blockon::block_on;
@@ -268,7 +270,7 @@ pub fn consent() -> u64 {
             .await
         {
             acc = acc.wrapping_add(record.consent_id.len() as u64);
-            acc = acc.wrapping_add(u64::from(record.covers(&scope, &[])));
+            acc = acc.wrapping_add(u64::from(record.covers(&scope, &[], RequestedDetails::none())));
             if let Ok(all) = server.consents_for_subject("probe-subject").await {
                 acc = acc.wrapping_add(all.len() as u64);
             }

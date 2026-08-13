@@ -7,10 +7,10 @@ review will hold you to it.
 
 ## Before you write any code
 
-Read `README.md`, `GOAL.md`, `ROADMAP.md`, and `SECURITY.md`. `GOAL.md` in particular defines
-what "done" means as ten checkable gates, and `ROADMAP.md` lists what is deliberately not built
-yet and why. If what you want to add is not on the roadmap, open an issue first and say what it
-buys a real deployment; "a competitor has it" is not a reason this project accepts.
+Read `README.md` and `SECURITY.md`. The README's "What is not claimed" section lists what is
+deliberately not built yet and why; `CHANGELOG.md` carries the same honesty per release, including
+a "known, and not fixed" section. Open an issue before writing code, and say what your change buys
+a real deployment; "a competitor has it" is not a reason this project accepts.
 
 ## Red before green
 
@@ -72,11 +72,11 @@ comments, not in commit messages, not in markdown, not in YAML. This applies to 
 your editor or an AI tool inserts one, remove it before committing. Use a comma, a colon, a
 semicolon, or a plain hyphen-minus instead.
 
-## Never AI attribution
+## Attribution
 
-Never add `Co-Authored-By: Claude`, `Co-Authored-By: <any AI tool>`, or any other AI or agent
-attribution to a commit message, a PR description, or anywhere else in this repository. Commits
-are attributed to their human author only.
+Commits are attributed to their human author only. Do not add `Co-Authored-By:` trailers for
+tooling of any kind, in a commit message, a PR description, or anywhere else in this repository.
+Whoever submits the change is accountable for it, and the history should say so plainly.
 
 ## Where the harness and the library disagree, the RFC wins
 
@@ -130,8 +130,18 @@ protocol behaviour, run this before opening a PR; `dev`'s CI gate does not run i
 Work happens on `dev`. `dev` runs the fast gate on every push and pull request: `cargo fmt --all
 --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
 `cargo test --workspace --locked`. `qa` runs the full suite, including MSRV verification, the
-conformance self-test, the live conformance check, the packaging dry run, and a mutation testing
-report. `main` publishes, by explicit manual dispatch only, never automatically on push.
+conformance self-test, the live conformance check, the packaging dry run, and the size budgets.
+
+Mutation testing is NOT a CI job. There used to be one, and it swallowed its own exit code and
+reported for information, which is a job that cannot fail; it was REMOVED at 0.9.1 rather than
+kept, and `.github/workflows/qa.yml` records the argument. Mutation testing is now run
+deliberately against a frozen tree between releases.
+
+`main` publishes. Reaching `main` IS the release: `publish.yml` triggers on push to `main`, reads
+the version from `crates/oauth-as/Cargo.toml`, and stops green without publishing if that version
+already exists on crates.io. So the deliberate act is editing the version in a reviewed commit,
+not pressing a button. `workflow_dispatch` is kept as an escape hatch for re-running a publish
+step that failed after the gate passed.
 
 `main` and `qa` are promotion branches. Promotion is the owner's call, not something a
 contributor's PR triggers by merging to `dev`.

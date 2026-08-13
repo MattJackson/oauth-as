@@ -18,6 +18,7 @@
 // all, so in that build there is nothing here that could run.
 
 use oauth_as::server::UserApproval;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -93,9 +94,17 @@ fn request() -> TokenRequest {
 }
 
 fn with_proof(proof: &str) -> TokenRequestContext<'_> {
-    TokenRequestContext {
-        dpop_proof: Some(proof),
-        ..Default::default()
+    TokenRequestContext::default().with_dpop_proof(proof)
+}
+
+/// A sink that keeps every event it is shown, so a test can ask which RFC 9449 s4.3 check the
+/// server actually reached. The wire cannot say: s5 collapses all ten faults into one code.
+#[derive(Default)]
+struct Recorder(Arc<Mutex<Vec<String>>>);
+
+impl oauth_as::events::EventSink for Recorder {
+    fn on_event(&self, event: oauth_as::events::Event<'_>) {
+        self.0.lock().unwrap().push(format!("{event:?}"));
     }
 }
 
@@ -244,39 +253,92 @@ async fn two_keys_may_use_the_same_jti() {
         .is_ok());
 }
 
+/// THE SWEEP INSTANT IS CHOSEN SO THAT ONLY THE `jti` IS DEAD, and that is the whole test.
+///
+/// `Storage::sweep_expired` returns ONE aggregate across every collection it walks, and the token
+/// request above also stored an access token with the default 3600 second TTL. A sweep at
+/// `now + 3600` therefore reports at least one removal whether or not the replay set was ever
+/// written to: making `claim_replay_id` a no-op left that assertion green. The proof's `jti` is
+/// remembered until `iat + MAX_PROOF_AGE` (300s) and the access token until `now + 3600`, so at
+/// `now + 600` the `jti` is the ONLY dead record in the store and the count is exactly one. The
+/// second sweep is what pins that reading: it reclaims the access token, so the two ones are two
+/// different records rather than the same one counted twice.
 #[tokio::test]
 async fn a_spent_proof_jti_is_reclaimed_by_the_host_s_sweep() {
     let key = EcdsaP256Key::generate("k");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
+    let issued_at = SystemTime::now();
     assert!(srv
         .token_with_context(request(), with_proof(&proof(&key, "p-1")))
         .await
         .is_ok());
+
     let swept = srv
         .store()
-        .sweep_expired(SystemTime::now() + Duration::from_secs(3600))
+        .sweep_expired(issued_at + Duration::from_secs(600))
         .await
         .unwrap();
-    assert!(swept > 0, "a sweep past the proof window reclaims its jti");
+    assert_eq!(
+        swept, 1,
+        "past the RFC 9449 s11.1 proof window and inside the access token's TTL, the claimed jti \
+         is the one record a sweep may reclaim"
+    );
+
+    let later = srv
+        .store()
+        .sweep_expired(issued_at + Duration::from_secs(3601))
+        .await
+        .unwrap();
+    assert_eq!(
+        later, 1,
+        "and the access token is still there to be reclaimed afterwards, which is what makes the \
+         count above the jti and not the token"
+    );
 }
 
 // ------------------------------------------------------------------------ proof binding attacks
 
+/// THE PROOF IS A POST, and the one character is what makes this test about `htu` at all.
+///
+/// RFC 9449 s4.3 checks `htm` before `htu`, so a proof captured with `GET` is refused as
+/// `WrongMethod` and the `htu` comparison is never reached: this test spelled `GET` until the 0.9.1
+/// audit and was therefore an exact duplicate of the `htm` test immediately below it, with the
+/// `htu` arm of the token endpoint's own path unexercised. A resource server that accumulates
+/// proofs accumulates whatever methods its API uses, `POST` included, so this is also the realistic
+/// capture.
+///
+/// The wire code cannot tell the two apart (RFC 9449 s5 makes every proof fault
+/// `invalid_dpop_proof`), so the audit channel is what is asserted: `Event::DpopProofRefused`
+/// carries the [`oauth_as::dpop::DpopFailure`] the verifier reached, and the absence of
+/// `WrongMethod` is asserted alongside `WrongUri` so that a regression to the old duplicate is
+/// caught here rather than passing quietly.
 #[tokio::test]
 async fn a_proof_captured_at_a_resource_server_cannot_be_spent_at_the_token_endpoint() {
     // The reason `htu` exists. The client sends a proof with EVERY resource-server request, so a
     // compromised or merely nosy resource server accumulates them by the thousand. If the token
     // endpoint accepted one, that resource server could mint fresh tokens for the client's key.
     let key = EcdsaP256Key::generate("device");
-    let srv = server();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let srv = server().with_event_sink(Box::new(Recorder(seen.clone())));
     srv.register_client(confidential_client()).await.unwrap();
 
-    let captured_at_the_rs = proof_for(&key, "p-1", "GET", "https://rs.example/orders/42");
+    let captured_at_the_rs = proof_for(&key, "p-1", "POST", "https://rs.example/orders/42");
     let refused = srv
         .token_with_context(request(), with_proof(&captured_at_the_rs))
         .await;
     assert_eq!(refused.unwrap_err().error, ErrorCode::InvalidDpopProof);
+
+    let events = seen.lock().unwrap().clone();
+    assert!(
+        events.iter().any(|e| e.contains("WrongUri")),
+        "RFC 9449 s4.3 (7): the refusal must be the htu comparison, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.contains("WrongMethod")),
+        "the method matches, so a WrongMethod here means this test is checking htm twice over \
+         again: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -354,21 +416,16 @@ async fn mint_refresh_token(
     srv.register_client(refreshing_client()).await.unwrap();
     let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let challenge = oauth_as::pkce::code_challenge_s256(verifier);
-    let request = oauth_as::AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some("app".into()),
-        redirect_uri: Some(REDIRECT.into()),
-        scope: Some("read".into()),
-        state: Some("s".into()),
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
+    let request = {
+        let mut request = oauth_as::AuthorizationRequest::default();
+        request.response_type = Some("code".into());
+        request.client_id = Some("app".into());
+        request.redirect_uri = Some(REDIRECT.into());
+        request.scope = Some("read".into());
+        request.state = Some("s".into());
+        request.code_challenge = Some(challenge.into());
+        request.code_challenge_method = Some("S256".into());
+        request
     };
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let code = srv
@@ -524,11 +581,10 @@ fn the_metadata_advertises_the_proof_algorithms_and_nothing_it_would_refuse() {
     let algs = doc
         .dpop_signing_alg_values_supported
         .expect("a server that verifies proofs advertises which algorithms it verifies");
+    // The exact list, which is the strongest form this can take and subsumes the two things RFC
+    // 9449 s4.2 forbids: an equality against `["ES256"]` already excludes `none` and every `HS*`,
+    // so a follow-up assertion naming them could never fail and is not written here.
     assert_eq!(algs, vec!["ES256".to_string()]);
-    assert!(
-        !algs.iter().any(|a| a == "none" || a.starts_with("HS")),
-        "RFC 9449 s4.2 requires an asymmetric algorithm"
-    );
 }
 
 #[test]
@@ -642,11 +698,8 @@ async fn a_signed_access_token_carries_both_bindings_when_the_client_holds_both(
                 client_secret: None,
                 scope: None,
             },
-            TokenRequestContext {
-                credential: ClientCredential::certificate(&certificate),
-                dpop_proof: Some(&dpop),
-                ..Default::default()
-            },
+            TokenRequestContext::new(ClientCredential::certificate(&certificate))
+                .with_dpop_proof(&dpop),
         )
         .await
         .expect("a certificate plus a proof is one client holding two constraints");

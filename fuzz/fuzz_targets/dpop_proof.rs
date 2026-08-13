@@ -206,10 +206,7 @@ fuzz_target!(|input: Input| {
                     .then(|| CONFIDENTIAL_SECRET.to_string()),
                 scope: None,
             },
-            TokenRequestContext {
-                dpop_proof: Some(&proof),
-                ..Default::default()
-            },
+            TokenRequestContext::default().with_dpop_proof(&proof),
         ),
     );
 

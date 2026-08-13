@@ -20,10 +20,10 @@
 //! `ca:urn:client:foo:42`. The attacker goes first, and the victim is refused as a replayer of an
 //! assertion nobody sent.
 //!
-//! HS256 throughout, so this file needs no ES256 backend and runs in every `client_assertion`
+//! HS256 throughout, so this file needs no ES256 backend and runs in every `client-assertion`
 //! build.
 
-#![cfg(feature = "client_assertion")]
+#![cfg(feature = "client-assertion")]
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -103,14 +103,10 @@ fn request(client_id: &str) -> TokenRequest {
 }
 
 fn context(assertion: &str) -> TokenRequestContext<'_> {
-    TokenRequestContext {
-        credential: ClientCredential {
-            client_assertion: Some(assertion),
-            client_assertion_type: Some(CLIENT_ASSERTION_TYPE),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
+    TokenRequestContext::new(ClientCredential::assertion(
+        Some(CLIENT_ASSERTION_TYPE),
+        assertion,
+    ))
 }
 
 /// THE ATTACK. The attacker authenticates first with a `jti` chosen to land on the victim's

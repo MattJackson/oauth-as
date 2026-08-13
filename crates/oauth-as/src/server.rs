@@ -16,7 +16,7 @@ use crate::authorization::{
     ValidatedAuthorizationRequest,
 };
 use crate::client::{Client, ClientId};
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 use crate::client_assertion::{verify_assertion, CLIENT_ASSERTION_TYPE};
 use crate::device::{
     normalize_user_code, DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState,
@@ -45,6 +45,35 @@ use crate::token::{
 /// Seconds since the Unix epoch, for the RFC 7519 `exp` / `iat` style claims RFC 7662 reuses.
 /// A pre-epoch instant is not representable in that encoding, so it is reported as absent rather
 /// than wrapped into a misleading number.
+/// `base + span`, saturating instead of panicking.
+///
+/// `SystemTime + Duration` PANICS on overflow, and every caller adds a HOST-CONFIGURED `Duration`
+/// to `now`. `ServerConfig`'s TTL fields are public and nothing validates them, so a deployment
+/// that sets one from a config file holding an out-of-range value would panic on an ordinary
+/// request rather than fail at startup. Saturating yields a deadline no clock will reach, which
+/// for an expiry means "does not expire by time" — which is what the absurd configuration asked
+/// for.
+///
+/// The ATTACKER-supplied durations in this crate (`dpop`, `client_assertion`) already use
+/// `checked_add`, with the reasoning written beside them. This is the host-supplied half of the
+/// same rule, and it was missing.
+pub(crate) fn saturating_deadline(base: SystemTime, span: std::time::Duration) -> SystemTime {
+    if let Some(exact) = base.checked_add(span) {
+        return exact;
+    }
+    // Halve until it fits, accumulating what does: this lands within a second of the platform's
+    // ceiling without needing to know what that ceiling is.
+    let mut out = base;
+    let mut span = span;
+    while span > std::time::Duration::from_secs(1) {
+        span /= 2;
+        if let Some(next) = out.checked_add(span) {
+            out = next;
+        }
+    }
+    out
+}
+
 pub(crate) fn unix_seconds(t: SystemTime) -> Option<u64> {
     t.duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -191,7 +220,7 @@ pub struct ServerConfig {
     /// names TYPING THE CODE as the friction that makes this hard, and this member is precisely the
     /// removal of that friction: the code arrives pre-filled from a URL the user did not compose.
     ///
-    /// OFF by default from 0.10.0, having been on. Section 3.3.1 makes the member OPTIONAL, so
+    /// OFF by default as of 0.9.1, having been on. Section 3.3.1 makes the member OPTIONAL, so
     /// omitting it is conformant and costs a deployment only the QR-code convenience, while
     /// including it by default made every host that never read this paragraph pay for a capability
     /// it did not ask for. That is the same posture the rest of this config takes:
@@ -236,6 +265,34 @@ pub struct ServerConfig {
     /// to hold the binding for it, and that decision belongs in a sentence somebody wrote and a
     /// reviewer can find.
     pub allow_sender_constrained_exchange: bool,
+    /// Allow an RFC 8693 exchange of a subject token that carries RFC 9396 `authorization_details`,
+    /// propagating those details onto a token issued to a DIFFERENT client. `false` by default, and
+    /// the default is the safe one.
+    ///
+    /// # Why this is off
+    ///
+    /// The exchange applies TWO ceilings to scope: the subject token's granted scope (RFC 6749
+    /// section 6 narrowing) and then the exchanging client's own
+    /// [`crate::client::Client::allowed_scopes`], because the issued token belongs to a different
+    /// principal. It applied NONE to `authorization_details`, which are strictly more specific:
+    /// RFC 9396 exists precisely because a scope token cannot say "transfer 50 euros to IBAN X".
+    ///
+    /// So the weaker rule was applied to the more dangerous grant. A downstream service registered
+    /// for `read`, which receives a payments client's token because forwarding the caller's token
+    /// is exactly what this grant is for, could exchange it asking for `read`, pass both scope
+    /// ceilings, and walk away with a token issued to ITSELF carrying the full payment
+    /// authorization, signed into the RFC 9068 claim, visible over RFC 7662 introspection, and with
+    /// a fresh lifetime that outlives the token it came from.
+    ///
+    /// # Why an opt-in rather than a per-client ceiling
+    ///
+    /// The correct ceiling is a per-client registration of the detail types a client may hold, the
+    /// analogue of `allowed_scopes`. [`crate::client::Client`] has no such field, and adding one is
+    /// a breaking change to a type hosts construct. Until it exists there is nothing to narrow
+    /// against, so the honest choice is to refuse and let a host that has reasoned about its own
+    /// delegation topology say so. Setting this to `true` accepts that any client permitted this
+    /// grant may inherit any detail any subject token carries.
+    pub allow_authorization_details_exchange: bool,
     /// Absolute refresh chain lifetime. Rotation preserves the chain's original expiry rather than
     /// sliding it, so this is a ceiling on the whole chain and not on one token.
     ///
@@ -328,6 +385,19 @@ pub const MIN_USER_CODE_LENGTH: usize = 8;
 /// unknown members. `invalid_target` (section 2) is the honest answer.
 pub const MAX_RESOURCE_INDICATORS: usize = 16;
 
+/// The RFC 8693 section 4.1 actor an issuance carries, in a wrapper that is ZERO SIZED without the
+/// `token-exchange` feature.
+///
+/// Exactly the same device as [`GrantedAuthentication`] below and for exactly the same reason: one
+/// `issue` signature in every feature configuration, because a `cfg` on an argument cannot be
+/// matched by a `cfg` at the call site. Only the delegation branch of a token exchange ever fills
+/// it; every other grant passes the default, which is what `None` on the record means.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub(crate) struct GrantedActor {
+    #[cfg(feature = "token-exchange")]
+    pub(crate) act: Option<Box<crate::token_exchange::ActClaim>>,
+}
+
 /// The host-reported authentication an issuance carries, in a wrapper that is ZERO SIZED without
 /// the `consent` feature.
 ///
@@ -389,7 +459,7 @@ impl GrantedAuthentication {
 ///
 /// It is NOT a proof, and no type this crate could define would be one: this library has no user,
 /// no session and no screen, so "the user agreed" is a fact only the host holds. Nor is it weaker
-/// than the seam it mirrors. A host can wire `|_| ConsentDecision::Approve` into the `http` path
+/// than the seam it mirrors. A host can wire `|_| ApprovalDecision::Approve` into the `http` path
 /// just as it can call [`UserApproval::granted`] here, so what BOTH seams buy is the same and is
 /// the whole of what a library at this boundary can buy: the approval becomes a sentence the host
 /// WROTE rather than a default it inherited, and the host that never considered RFC 6749 section
@@ -407,6 +477,12 @@ impl GrantedAuthentication {
 pub struct UserApproval<'a> {
     request: &'a ValidatedAuthorizationRequest,
     subject: String,
+    /// When the decision this approval reports was MADE, if the host knows.
+    ///
+    /// `None` means "now", which is right for a host that prompted the user during this request
+    /// and wrong for one that is acting on a standing approval it read a moment ago. See
+    /// [`UserApproval::decided_at`] for why the difference is load bearing.
+    decided_at: Option<std::time::SystemTime>,
 }
 
 impl<'a> UserApproval<'a> {
@@ -422,7 +498,46 @@ impl<'a> UserApproval<'a> {
         UserApproval {
             request,
             subject: subject.into(),
+            decided_at: None,
         }
+    }
+
+    /// The same approval, dated.
+    ///
+    /// WHAT THIS IS FOR, and it is not bookkeeping. A revocation barrier refuses a write whose
+    /// GRANT predates the revocation, and the grant instant a code carries is the instant of the
+    /// decision it rests on. For a host that prompted the user during this request those are the
+    /// same moment and [`UserApproval::granted`] is right. For a host acting on a STANDING
+    /// approval — a remembered consent it read at the top of the request — they are not, and
+    /// dating a months-old approval at this instant makes it outrank a withdrawal recorded in
+    /// between.
+    ///
+    /// The failure that costs is precise. The user opens the authorization page; the host reads
+    /// their standing consent; the user, elsewhere, clicks "remove this application", and the
+    /// withdrawal cascades away every token and records its barrier; the first request then
+    /// resumes and mints a code on the strength of the pre-withdrawal snapshot. Nothing refuses
+    /// the code — `put_authorization_code` is deliberately barrier-exempt — and at redemption a
+    /// code dated NOW postdates the barrier, so the token is issued and its refresh chain
+    /// inherits the same instant, rotating happily long after the barrier is swept.
+    ///
+    /// Pass the instant the decision was made: the standing record's own `granted_at`, or the
+    /// instant the request was received, whichever the host can honestly claim. Both are earlier
+    /// than any withdrawal that has not yet been read, which is the whole of what is needed.
+    pub fn granted_at(
+        request: &'a ValidatedAuthorizationRequest,
+        subject: impl Into<String>,
+        decided_at: std::time::SystemTime,
+    ) -> Self {
+        UserApproval {
+            request,
+            subject: subject.into(),
+            decided_at: Some(decided_at),
+        }
+    }
+
+    /// When the decision was made, if the host said. See [`UserApproval::granted_at`].
+    pub fn decided_at(&self) -> Option<std::time::SystemTime> {
+        self.decided_at
     }
 
     /// The request this approves.
@@ -499,6 +614,7 @@ impl ServerConfig {
             // OFF: an exchange that drops a sender constraint is a decision, not a default. See the
             // field's own docs for what turning it on gives up.
             allow_sender_constrained_exchange: false,
+            allow_authorization_details_exchange: false,
             refresh_token_ttl: None,
             // 30 days: long enough that a chain abandoned by a client that later comes back with
             // a stale token is still recognised as reuse rather than as noise.
@@ -646,6 +762,13 @@ impl fmt::Debug for TokenRequest {
 ///
 /// [`Default`] is a PUBLIC client: no secret, no assertion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `#[non_exhaustive]`: `client-assertion` adds two fields and `mtls` adds a third, so this is four
+/// different structs depending on the flag set. Three named constructors already cover the three
+/// ways a client can authenticate ([`ClientCredential::secret`], [`ClientCredential::assertion`],
+/// [`ClientCredential::certificate`]), and the RFC 8705 section 4 case of binding a token for a
+/// client that authenticated some other way is a field assignment on top of one of them, which is
+/// exactly what that field's own documentation already tells a host to do.
+#[non_exhaustive]
 pub struct ClientCredential<'a> {
     /// The RFC 6749 section 2.3.1 shared secret, from `Authorization: Basic` or from the form body.
     /// `None` for a public client, and `None` when an assertion is presented instead.
@@ -654,10 +777,10 @@ pub struct ClientCredential<'a> {
     /// [`crate::client_assertion::CLIENT_ASSERTION_TYPE`]; any other value is refused rather than
     /// ignored, because an assertion format this server does not implement is a credential it
     /// cannot check, and "cannot check" must never read as "checked out".
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     pub client_assertion_type: Option<&'a str>,
-    /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.
-    #[cfg(feature = "client_assertion")]
+    /// RFC 7523 section 2.2 `client-assertion`: the signed JWT itself.
+    #[cfg(feature = "client-assertion")]
     pub client_assertion: Option<&'a str>,
     /// The RFC 8705 client certificate the HOST has ALREADY VERIFIED for this connection.
     ///
@@ -690,9 +813,9 @@ impl<'a> ClientCredential<'a> {
     pub fn secret(client_secret: Option<&'a str>) -> Self {
         ClientCredential {
             client_secret,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion_type: None,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion: None,
             #[cfg(feature = "mtls")]
             certificate: None,
@@ -700,7 +823,7 @@ impl<'a> ClientCredential<'a> {
     }
 
     /// The RFC 7523 credential: the assertion, and the type that names its format.
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     pub fn assertion(client_assertion_type: Option<&'a str>, client_assertion: &'a str) -> Self {
         ClientCredential {
             client_secret: None,
@@ -742,6 +865,15 @@ impl<'a> ClientCredential<'a> {
 /// cheap; growing [`TokenRequest`] is not, because a host copies that around and
 /// `tests/allocation.rs` holds it to a size budget.
 #[derive(Debug, Clone, Copy, Default)]
+/// `#[non_exhaustive]`: `rar` and `dpop` each add a field, and this is the type a host assembles on
+/// EVERY token request, so it is the single most likely struct literal in a host's codebase and the
+/// most expensive one to break. "Growing this struct is cheap" above is only true while growing it
+/// is not a semver-major change, which is what the attribute buys.
+///
+/// Build it with [`TokenRequestContext::new`] and assign what the request carried; `Default` is
+/// still there for a request with no credential at all, though the credential is the one thing
+/// every request has an answer for, which is why it is the constructor's only argument.
+#[non_exhaustive]
 pub struct TokenRequestContext<'a> {
     /// How the client is authenticating.
     pub credential: ClientCredential<'a>,
@@ -757,7 +889,12 @@ pub struct TokenRequestContext<'a> {
     /// so its details are checked against the supported types and used; and the device grant
     /// refuses any at all, because the RFC 8628 section 3.1 request cannot carry them in
     /// this crate and so granted nothing for a poll to narrow to.
-    #[cfg(feature = "rar")]
+    ///
+    /// NOT FEATURE GATED, for the reason
+    /// [`crate::authorization::AuthorizationRequest::authorization_details`] is not: a build
+    /// without `rar` still has to be TOLD the parameter arrived, because refusing it is what
+    /// RFC 9396 section 5 requires of exactly that build. Setting it in such a build makes the
+    /// request an error rather than making the field meaningless.
     pub authorization_details: Option<&'a str>,
     /// The RFC 9449 `DPoP` request header, verbatim and unparsed.
     ///
@@ -767,6 +904,45 @@ pub struct TokenRequestContext<'a> {
     /// `cnf.jkt`.
     #[cfg(feature = "dpop")]
     pub dpop_proof: Option<&'a str>,
+}
+
+impl<'a> TokenRequestContext<'a> {
+    /// The context of a request that carried nothing but its client authentication, which is every
+    /// request in a deployment that has enabled none of the parameters the other fields exist for.
+    ///
+    /// The RFC 8707 `resource` list, the RFC 9396 `authorization_details` and the RFC 9449 `DPoP`
+    /// header are public fields on the returned value, so a host's token endpoint reads as the
+    /// sequence of parameters it actually found on the wire.
+    pub fn new(credential: ClientCredential<'a>) -> Self {
+        TokenRequestContext {
+            credential,
+            resources: &[],
+            authorization_details: None,
+            #[cfg(feature = "dpop")]
+            dpop_proof: None,
+        }
+    }
+
+    /// The RFC 8707 `resource` parameters the request carried, in wire order.
+    pub fn with_resources(mut self, resources: &'a [String]) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    /// The RFC 9396 `authorization_details` parameter, raw and unparsed. Available in every
+    /// build: without `rar` what it buys is a REFUSAL rather than a grant, which is what RFC 9396
+    /// section 5 asks of a server that supports no detail type.
+    pub fn with_authorization_details(mut self, authorization_details: &'a str) -> Self {
+        self.authorization_details = Some(authorization_details);
+        self
+    }
+
+    /// The RFC 9449 `DPoP` request header, verbatim.
+    #[cfg(feature = "dpop")]
+    pub fn with_dpop_proof(mut self, dpop_proof: &'a str) -> Self {
+        self.dpop_proof = Some(dpop_proof);
+        self
+    }
 }
 
 /// What each grant helper needs about the REQUEST rather than about the grant.
@@ -853,16 +1029,88 @@ const USER_CODE_ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 /// Fresh OS randomness, hex encoded: `n` bytes of entropy, `2n` characters. Used for device codes
 /// and tokens; 32 bytes = 256 bits, far past any brute-force horizon for a 10-minute artifact.
 ///
+/// `None` means the OS would not give this process randomness. That is a real runtime condition —
+/// an exhausted file descriptor table on the platforms where `getrandom` opens `/dev/urandom`, a
+/// seccomp policy, a container without the syscall — and it is a condition every OTHER fallible
+/// operation on these paths reports as [`ErrorCode::ServerError`] and returns from. Panicking
+/// instead means a library aborting the HOST's request handler, and in a host built with
+/// `panic = "abort"` it means taking the whole process down: an authorization server that stops
+/// serving the requests it COULD still serve because one of them could not be given 32 bytes.
+///
+/// THERE IS NO PANICKING FORM ANY MORE, and its removal is the point. A `random_hex` that
+/// `expect`ed survived here through 0.9.0 with a doc claiming its remaining call sites were
+/// "outside the request path" — `crate::registration`'s minting and `crate::par`'s `request_uri`.
+/// Both halves were false by the time the doc was read: PAR had already moved to this function,
+/// and RFC 7591 dynamic registration is an ordinary unauthenticated `POST /register` route. A
+/// function that cannot be called is the only reliable way to keep that from happening again.
+///
 /// The DRAW and the ENCODING are separate calls so that one `getrandom` call can feed several
 /// artifacts. `getrandom::fill` is a SYSCALL, and the measurement that matters is that its cost is
 /// almost entirely per CALL rather than per byte: 875 ns for one byte against 1025 ns for
 /// thirty-two on the machine benches/README.md names. So the number of calls is the thing to
 /// reduce, and a caller that needs two 32-byte artifacts should draw 64 bytes once rather than 32
 /// bytes twice. See `issue`.
-pub(crate) fn random_hex(n_bytes: usize) -> String {
+pub(crate) fn try_random_hex(n_bytes: usize) -> Option<String> {
     let mut buf = vec![0u8; n_bytes];
-    getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
-    hex_encode(&buf)
+    getrandom::fill(&mut buf).ok()?;
+    Some(hex_encode(&buf))
+}
+
+/// The refusal a request-reachable randomness failure becomes, in the one spelling all three sites
+/// use.
+///
+/// Modelled on [`storage_error`], and for the same reason: the host learns what happened through
+/// its own logs, the wire gets the opaque RFC 6749 section 5.2 `server_error` and nothing about
+/// this server's internals. It IS a server error in the section's sense — "the authorization
+/// server encountered an unexpected condition that prevented it from fulfilling the request" — and
+/// the client's correct response, retrying later, is the same one it would make to a store that
+/// was briefly unavailable.
+/// The fixed input [`AuthorizationServer::dummy_assertion_verify`] verifies over.
+///
+/// It is not a JWS signing input and does not need to be: an ES256 verification costs the same
+/// whatever it is handed, and the string exists only so the operation is well defined.
+#[cfg(feature = "client-assertion")]
+const DUMMY_ASSERTION_SIGNING_INPUT: &str = "oauth-as dummy verification input";
+
+/// A real ES256 signature over [`DUMMY_ASSERTION_SIGNING_INPUT`], made once by a throwaway key.
+///
+/// IT IS A COST, NOT A CREDENTIAL, exactly as the dummy secret hash beside it is: the private half
+/// was never kept, no registration names the public half below, and the value it signs is a
+/// constant rather than a token request. What it buys is a verification that runs to completion —
+/// a malformed signature or a point off the curve would be refused in the parse and cost a
+/// fraction of the real work, which is the leak again.
+#[cfg(feature = "client-assertion")]
+const DUMMY_ASSERTION_SIGNATURE: [u8; 64] = [
+    91, 15, 217, 171, 65, 158, 255, 105, 97, 207, 103, 199, 34, 188, 42, 123, 113, 63, 9, 92, 242,
+    81, 20, 20, 147, 223, 209, 148, 122, 59, 212, 156, 132, 79, 44, 44, 108, 53, 228, 247, 251,
+    153, 155, 251, 71, 102, 34, 231, 227, 160, 80, 16, 215, 84, 84, 74, 117, 3, 91, 5, 148, 20, 28,
+    47,
+];
+
+/// The public half of that throwaway key.
+///
+/// BUILT PER CALL, not cached in a `OnceLock`: this crate promises no global statics and no lazy
+/// singletons (the crate docs say so, and `tests/allocation.rs` enforces it), and the four small
+/// allocations a [`crate::jwt::PublicJwk`] costs are invisible beside the ES256 verification they
+/// are there to feed — which is the whole point, since the KNOWN-id path this is matching pays
+/// that verification too. The `Jwk` literal is the crate's own publishing shape, whose coordinates
+/// are by construction the 32-byte base64url a verifier expects.
+#[cfg(feature = "client-assertion")]
+fn dummy_assertion_key() -> crate::jwt::PublicJwk {
+    crate::jwt::Jwk {
+        kty: "EC",
+        crv: "P-256",
+        x: "LIZkYOSRaSLc5uMxzlzV9pgt1ARaDl_3tZfRkt9mzFY".to_string(),
+        y: "fBSzqWfCploda0TpKf3N56v6fk-fORAiVsXUmkWYWkw".to_string(),
+        kid: "oauth-as-dummy-verification-key".to_string(),
+        use_: "sig",
+        alg: "ES256",
+    }
+    .to_public_jwk()
+}
+
+fn randomness_error() -> ErrorResponse {
+    ErrorResponse::new(ErrorCode::ServerError)
 }
 
 /// The rejection-sampling bound: the largest multiple of [`USER_CODE_ALPHABET`]'s length that fits
@@ -915,11 +1163,15 @@ fn user_code_symbol(byte: u8) -> Option<u8> {
 /// The buffer is a fixed stack array, so this adds no allocation: 64 bytes is enough that the
 /// probability of needing a second draw for the default eight-symbol code is negligible (each byte
 /// is accepted with probability 240/256), while staying small enough to sit in a frame.
-fn random_user_code(len: usize) -> String {
+///
+/// `None` for the reason [`try_random_hex`] gives: this runs on RFC 8628 section 3.1's device
+/// authorization endpoint, which is an ordinary request, and a library must not abort its host's
+/// process because the OS momentarily would not hand over 64 bytes.
+fn random_user_code(len: usize) -> Option<String> {
     let mut out = String::with_capacity(len);
     let mut buf = [0u8; 64];
     while out.len() < len {
-        getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
+        getrandom::fill(&mut buf).ok()?;
         for &byte in buf.iter() {
             if out.len() == len {
                 break;
@@ -929,7 +1181,7 @@ fn random_user_code(len: usize) -> String {
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// `WDJBMJHT` to `WDJB-MJHT`: hyphenate the middle for display when the length is even and at
@@ -961,7 +1213,7 @@ fn challenge_is_well_formed(challenge: &str) -> bool {
 
 /// The number of decimal digits `n` is written in, which is what `replay_key` has to reserve for
 /// its length prefix. `0` is one digit, and there is no case with none.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 fn decimal_width(n: usize) -> usize {
     let mut width = 1;
     let mut rest = n / 10;
@@ -1005,7 +1257,7 @@ fn decimal_width(n: usize) -> usize {
 ///
 /// One allocation per assertion or proof, on a path that only exists when the feature is on: the
 /// capacity below is exact, and `write!` into a `String` with room does not grow it.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+#[cfg(any(feature = "client-assertion", feature = "dpop"))]
 fn replay_key(kind: &str, owner: &str, jti: &str) -> String {
     use std::fmt::Write as _;
     let mut key = String::with_capacity(
@@ -1180,7 +1432,7 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
     /// of the server: `config` is moved in here and there is no way to mutate it afterwards.
     /// `Box<str>` rather than `String` because it is never appended to, which keeps the field at
     /// 16 bytes instead of 24 on a struct `tests/allocation.rs` holds to a size budget.
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     token_endpoint: Box<str>,
     /// The host's optional seams (audit sink, rate limiter, secret verifier). ONE pointer wide and
     /// null until the host installs something: see [`Hooks`] for why the three do not sit here as
@@ -1202,7 +1454,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Derived HERE and not at each use, and derived exactly as
         // `AuthorizationServerMetadata::from_config` derives it, because a server whose own idea
         // of its token endpoint differs from the one it publishes refuses every conforming client.
-        #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+        #[cfg(any(feature = "client-assertion", feature = "dpop"))]
         let token_endpoint: Box<str> = match &config.token_endpoint {
             Some(endpoint) => endpoint.as_str().into(),
             None => format!("{}/token", config.issuer.trim_end_matches('/')).into_boxed_str(),
@@ -1211,7 +1463,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             config,
             store,
             clock,
-            #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+            #[cfg(any(feature = "client-assertion", feature = "dpop"))]
             token_endpoint,
             hooks: Hooks::new(),
         }
@@ -1314,7 +1566,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     // Gated on the features that actually VERIFY rather than on `jwt`: a build that signs and
     // never checks anybody else's signature has no caller for this, and an uncalled resolver is
     // one more thing a reader has to work out is not reachable.
-    #[cfg(any(feature = "dpop", feature = "jar", feature = "client_assertion"))]
+    #[cfg(any(feature = "dpop", feature = "jar", feature = "client-assertion"))]
     pub(crate) fn es256_verifier(&self) -> Option<&dyn crate::jwt::Es256Verifier> {
         match self.hooks.es256_verifier() {
             Some(installed) => Some(&**installed),
@@ -1335,6 +1587,88 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// ([`crate::registration`]) and cannot reach the private field.
     pub(crate) fn now(&self) -> SystemTime {
         self.clock.now()
+    }
+
+    /// How long a [`crate::store::RevocationBarrier`] this server records has to stand.
+    ///
+    /// A barrier exists to refuse a write from a request that was ALREADY HOLDING a record when
+    /// the revocation ran. What bounds that is not the request's wall time, which nothing here can
+    /// know, but the lifetime of what such a request could still write: no in-flight issuance can
+    /// produce a credential that outlives the longest this server is configured to mint. So the
+    /// deadline is now plus that longest lifetime, and a barrier that has stood for it has
+    /// outlived everything it was recorded to refuse.
+    ///
+    /// All four durations are considered rather than just the access token TTL, and the
+    /// `refresh_reuse_window` is in the list on purpose: a chain with NO absolute lifetime
+    /// (`refresh_token_ttl: None`) has its spent records retained for exactly that window, so it
+    /// is the longest-lived thing such a family produces.
+    ///
+    /// Erring long costs storage that [`crate::store::Storage::sweep_expired`] reclaims. Erring
+    /// short costs the revocation itself, silently, which is the failure this whole mechanism
+    /// exists to prevent, so the asymmetry is taken deliberately.
+    /// Put a taken refresh record back, after a judgement that is NOT evidence of compromise.
+    ///
+    /// [`crate::store::Storage::take_refresh_token`] removes the record before anything about it
+    /// has been judged, so every refusal that is not reuse has to restore it, or a client that
+    /// merely asked for the wrong scope would lose its chain. Five refusal paths do that, and they
+    /// all handle a refused write the same way, so they call this rather than each writing the
+    /// handling out: the last time this crate had one operation at several seams, the copy that
+    /// diverged was the one that failed open.
+    ///
+    /// A [`crate::store::WriteOutcome::RefusedRevoked`] here is neither an error nor a surprise.
+    /// It means a revocation reached this family, client or consent while the record was out of
+    /// the store, and the record STAYING gone is exactly what that revocation asked for. The
+    /// caller's own refusal is the answer to the client either way. A genuine storage failure is
+    /// still fatal, because then it is not known whether the chain survived.
+    async fn restore_refresh_token(
+        &self,
+        record: crate::token::RefreshTokenRecord,
+    ) -> Result<(), ErrorResponse> {
+        let _outcome = self
+            .store
+            .put_refresh_token(record)
+            .await
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    /// Take back an access token this server wrote and then decided not to hand out.
+    ///
+    /// Issuance is two writes and [`crate::store::Storage`] has no transaction spanning them (see
+    /// the trait's own docs on why requiring cross-key atomicity would exclude most stores). A
+    /// revocation landing between them leaves the first write standing, so issuance has to be able
+    /// to reverse itself, and this is that reversal.
+    ///
+    /// FAILURE IS SWALLOWED, deliberately, and this is the one judgement in it. The caller is
+    /// already returning an error and the client will never see the token; the alternative is to
+    /// report a storage failure INSTEAD of the revocation, which tells the caller the wrong thing
+    /// about why it was refused. What is left behind on a failed undo is one orphaned access token
+    /// that [`crate::store::Storage::sweep_expired`] reclaims at its own expiry, and which no
+    /// client holds the string for.
+    async fn undo_issuance(&self, access_token: &str) {
+        let _ = self.store.delete_token(access_token).await;
+    }
+
+    /// The window a revocation happening NOW should record: the instant it happened, and the
+    /// instant past which nothing it was entitled to kill can still be in flight.
+    ///
+    /// Both come from ONE reading of the clock. Taking `now` twice would let the two instants
+    /// straddle a tick, and `recorded_at` is compared against by every subsequent write, so a
+    /// `recorded_at` even fractionally later than the revocation's own effect is a grant
+    /// wrongly refused.
+    pub(crate) fn revocation_window(&self) -> crate::store::RevocationWindow {
+        let longest = self
+            .config
+            .access_token_ttl
+            .max(self.config.refresh_token_ttl.unwrap_or_default())
+            .max(self.config.refresh_reuse_window)
+            .max(self.config.authorization_code_ttl)
+            .max(self.config.device_code_ttl);
+        let recorded_at = self.clock.now();
+        crate::store::RevocationWindow {
+            recorded_at,
+            until: saturating_deadline(recorded_at, longest),
+        }
     }
 
     /// Turn the freshly minted random token into what actually goes on the wire: itself when the
@@ -1363,8 +1697,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         resource: &[String],
         details: &GrantedDetails,
         now: SystemTime,
+        // The instant the caller has decided this token dies at, which is NOT always
+        // `now + access_token_ttl`: see the `lifetime_ceiling` argument of
+        // [`AuthorizationServer::issue`]. Handed in rather than recomputed here, because a signed
+        // `exp` that disagrees with the stored expiry is a token two halves of one deployment
+        // enforce differently.
+        expires_at: SystemTime,
         jti: String,
         bound: &Bound<'_>,
+        actor: &GrantedActor,
     ) -> Result<Result<(&crate::jwt::JwtConfig, String), String>, ErrorResponse> {
         // Only the RFC 8705 binding is read out of it here; without that feature the
         // signed claim set does not depend on how the client authenticated.
@@ -1383,6 +1724,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             AccessTokenFormat::Opaque => return Ok(Err(jti)),
             AccessTokenFormat::Jwt(jwt) => jwt,
         };
+        // Without the feature the wrapper is empty and genuinely unused here, exactly as `bound`
+        // is without `dpop`; see the note at the top of `issue`.
+        #[cfg(not(feature = "token-exchange"))]
+        let _ = actor;
         let claims = AccessTokenClaims {
             // The SAME spelling the RFC 8414 document publishes, the RFC 9207 `iss` parameter
             // carries and introspection reports. `issuer_identifier` trims a trailing slash, and
@@ -1393,7 +1738,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // mix-up defence RFC 9207 exists to provide. One server, one identity, everywhere it
             // states it.
             iss: self.issuer_identifier().to_string(),
-            exp: crate::jwt::unix_seconds(now + self.config.access_token_ttl)
+            exp: crate::jwt::unix_seconds(expires_at)
                 .map_err(|_| ErrorResponse::new(ErrorCode::ServerError))?,
             // RFC 8707 s2 with RFC 9068 s2.2: when the client named the resource server(s) it
             // means to call, THAT is the audience, and the configured default is not. The default
@@ -1441,6 +1786,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 };
                 (!cnf.is_empty()).then_some(cnf)
             },
+            // RFC 8693 s4.1, in the token itself. A JWT is typically validated offline by a
+            // resource server that never introspects, so the record alone would not reach it.
+            #[cfg(feature = "token-exchange")]
+            act: actor.act.as_deref().cloned(),
         };
         // `claims` dies HERE, before the caller awaits the signature. See this function's doc.
         jwt.signing_input(&claims)
@@ -1500,7 +1849,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Only the ES256-dependent members need adjusting, and only in a build that could verify
         // at all: the `cfg` is exactly the set `es256_verifier` is gated on, because those three
         // features are the three that advertise something an ES256 signature check has to back.
-        #[cfg(any(feature = "client_assertion", feature = "jar", feature = "dpop"))]
+        #[cfg(any(feature = "client-assertion", feature = "jar", feature = "dpop"))]
         if self.es256_verifier().is_some() {
             meta.es256_verification_is_available();
         }
@@ -1567,22 +1916,54 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // scope string the two happen to share. Scope-name collision between resource servers
             // is the ordinary case, not an exotic one.
             //
-            // An EMPTY allowlist keeps the previous behaviour rather than refusing everything,
-            // because refusing would break every deployment that already relies on resource
-            // indicators. That means this check protects only hosts that configure it, which is
-            // stated plainly on the config field rather than left for someone to discover.
-            if let Some(allowed) = &self.config.allowed_resources {
-                if !allowed.iter().any(|a| &**a == value) {
-                    return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
-                        .with_description("this server does not issue tokens for that resource"));
-                }
-            }
+            // FACTORED OUT rather than written here, because RFC 8693 s2.1.1 `audience` names the
+            // same thing as `resource` in a spelling that need not be a URI: it must skip the
+            // syntax check above and must NOT skip this one. See `target_is_permitted`.
+            self.target_is_permitted(value)?;
             // A repeated identical indicator is the same request twice, not two audiences.
             if !out.iter().any(|kept: &String| kept == value) {
                 out.push(value.to_string());
             }
         }
         Ok(out)
+    }
+
+    /// Whether this server is willing to issue a token naming `value` at all: the
+    /// [`ServerConfig::allowed_resources`] check, on its own.
+    ///
+    /// SYNTAX IS NOT AUTHORISATION, and the two questions had been welded together. RFC 8707
+    /// section 2 requires `invalid_target` when the server "is unwilling or unable to issue an
+    /// access token" for a named target, and that is a statement about the DEPLOYMENT: it is how an
+    /// operator decommissions a resource server, and until it existed any well-formed URI was
+    /// accepted. It matters most with the `jwt` feature on, where the requested target REPLACES the
+    /// configured audience in the RFC 9068 `aud` claim, so a client registered for one resource
+    /// server could name another and receive a token this server had signed, with that other
+    /// server's identifier in `aud`. The second server fetches our JWKS, the signature verifies,
+    /// `aud` names it, and it authorises on a scope string the two happen to share. Scope-name
+    /// collision between resource servers is the ordinary case, not an exotic one.
+    ///
+    /// SPLIT OUT OF [`AuthorizationServer::validate_resources`] because RFC 8693 section 2.1.1
+    /// `audience` names the same target in a spelling that need not be a URI. It therefore has to
+    /// skip the absolute-URI check and must not thereby skip this one, which is what it did through
+    /// 0.9.1: an operator who decommissioned a resource server by removing it from the allowlist
+    /// went on handing out signed tokens naming it, to any client holding a token whose grant
+    /// recorded it, via `audience` on an exchange.
+    ///
+    /// An EMPTY allowlist keeps the previous behaviour rather than refusing everything, because
+    /// refusing would break every deployment that already relies on resource indicators. That means
+    /// this check protects only hosts that configure it, which is stated plainly on the config field
+    /// rather than left for someone to discover.
+    pub(crate) fn target_is_permitted(&self, value: &str) -> Result<(), ErrorResponse> {
+        if let Some(allowed) = &self.config.allowed_resources {
+            if !allowed.iter().any(|a| &**a == value) {
+                // The offending value is NOT echoed, for the reason `validate_resources` gives:
+                // RFC 6749 section 5.2 restricts `error_description` to a charset an
+                // attacker-supplied value need not respect.
+                return Err(ErrorResponse::new(ErrorCode::InvalidTarget)
+                    .with_description("this server does not issue tokens for that resource"));
+            }
+        }
+        Ok(())
     }
 
     /// The resource set an issuance actually gets: the request may NARROW what the grant carries,
@@ -1599,12 +1980,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ///
     /// # On the O(requested * granted) scan
     ///
-    /// It needs no cap of its own, and deliberately does not have one. BOTH sides came through
-    /// [`AuthorizationServer::validate_resources`], which refuses past
-    /// [`MAX_RESOURCE_INDICATORS`]: `granted` was validated when the grant was created and
-    /// `requested` was validated by the caller a few lines earlier. So the worst case is 16 * 16
-    /// string comparisons, most of which fail on the length, and a second constant here would be a
-    /// second number to keep in step with the first for no gain.
+    /// It needs no cap of its own, and deliberately does not have one, but the reason is now a
+    /// count rather than the claim it used to make. That claim was that BOTH sides came through
+    /// [`AuthorizationServer::validate_resources`], and it stopped being true when RFC 8693 token
+    /// exchange started calling this: `granted` is still a validated grant record, but `requested`
+    /// there is `resource` values (validated) PLUS section 2.1.1 `audience` values, which skip the
+    /// URI-syntax check by design. What still bounds both sides is a CAP EACH:
+    /// [`MAX_RESOURCE_INDICATORS`] on the resource list, and
+    /// [`crate::token_exchange::MAX_AUDIENCE_VALUES`], deliberately the same number, on the
+    /// audience list. So the worst case is 16 * 32 string comparisons, most of which fail on the
+    /// length, and a third constant here would be a third number to keep in step with the other two
+    /// for no gain.
     pub(crate) fn narrow_resources(
         granted: &[String],
         requested: &[String],
@@ -1619,6 +2005,66 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         }
         Ok(requested.to_vec())
+    }
+
+    /// [`AuthorizationServer::narrow_resources`], then the allowlist ON WHAT SURVIVES.
+    ///
+    /// THE ALLOWLIST IS A PROPERTY OF THE ISSUED SET, NOT OF THE REQUESTED ONE, and that is the
+    /// whole of this function. [`AuthorizationServer::target_is_permitted`] was consulted only
+    /// about values a REQUEST named, and `narrow_resources` returns the grant's recorded list
+    /// verbatim when the request names none, which is the ordinary case: a refresh sending no
+    /// `resource`, an RFC 8693 exchange sending neither `resource` nor `audience`. So the values
+    /// that reached the issued token on that path were never checked at all.
+    ///
+    /// What that cost is exactly what `target_is_permitted`'s own doc describes for the `audience`
+    /// spelling, reached by a shorter road: an operator decommissions a resource server by removing
+    /// it from [`ServerConfig::allowed_resources`], and every grant that had already recorded it
+    /// goes on minting tokens naming it. Under `jwt` the issued set REPLACES the configured
+    /// audience in the RFC 9068 `aud` claim, so those are freshly SIGNED tokens naming a server the
+    /// operator believes they switched off, and with `refresh_token_ttl` defaulting to `None` the
+    /// chain that mints them never expires.
+    ///
+    /// # Refused when NAMED, dropped when INHERITED, and the difference is what the client asked
+    ///
+    /// A request that NAMES a decommissioned target is asking for something this server will not
+    /// issue, and RFC 8707 section 2's answer to that is `invalid_target`. That is what
+    /// `narrow_resources` above already delivers, through the same
+    /// [`AuthorizationServer::target_is_permitted`] every named value goes through.
+    ///
+    /// A request that names NOTHING has asked for whatever the grant still supports, so a target
+    /// the server has since retired is DROPPED rather than made fatal. Refusing there would mean an
+    /// operator retiring one resource server instantly breaks every live chain that ever recorded
+    /// it, including clients that only ever call the ones still standing, over a value none of them
+    /// mentioned. That is a bigger outage than the decommissioning itself, and it is avoidable.
+    ///
+    /// UNLESS NOTHING SURVIVES, which is the one case that must refuse. An empty resource list does
+    /// not mean "no audience restriction" further down: [`AuthorizationServer::issue`] falls back
+    /// to the configured [`crate::jwt::JwtConfig`] audience when the list is empty, so silently
+    /// emptying a grant that DID name resources would WIDEN the token to this deployment's default
+    /// audience, which is the opposite of what dropping was meant to do.
+    pub(crate) fn narrow_and_permit(
+        &self,
+        granted: &[String],
+        requested: &[String],
+    ) -> Result<Vec<String>, ErrorResponse> {
+        let issued = Self::narrow_resources(granted, requested)?;
+        if !requested.is_empty() {
+            // Every value here is one the request named, so each has already been through
+            // `target_is_permitted` at its own endpoint, and naming a retired one is fatal there.
+            return Ok(issued);
+        }
+        let permitted: Vec<String> = issued
+            .into_iter()
+            .filter(|value| self.target_is_permitted(value).is_ok())
+            .collect();
+        if permitted.is_empty() && !granted.is_empty() {
+            return Err(
+                ErrorResponse::new(ErrorCode::InvalidTarget).with_description(
+                    "this server no longer issues tokens for any resource this grant names",
+                ),
+            );
+        }
+        Ok(permitted)
     }
 
     /// The storage seam, so the host can administer its own store.
@@ -1645,8 +2091,173 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// [`crate::registration::RegistrationPolicy`] check, the minted `client_id` and secret, and
     /// the RFC 7592 management credential. A host calling THIS method is asserting that the
     /// registration was authorised somewhere it can point to.
+    ///
+    /// # What IS checked, despite "no policy is consulted"
+    ///
+    /// Every `redirect_uris` entry, against the same rule RFC 7591 registration applies (RFC 6749
+    /// section 3.1.2: an absolute URI with no fragment, and nothing outside printable ASCII, which
+    /// RFC 3986 requires of a URI anyway). This is not policy: it is whether the value can work at
+    /// all, and the two ways of creating a client used to disagree about it, with the DIRECT one —
+    /// the one a default build has, since `http` and dynamic registration are optional — being the
+    /// permissive half.
+    ///
+    /// The reason it is worth a refusal here rather than being left to fail later is WHERE it fails
+    /// later, which is three layers away from its cause. A redirect URI containing a space passes
+    /// the authorization endpoint's exact-string match, the host's resolver approves, an
+    /// authorization code is MINTED AND PERSISTED, and only then does building the `Location`
+    /// header fail: the user sees a 500, the client is never reached, and the code sits in storage
+    /// until it expires while every retry does it again. Refusing at registration turns that into
+    /// one error, at startup, in front of the person who wrote the value.
+    ///
+    /// A [`StorageError`] rather than a new error type, and it is the honest reading rather than a
+    /// convenience: the answer is that this registration cannot be stored as given. The message
+    /// names the offending URI, because the caller is the operator who just supplied it.
     pub async fn register_client(&self, client: Client) -> Result<(), StorageError> {
+        for uri in &client.redirect_uris {
+            // The SAME function `crate::registration`'s `redirect_uri_is_registerable` delegates
+            // to, called directly rather than copied: two implementations of one rule is how the
+            // two registration paths came to disagree in the first place.
+            if !crate::authorization::is_valid_resource_indicator(uri) {
+                return Err(StorageError::new(format!(
+                    "redirect_uri {uri:?} is not registerable: RFC 6749 s3.1.2 requires an \
+                     absolute URI with no fragment, and the authorization endpoint matches it by \
+                     exact string, so a registration this server cannot reproduce is a client that \
+                     can never complete a flow"
+                )));
+            }
+        }
+        // A registration whose `default_scopes` exceed its `allowed_scopes` is NOT refused here,
+        // and that is a decision rather than an omission. It is a real state an operator reaches by
+        // the control this crate tells them to reach for: `tests/registration_narrowing.rs` narrows
+        // `allowed_scopes` alone, exactly as an operator correcting an over-broad registration
+        // does, and refusing that would turn a security control into an error message. What made
+        // the disagreement dangerous was the GRANT it produced, not the registration itself, and
+        // that is closed at the point of issuance instead: see
+        // `AuthorizationServer::granted_default_scope`, which trims the default to the allowance so
+        // no grant is ever minted that the rotation ceiling would later destroy.
         self.store.put_client(client).await
+    }
+
+    /// Verify `presented` against a stored verifier NOBODY holds the secret for, and throw the
+    /// answer away.
+    ///
+    /// The point is the elapsed time, not the result: see the timing section on
+    /// [`AuthorizationServer::authenticate_client`], which is the only caller. The scheme comes
+    /// from the installed [`crate::client::SecretVerifier`] when it offers one, so the dummy costs
+    /// what that host's real registrations cost; otherwise it is the crate's own `sha256-hex`,
+    /// which prices the built-in scheme exactly and any other scheme not at all.
+    ///
+    /// `None` presented does no work, and that is not an omission FOR A SECRET: `verify_with`
+    /// answers `false` for a confidential registration with no secret presented without verifying
+    /// anything either, so doing nothing here is what MATCHES the known-id path rather than what
+    /// diverges from it. It is NOT a general claim, and reading it as one is what left the RFC
+    /// 7523 path uncovered through 0.9.0: a `private_key_jwt` request carries an assertion and no
+    /// secret at all, so on that path the known id paid an ES256 verification and the unknown id
+    /// paid nothing. [`AuthorizationServer::dummy_assertion_verify`] is that half.
+    ///
+    /// [`std::hint::black_box`] because the whole call is dead code by every rule the optimiser
+    /// has: a pure function whose result is discarded. Without it the hashing this exists to spend
+    /// is exactly what a release build is entitled to delete.
+    fn dummy_verify(&self, presented: Option<&str>) {
+        let presented = match presented {
+            Some(p) => p,
+            None => return,
+        };
+        let verifier = self.hooks.secret_verifier();
+        let hash = match verifier.and_then(|v| v.dummy_hash()) {
+            Some(hash) => hash,
+            // The crate's own, over a constant that is not a secret and does not need to be: no
+            // registration names this hash, so nothing authenticates by presenting the string it
+            // was built from. It is a cost, not a credential.
+            None => crate::client::SecretHash::sha256(
+                "oauth-as dummy verification input; no registration is stored under this",
+            ),
+        };
+        let dummy = crate::client::ClientAuth::ConfidentialSecretHash { hash };
+        let _ = std::hint::black_box(dummy.verify_with(Some(presented), verifier));
+    }
+
+    /// [`AuthorizationServer::dummy_verify`]'s twin for RFC 7523 client assertions: one ES256
+    /// verification through the installed seam, over a key nobody registered, answer discarded.
+    ///
+    /// WHY IT IS NEEDED SEPARATELY. A `private_key_jwt` request carries a `client_assertion` and
+    /// NO `client_secret` — `authenticate_by_assertion` refuses a request carrying both — so
+    /// `dummy_verify` was handed `None` and returned immediately, while a KNOWN id on the same
+    /// request went on to a real ES256 verification, which `crate::jwt` prices at about 133
+    /// microseconds. The probed id is attacker-chosen and free: `crate::http` reads it from the
+    /// UNSIGNED `sub` of the assertion when the form carries no `client_id`, and a garbage
+    /// signature never reaches `claim_replay_id`, so the probe is repeatable and averageable while
+    /// per-id throttling sees exactly one request per candidate — the same shape the secret case
+    /// above describes.
+    ///
+    /// WHICH VERIFICATION, and why it is not always the ES256 one. RFC 7523 has TWO client
+    /// authentication methods and this crate implements both: `private_key_jwt` is ES256 through
+    /// the installed seam, and `client_secret_jwt` is an HS256 HMAC over the registered secret,
+    /// which `verify_assertion` performs itself and which therefore needs no seam at all. So the
+    /// real cost of a known id depends on the deployment, and the dummy tracks it: an ES256
+    /// verification where a verifier is installed, and an HS256 tag verification where none is,
+    /// which is exactly the shape of a `client_secret_jwt`-only deployment. This used to return
+    /// early on a missing verifier on the grounds that "the real path refuses without verifying
+    /// anything either", and that was true only of `private_key_jwt`: a `client_secret_jwt`
+    /// deployment with no ES256 backend had its known ids paying an HMAC while unknown ids paid
+    /// nothing.
+    ///
+    /// WHAT REMAINS, stated rather than left to be discovered: a deployment running BOTH methods
+    /// can still be timed to tell which method a KNOWN, EXISTING client is registered for, because
+    /// an HMAC and an ES256 verification are three orders of magnitude apart and no single dummy
+    /// can be both. That is a much weaker fact than the one this closes: it says nothing about
+    /// whether an id exists, so it is not an enumeration primitive, and it is only readable for an
+    /// id the attacker already knows is registered.
+    ///
+    /// WHAT IT COSTS, stated rather than left to be found: a probe that could have reached a
+    /// verification now buys one of this server's time whether or not its id exists. That is a
+    /// denial-of-service consideration, it was already true for every KNOWN id, and the
+    /// [`RateLimiter`] is charged for the attempt either way. The aim of the whole mechanism is
+    /// that the two ids cost the same; see the residuals section on
+    /// [`AuthorizationServer::authenticate_client`] for where they still do not, because that
+    /// claim has now been false in three different ways across three audit rounds and stating it
+    /// without the exceptions is what let each one survive.
+    #[cfg(feature = "client-assertion")]
+    fn dummy_assertion_verify(&self) {
+        match self.es256_verifier() {
+            Some(verifier) => {
+                let _ = std::hint::black_box(verifier.verify(
+                    &dummy_assertion_key(),
+                    DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
+                    &DUMMY_ASSERTION_SIGNATURE,
+                ));
+            }
+            // The `client_secret_jwt` cost. The secret is the signing input itself, which is a
+            // constant: as with the ES256 signature above this is a COST and not a credential, and
+            // an HMAC costs the same whatever key it is handed.
+            None => {
+                let _ = std::hint::black_box(crate::jwt::verify_hs256(
+                    DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
+                    DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
+                    &DUMMY_ASSERTION_SIGNATURE[..32],
+                ));
+            }
+        }
+    }
+
+    /// Whether this request COULD have reached an assertion verification had its client id
+    /// existed, which is the only condition under which charging
+    /// [`AuthorizationServer::dummy_assertion_verify`] makes the two ids cost the same.
+    ///
+    /// It mirrors, exactly, the three refusals `authenticate_by_assertion` makes before it decodes
+    /// a byte: an assertion has to be present, the RFC 7521 section 4.2 `client_assertion_type` has
+    /// to be the one this server implements, and RFC 6749 section 2.3 forbids a `client_secret`
+    /// alongside. Charging on the presence of the assertion ALONE, which is what this used to do,
+    /// reopened the leak pointing the other way: a known id sending a garbage
+    /// `client_assertion_type` was refused in nanoseconds while an unknown id sending the same
+    /// bytes paid a full ES256 verification, so one request per candidate separated "registered"
+    /// from "not registered" again. The two conditions have to be kept in step; if a refusal is
+    /// ever added there before the verification, it belongs here too.
+    #[cfg(feature = "client-assertion")]
+    fn assertion_could_be_verified(cred: &ClientCredential<'_>) -> bool {
+        cred.client_assertion.is_some()
+            && cred.client_assertion_type == Some(CLIENT_ASSERTION_TYPE)
+            && cred.client_secret.is_none()
     }
 
     /// Authenticate a client for a token-plane call: unknown id and failed secret verification
@@ -1660,6 +2271,113 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The host's [`RateLimiter`] is asked FIRST, before the store is touched, so a refused
     /// attempt costs nothing and reveals nothing (RFC 9700 section 4.13 on credential stuffing at
     /// the token endpoint).
+    ///
+    /// # The collapse is a TIMING property too, and how far this goes
+    ///
+    /// Answering both cases with the same code is worth nothing if the two take visibly different
+    /// wall times, and the unknown-id path is naturally the cheaper one: there is no secret to
+    /// verify. So this function performs a DUMMY verification when the id is unknown, through the
+    /// same [`crate::client::ClientAuth::verify_with`] every real authentication goes through.
+    ///
+    /// What that covers exactly:
+    ///
+    /// - [`crate::client::ClientAuth::ConfidentialSecretHash`] in the built-in `sha256-hex`
+    ///   scheme, and [`crate::client::ClientAuth::ConfidentialSecret`], which this crate can price
+    ///   for itself because it performs the comparison itself.
+    /// - A HOST scheme, whenever the installed [`crate::client::SecretVerifier`] implements
+    ///   [`crate::client::SecretVerifier::dummy_hash`]. This is the case that matters, because a
+    ///   host scheme is the expensive one.
+    /// - RFC 7523 CLIENT ASSERTIONS, through
+    ///   [`AuthorizationServer::dummy_assertion_verify`]: a request presenting a
+    ///   `client_assertion` for an unknown id pays one verification, which is what the known id
+    ///   pays. This was uncovered through 0.9.0 because such a request carries no
+    ///   `client_secret`, so the secret dummy above had nothing to do and the doc for that
+    ///   `None` case read as though nothing needed doing.
+    /// - THE ASSERTION CASE IN BOTH DIRECTIONS, which the first fix for it did not. The dummy is
+    ///   charged only when the request could have reached a verification at all
+    ///   (`assertion_could_be_verified`), and a KNOWN id whose registration does not use
+    ///   assertions pays it too before `authenticate_by_assertion` returns `WrongPrincipal`.
+    ///   Without the second half the mechanism ran backwards: an id registered for
+    ///   `client_secret_basic` refused in nanoseconds while an unknown id sending identical bytes
+    ///   paid 133 microseconds, which separates "registered, but not this way" from "not
+    ///   registered" in one un-throttleable request per candidate.
+    ///
+    /// - THE KNOWN-ID PATHS THAT DID NO VERIFICATION AT ALL, which is the same rule pointing the
+    ///   other way and had three separate instances. An expired `client_secret_expires_at` returns
+    ///   before every credential branch; `verify_with` answers `false` in nanoseconds for a
+    ///   `Public` or `ConfidentialAssertion` registration handed a posted secret; a mutual-TLS
+    ///   registration refuses on a thumbprint comparison. Each of those was FASTER than the
+    ///   unknown-id path, which pays `dummy_verify` through the host's scheme, so "fast" positively
+    ///   identified a registered id. Each now charges the dummy before refusing.
+    ///
+    /// - THE REFUSALS THAT PRECEDE THE ASSERTION VERIFICATION, which the fix for the case above
+    ///   introduced. `authenticate_by_assertion` refuses three requests before it decodes a byte,
+    ///   and it now charges `dummy_verify` for all three through the SAME
+    ///   `assertion_could_be_verified` predicate this function uses, rather than through a comment
+    ///   asking the two to be kept in step. They were not kept in step: a request carrying an
+    ///   assertion AND a `client_secret` was refused by a known id for free while an unknown id
+    ///   paid the host's secret scheme, so the fix for the previous bullet reopened the bullet
+    ///   before it. See the comment at the top of that function.
+    ///
+    /// # What it does NOT cover, stated rather than left to be discovered
+    ///
+    /// THE STRUCTURE IS STILL WRONG, and this list is the evidence rather than a footnote to it.
+    /// This function decides how much work to do by branching on the very facts an attacker is
+    /// trying to learn: whether the id exists, what KIND of registration it is, and whether its
+    /// secret has expired. Every such branch is a potential oracle. FOUR variants of this one bug
+    /// have now been found in four consecutive audit rounds, and each was a consequence of the fix
+    /// before it: round 7 added a dummy, round 8 found the dummy made an unknown id cost MORE than
+    /// a known one, round 9 found three known-id paths costing nothing, and round 10 found that
+    /// round 9's own guard had two refusal sites it did not reach. The failures are getting harder
+    /// to see rather than easier, which is the argument for the structure and not for another
+    /// site. Any change to this function or to `authenticate_by_assertion` must therefore ask what
+    /// a request costs on BOTH paths, not only whether it is refused correctly. The
+    /// structural answer is for the cost to be uniform by CONSTRUCTION: perform exactly one
+    /// verification of the kind the request PRESENTED, never of the kind the registration holds,
+    /// and let every branch below compute a boolean that falls through to a single refusal. That
+    /// is a redesign of the most security-sensitive function in this crate, it changes the order of
+    /// rate-limit accounting and of which failure the audit channel hears, and it needs the
+    /// unknown-id path to simulate an assertion verification WITHOUT spending a `jti`. It is
+    /// deferred past 0.9.1 deliberately, and the residuals below are what that costs meanwhile.
+    ///
+    /// THE SHAPE THAT REDESIGN SHOULD TAKE, recorded now so the next attempt does not start from
+    /// nothing. The costly half is not the branching: it is that the branches are also the EXITS.
+    /// Every refusal returns from where it was decided, so each one has to remember to charge, and
+    /// that is the obligation that has been forgotten four times. Keeping every branch, every
+    /// `ClientAuthFailure` and every wire answer exactly as they are, and routing them through ONE
+    /// exit that charges whatever the request's presented credential has not yet been charged for,
+    /// gets the property by construction without redesigning the semantics. It is a mechanical
+    /// change that a reviewer can check by counting exits, which is the part that makes it worth
+    /// doing after a release rather than during one.
+    ///
+    /// FIRST, a host scheme whose verifier returns `None` from `dummy_hash`. This crate cannot
+    /// invent a well-formed argon2id or bcrypt encoding to hand such a verifier, and one in the
+    /// wrong scheme would be rejected on inspection in microseconds, which is the leak again. A
+    /// deployment using a slow custom scheme SHOULD implement that method; until it does, the wire
+    /// answer is still collapsed but the wall time is not. That residual is unfixable HERE, unlike
+    /// the assertion one above, which is why the assertion one was closed rather than written down
+    /// beside it.
+    ///
+    /// SECOND, WHICH RFC 7523 METHOD an id that is known to exist is registered for, in a
+    /// deployment running both. `private_key_jwt` costs an ES256 verification and
+    /// `client_secret_jwt` costs an HMAC, three orders of magnitude apart, and one dummy cannot be
+    /// both; [`AuthorizationServer::dummy_assertion_verify`] picks whichever matches the
+    /// deployment. This is not an enumeration primitive: it says nothing about whether an id
+    /// exists, and it is readable only for one the attacker already knows does.
+    ///
+    /// THIRD, and in the same class: a `ConfidentialSecret` registration compares its secret with
+    /// [`crate::client::constant_time_eq`], two SHA-256 digests, while the dummy an unknown id pays
+    /// goes through the INSTALLED verifier's scheme. In a deployment that installs argon2id and
+    /// still holds plaintext-secret registrations those differ by milliseconds, so such a
+    /// registration is distinguishable from an unknown id. A deployment that stores hashes
+    /// throughout, which is what [`crate::client::SecretHash`] exists for and what RFC 9700 section
+    /// 4.13 expects, has nothing here to read. The structural fix above is what closes it properly;
+    /// charging a second dummy on top of the real comparison would only make the same registration
+    /// distinguishable in the other direction.
+    ///
+    /// RFC 8705 mutual TLS is not on this list because there is nothing to price: the HOST
+    /// verified the certificate before this crate saw it, and what happens here is a thumbprint
+    /// comparison.
     pub(crate) async fn authenticate_client(
         &self,
         client_id: &ClientId,
@@ -1686,6 +2404,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let client = match found {
             Some(client) => client,
             None => {
+                // THE COLLAPSE IS ALSO A TIMING PROPERTY, and it was one this function did not
+                // keep. Returning here without verifying anything makes an unknown id answer in
+                // the time of one store read, while a real id additionally pays a full secret
+                // verification. Under the shape `with_secret_verifier` exists to serve — a
+                // `ConfidentialSecretHash` in a host scheme such as argon2id — that is roughly two
+                // milliseconds against two hundred, so one request per candidate id enumerates the
+                // whole client registry. Per-id throttling cannot see it: the attacker sends
+                // exactly one request per id and never repeats one.
+                //
+                // So the same work happens on this path, through the SAME `verify_with` seam, and
+                // the result is discarded. See `SecretVerifier::dummy_hash` for the half only the
+                // host can supply, and the doc on this function for what remains uncovered.
+                self.dummy_verify(cred.client_secret);
+                // The RFC 7523 half of the same rule. Charged only when this request could have
+                // reached a verification had the id existed, so a request a KNOWN id would have
+                // had refused before any verification does not pay for one here either; see
+                // `assertion_could_be_verified`.
+                #[cfg(feature = "client-assertion")]
+                if Self::assertion_could_be_verified(cred) {
+                    self.dummy_assertion_verify();
+                }
                 self.hooks.record(attempt, AttemptOutcome::Failed);
                 self.hooks.emit(|| Event::ClientAuthenticationFailed {
                     client_id: client_id.as_str(),
@@ -1722,6 +2461,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         // host's problem rather than a reason to refuse a live credential.
                         .unwrap_or(false);
                 if expired {
+                    // AND IT PAYS FOR THE VERIFICATION IT SKIPPED. This return is BEFORE every
+                    // credential branch below, so an expired registration answered in the time of
+                    // one store read while an unknown id paid a full `dummy_verify` through the
+                    // host's scheme, which `SecretVerifier::dummy_hash` prices at argon2id
+                    // milliseconds. Fast therefore meant "this id is registered", which is the one
+                    // fact the bare `invalid_client` two lines down exists to withhold.
+                    self.dummy_verify(cred.client_secret);
+                    #[cfg(feature = "client-assertion")]
+                    if Self::assertion_could_be_verified(cred) {
+                        self.dummy_assertion_verify();
+                    }
                     self.hooks.record(attempt, AttemptOutcome::Failed);
                     self.hooks.emit(|| Event::ClientAuthenticationFailed {
                         client_id: client_id.as_str(),
@@ -1739,7 +2489,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // from the secret comparison below because it is a different KIND of credential: there is
         // nothing to compare, there is a signature to verify against the REGISTRATION's key and a
         // `jti` to spend so the request cannot be repeated.
-        #[cfg(feature = "client_assertion")]
+        #[cfg(feature = "client-assertion")]
         if cred.client_assertion.is_some() {
             // NOT boxed, and that is a measurement rather than a style, in both directions.
             //
@@ -1747,7 +2497,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // grant helpers and so into the token future, which `tests/allocation.rs` holds under
             // tokio's 2048-byte debug boxing threshold, and inlining the assertion state (a claim
             // set, two owned Strings, a storage future) once pushed it over. It no longer does.
-            // Measured both ways: 1144 under `client_assertion` alone, 1256 with `rar`, 1344 with
+            // Measured both ways: 1144 under `client-assertion` alone, 1256 with `rar`, 1344 with
             // `dpop,mtls,consent,rar,par` and with `--all-features`, IDENTICAL boxed and unboxed,
             // because the token future's high-water mark moved elsewhere when the endpoint was
             // restructured (see `token_with_context`).
@@ -1762,13 +2512,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     self.hooks.record(attempt, AttemptOutcome::Succeeded);
                     Ok(client)
                 }
-                Err(error) => {
+                Err(reason) => {
                     self.hooks.record(attempt, AttemptOutcome::Failed);
                     self.hooks.emit(|| Event::ClientAuthenticationFailed {
                         client_id: client_id.as_str(),
-                        failure: ClientAuthFailure::AssertionInvalid,
+                        failure: ClientAuthFailure::AssertionInvalid { reason },
                     });
-                    Err(error)
+                    // The one bare `invalid_client`, built HERE, because it is the same one for
+                    // every reason above: the wire's collapse is the point, and the reason went to
+                    // the audit channel one line up.
+                    Err(ErrorResponse::new(ErrorCode::InvalidClient))
                 }
             };
         }
@@ -1791,6 +2544,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     Ok(client)
                 }
                 Err(failure) => {
+                    // A thumbprint comparison is microseconds, so an mTLS registration handed a
+                    // posted `client_secret` refused far faster than an unknown id paying
+                    // `dummy_verify`. `dummy_verify` does nothing at all for the `None` a real
+                    // mutual-TLS request carries, so the ordinary path is unchanged and only the
+                    // probe pays; see the residuals section on this function.
+                    self.dummy_verify(cred.client_secret);
                     self.hooks.record(attempt, AttemptOutcome::Failed);
                     self.hooks.emit(|| Event::ClientAuthenticationFailed {
                         client_id: client_id.as_str(),
@@ -1811,6 +2570,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .auth
             .verify_with(cred.client_secret, self.hooks.secret_verifier())
         {
+            // A REGISTRATION THAT CANNOT VERIFY A SECRET STILL PAYS FOR ONE. `verify_with` answers
+            // `false` in nanoseconds for `Public` and for `ConfidentialAssertion` (see the arms in
+            // `crate::client`: there is no presented string that could be right), so a request
+            // posting junk as `client_secret` separated those registrations from an unknown id by
+            // wall time alone, and the unknown id was the SLOW one. Under a host scheme that is
+            // argon2id milliseconds against nanoseconds, which sorts a whole registry in one
+            // request per candidate. `matches!` on the two kinds that DID verify, so a
+            // `ConfidentialSecret` or `ConfidentialSecretHash` is never charged twice.
+            if !matches!(
+                client.auth,
+                crate::client::ClientAuth::ConfidentialSecret { .. }
+                    | crate::client::ClientAuth::ConfidentialSecretHash { .. }
+            ) {
+                self.dummy_verify(cred.client_secret);
+            }
             self.hooks.record(attempt, AttemptOutcome::Failed);
             self.hooks.emit(|| Event::ClientAuthenticationFailed {
                 client_id: client_id.as_str(),
@@ -1829,36 +2603,88 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// reached once the client id is known to exist, so a description naming which check failed
     /// would be the difference between "this client id is real" and "it is not", which is exactly
     /// the distinction `authenticate_client` collapses on purpose. The host's audit channel is
-    /// told (`ClientAuthFailure::AssertionInvalid`); the wire is not.
-    #[cfg(feature = "client_assertion")]
+    /// told (`ClientAuthFailure::AssertionInvalid { reason }`); the wire is not.
+    ///
+    /// RETURNS THE REASON rather than a built `ErrorResponse`, which is what makes that sentence
+    /// true. Every refusal here is byte for byte the same bare `invalid_client`, so there was
+    /// nothing for the caller to choose between and the `ErrorResponse` was constructed here only
+    /// to be discarded by a `map_err(|_| ..)` that also discarded the `AssertionFailure` with it.
+    /// The caller builds the one response and emits the reason, so the audit channel gets what
+    /// `AssertionFailure` documents itself as existing for.
+    #[cfg(feature = "client-assertion")]
     async fn authenticate_by_assertion(
         &self,
         client: &Client,
         cred: &ClientCredential<'_>,
-    ) -> Result<(), ErrorResponse> {
-        let refused = || ErrorResponse::new(ErrorCode::InvalidClient);
-        let assertion = cred.client_assertion.ok_or_else(refused)?;
-
-        // RFC 7521 section 4.2: the type is what says which assertion format this is, and this
-        // server implements exactly one. An absent or unrecognised type is refused rather than
-        // assumed, because assuming would mean verifying a credential in a format nobody declared.
-        if cred.client_assertion_type != Some(CLIENT_ASSERTION_TYPE) {
-            return Err(refused());
+    ) -> Result<(), crate::client_assertion::AssertionFailure> {
+        use crate::client_assertion::AssertionFailure;
+        // THE THREE REFUSALS THAT PRECEDE ANY DECODING ARE ONE EXPRESSION, and it is the SAME
+        // expression `authenticate_client` uses to decide whether to charge the assertion dummy on
+        // the unknown-id path. They were three separate `if`s here and a predicate there, kept in
+        // step by a comment, and a comment cannot hold an invariant across two functions: the
+        // predicate reached all three conditions and this function reached none of them with a
+        // charge, so two of the three were free.
+        //
+        // WHAT THAT COST, because it is the fourth variant of one bug in four audit rounds and the
+        // pattern is the point. `authenticate_client` enters this function on
+        // `cred.client_assertion.is_some()` ALONE, so a request carrying an assertion AND a
+        // `client_secret` arrives here and is refused by the RFC 6749 section 2.3 check below in
+        // nanoseconds. The UNKNOWN id sending identical bytes takes the not-found arm, which
+        // charges `dummy_verify(cred.client_secret)` unconditionally, and with a secret present
+        // that runs the host's `SecretVerifier` scheme: argon2id milliseconds against nanoseconds.
+        // The assertion dummy is skipped on both sides (the predicate is false when a secret is
+        // present), so nothing balanced it. One request per candidate id, never repeated, sorts
+        // registered ids from unregistered ones, which is the enumeration the whole mechanism
+        // exists to close, reopened by the round that closed its previous variant.
+        //
+        // The three conditions, and why each refuses before anything is read:
+        //
+        // - An assertion has to be present at all.
+        // - RFC 7521 section 4.2: the type is what says which assertion format this is, and this
+        //   server implements exactly one. An absent or unrecognised type is refused rather than
+        //   assumed, because assuming would mean verifying a credential in a format nobody
+        //   declared.
+        // - RFC 6749 section 2.3: "The client MUST NOT use more than one authentication method in
+        //   each request." A request carrying both a secret and an assertion has not said which
+        //   credential it means, and a server that picks one behaves differently from the next
+        //   server, which is exactly the ambiguity an intermediary would exploit.
+        //
+        // All three answered `AssertionFailure::Malformed` before and all three answer it now:
+        // there is no more specific variant for "this server will not read the string it was
+        // handed", and the wire answer was one bare `invalid_client` for every one of them anyway.
+        // So collapsing them changes what is SPENT and nothing else, on the wire or in the audit
+        // channel.
+        //
+        // The dummy charged is `dummy_verify`, not the assertion one, and that is deliberate: it is
+        // the same call the unknown-id path makes for the same request, which is the only thing
+        // that makes the two cost the same. When no secret was presented it does nothing, on both
+        // paths, and there is nothing to balance.
+        if !Self::assertion_could_be_verified(cred) {
+            self.dummy_verify(cred.client_secret);
+            return Err(AssertionFailure::Malformed);
         }
-        // RFC 6749 section 2.3: "The client MUST NOT use more than one authentication method in
-        // each request." A request carrying both a secret and an assertion has not said which
-        // credential it means, and a server that picks one behaves differently from the next
-        // server, which is exactly the ambiguity an intermediary would exploit.
-        if cred.client_secret.is_some() {
-            return Err(refused());
-        }
+        let assertion = cred.client_assertion.ok_or(AssertionFailure::Malformed)?;
 
         // THE REGISTRATION DECIDES, and this is where that starts. A client registered for
         // `client_secret_basic` cannot promote itself to `private_key_jwt` by sending an assertion,
         // because there is no key here that anybody vouched for on its behalf.
         let keys = match &client.auth {
             crate::client::ClientAuth::ConfidentialAssertion { keys } => keys,
-            _ => return Err(refused()),
+            // The registration does not authenticate this way at all, so there is no key any
+            // assertion could have been signed with. `WrongPrincipal` is the closest true
+            // statement: the party this credential claims to be is not the party it names.
+            _ => {
+                // AND IT PAYS THE DUMMY FIRST, which is the half of the timing collapse that is
+                // only fixable here. `authenticate_client` charges an unknown id one verification
+                // so that "this id exists" cannot be read off the clock; returning from here for
+                // free undid that, because a registered id that does not use assertions answered
+                // in nanoseconds while an unknown id sending identical bytes paid the full
+                // verification. The registration KIND is exactly what such a probe is after, so
+                // this cannot be fixed by choosing when to charge on the other path: the known
+                // path has to pay too. See `dummy_assertion_verify`.
+                self.dummy_assertion_verify();
+                return Err(AssertionFailure::WrongPrincipal);
+            }
         };
 
         // RFC 7523 section 3 (3) admits either the token endpoint URL or, by long-established
@@ -1877,8 +2703,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             client.client_id.as_str(),
             &[self.token_endpoint(), self.issuer_identifier()],
             self.clock.now(),
-        )
-        .map_err(|_| refused())?;
+        )?;
 
         // RFC 7523 section 3: the `jti` is single use within the assertion's validity. THIS is the
         // check that makes an observed request unrepeatable, and it is the whole difference between
@@ -1895,9 +2720,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // FAILING CLOSED. A claim that could not be recorded is a claim that did not happen,
             // and treating a storage outage as "probably fine" would turn every assertion into a
             // replayable one for the duration of the outage.
-            .map_err(|_| refused())?;
+            //
+            // REPORTED AS ITS OWN REASON, and not as `Replayed`, which is what it was through
+            // 0.9.0. The wire answer is identical either way (`invalid_client`), so this is
+            // entirely a question about the audit channel, and there the two are opposites:
+            // `Replayed` is documented as a captured-and-replayed assertion, which
+            // `crate::events` calls "a different incident and a much worse one", while this is the
+            // store being unreachable. An outage fails EVERY `private_key_jwt` client at once, so
+            // the mislabel fired a burst of this crate's worst-incident signal at the exact moment
+            // an operator was reading the channel to find out what had broken. The DPoP twin below
+            // propagates the same failure with `map_err(storage_error)`.
+            .map_err(|_| AssertionFailure::ReplayCheckUnavailable)?;
         if !claimed {
-            return Err(refused());
+            return Err(AssertionFailure::Replayed);
         }
         Ok(())
     }
@@ -1915,7 +2750,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// verification and once per RFC 7523 assertion verification, so a `private_key_jwt` client
     /// sending DPoP paid two `format!`s of a constant on every token request. The crate already
     /// precomputes the metadata document, the JWKS and the JOSE header for exactly this reason.
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     fn token_endpoint(&self) -> &str {
         &self.token_endpoint
     }
@@ -1946,8 +2781,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // this proof acceptable, so an unauthenticated caller does not get to spend a base64 decode
         // and a JSON parse finding that out.
         let verifier = self.es256_verifier().ok_or_else(|| {
+            // EMITTED, and this is the refusal it matters most to emit. `jwt` carries the verifier
+            // seam and `jwt-p256` carries the arithmetic, so a build with `dpop` and neither an
+            // installed verifier nor that backend refuses EVERY proof: the deployment is
+            // misconfigured, not the client, and through 0.9.0 this was the one refusal the audit
+            // channel never heard about at all. `UnsupportedAlgorithm` is the honest reading of
+            // `DpopFailure`'s existing vocabulary — with no backend, ES256 is not an algorithm
+            // this build accepts, whatever `dpop_signing_alg_values_supported` advertises.
+            self.hooks.emit(|| Event::DpopProofRefused {
+                failure: crate::dpop::DpopFailure::UnsupportedAlgorithm,
+            });
+            // BARE, like the nine section 4.3 checks below. The event above carries the reason,
+            // which is where `dpop.rs` says the distinction belongs; the description would have
+            // put it on the wire, and `verify_dpop` runs BEFORE any client authentication, so an
+            // anonymous caller could read a deployment misconfiguration off a refusal.
             ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                .with_description("no ES256 verifier is installed")
         })?;
         let verified = verify_proof(
             verifier,
@@ -1956,7 +2804,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             self.token_endpoint(),
             self.clock.now(),
         )
-        .map_err(|_| ErrorResponse::new(ErrorCode::InvalidDpopProof))?;
+        // THE REASON GOES TO THE AUDIT CHANNEL, and until 0.9.1 it went nowhere: this arm was
+        // `map_err(|_| ..)` and no event was emitted at all, against `dpop.rs`'s statement that
+        // "the distinction here is for the host's audit channel, not for the wire". A deployment
+        // could therefore not tell a client with a skewed clock (`StaleProof`) from one whose
+        // proofs are being captured and replayed (`Replayed`), which are a configuration problem
+        // and an incident.
+        .map_err(|failure| {
+            self.hooks.emit(|| Event::DpopProofRefused { failure });
+            ErrorResponse::new(ErrorCode::InvalidDpopProof)
+        })?;
         // Namespaced by THUMBPRINT rather than by client id: a proof is bound to a key, not to a
         // registration (a public client's proof arrives before anything has authenticated), so the
         // key is the only identity available at this point that an attacker cannot choose freely.
@@ -1969,10 +2826,58 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .await
             .map_err(storage_error)?;
         if !claimed {
-            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                .with_description("this DPoP proof has already been used"));
+            // The single-use check is one of RFC 9449 section 4.3's, so its failure is reported
+            // through the same channel as the nine `verify_proof` performs. It was the one
+            // `DpopFailure::Replayed` nothing ever produced.
+            self.hooks.emit(|| Event::DpopProofRefused {
+                failure: crate::dpop::DpopFailure::Replayed,
+            });
+            // BARE, for the reason the no-verifier arm above gives and one more of its own. This
+            // path is reached without authentication, and "already used" told an anonymous caller
+            // that the proof they presented is in the replay cache, which confirms that its
+            // signature, `htu`, `htm` and `iat` all PASSED: a captured proof could be tested for
+            // freshness against the server that would otherwise have accepted it. The event
+            // carries `DpopFailure::Replayed` to the host, which is the whole distinction.
+            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
         }
         Ok(Some(verified.jkt.into_boxed_str()))
+    }
+
+    /// The registered default, TRIMMED to what the registration also says may ever be granted.
+    ///
+    /// The trim is a fix for a defect the 0.9.1 rotation ceiling created rather than a
+    /// belt-and-braces check. Nothing had ever compared `default_scopes` with `allowed_scopes`:
+    /// both are plain public fields on [`crate::client::Client`], and a registration can reach a
+    /// host's store without passing through [`AuthorizationServer::register_client`] at all. So a
+    /// registration whose default exceeded its own allowance granted the default, and then
+    /// [`AuthorizationServer::refresh_token`]'s ceiling refused the first rotation with
+    /// `invalid_scope` and did NOT put the record back, destroying the chain permanently. That
+    /// ceiling's premise is that "the client asked to continue a grant this server is no longer
+    /// willing to honour", and the premise is false here: an identical fresh authorization request
+    /// naming no scope mints the same grant again. Trimming is the reading that makes the two
+    /// halves agree, and it is the fail-closed one: what is granted is exactly what the
+    /// registration says may ever be granted.
+    ///
+    /// Written as a guarded clone so the OVERWHELMINGLY common case is byte for byte what this
+    /// always did. `register_client` refuses the disagreement outright, so a host that registers
+    /// through this crate never reaches the second arm at all.
+    ///
+    /// Called from BOTH places the RFC 6749 section 3.3 default is applied, which is the other
+    /// half of the fix: the authorization endpoint had its own copy of "absent means the registered
+    /// default", and a rule with two implementations is a rule that drifts.
+    fn granted_default_scope(client: &Client) -> ScopeSet {
+        if client.default_scopes.is_subset(&client.allowed_scopes) {
+            return client.default_scopes.clone();
+        }
+        ScopeSet::from_tokens(
+            client
+                .default_scopes
+                .iter()
+                .filter(|s| client.allowed_scopes.contains(s.as_str()))
+                .map(|s| s.as_str()),
+        )
+        // Unreachable: every token here came out of a `ScopeSet` and so parsed once already.
+        .unwrap_or_else(|_| ScopeSet::empty())
     }
 
     /// Resolve the scope a request will be granted: the client default when the request names
@@ -1982,7 +2887,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         requested: Option<&ScopeSet>,
     ) -> Result<ScopeSet, ErrorResponse> {
         match requested {
-            None => Ok(client.default_scopes.clone()),
+            // INTERSECTED, not taken whole, and that is a fix for a defect the 0.9.1 rotation
+            // ceiling created rather than a belt-and-braces check. Nothing had ever compared
+            // `default_scopes` with `allowed_scopes`: both are plain public fields on
+            // `crate::client::Client`, and a registration can reach a host's store without passing
+            // through `register_client` at all. So a registration whose default exceeded its own
+            // allowance granted the default, and then `refresh_token`'s ceiling refused the first
+            // rotation with `invalid_scope` and did NOT put the record back, destroying a chain
+            // permanently. That ceiling's premise is that "the client asked to continue a grant
+            // this server is no longer willing to honour", and that premise is false here: an
+            // identical fresh authorization request naming no scope mints the same grant again.
+            // Intersecting is the only reading that makes the two halves agree, and it is the
+            // fail-closed one: what is granted is exactly what the registration says may ever be
+            // granted. `register_client` refuses the disagreement outright, so a host that goes
+            // through it never reaches this arm with anything to trim.
+            None => Ok(Self::granted_default_scope(client)),
             Some(s) if s.is_subset(&client.allowed_scopes) => Ok(s.clone()),
             // NB: descriptions must stay inside the RFC 6749 section 5.2 charset (no double
             // quote, no backslash), which scope tokens themselves already satisfy.
@@ -2028,6 +2947,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         cred: &ClientCredential<'_>,
         requested_scope: Option<&ScopeSet>,
     ) -> Result<DeviceAuthorizationResponse, ErrorResponse> {
+        // STAMPED BEFORE THE REGISTRATION IS READ, for the reason `client_credentials_token`
+        // states at length: `created_at` is the instant a revocation barrier compares this grant
+        // against at redemption, so it must predate the read the write is derived from. Taking it
+        // after `authenticate_client` would date the grant later than a `delete_client` landing in
+        // that window, and the comparison would then admit a token for a registration deleted
+        // before the grant was even written.
+        //
+        // The device flow makes that worse than elsewhere, which is why it is worth the extra
+        // line: `put_device_grant` consults no barrier at all, the approval that follows is a
+        // compare-and-swap against a record that is present, and a device client is typically
+        // PUBLIC — so a host re-provisioning the same `client_id` needs no secret for the polling
+        // device to redeem it.
+        let created_at = self.clock.now();
+
         let client = self.authenticate_client(client_id, cred).await?;
         if !client.allows_grant(GrantType::DeviceCode) {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient)
@@ -2036,7 +2969,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let scope = Self::resolve_scope(&client, requested_scope)?;
 
         let now = self.clock.now();
-        let device_code = random_hex(32);
+        // `?` rather than a panic: this is an unauthenticated-shaped request path like any
+        // other, and an OS that will not hand over 32 bytes is a `server_error`, not a reason to
+        // abort the host's process. See `try_random_hex`.
+        let device_code = try_random_hex(32).ok_or_else(randomness_error)?;
         let user_code = self.unique_user_code().await?;
         let grant = DeviceGrant {
             device_code: device_code.clone(),
@@ -2044,8 +2980,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             client_id: client.client_id.clone(),
             scope,
             state: DeviceGrantState::Pending,
-            created_at: now,
-            expires_at: now + self.config.device_code_ttl,
+            // Read at request ENTRY, above, not here. `expires_at` below stays measured from the
+            // write, because the TTL is a promise about how long the user has to type the code.
+            created_at,
+            expires_at: saturating_deadline(now, self.config.device_code_ttl),
             interval: self.config.poll_interval,
             last_poll_at: None,
         };
@@ -2054,10 +2992,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .await
             .map_err(storage_error)?;
 
-        let verification_uri_complete = self
-            .config
-            .include_verification_uri_complete
-            .then(|| format!("{}?user_code={}", self.config.verification_uri, user_code));
+        let verification_uri_complete = self.config.include_verification_uri_complete.then(|| {
+            // RFC 8628 s3.3.1: this is a DEEP LINK whose only job is to prefill the code, so
+            // a `?` appended to a `verification_uri` that already carries a query does not
+            // merely look wrong — it folds the code into the previous parameter's value and
+            // the page prefills nothing. The same helper every authorization-response URL in
+            // this crate uses, rather than a second answer to the same question.
+            format!(
+                "{}{}user_code={}",
+                self.config.verification_uri,
+                crate::authorization::query_separator(&self.config.verification_uri),
+                user_code
+            )
+        });
         Ok(DeviceAuthorizationResponse {
             device_code,
             user_code,
@@ -2083,7 +3030,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Clamped, not honoured: see `ServerConfig::user_code_length`.
         let len = self.config.user_code_length.max(MIN_USER_CODE_LENGTH);
         for _ in 0..USER_CODE_GENERATION_ATTEMPTS {
-            let raw = random_user_code(len);
+            // `None` is the OS refusing randomness, which is the same `server_error` the
+            // storage failures in this loop become rather than a panic on a request path.
+            let raw = random_user_code(len).ok_or_else(randomness_error)?;
             // The store indexes NORMALIZED codes, and `raw` is already the normalized form (the
             // alphabet is upper case and carries no hyphen), so this needs no second pass.
             if self
@@ -2161,11 +3110,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// RFC 8628 section 5.1 is explicit that the user code's entropy is sufficient only IN
     /// COMBINATION WITH rate limiting: the code is short because a human types it, and an
     /// unthrottled verification endpoint turns "short enough to type" into "short enough to
-    /// enumerate". This library performs NO rate limiting and cannot, because it never sees a
-    /// request: it has no notion of a caller, an IP, a session, or a user. Every unknown-code
-    /// answer this returns must be counted and throttled by the HOST, per whatever identity the
-    /// host actually has. Without that, [`MIN_USER_CODE_LENGTH`] symbols is a guessing exercise,
-    /// not a credential.
+    /// enumerate".
+    ///
+    /// This crate CAN throttle this call, and does: the first thing this method does is
+    /// `pending_grant_by_user_code`, which asks the installed [`RateLimiter`] about an
+    /// [`crate::events::Attempt::DeviceUserCodeEntry`] BEFORE the code is looked up, and reports
+    /// the outcome back afterwards. [`DeviceApprovalError::RateLimited`] is what a refusal looks
+    /// like from here. A limiter is shipped ([`crate::rate_limit::FixedWindowRateLimiter`]), and
+    /// the crate's own `http` service installs nothing by default, so a host that installs none
+    /// gets none. This paragraph said the opposite through 0.9.1 — "performs NO rate limiting and
+    /// cannot" — which was a promise of absence beside code that consults the throttle on its
+    /// first statement, and is the kind of doc that gets a host to build a second throttle or,
+    /// worse, to conclude the risk is unavoidable.
+    ///
+    /// What remains the HOST's, and it is the important half: this crate has no notion of a
+    /// caller, an IP, a session or a user, so it can only key the throttle on what it is given.
+    /// An attacker who spreads guesses across the whole code space from many sources is visible
+    /// to the host and not to this crate. Without a limiter installed, [`MIN_USER_CODE_LENGTH`]
+    /// symbols is a guessing exercise, not a credential.
     pub async fn approve_device(
         &self,
         entered_user_code: &str,
@@ -2242,6 +3204,46 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Equivalent to [`AuthorizationServer::token_with_resources`] with an empty list, which is
     /// what a token request carrying no `resource` parameter means: no NARROWING is asked for, so
     /// the issued token inherits whatever the grant already carries.
+    ///
+    /// # THIS FUTURE IS NOT CANCELLATION SAFE, and what a drop costs
+    ///
+    /// Applies equally to [`AuthorizationServer::token_with_resources`] and
+    /// [`AuthorizationServer::token_with_context`], which are the same future.
+    ///
+    /// A Rust future stops at whatever `await` it is suspended in when it is dropped, and it never
+    /// resumes. Two grants reached through here are TAKE-THEN-WRITE sequences, meaning they remove
+    /// a single-use credential from the store and then persist what that credential became. A drop
+    /// between the two leaves the first half done and nothing to finish it, and the crate cannot
+    /// make a dropped future complete: there is no destructor that can run an `async` store call.
+    /// So the CONTRACT is stated here rather than silently relied on, because until 0.9.1 a host
+    /// had no way to learn it.
+    ///
+    /// Named exactly, because the cost differs:
+    ///
+    /// - `authorization_code`. The code is TAKEN (RFC 6749 s4.1.2's one-time use), then a CONSUMED
+    ///   record is written, then the tokens are issued, then that record is updated with what they
+    ///   were. A drop between the take and the consumed write is the most expensive one in the
+    ///   crate: the code is gone, so it cannot be redeemed twice, but RFC 9700 s4.1.1 replay
+    ///   DETECTION works by recognising a code that was already redeemed, and this leaves no record
+    ///   to recognise. A later replay of a code that leaked into a log, a `Referer` header or
+    ///   browser history reads as an unknown string, permanently and silently, for that grant. The
+    ///   write order was chosen to make a store FAILURE fall this way round rather than the other,
+    ///   and a drop lands in the same window that ordering shrank; it cannot close it.
+    /// - `refresh_token`. The presented token is TAKEN, then a SPENT record is written, then the
+    ///   rotated chain is issued. A drop between the take and the spent write destroys the client's
+    ///   chain (the string it holds is gone and no replacement was persisted, so the user
+    ///   authenticates again) and loses the RFC 9700 s4.14.2 reuse marker for it, which is the same
+    ///   loss as above: a later presentation of that token is an unknown string rather than
+    ///   evidence of compromise, so it revokes no family.
+    /// - The device grant's successful poll takes its grant record before issuing, with the same
+    ///   shape and the same cost as the code path.
+    ///
+    /// WHAT A HOST MUST DO. Drive this from a task the connection cannot cancel, and await THAT:
+    /// spawn the call and await the join handle, so a disconnecting client aborts the response and
+    /// not the work. This crate's own axum adapter does exactly that; see [`crate::http`]. A host
+    /// that instead selects this future against a timeout, a shutdown signal, or a connection
+    /// watcher is choosing every cost listed above, and choosing it at whatever rate its clients
+    /// disconnect.
     pub fn token(
         &self,
         request: TokenRequest,
@@ -2339,6 +3341,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     GrantedDetails::of(&parsed)
                 }
             };
+            // And the build that supports NO type refuses the parameter outright, which is the
+            // same s5 rule with the type list empty. Checked before the grant is looked up, so
+            // the client hears about the parameter it sent rather than about the code it sent:
+            // an `invalid_grant` for a request whose real defect is `authorization_details`
+            // sends the client's author to the wrong half of the request.
+            #[cfg(not(feature = "rar"))]
+            if context.authorization_details.is_some() {
+                return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                    .with_description("this server does not support authorization_details"));
+            }
             #[cfg(not(feature = "rar"))]
             let requested_details = GrantedDetails::default();
             // RFC 9449 s4.3, before anything else touches the store: see `verify_dpop`.
@@ -2570,6 +3582,55 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         request: &AuthorizationRequest<'_>,
     ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {
+        // THE THROTTLE, and this endpoint had none. RFC 9700 section 4.13 is about credential
+        // stuffing at the token endpoint; this one takes NO CREDENTIAL, which is precisely why it
+        // needs a bound of its own rather than sharing `Attempt::ClientAuthentication`'s. What a
+        // deployment is bounding here is work and storage: every request costs a `get_client`, and
+        // an approved one goes on to WRITE an authorization code record that nothing but
+        // `Storage::sweep_expired` ever reclaims.
+        //
+        // Asked FIRST, before the store is touched, for the same reason `authenticate_client` asks
+        // first: a refused attempt must cost nothing and reveal nothing.
+        //
+        // `temporarily_unavailable` (RFC 6749 section 4.1.2.1) rather than `invalid_request`,
+        // because nothing about the request was wrong and a client that retries later will
+        // succeed. It is DIRECT rather than a redirect: at this point neither the client nor the
+        // redirect URI has been validated, so there is no address this server may safely send
+        // anything to.
+        let attempt = Attempt::AuthorizationRequest {
+            client_id: request.client_id.as_deref().unwrap_or(""),
+        };
+        if self.hooks.check(attempt) == RateLimitDecision::Deny {
+            return Err(AuthorizationError::Direct(
+                ErrorResponse::new(ErrorCode::TemporarilyUnavailable)
+                    .with_description("too many authorization requests; retry later"),
+            ));
+        }
+        let outcome = self
+            .validate_direct_authorization_request_inner(request)
+            .await;
+        // Reported back so a limiter can count FAILURES rather than traffic, exactly as the token
+        // plane does. A refused authorization request is the signal worth counting here: a caller
+        // walking client ids, or replaying a malformed request, produces nothing else.
+        self.hooks.record(
+            attempt,
+            match &outcome {
+                Ok(_) => AttemptOutcome::Succeeded,
+                Err(_) => AttemptOutcome::Failed,
+            },
+        );
+        outcome
+    }
+
+    /// The validation itself, with the throttle above already satisfied.
+    ///
+    /// Split out so that every `?` below reports its refusal to the limiter through ONE place. The
+    /// alternative, threading `hooks.record` through a dozen early returns, is the shape that ends
+    /// with one path that forgot to.
+    async fn validate_direct_authorization_request_inner(
+        &self,
+        request: &AuthorizationRequest<'_>,
+    ) -> Result<ValidatedAuthorizationRequest, AuthorizationError> {
         // `&'static str`: every description below is a constant naming a condition, never a
         // value out of the request, so the refusal borrows it rather than copying it. The
         // authorization endpoint is unauthenticated, so its refusal rate is the attacker's to
@@ -2595,6 +3656,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // 2. The redirect URI. OAuth 2.1 section 4.1.3 requires exact string comparison: no
         //    prefix matching, no ignoring a trailing slash, no normalising case. Every relaxation
         //    of this rule has a published attack behind it.
+        //
+        //    WHETHER IT WAS SENT is recorded as well as what it resolved to, because RFC 6749
+        //    section 4.1.3 makes the token endpoint's copy of this parameter conditional on the
+        //    authorization request having carried one. The resolved value below cannot answer that
+        //    question: the section 3.1.2.3 omission path fills it in from the registration, so both
+        //    cases arrive at the token endpoint looking identical.
+        let redirect_uri_was_explicit = request.redirect_uri.is_some();
         let redirect_uri = match request.redirect_uri.as_deref() {
             Some(requested) => client
                 .redirect_uris
@@ -2610,18 +3678,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // RFC 6749 section 3.1.2.3: the request may omit it only when there is exactly one
             // registration to mean. With several, the server would be guessing where to send a
             // credential, and a wrong guess is the whole attack.
+            //
+            // ZERO AND SEVERAL ARE ONE ANSWER, and that is the same rule step 1 above states.
+            // Separate descriptions ("client has no registered redirect_uri" against "redirect_uri
+            // is required when several are registered") sorted every client id into three buckets
+            // by how many URIs it has registered, from one UNAUTHENTICATED request carrying
+            // nothing but a `client_id`. Combined with the unknown-id refusal that is four
+            // distinguishable answers about a registration the caller has proved no relationship
+            // to, which defeats the collapse the comment on step 1 promises. Neither case can be
+            // repaired by the client anyway: both are answered by SENDING a `redirect_uri`, and
+            // the string below says so.
             None => match client.redirect_uris.as_slice() {
                 [only] => only.clone(),
-                [] => {
-                    return Err(direct(
-                        ErrorCode::InvalidRequest,
-                        "client has no registered redirect_uri",
-                    ))
-                }
                 _ => {
                     return Err(direct(
                         ErrorCode::InvalidRequest,
-                        "redirect_uri is required when several are registered",
+                        "redirect_uri is required for this client",
                     ))
                 }
             },
@@ -2690,9 +3762,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             ));
         }
 
-        // 5. Scope. RFC 6749 section 3.3: absent means the registered default.
+        // 5. Scope. RFC 6749 section 3.3: absent means the registered default, trimmed to what the
+        // registration allows. See `granted_default_scope`, which is shared with `resolve_scope`
+        // precisely so this endpoint and the token endpoint cannot answer differently.
         let scope = match request.scope.as_deref() {
-            None => client.default_scopes.clone(),
+            None => Self::granted_default_scope(&client),
             Some(s) => {
                 let requested = ScopeSet::parse(s)
                     .map_err(|_| redirect(ErrorCode::InvalidScope, "malformed scope"))?;
@@ -2727,6 +3801,23 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // rather than to the user, since by here the redirect URI is trusted, and REFUSED
         // rather than ignored (section 5), because a client whose authorization detail was
         // silently dropped would obtain a token it believes says something it does not.
+        //
+        // THE BUILD WITHOUT `rar` REFUSES EVERY ONE OF THEM, which is the stronger case and not
+        // an absent one: it supports no authorization detail type whatsoever, so section 5's
+        // condition holds for any value at all and there is nothing to parse before answering.
+        // Same posture as the RFC 9101 request object path in `crate::par`, which already said
+        // this; this is the plain query request, and the RFC 9126 push, which reaches here too.
+        #[cfg(not(feature = "rar"))]
+        if request.authorization_details.is_some() {
+            return Err(AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                redirect_uri: redirect_uri.clone(),
+                error: ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+                    .with_description("this server does not support authorization_details"),
+                state: state.clone(),
+                iss: self.issuer_identifier().to_string(),
+            }));
+        }
+
         #[cfg(feature = "rar")]
         let details = {
             let to_redirect = |error: ErrorResponse| {
@@ -2783,6 +3874,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // shared read saved on it.
             client.client_id.clone(),
             redirect_uri,
+            redirect_uri_was_explicit,
             scope,
             state,
             code_challenge.to_string(),
@@ -2816,6 +3908,33 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         approval: UserApproval<'_>,
     ) -> Result<AuthorizationResponse, AuthorizationError> {
+        // RFC 9470 IS ENFORCED HERE TOO, and it was not until the 0.9.1 audit.
+        // `validate_authorization_request` parses `acr_values` and `max_age` onto the validated
+        // request, and this entry point threw the result away: it minted a code for a request that
+        // demanded a step-up without evaluating the demand, and `GrantedAuthentication::default()`
+        // then recorded no authentication, so introspection reported no `auth_time` and no `acr`
+        // for every token the code produced. The sibling below calls that enforcement "a library
+        // job rather than a host job on purpose: a `max_age` the host is trusted to check for
+        // itself is a `max_age` that gets checked in whichever code path somebody remembered", and
+        // this was the path nobody remembered. `crate::http` uses the sibling, so what shipped
+        // unenforced was the DIRECT API, which is the path `UserApproval` documents as the one
+        // this crate's default build invites.
+        //
+        // Routed through the sibling with NO report, rather than duplicating the check: this entry
+        // point has no argument through which a host could report an authentication, so `None` is
+        // the only honest value and `satisfied_by` answers `Ok(())` for an empty requirement. A
+        // request carrying neither parameter is therefore completely unaffected, and one carrying
+        // either is refused with RFC 9470 section 3 `insufficient_user_authentication` rather than
+        // granted, which is the fail-closed direction and the same answer the sibling gives an
+        // unreported requirement.
+        #[cfg(feature = "consent")]
+        {
+            let requirement = approval.request().authentication_requirement.clone();
+            return self
+                .issue_authorization_code_with_authentication(approval, &requirement, None)
+                .await;
+        }
+        #[cfg(not(feature = "consent"))]
         self.issue_authorization_code_inner(approval, GrantedAuthentication::default())
             .await
     }
@@ -2874,13 +3993,75 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Destructured rather than borrowed through the approval: `subject` is MOVED into the
         // record below, which is the same one allocation the previous `impl Into<String>` argument
         // produced. The approval adds no allocation of its own; it is a borrow plus that String.
-        let UserApproval { request, subject } = approval;
+        let UserApproval {
+            request,
+            subject,
+            decided_at,
+        } = approval;
+        // THE SECOND CHARGE, and it is a separate one on purpose. `validate_authorization_request`
+        // is charged for a READ; this is where the authorization code record is WRITTEN, and
+        // nothing but `Storage::sweep_expired` reclaims one. Charging the write to the validation
+        // would let a caller who validated once go on issuing for free, which is the half that
+        // actually grows the store.
+        //
+        // A REDIRECT rather than a direct refusal, unlike the validation's: by this point the
+        // redirect URI has been validated, so RFC 6749 section 4.1.2.1 sends the error back to the
+        // client, carrying the state that lets it correlate. `temporarily_unavailable` because
+        // nothing about the request was wrong and a retry later will succeed. Nothing is minted
+        // and no consent is touched, which is the same posture the step-up refusal above takes.
+        //
+        // NOTHING IS RECORDED on the deny, and that is the same rule every other classification
+        // site in this crate follows (`authenticate_client`, the validation above,
+        // `pending_grant_by_user_code`, `register_dynamic_client`). `RateLimiter::record` is
+        // documented as reporting how an ALLOWED attempt turned out, and a denial never became an
+        // attempt: reporting it as `Failed` would drive the failure count with the very traffic
+        // the limiter refused, and a host alerting on failure rate — which this crate tells hosts
+        // to do — would read a client that merely exceeded its ceiling as a caller walking the
+        // redirect-URI space. This site reported it through the 0.9.1 audit's second charge and
+        // was the one exception.
+        let attempt = Attempt::AuthorizationRequest {
+            client_id: request.client_id.as_str(),
+        };
+        if self.hooks.check(attempt) == RateLimitDecision::Deny {
+            return Err(AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                redirect_uri: request.redirect_uri.clone(),
+                error: ErrorResponse::new(ErrorCode::TemporarilyUnavailable)
+                    .with_description("too many authorization requests; retry later"),
+                state: request.state.clone(),
+                iss: request.issuer.clone(),
+            }));
+        }
         let now = self.clock.now();
-        let code = random_hex(32);
+        // `?` rather than a panic, for the reason `try_random_hex` gives. The refusal is a
+        // REDIRECT because by this point the redirect URI has been validated (RFC 6749 s4.1.2.1),
+        // so it goes back to the client the same way the storage failure below does.
+        let code = try_random_hex(32).ok_or_else(|| {
+            self.hooks.record(attempt, AttemptOutcome::Failed);
+            AuthorizationError::Redirect(AuthorizationErrorRedirect {
+                redirect_uri: request.redirect_uri.clone(),
+                error: ErrorResponse::new(ErrorCode::ServerError),
+                state: request.state.clone(),
+                iss: request.issuer.clone(),
+            })
+        })?;
         let record = AuthorizationCodeRecord {
+            // WHEN THE USER'S DECISION HAPPENED, which is not always now. Redemption carries this
+            // into the issued token so a revocation can tell this code from one minted after it,
+            // and a barrier refuses a grant that PREDATES it — so dating the decision later than
+            // it happened is what lets a code outrank a withdrawal recorded in between.
+            //
+            // `None` means the host prompted during this request and the two instants are the
+            // same. A host acting on a standing approval must say so with
+            // [`UserApproval::granted_at`]; this crate's own `http` service does, passing the
+            // instant the authorization request was received. See that method for the ordering
+            // this closes.
+            issued_at: decided_at.unwrap_or(now),
             code: code.clone(),
             client_id: request.client_id.clone(),
             redirect_uri: request.redirect_uri.clone(),
+            // RFC 6749 s4.1.3: carried so the token endpoint can require the parameter exactly
+            // when the authorization request sent one. See the field.
+            redirect_uri_was_explicit: request.redirect_uri_was_explicit,
             scope: request.scope.clone(),
             subject,
             code_challenge: request.code_challenge.clone(),
@@ -2891,9 +4072,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // may narrow and what the issued token will carry.
             #[cfg(feature = "rar")]
             authorization_details: request.authorization_details.clone(),
-            expires_at: now + self.config.authorization_code_ttl,
+            expires_at: saturating_deadline(now, self.config.authorization_code_ttl),
             state: AuthorizationCodeState::Issued,
-            // RFC 9470 s5: recorded here because the token endpoint has no user in front of it and
+            // RFC 9470 s6.2: recorded here because the token endpoint has no user in front of it and
             // could not ask. See `AuthorizationCodeRecord::authentication`.
             #[cfg(feature = "consent")]
             authentication: authentication.authentication,
@@ -2902,6 +4083,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .put_authorization_code(record)
             .await
             .map_err(|_| {
+                self.hooks.record(attempt, AttemptOutcome::Failed);
                 AuthorizationError::Redirect(AuthorizationErrorRedirect {
                     redirect_uri: request.redirect_uri.clone(),
                     error: ErrorResponse::new(ErrorCode::ServerError),
@@ -2909,6 +4091,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     iss: request.issuer.clone(),
                 })
             })?;
+        // The record is written, so the charge is settled as a success. Reported at all because a
+        // limiter that counts failures needs to be told about the ones that were not.
+        self.hooks.record(attempt, AttemptOutcome::Succeeded);
         Ok(AuthorizationResponse {
             code,
             state: request.state.clone(),
@@ -2985,11 +4170,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // A code presented twice is evidence it leaked, so RFC 6749 section 4.1.2 and RFC 9700
         // section 4.1.1 want the tokens it already minted revoked, not just the replay refused.
         // Refusing the replay alone would leave the attacker's stolen access token live.
-        if let AuthorizationCodeState::Consumed {
-            access_token,
-            refresh_token,
-        } = &record.state
-        {
+        // `Replayed` counts too: a THIRD presentation is still a replay, and the record still
+        // names what to revoke. Reading only `Consumed` here would make every presentation after
+        // the second one look like an unknown code, which is the answer a typo gets.
+        if let Some((access_token, refresh_token)) = record.state.minted() {
+            let (access_token, refresh_token) = (
+                access_token.map(str::to_string),
+                refresh_token.map(str::to_string),
+            );
+            let (access_token, refresh_token) = (&access_token, &refresh_token);
             // Revoking by FAMILY rather than by the two recorded strings, so that a chain the
             // client has legitimately rotated since redemption dies too: the compromise is of the
             // grant, not of one token from it (RFC 9700 section 4.14.2).
@@ -3021,7 +4210,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         // moment this server was responding to a detected compromise reported a
                         // clean containment: the attacker's chain still live, the audit log saying
                         // it was killed.
-                        match self.store.revoke_token_family(&rec.family_id).await {
+                        match self
+                            .store
+                            .revoke_token_family(&rec.family_id, self.revocation_window())
+                            .await
+                        {
                             Ok(_) => revoked_family = true,
                             Err(_) => containment_failed = true,
                         }
@@ -3046,12 +4239,26 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     }
                 }
             }
-            // The consumed record goes BACK. `src/authorization.rs` and `src/store.rs` both
-            // promise it is retained until its own expiry, and that promise is what makes replay
-            // detection work more than once: taking it here would make the NEXT replay read as an
-            // unknown code, which is the answer a typo gets. Losing this write therefore loses the
-            // EVIDENCE, not just a record, which is why it counts as a containment failure too.
-            if self.store.put_authorization_code(record).await.is_err() {
+            // The record goes BACK, and it goes back as `Replayed` rather than as what was read.
+            // `src/authorization.rs` and `src/store.rs` both promise it is retained until its own
+            // expiry, and that promise is what makes replay detection work more than once: taking
+            // it here would make the NEXT replay read as an unknown code. Losing this write
+            // therefore loses the EVIDENCE, not just a record, which is why it counts as a
+            // containment failure too.
+            //
+            // `Replayed` is the DURABLE TRACE, and it is the half of this that a concurrent
+            // redemption can see. Putting `Consumed` back would be byte for byte what a redemption
+            // suspended on the host's signer wrote before it suspended, so that redemption would
+            // wake, record what it minted, and hand out an access token and a refresh chain this
+            // very replay was supposed to have contained. See `AuthorizationCodeState::Replayed`.
+            let replayed = AuthorizationCodeRecord {
+                state: AuthorizationCodeState::Replayed {
+                    access_token: access_token.clone(),
+                    refresh_token: refresh_token.clone(),
+                },
+                ..record
+            };
+            if self.store.put_authorization_code(replayed).await.is_err() {
                 containment_failed = true;
             }
             // EVIDENCE OF COMPROMISE (RFC 6749 section 4.1.2, RFC 9700 section 4.1.1). The
@@ -3075,20 +4282,45 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // RFC 6749 section 4.1.3: the redirect URI presented here must be the one the code was
         // issued against, which is what stops a code obtained for one registered URI being
         // redeemed as if it had been issued for another.
-        match redirect_uri {
-            Some(u) if u == record.redirect_uri => {}
-            _ => {
-                let _ = self.store.put_authorization_code(record).await;
-                return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
-                    .with_description("redirect_uri does not match the authorization request"));
-            }
+        //
+        // THE PARAMETER IS CONDITIONAL, and conditional in both directions. Section 4.1.3 makes it
+        // REQUIRED "if the `redirect_uri` parameter was included in the authorization request", and
+        // section 3.1.2.3 entitles a client with exactly one registered URI to omit it there. This
+        // endpoint required it unconditionally through 0.9.1, so that ordinary and conforming
+        // client was refused here — and refused with a message blaming a mismatch that had not
+        // happened, which is the answer that sends its developer looking at its registration.
+        //
+        // The check is not weakened for the request that DID send one: `Some` still has to equal
+        // the recorded URI, and `None` is accepted only against a record that says the
+        // authorization request named nothing. Sending one where none was sent is still refused,
+        // because a code minted for a registration-derived URI must not be redeemable as if the
+        // client had chosen the address itself.
+        let redirect_uri_matches = match redirect_uri {
+            Some(u) => u == record.redirect_uri,
+            None => !record.redirect_uri_was_explicit,
+        };
+        if !redirect_uri_matches {
+            let _ = self.store.put_authorization_code(record).await;
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                .with_description("redirect_uri does not match the authorization request"));
         }
 
         // RFC 7636 section 4.6. A missing verifier is the exact downgrade PKCE exists to stop, so
         // it is a failure, never a skipped check.
+        //
+        // The LENGTH AND ALPHABET of the verifier are checked here too (section 4.1: 43 to 128
+        // characters from the unreserved set), and until the 0.9.1 audit they were checked
+        // nowhere — `pkce::verifier_is_valid` existed and had no caller outside the tests. The
+        // asymmetry mattered: this crate pins the challenge it MINTS at 43 base64url characters
+        // and refuses `plain`, so it validated everything the server produced and nothing the
+        // client presented. A client deriving its challenge from a six-character verifier gets a
+        // grant an attacker can finish, because section 7.1 puts the `code_challenge` in the
+        // authorization request — browser history, `Referer`, proxy logs — and six characters is
+        // not a search. Refusing costs a conforming client nothing.
         let verified = match (code_verifier, record.code_challenge_method) {
             (Some(v), CodeChallengeMethod::S256) => {
-                crate::pkce::verify_s256(v, &record.code_challenge)
+                crate::pkce::verifier_is_valid(v)
+                    && crate::pkce::verify_s256(v, &record.code_challenge)
             }
             (None, _) => false,
         };
@@ -3114,8 +4346,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // The code goes BACK on refusal, exactly as the redirect_uri and PKCE mismatches
         // above do: asking for the wrong thing is a client bug, and burning a live code for
         // a bug the client can fix on retry is a denial of service the attacker gets free.
-        let narrowed =
-            Self::narrow_resources(&record.resource, requested_resources).and_then(|r| {
+        let narrowed = self
+            .narrow_and_permit(&record.resource, requested_resources)
+            .and_then(|r| {
                 GrantedDetails::of_code(&record)
                     .narrow(&requested_details)
                     .map(|d| (r, d))
@@ -3166,6 +4399,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 &client,
                 bound,
                 GrantType::AuthorizationCode,
+                // The user's decision, taken from the code being redeemed. NOT `now`: a code
+                // minted before a revocation must still be refused when it is redeemed after one.
+                record.issued_at,
                 Some(subject),
                 scope,
                 resource,
@@ -3173,16 +4409,43 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 None,
                 true,
                 authentication,
+                // No actor: this grant delegates nothing (RFC 8693 s4.1).
+                GrantedActor::default(),
+                // No ceiling: an authorization code's redemption is the START of a grant's
+                // lifetime, so the ordinary `access_token_ttl` is the whole rule.
+                None,
             )
             .await?;
 
         // Now the record can name what it minted, which is what lets a replay REVOKE rather than
         // merely be refused.
+        //
+        // A COMPARE-AND-SWAP against the record this function wrote itself, not a blind put, and
+        // the expectation is exactly the `Consumed { None, None }` written before issuance. Two
+        // things can have happened during the issuance above, which may have suspended on the
+        // host's `Es256Signer` for a network round trip:
+        //
+        // - A REPLAY was detected and marked the record `Replayed`. The swap fails, and it must:
+        //   the replay path already decided this grant is compromised and found nothing to revoke
+        //   because nothing had been issued yet. Writing here would hand out the very tokens it
+        //   was trying to contain.
+        // - The code was cascaded away by `delete_client` or `revoke_consent`. Absent refuses too,
+        //   so a withdrawn consent is not undone by a redemption that started before it.
+        //
+        // Either way the issuance is undone below rather than reported as a storage failure.
+        let expected_before_issuance = AuthorizationCodeState::Consumed {
+            access_token: None,
+            refresh_token: None,
+        };
         consumed.state = AuthorizationCodeState::Consumed {
             access_token: Some(issued.access_token.clone()),
             refresh_token: issued.refresh_token.clone(),
         };
-        if self.store.put_authorization_code(consumed).await.is_err() {
+        let recorded = self
+            .store
+            .compare_and_swap_authorization_code(&expected_before_issuance, consumed)
+            .await;
+        if !matches!(recorded, Ok(true)) {
             // The client is answered with an error, so it never receives the tokens that were just
             // minted and they become orphans: live records nobody was ever handed. Best effort
             // cleanup, and the `Result` is deliberately discarded rather than reported, because
@@ -3191,12 +4454,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // `Storage::sweep_expired` reclaims at the token's own expiry, and nothing else. The
             // Both artifacts are nameable directly here, which is cheaper and more precise than
             // asking the store for the family they belong to.
-            let _ = self.store.delete_token(&issued.access_token).await;
+            self.undo_issuance(&issued.access_token).await;
             if let Some(rt) = &issued.refresh_token {
                 let _ = self.store.take_refresh_token(rt).await;
             }
-            return Err(ErrorResponse::new(ErrorCode::ServerError)
-                .with_description("could not record the redemption"));
+            // The two outcomes are answered DIFFERENTLY, because they are different facts about
+            // the deployment and the wire code is what a host's dashboards count.
+            //
+            // `Ok(false)` is not a failure of this server: the swap did exactly its job. The grant
+            // was replayed or revoked while this redemption was in flight, so `invalid_grant` is
+            // the true answer and a `server_error` would send an operator looking for a storage
+            // fault that never happened.
+            return Err(match recorded {
+                Ok(_) => ErrorResponse::new(ErrorCode::InvalidGrant).with_description(
+                    "this authorization code was replayed or revoked during redemption",
+                ),
+                Err(_) => ErrorResponse::new(ErrorCode::ServerError)
+                    .with_description("could not record the redemption"),
+            });
         }
 
         Ok(issued)
@@ -3211,6 +4486,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         resource: Vec<String>,
         details: GrantedDetails,
     ) -> Result<TokenResponse, ErrorResponse> {
+        // STAMPED BEFORE THE REGISTRATION IS READ, and that ordering is the whole point.
+        //
+        // This grant has no resource owner, so the client's own authentication IS the decision and
+        // this is the instant it dates from. Taking it AFTER `authenticate_client` would date the
+        // grant later than the read it derives from, and a `delete_client` landing in between —
+        // one `get_client` round trip, plus a secret verification, plus on the assertion path a
+        // JWT verify and a replay claim — would then record a barrier EARLIER than the grant it is
+        // supposed to refuse. The write would be applied and a live token minted for a
+        // registration that no longer exists.
+        //
+        // That is the exact resurrection the barrier exists to stop, and it was introduced by the
+        // 0.9.1 audit fix that made barriers compare instants at all: refusing on identity alone
+        // had closed it for free. Found by auditing that fix rather than by any test.
+        let grant_established_at = self.clock.now();
         let client = self.authenticate_client(client_id, &bound.cred).await?;
         // RFC 6749 section 4.4: this grant is for confidential clients. A public client has no
         // secret, so "the client itself" is not an identity anyone has proven.
@@ -3232,6 +4521,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             &client,
             bound,
             GrantType::ClientCredentials,
+            // Read at request ENTRY, above, not here. See the comment there.
+            grant_established_at,
             None,
             scope,
             resource,
@@ -3244,6 +4535,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             false,
             // RFC 6749 s4.4 has no resource owner, so there is no user authentication to report.
             GrantedAuthentication::default(),
+            // No actor: this grant delegates nothing (RFC 8693 s4.1).
+            GrantedActor::default(),
+            // No ceiling: this grant derives from the client's own live credentials and from no
+            // earlier token, so there is nothing for its lifetime to be capped against.
+            None,
         )
         .await
     }
@@ -3303,9 +4599,26 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // and it is why this is a compare-and-swap rather than a re-read-and-merge: re-reading
         // narrows the window, it does not close it, and the decision must not be losable at all.
         if let Some(last) = grant.last_poll_at {
-            if now < last + grant.interval {
+            // `checked_add`, not `+`: `SystemTime + Duration` PANICS on overflow, and
+            // `grant.interval` is grown by the poll rate below against a host-set increment that
+            // nothing validates. `None` means the deadline is past any representable instant, so
+            // the client is unconditionally too early.
+            // `map_or(true, ..)` rather than `is_none_or`, which is stable only since 1.82 while
+            // this crate's MSRV is 1.75. The clippy lint that prefers `is_none_or` does not know
+            // that, so it is silenced here rather than obeyed.
+            #[allow(clippy::unnecessary_map_or)]
+            if last
+                .checked_add(grant.interval)
+                .map_or(true, |next| now < next)
+            {
                 let expected = grant.state.clone();
-                grant.interval += self.config.slow_down_increment;
+                // `saturating_add`: `Duration: AddAssign` panics on overflow, and this
+                // accumulator is paced by the client's own polling against a host-set increment.
+                // A saturated interval is a client that must wait longer than the grant lives,
+                // which is the same refusal by a different route.
+                grant.interval = grant
+                    .interval
+                    .saturating_add(self.config.slow_down_increment);
                 grant.last_poll_at = Some(now);
                 // A genuine storage FAILURE is still fatal, exactly as it was before: only losing
                 // the race is tolerated. The `slow_down` answer stands either way, because the
@@ -3351,6 +4664,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     &client,
                     bound,
                     GrantType::DeviceCode,
+                    // The instant the DEVICE ASKED, which is NOT the instant the user approved.
+                    // RFC 8628 s3.3 approval happens at the host's own verification UI and
+                    // `DeviceGrantState::Approved` records only the subject, so the approval
+                    // instant is never persisted and `created_at` is the closest thing that
+                    // exists. It is EARLIER than the decision, never later, so a barrier recorded
+                    // in between refuses this grant rather than admitting it: fail-closed, at the
+                    // cost of a user who re-approves after withdrawing consent having to restart
+                    // the device flow. See `IssuedToken::grant_established_at`, which states the
+                    // window in full.
+                    taken.created_at,
                     Some(subject),
                     taken.scope,
                     Vec::new(),
@@ -3364,6 +4687,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // have to be taken, and inventing one here would be this server asserting
                     // something it never witnessed.
                     GrantedAuthentication::default(),
+                    // No actor: this grant delegates nothing (RFC 8693 s4.1).
+                    GrantedActor::default(),
+                    // No ceiling: RFC 8628 approval starts a grant, exactly as a code redemption
+                    // does, so the ordinary `access_token_ttl` is the whole rule.
+                    None,
                 )
                 .await
             }
@@ -3400,10 +4728,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // the client that legitimately holds it while costing the attacker nothing. Same reasoning
         // as the authorization code path, which has always put the record back on a mismatch.
         if record.client_id != client.client_id {
-            self.store
-                .put_refresh_token(record)
-                .await
-                .map_err(storage_error)?;
+            self.restore_refresh_token(record).await?;
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
 
@@ -3414,20 +4739,52 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // because the party who presents the superseded token is by definition the one who did NOT
         // redeem it first, which in a theft is the victim.
         //
-        // The family revocation removes every record carrying this id, including this one, so
-        // there is nothing to put back.
+        // When the revocation SUCCEEDS it removes every record carrying this id, including this
+        // one, so there is nothing to put back. When it fails there is, and that is the whole of
+        // the paragraph below.
         if record.state == RefreshTokenState::Spent {
-            let records_revoked = self
+            // THE STORE FAILING HERE MUST NOT PROPAGATE, and the reason is the same one the
+            // authorization-code replay path states above: the wire cannot carry this news. The
+            // answer to a reused refresh token is `invalid_grant` however badly the store is
+            // behaving, so the AUDIT EVENT is the only signal a deployment gets. Returning the
+            // storage error instead lost all three halves of the response at once — the family
+            // was not revoked, so the thief's rotated chain stayed live; the `Spent` record had
+            // ALREADY been removed by `take_refresh_token` above and was never put back, so RFC
+            // 9700 section 4.14.2 reuse detection for that family was off from then on and a later
+            // presentation of the same string read as an unknown token; and no event fired at all,
+            // so the host's only audit channel was never told any of it.
+            let mut containment_failed = false;
+            // MOVED out of the record before the `Err` arm below can move the record itself back
+            // into the store. One allocation, on the detected-compromise path only.
+            let family_id = record.family_id.clone();
+            let mut records_revoked = 0;
+            match self
                 .store
-                .revoke_token_family(&record.family_id)
+                .revoke_token_family(&family_id, self.revocation_window())
                 .await
-                .map_err(storage_error)?;
+            {
+                Ok(revoked) => records_revoked = revoked,
+                Err(_) => {
+                    containment_failed = true;
+                    // THE ALARM STAYS ARMED. The record goes back exactly as it was read, still
+                    // `Spent`, because it is the evidence: it is what makes the NEXT presentation
+                    // of this string detectable as reuse rather than as an unknown token. Its own
+                    // outcome is not inspected because `containment_failed` is already true —
+                    // the revocation failing is the compromise this event has to report, and a
+                    // refused or failed restore only adds to a story that is already the bad one.
+                    let _ = self.store.put_refresh_token(record).await;
+                }
+            }
             // EVIDENCE OF COMPROMISE, and the event most likely to be asked about after the fact:
-            // the family revocation also logs out the legitimate client.
+            // the family revocation also logs out the legitimate client. It is emitted on BOTH
+            // outcomes. A reuse that could not be contained is the more urgent of the two, not the
+            // one worth staying quiet about, and `containment_failed` is what stops the event
+            // claiming a containment that did not happen.
             self.hooks.emit(|| Event::RefreshTokenReuseDetected {
                 client_id: client.client_id.as_str(),
-                family_id: &record.family_id,
+                family_id: &family_id,
                 records_revoked,
+                containment_failed,
             });
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
                 .with_description("refresh token reuse detected; the grant has been revoked"));
@@ -3441,10 +4798,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // for every other judgement here that is not evidence of compromise.
         #[cfg(feature = "dpop")]
         if record.jkt.as_deref() != bound.jkt {
-            self.store
-                .put_refresh_token(record)
-                .await
-                .map_err(storage_error)?;
+            self.restore_refresh_token(record).await?;
             return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)
                 .with_description("this refresh token is bound to a different DPoP key"));
         }
@@ -3458,10 +4812,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // client nothing, since it presents that certificate on every request anyway.
         #[cfg(feature = "mtls")]
         if record.x5t_s256.as_deref() != bound.cred.certificate.map(|c| c.thumbprint()) {
-            self.store
-                .put_refresh_token(record)
-                .await
-                .map_err(storage_error)?;
+            self.restore_refresh_token(record).await?;
             return Err(
                 ErrorResponse::new(ErrorCode::InvalidGrant).with_description(
                     "this refresh token is bound to a different client certificate",
@@ -3478,6 +4829,34 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         }
 
+        // THE REGISTRATION'S CEILING, RE-APPLIED AT EVERY ROTATION.
+        //
+        // `Client::allowed_scopes` is documented as "the scopes this client may ever be granted",
+        // and until the 0.9.1 audit a refresh chain was the one place that promise was not kept:
+        // the only ceiling here was `record.scope`, so an operator who discovered a client should
+        // never have held `payments:write` and narrowed the registration kept minting it on every
+        // rotation. With `refresh_token_ttl` defaulting to `None` — no expiry at all — "may ever
+        // be granted" was, by default, "may be granted forever regardless of what the registration
+        // now says". Only `delete_client` or a per-family revocation the operator has no list of
+        // actually stopped it.
+        //
+        // A code or a device grant has the same gap for its own lifetime, but those are 60 and 600
+        // seconds and self-closing; a chain is not, which is why the check lands here.
+        //
+        // Refusing rather than silently intersecting is the fail-closed direction and the honest
+        // one: the client asked to continue a grant this server is no longer willing to honour, and
+        // quietly handing back a narrower token would look to the client like the grant it had. The
+        // record is NOT put back — unlike the widening attempt below, this is not a retryable client
+        // mistake, and leaving the chain alive would mean answering `invalid_scope` forever while
+        // the credential stays valid.
+        if !record.scope.is_subset(&client.allowed_scopes) {
+            return Err(
+                ErrorResponse::new(ErrorCode::InvalidScope).with_description(
+                    "this grant carries scopes the client's registration no longer allows",
+                ),
+            );
+        }
+
         // Narrowing only (RFC 6749 section 6: scope must not include any scope not originally
         // granted). A widening attempt is a client bug, not a compromise: put the record back so
         // the mistake is retryable.
@@ -3485,10 +4864,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             None => record.scope.clone(),
             Some(s) if s.is_subset(&record.scope) => s.clone(),
             Some(_) => {
-                self.store
-                    .put_refresh_token(record)
-                    .await
-                    .map_err(storage_error)?;
+                self.restore_refresh_token(record).await?;
                 return Err(ErrorResponse::new(ErrorCode::InvalidScope)
                     .with_description("refresh may narrow scope, never widen it"));
             }
@@ -3501,8 +4877,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // PREVIOUS leg narrowed to, so a client that narrowed once cannot climb back on the
         // next rotation; the record goes back either way, because a widening attempt here is
         // a client bug and not evidence of compromise.
-        let narrowed =
-            Self::narrow_resources(&record.resource, requested_resources).and_then(|r| {
+        let narrowed = self
+            .narrow_and_permit(&record.resource, requested_resources)
+            .and_then(|r| {
                 GrantedDetails::of_refresh(&record)
                     .narrow(&requested_details)
                     .map(|d| (r, d))
@@ -3510,10 +4887,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let (resource, details) = match narrowed {
             Ok(narrowed) => narrowed,
             Err(e) => {
-                self.store
-                    .put_refresh_token(record)
-                    .await
-                    .map_err(storage_error)?;
+                self.restore_refresh_token(record).await?;
                 return Err(e);
             }
         };
@@ -3550,21 +4924,45 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let subject = record.subject.clone();
         let family_id = record.family_id.clone();
         let authentication = GrantedAuthentication::from_refresh(&record);
+        // Read BEFORE `record` is consumed into `spent` below.
+        let grant_established_at = record.grant_established_at;
         let spent = RefreshTokenRecord {
             state: RefreshTokenState::Spent,
-            expires_at: chain_expires_at
-                .or_else(|| Some(self.clock.now() + self.config.refresh_reuse_window)),
+            // `saturating_deadline` rather than `+`: `refresh_reuse_window` is a plain public
+            // field with no validating constructor, and this branch is the DEFAULT
+            // configuration's (`refresh_token_ttl: None` means the chain has no absolute expiry),
+            // so every rotation in such a deployment performs this addition on a request path.
+            expires_at: chain_expires_at.or_else(|| {
+                Some(saturating_deadline(
+                    self.clock.now(),
+                    self.config.refresh_reuse_window,
+                ))
+            }),
             ..record
         };
-        self.store
+        // NOT `restore_refresh_token`: this write is not a restoration and a refusal here is not
+        // benign. The spent marker is what arms reuse detection for the token about to be minted,
+        // so if a revocation has reached this family the rotation must STOP rather than continue
+        // to issuance. Continuing would mint a chain from a grant that was revoked a moment ago,
+        // and would do it with the alarm disarmed.
+        if self
+            .store
             .put_refresh_token(spent)
             .await
-            .map_err(storage_error)?;
+            .map_err(storage_error)?
+            .is_refused()
+        {
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                .with_description("the grant was revoked while this token was being refreshed"));
+        }
 
         self.issue_boxed(
             &client,
             bound,
             GrantType::RefreshToken,
+            // CARRIED from the chain, never restamped. Restamping here would let a chain walk
+            // forward past the revocation that killed the decision it descends from.
+            grant_established_at,
             subject,
             scope,
             resource,
@@ -3575,6 +4973,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }),
             true,
             authentication,
+            // A rotation carries no actor of its own: nothing was delegated by refreshing.
+            GrantedActor::default(),
+            // No ceiling from the access token being replaced: the CHAIN's own absolute expiry is
+            // what bounds a refresh grant's total lifetime, and it is applied to the rotated
+            // refresh token above rather than to the access token here.
+            None,
         )
         .await
     }
@@ -3623,6 +5027,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client: &'a Client,
         bound: &'a Bound<'_>,
         grant_type: GrantType,
+        // The instant the GRANT behind this issuance was authorized: the code's mint, the device
+        // approval, or the instant carried forward from the chain. NOT `now`. See
+        // `crate::token::IssuedToken::grant_established_at`.
+        grant_established_at: SystemTime,
         subject: Option<String>,
         scope: ScopeSet,
         resource: Vec<String>,
@@ -3630,6 +5038,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         chain: Option<RefreshChain>,
         allow_refresh: bool,
         authentication: GrantedAuthentication,
+        actor: GrantedActor,
+        lifetime_ceiling: Option<SystemTime>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<TokenResponse, ErrorResponse>> + Send + 'a>,
     > {
@@ -3637,6 +5047,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             client,
             bound,
             grant_type,
+            grant_established_at,
             subject,
             scope,
             resource,
@@ -3644,6 +5055,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             chain,
             allow_refresh,
             authentication,
+            actor,
+            lifetime_ceiling,
         ))
     }
 
@@ -3653,6 +5066,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         client: &Client,
         bound: &Bound<'_>,
         grant_type: GrantType,
+        // The instant the GRANT behind this issuance was authorized: the code's mint, the device
+        // approval, or the instant carried forward from the chain. NOT `now`. See
+        // `crate::token::IssuedToken::grant_established_at`.
+        grant_established_at: SystemTime,
         subject: Option<String>,
         scope: ScopeSet,
         resource: Vec<String>,
@@ -3660,6 +5077,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         chain: Option<RefreshChain>,
         allow_refresh: bool,
         authentication: GrantedAuthentication,
+        actor: GrantedActor,
+        // An ABSOLUTE CEILING on the issued access token's expiry, or `None` for the ordinary
+        // `access_token_ttl` from now. `Some` exists for RFC 8693 token exchange, where the issued
+        // token derives its authority from a subject token that is itself expiring: without a
+        // ceiling the exchanged token is an ordinary access token, therefore an acceptable SUBJECT
+        // token, therefore re-exchangeable just before each expiry for a fresh full TTL, forever.
+        // That is a grant renewing its own lifetime without limit, which is exactly what this
+        // grant refuses to issue a refresh token for.
+        lifetime_ceiling: Option<SystemTime>,
     ) -> Result<TokenResponse, ErrorResponse> {
         // `bound` carries only the RFC 9449 key binding, so with that feature off it is genuinely
         // unused HERE. It stays in the signature regardless, so the four call sites do not have to
@@ -3672,10 +5098,28 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // differs by feature.
         #[cfg(not(feature = "consent"))]
         let _ = authentication;
+        // And the RFC 8693 actor, which only a delegation exchange ever fills.
+        #[cfg(not(feature = "token-exchange"))]
+        let _ = actor;
         // Likewise: without `rar` the details are a zero sized value nothing reads.
         #[cfg(not(feature = "rar"))]
         let _ = details;
         let now = self.clock.now();
+        // ONE expiry instant, computed ONCE and used by all three places that state it: the
+        // persisted record, the RFC 9068 `exp` claim, and the RFC 6749 s5.1 `expires_in` member. A
+        // token whose signed `exp` disagrees with the expiry this server enforces on introspection
+        // is worse than either bound on its own, because the two halves of the deployment then
+        // disagree about when the token died.
+        //
+        // The ceiling can only ever SHORTEN the lifetime: `min` of the ordinary deadline and
+        // whatever the caller capped it at.
+        let expires_at = {
+            let ordinary = saturating_deadline(now, self.config.access_token_ttl);
+            match lifetime_ceiling {
+                Some(ceiling) => ordinary.min(ceiling),
+                None => ordinary,
+            }
+        };
 
         let issues_refresh = allow_refresh
             && self.config.issue_refresh_tokens
@@ -3698,7 +5142,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // path where the unused half is not overwritten.
         let (family_id, access_token, pending_refresh) = {
             let mut entropy = [0u8; 80];
-            getrandom::fill(&mut entropy).expect("OS randomness for OAuth artifacts");
+            // `ok_or_else` rather than `expect`: this is the token endpoint, every other
+            // fallible step of which answers `server_error`, and a panic here aborts the host
+            // in a host built with `panic = "abort"`. See `try_random_hex`.
+            getrandom::fill(&mut entropy).map_err(|_| randomness_error())?;
             // The family id is minted (or inherited) BEFORE the access token, because the access
             // token has to carry it: RFC 9700 section 4.14.2 revokes the tokens of the whole grant
             // on detected reuse, and an access token with no family is unreachable from that event.
@@ -3751,8 +5198,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             &resource,
             &details,
             now,
+            expires_at,
             access_token,
             bound,
+            &actor,
         )?;
         #[cfg(feature = "jwt")]
         let access_token = match prepared {
@@ -3766,13 +5215,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 ErrorResponse::new(ErrorCode::ServerError)
             })?,
         };
-        self.store
+        let refused = self
+            .store
             .put_token(IssuedToken {
                 // RFC 9449 s6: the binding is recorded on the AS side too, not only in the token,
                 // so that RFC 7662 introspection can report it and a resource server can check it
                 // without having to parse a token this server may have issued as opaque.
                 #[cfg(feature = "dpop")]
                 jkt: bound.jkt.map(Box::from),
+                // Through 0.9.1 introspection answers only the token's own client; the
+                // resource-server channel is 0.9.2. The record is written now regardless,
+                // because the record is the half that cannot be added later.
+                //
                 // RFC 8705 s3, and the same argument as `jkt` immediately above: an opaque
                 // token carries its binding nowhere else, so s3.2 introspection could not
                 // report it if it were not written down here.
@@ -3788,25 +5242,47 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 #[cfg(feature = "rar")]
                 authorization_details: details.clone().into_details(),
                 issued_at: now,
-                expires_at: now + self.config.access_token_ttl,
+                // The GRANT's instant, not this issuance's: a barrier is compared against it, and
+                // a rotation writing at `now` must not thereby outlive the revocation that killed
+                // the decision it descends from.
+                grant_established_at,
+                // Computed at the top of this function, so the record, the signed `exp` and the
+                // `expires_in` below are one instant stated three times rather than three.
+                expires_at,
                 family_id: family_id.clone(),
-                // RFC 9470 s5: the token reports the authentication behind it, so introspection can
+                // RFC 8693 s4.1: the token records who authority was delegated TO, so that RFC
+                // 7662 introspection can report it. An opaque token carries it nowhere else.
+                #[cfg(feature = "token-exchange")]
+                act: actor.act.clone(),
+                // RFC 9470 s6.2: the token reports the authentication behind it, so introspection can
                 // answer the question the resource server's challenge asked.
                 #[cfg(feature = "consent")]
                 authentication: authentication.authentication.clone(),
             })
             .await
             .map_err(storage_error)?;
+        // The grant was revoked while this issuance was in flight, most likely across the signing
+        // await immediately above, which is a network round trip when the host's `Es256Signer`
+        // fronts a KMS. Nothing was written, so there is nothing to undo; the client is told its
+        // grant is invalid, which by now it is.
+        if refused.is_refused() {
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                .with_description("the grant was revoked while this token was being issued"));
+        }
 
         let refresh_token = if issues_refresh {
             let expires_at = match &chain {
                 Some(c) => c.expires_at,
-                None => self.config.refresh_token_ttl.map(|ttl| now + ttl),
+                None => self
+                    .config
+                    .refresh_token_ttl
+                    .map(|ttl| saturating_deadline(now, ttl)),
             };
             // Drawn in the single `getrandom` call at the top of this function; `issues_refresh`
             // is what decided both that draw and this branch, so the value is always present.
             let rt = pending_refresh.expect("issues_refresh decided both");
-            self.store
+            let refused = self
+                .store
                 .put_refresh_token(RefreshTokenRecord {
                     // RFC 9449 s5: the chain remembers the key it was issued to, and rotation
                     // checks it. See the check in `refresh_token`.
@@ -3825,6 +5301,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     #[cfg(feature = "rar")]
                     authorization_details: details.clone().into_details(),
                     expires_at,
+                    // CARRIED, never restamped: see `RefreshTokenRecord::grant_established_at`.
+                    grant_established_at,
                     // Present whenever a refresh token is: `issues_refresh` is what decided both.
                     family_id: family_id.unwrap_or_default(),
                     state: RefreshTokenState::Active,
@@ -3834,6 +5312,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 })
                 .await
                 .map_err(storage_error)?;
+            // Revoked BETWEEN the two writes. This is the case that needs undoing rather than
+            // merely refusing: the access token a few lines above is already in the store, and
+            // leaving it there would hand the caller a live credential minted from a grant that no
+            // longer exists, which is the resurrection defect wearing a different hat.
+            if refused.is_refused() {
+                self.undo_issuance(&access_token).await;
+                return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                    .with_description("the grant was revoked while this token was being issued"));
+            }
             Some(rt)
         } else {
             None
@@ -3863,7 +5350,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             },
             #[cfg(not(feature = "dpop"))]
             token_type: TokenType::Bearer,
-            expires_in: self.config.access_token_ttl.as_secs(),
+            // RFC 6749 s5.1: the lifetime IN SECONDS FROM NOW of the token just issued, derived
+            // from the same `expires_at` the record and the signed `exp` carry. Not
+            // `access_token_ttl`, which is only the same number when nothing capped the lifetime;
+            // reporting the uncapped TTL for a capped token would have the client keep using a
+            // token this server has already stopped honouring.
+            //
+            // `unwrap_or_default` is the fail-closed direction: a ceiling already in the past
+            // yields zero rather than an underflow, and zero tells the client the token is spent.
+            expires_in: expires_at.duration_since(now).unwrap_or_default().as_secs(),
             refresh_token,
             scope: (!scope.is_empty()).then(|| scope.to_string()),
             // RFC 9396 s7: what was GRANTED, from the same value that reaches the stored record
@@ -3952,7 +5447,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // the grant carried RFC 8707 resource indicators. Omitted rather than empty when it
                 // does not: see `IntrospectionResponse::aud`.
                 aud: (!t.resource.is_empty()).then(|| t.resource.clone()),
-                // RFC 9470 s5. A resource server that sent a step-up challenge has to be able to
+                // RFC 9470 s6.2. A resource server that sent a step-up challenge has to be able to
                 // see whether the token it now holds satisfies it; without these two it would have
                 // to take the client's word for that, which is the whole thing the challenge exists
                 // to avoid.
@@ -3969,16 +5464,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // RFC 9396 s9.2: the details as a top-level member of the introspection
                 // response. For an OPAQUE token this is the ONLY way a resource server can
                 // learn what the token actually authorizes, which is the whole point of the
-                // parameter.
+                // parameter. Through 0.9.1 introspection answers only the token's own client;
+                // the resource-server channel is 0.9.2.
                 #[cfg(feature = "rar")]
                 authorization_details: t.authorization_details.clone(),
-                // RFC 9449 s6.1 with RFC 7800 s3.1. A resource server that introspects must be
-                // able to confirm the binding, or the binding stops at this server and the RS is
-                // back to trusting a bearer string.
-                // RFC 9449 s6.1 and RFC 8705 s3.2, in ONE RFC 7800 s3.1 object. Both
-                // mechanisms register a member of `cnf` and a token can carry both, so this
-                // is built from every binding the record has rather than from whichever one
-                // happens to be checked first. Omitted entirely when there is none.
+                // RFC 9449 s6.1 and RFC 8705 s3.2, in ONE RFC 7800 s3.1 object. Both mechanisms
+                // register a member of `cnf` and a token can carry both, so this is built from
+                // every binding the record has rather than from whichever one happens to be
+                // checked first. Omitted entirely when there is none.
+                //
+                // A caller that introspects must be able to confirm the binding, or the binding
+                // stops at this server and the caller is back to trusting a bearer string.
+                // Through 0.9.1 that caller is the token's own client; the resource-server
+                // channel is 0.9.2.
                 #[cfg(any(feature = "dpop", feature = "mtls"))]
                 cnf: {
                     let cnf = crate::token::Confirmation {
@@ -3989,6 +5487,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     };
                     (!cnf.is_empty()).then_some(cnf)
                 },
+                // RFC 8693 s4.1, and the reason it is on the record at all: for an OPAQUE token
+                // this is the only channel a resource server has for learning that what it holds
+                // is a DELEGATION rather than the subject acting directly.
+                #[cfg(feature = "token-exchange")]
+                act: t.act.as_deref().cloned(),
             },
             // Unknown, expired, or somebody else's. All three are one answer on purpose.
             _ => IntrospectionResponse::inactive(),
@@ -4006,26 +5509,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// to something, and this crate has no way to know that: it never sees a user. The host calls
     /// it once its own consent step has actually been answered.
     ///
-    /// # THE HOST MUST NOT CALL THIS CONCURRENTLY FOR ONE (client, subject) PAIR
+    /// # Concurrency, and what this used to concede
     ///
-    /// This is a read-modify-write: it looks for an existing record, widens it, and writes it back.
-    /// [`Storage`] has no uniqueness constraint on `(client_id, subject)` and no primitive that
-    /// could express one, so two calls that overlap can each find nothing and each create a record,
-    /// leaving the pair with two.
+    /// This is a read-modify-write: it looks for an existing record, widens it, and writes it
+    /// back. It is now a COMPARE-AND-SWAP against what it read
+    /// ([`Storage::compare_and_swap_consent`]), retried once, and both halves of that matter.
     ///
-    /// That is NOT fixed here, and the reason is worth stating rather than leaving as an omission.
-    /// The consequences are benign in the direction that matters: the records are ADDITIVE, so
-    /// nothing is lost, [`AuthorizationServer::remembered_consent`] may report the narrower of the
-    /// two and cause a re-prompt (the harmless direction, and the same one
-    /// [`crate::consent::ConsentRecord::extend`] already fails in), and
-    /// [`AuthorizationServer::consents_for_subject`] lists both so a user can still see and
-    /// withdraw the whole relationship. Against that, closing it would mean a second
-    /// compare-and-swap primitive on the [`Storage`] trait for a path that runs ONCE PER HUMAN
-    /// CONSENT DECISION rather than per request, and whose two writers are two tabs of the same
-    /// user's own browser.
+    /// The half this doc used to argue away was two overlapping FIRST approvals each finding
+    /// nothing and each creating a record, leaving the pair with two. The argument was that the
+    /// records are additive so the damage is a possible re-prompt. That much was true, and it is
+    /// no longer relevant: the create is conditional on the pair still being empty, so the loser
+    /// sees the winner's record and widens it instead.
     ///
-    /// What the host owes instead: serialise its own consent writes per (client, subject), which
-    /// any host that already has a session lock around its consent screen gets for nothing.
+    /// The half this doc never considered is the one that was not benign, and it is the reason
+    /// this changed. The second writer it reasoned about was another `record_consent`. The writer
+    /// that actually mattered was [`AuthorizationServer::withdraw_consent`]: a widen that read a
+    /// record, and wrote it back after the user clicked withdraw, RESURRECTED a consent the user
+    /// had destroyed, and every later authorization request was answered from it. "Benign in the
+    /// direction that matters" was a statement about the wrong direction. See the resurrection
+    /// rule in the [`crate::store`] module docs.
+    ///
+    /// A host no longer owes this path a lock of its own.
     #[cfg(feature = "consent")]
     pub async fn record_consent(
         &self,
@@ -4035,46 +5539,121 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         resource: &[String],
         authentication: Option<crate::consent::Authentication>,
     ) -> Result<crate::consent::ConsentRecord, StorageError> {
-        let now = self.clock.now();
-        // CLONED out of the shared snapshot, because this is the one consent path that MUTATES
-        // what it read (`extend` below widens the grant in place). An `Arc` cannot be widened
-        // while the store still holds it, so the clone the read used to make happens here
-        // instead: the cost moved, it did not go away. It is paid once per host consent
-        // decision, against the read being free on the authorization endpoint, which runs per
-        // request. See `remembered_consent`.
-        let mut record = match self.store.find_consent(client_id, subject).await? {
-            Some(existing) => (*existing).clone(),
-            None => crate::consent::ConsentRecord {
-                // 16 bytes of OS randomness, hex encoded, the same shape as every other opaque
-                // identifier this server mints. It is not a credential (see the field's own docs),
-                // but it names a record that can end a user's sessions, so it must not be something
-                // a third party can produce by guessing two strings it already knows.
-                consent_id: random_hex(16).into_boxed_str(),
-                client_id: client_id.clone(),
-                subject: subject.into(),
-                scope: ScopeSet::empty(),
-                resource: Vec::new(),
-                granted_at: now,
-                authentication: None,
-            },
-        };
-        record.extend(scope, resource);
-        // The LATEST authentication replaces the previous one: it is what the user just did, and it
-        // is what an RFC 9470 `max_age` on the next request has to be measured against. A host that
-        // reports nothing this time leaves the previous report standing rather than erasing it,
-        // because "did not say" is not "no longer authenticated".
-        if let Some(a) = authentication {
-            record.authentication = Some(Box::new(a));
+        // REFUSED AT CREATION, because refusing at withdrawal is refusing at the one operation
+        // that undoes damage.
+        //
+        // `Storage::revoke_consent` rejects an empty `client_id` or `subject`, and it reads them
+        // out of the STORED record rather than off its argument — so a record created with an
+        // empty subject can never be withdrawn by any input at all. The record stands, the cascade
+        // never runs, and every token and refresh chain beneath it stays live for its full
+        // lifetime, while `withdraw_consent` answers an error that contradicts its own
+        // documented contract ("withdrawing a consent that is already gone is `Ok(0)`, not an
+        // error"). A host whose subject resolver can yield the empty string — which this crate
+        // never checks, because a subject is the host's own vocabulary for users — reaches that
+        // state through the ordinary API.
+        //
+        // A `StorageError` rather than a new error type: this is the same class of refusal
+        // `revoke_consent` already answers with, and a consent that names nobody is not a consent.
+        if subject.is_empty() {
+            return Err(StorageError::new(
+                "a consent must name a subject; an empty subject cannot be withdrawn",
+            ));
         }
-        self.store.put_consent(record.clone()).await?;
-        Ok(record)
+        let now = self.clock.now();
+        // TWO attempts, and no more. One retry is what a compare-and-swap needs to absorb an
+        // ordinary lost race (the other writer created or widened the record, and this call can
+        // simply widen theirs instead); a loop would be a spin against a withdrawal that is going
+        // to keep refusing, on a path a human drives by clicking. The second failure is reported
+        // as a storage error, which is the honest answer: the consent was NOT recorded.
+        // WHAT THE FIRST ATTEMPT SAW, and the retry may not contradict it. A call that started as
+        // a WIDEN must not become a CREATE on its second attempt: the only way the record can have
+        // vanished between them is that it was withdrawn, and turning that into a fresh consent
+        // hands the user back a live grant moments after they ended it. The other direction is
+        // fine and is the ordinary lost race: a call that started as a create and now finds a
+        // record simply widens that record instead.
+        //
+        // This is NOT enforced by refusing on the barrier, deliberately. A consent barrier stands
+        // for the longest token lifetime the server mints, and refusing every create for that long
+        // would mean a user who withdraws an application and approves it again five minutes later
+        // is told no, for an hour, with nothing to tell them why. The rule that is actually needed
+        // is narrower: within ONE call, the shape may not change.
+        let mut started_as_widen = None;
+        for attempt in 0..2 {
+            // CLONED out of the shared snapshot, because this is the one consent path that MUTATES
+            // what it read (`extend` below widens the grant in place). An `Arc` cannot be widened
+            // while the store still holds it, so the clone the read used to make happens here
+            // instead: the cost moved, it did not go away. It is paid once per host consent
+            // decision, against the read being free on the authorization endpoint, which runs per
+            // request. See `remembered_consent`.
+            let existing = self.store.find_consent(client_id, subject).await?;
+            let expected = existing.as_deref().cloned();
+            match started_as_widen {
+                None => started_as_widen = Some(expected.is_some()),
+                // Started as a widen, and the record is gone. It was withdrawn while this call was
+                // in flight, which is the direction that is not benign.
+                Some(true) if expected.is_none() => {
+                    return Err(StorageError::new(
+                        "the consent was withdrawn while it was being recorded",
+                    ))
+                }
+                Some(_) => {}
+            }
+            let _ = attempt;
+            let mut record = match &expected {
+                Some(existing) => existing.clone(),
+                None => crate::consent::ConsentRecord {
+                    // 16 bytes of OS randomness, hex encoded, the same shape as every other opaque
+                    // identifier this server mints. It is not a credential (see the field's own
+                    // docs), but it names a record that can end a user's sessions, so it must not
+                    // be something a third party can produce by guessing two strings it already
+                    // knows.
+                    // `?` rather than a panic, for the reason `try_random_hex` gives. This
+                    // function answers `StorageError`, so that is the shape the refusal takes
+                    // here; the host learns what happened from its own logs either way.
+                    consent_id: try_random_hex(16)
+                        .ok_or_else(|| {
+                            StorageError::new(
+                                "the OS would not provide randomness for a consent id",
+                            )
+                        })?
+                        .into_boxed_str(),
+                    client_id: client_id.clone(),
+                    subject: subject.into(),
+                    scope: ScopeSet::empty(),
+                    resource: Vec::new(),
+                    granted_at: now,
+                    authentication: None,
+                },
+            };
+            record.extend(scope, resource);
+            // The LATEST authentication replaces the previous one: it is what the user just did,
+            // and it is what an RFC 9470 `max_age` on the next request has to be measured against.
+            // A host that reports nothing this time leaves the previous report standing rather
+            // than erasing it, because "did not say" is not "no longer authenticated".
+            if let Some(a) = &authentication {
+                record.authentication = Some(Box::new(a.clone()));
+            }
+            // The write happens only if the pair still holds exactly what was read a moment ago:
+            // still nothing when creating, still that record when widening. A withdrawal in
+            // between refuses BOTH shapes, which is the point.
+            if self
+                .store
+                .compare_and_swap_consent(expected.as_ref(), record.clone())
+                .await?
+            {
+                return Ok(record);
+            }
+        }
+        Err(StorageError::new(
+            "consent record changed concurrently twice; not recorded",
+        ))
     }
 
     /// The consent this user has already given this client, if any.
     ///
     /// This ANSWERS a question; it does not make a decision, and nothing in this crate approves an
     /// authorization request on the strength of it. See the `http` feature's
-    /// `ServiceBuilder::with_consent_resolver`: the library reports what it remembers
+    /// `ServiceBuilder::with_approval_resolver`: the library reports what it remembers
     /// and the host decides what that is worth, because "the user agreed to this once" and "the
     /// user agrees to this now" are different sentences and only the host can tell them apart.
     #[cfg(feature = "consent")]
@@ -4114,7 +5693,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // on a path a person drives by hand is not a cost worth optimising away, and an event that
         // said only "some consent was withdrawn" is an event nobody can act on.
         let record = self.store.get_consent(consent_id).await?;
-        let records_revoked = self.store.revoke_consent(consent_id).await?;
+        let records_revoked = self
+            .store
+            .revoke_consent(consent_id, self.revocation_window())
+            .await?;
         if let Some(record) = &record {
             self.hooks.emit(|| Event::ConsentWithdrawn {
                 client_id: record.client_id.as_str(),
@@ -4144,6 +5726,31 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// [`introspection_response`](AuthorizationServer::introspection_response) does; see the
     /// comment inside [`revoke_with_credential`](AuthorizationServer::revoke_with_credential) for
     /// why the two RFCs differ.
+    ///
+    /// # THIS FUTURE IS NOT CANCELLATION SAFE, and what a drop costs
+    ///
+    /// Applies equally to
+    /// [`revoke_with_credential`](AuthorizationServer::revoke_with_credential), which is the same
+    /// future. A dropped future stops at whatever `await` it was suspended in and never resumes,
+    /// and this crate cannot make it finish: there is no destructor that can run an `async` store
+    /// call. So the contract is stated rather than left to be discovered.
+    ///
+    /// Revoking a REFRESH token is a two-write sequence: the RFC 7009 s2.1 cascade over the
+    /// grant's family, and the removal of the presented string. A drop between them leaves the
+    /// family revoked, with a barrier recorded, and one live-LOOKING refresh string that names a
+    /// family nothing will honour. That is fail-closed on purpose, and it is why the cascade runs
+    /// first; the opposite order was worse than an incomplete revocation, because the client's
+    /// RETRY found the presented string already gone and answered 200 without cascading at all,
+    /// leaving every access token of a grant the user had logged out of live for its whole TTL.
+    /// A retry after a drop now still reaches the cascade, and the cascade is idempotent
+    /// ([`crate::store::Storage::revoke_token_family`]). `tests/revocation_cancellation.rs` pins
+    /// it.
+    ///
+    /// WHAT IS STILL LOST to a drop, stated rather than implied: the [`crate::events::Event`] the
+    /// completed call would have emitted, so an audit trail can miss a revocation that partly
+    /// happened. A host that needs the sequence to complete must drive it from a task the
+    /// connection cannot cancel, spawning the call and awaiting the join handle, which is what this
+    /// crate's own axum adapter does; see [`crate::http`].
     pub async fn revoke(
         &self,
         client_id: &ClientId,
@@ -4207,10 +5814,35 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // Reading first means a non-owner's request touches nothing at all.
             match self.store.get_refresh_token(token).await {
                 Ok(Some(record)) if record.client_id == client.client_id => {
-                    self.store
-                        .take_refresh_token(token)
-                        .await
-                        .map_err(storage_error)?;
+                    // THE CASCADE RUNS FIRST, AND THE ORDER IS THE FIX. It used to take the
+                    // presented refresh token and revoke the family afterwards, which is the
+                    // fail-OPEN order for a two-write sequence that can stop between the writes:
+                    // this future is dropped whenever the host's connection is cancelled, and a
+                    // drop after the take left the presented string gone and the family whole.
+                    // The client's retry then found nothing at `get_refresh_token`, fell to the
+                    // `Ok(_)` arm below, and answered 200 with no cascade at all, so every access
+                    // token of a grant the user had just logged out of stayed live for its whole
+                    // TTL and nothing anywhere recorded it. Note that the store-ERROR path was
+                    // already handled honestly (`cascade_failed` below, emitted either way); the
+                    // DROP path emitted nothing, which is why it was invisible.
+                    //
+                    // Revoking first inverts that. A drop between the two writes leaves the family
+                    // revoked, with a barrier recorded, and one live-looking refresh string that
+                    // names a family nothing will honour: fail-closed, and the retry re-runs a
+                    // cascade that is idempotent by contract (see `Storage::revoke_token_family`,
+                    // "removing records that are already gone is success").
+                    //
+                    // The `family_id` comes from the record READ above rather than from a taken
+                    // one. A refresh token string cannot change families, so the two always agreed;
+                    // and after this call there is usually no record left to take, because
+                    // `revoke_token_family` removes the family's refresh records as well.
+                    //
+                    // The in-flight-rotation case the previous ordering worried about is handled
+                    // by the barrier, not by the ordering: a rotation that has already taken its
+                    // record is invisible to the cascade's scan, and it is the barrier that
+                    // REFUSES its later writes rather than letting them restore the chain the user
+                    // just revoked. Recording that barrier sooner can only help.
+                    //
                     // RFC 7009 section 2.1: "If the particular token is a refresh token and the
                     // authorization server supports the revocation of access tokens, then the
                     // authorization server SHOULD also invalidate all access tokens based on the
@@ -4222,9 +5854,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // which is the opposite of what a client asking for revocation has just said.
                     //
                     // Deliberately NOT fatal on a storage failure. Section 2.2 makes the presented
-                    // token's own revocation the answer and that has already succeeded; a cascade
-                    // that could turn a completed revocation into a 503 would leave the client
-                    // believing nothing was revoked when the token it named is already gone.
+                    // token's own revocation the answer, and the take below still runs and still
+                    // reports its own failure; a cascade that could turn a completed revocation
+                    // into a 503 would leave the client believing nothing was revoked when the
+                    // token it named is already gone.
                     //
                     // NOT fatal, but no longer INVISIBLE. The event fired unconditionally, so an
                     // operator could not tell a complete revocation from one that killed the
@@ -4234,9 +5867,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // decide what to do about it.
                     let cascade_failed = self
                         .store
-                        .revoke_token_family(&record.family_id)
+                        .revoke_token_family(record.family_id.as_str(), self.revocation_window())
                         .await
                         .is_err();
+                    // The presented string, in case the cascade did not reach it: it will already
+                    // be gone in a store whose `revoke_token_family` removed the family's refresh
+                    // records, and removing a record that is not there is not an error. This is
+                    // what makes the sequence safe to stop after the cascade rather than before
+                    // it, and what makes a retry a no-op.
+                    self.store
+                        .take_refresh_token(token)
+                        .await
+                        .map_err(storage_error)?;
                     self.hooks.emit(|| Event::TokenRevoked {
                         client_id: client.client_id.as_str(),
                         token_type: TokenTypeHint::RefreshToken,

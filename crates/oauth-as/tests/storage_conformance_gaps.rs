@@ -161,8 +161,20 @@ impl Storage for Faulty {
         self.inner.put_client(client).await
     }
 
-    async fn delete_client(&self, client_id: &ClientId) -> Result<bool, StorageError> {
-        self.inner.delete_client(client_id).await
+    async fn compare_and_swap_client(
+        &self,
+        expected: &Client,
+        updated: Client,
+    ) -> Result<bool, StorageError> {
+        self.inner.compare_and_swap_client(expected, updated).await
+    }
+
+    async fn delete_client(
+        &self,
+        client_id: &ClientId,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<bool, StorageError> {
+        self.inner.delete_client(client_id, window).await
     }
 
     async fn put_device_grant(&self, mut grant: DeviceGrant) -> Result<(), StorageError> {
@@ -262,6 +274,16 @@ impl Storage for Faulty {
         self.inner.put_authorization_code(record).await
     }
 
+    async fn compare_and_swap_authorization_code(
+        &self,
+        expected: &oauth_as::authorization::AuthorizationCodeState,
+        updated: AuthorizationCodeRecord,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .compare_and_swap_authorization_code(expected, updated)
+            .await
+    }
+
     async fn take_authorization_code(
         &self,
         code: &str,
@@ -273,7 +295,7 @@ impl Storage for Faulty {
     async fn put_pushed_authorization_request(
         &self,
         record: oauth_as::par::PushedAuthorizationRequest,
-    ) -> Result<(), StorageError> {
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         self.inner.put_pushed_authorization_request(record).await
     }
 
@@ -287,7 +309,10 @@ impl Storage for Faulty {
             .await
     }
 
-    async fn put_token(&self, token: IssuedToken) -> Result<(), StorageError> {
+    async fn put_token(
+        &self,
+        token: IssuedToken,
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         if let Some(e) = self.refuse("put_token") {
             return Err(e);
         }
@@ -316,7 +341,10 @@ impl Storage for Faulty {
         self.inner.delete_token(access_token).await
     }
 
-    async fn put_refresh_token(&self, record: RefreshTokenRecord) -> Result<(), StorageError> {
+    async fn put_refresh_token(
+        &self,
+        record: RefreshTokenRecord,
+    ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         if let Some(e) = self.refuse("put_refresh_token") {
             return Err(e);
         }
@@ -343,8 +371,12 @@ impl Storage for Faulty {
         self.inner.take_refresh_token(refresh_token).await
     }
 
-    async fn revoke_token_family(&self, family_id: &str) -> Result<u64, StorageError> {
-        self.inner.revoke_token_family(family_id).await
+    async fn revoke_token_family(
+        &self,
+        family_id: &str,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<u64, StorageError> {
+        self.inner.revoke_token_family(family_id, window).await
     }
 
     #[cfg(feature = "consent")]
@@ -400,11 +432,24 @@ impl Storage for Faulty {
     }
 
     #[cfg(feature = "consent")]
-    async fn revoke_consent(&self, consent_id: &str) -> Result<u64, StorageError> {
-        self.inner.revoke_consent(consent_id).await
+    async fn compare_and_swap_consent(
+        &self,
+        expected: Option<&oauth_as::ConsentRecord>,
+        updated: oauth_as::ConsentRecord,
+    ) -> Result<bool, StorageError> {
+        self.inner.compare_and_swap_consent(expected, updated).await
     }
 
-    #[cfg(any(feature = "client_assertion", feature = "dpop"))]
+    #[cfg(feature = "consent")]
+    async fn revoke_consent(
+        &self,
+        consent_id: &str,
+        window: oauth_as::store::RevocationWindow,
+    ) -> Result<u64, StorageError> {
+        self.inner.revoke_consent(consent_id, window).await
+    }
+
+    #[cfg(any(feature = "client-assertion", feature = "dpop"))]
     async fn claim_replay_id(
         &self,
         id: &str,
@@ -439,7 +484,7 @@ fn detail_of(violations: &[Violation], check: &str) -> String {
 
 // ---------------------------------------------------------------------- the round-trip checks
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:442:9: replace
+/// SURVIVOR: `storage_conformance.rs replace
 /// StorageConformance<F>::round_trip_client with ()`, and
 /// `2222:5: replace scopes -> ScopeSet with Default::default()`.
 ///
@@ -474,7 +519,7 @@ async fn a_store_that_drops_a_clients_scope_ceilings_is_caught() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:486:9: replace
+/// SURVIVOR: `storage_conformance.rs replace
 /// StorageConformance<F>::round_trip_device_grant with ()`.
 ///
 /// Same shape, on the device grant. The field planted here is the RFC 8628 section 3.2 polling
@@ -502,7 +547,7 @@ async fn a_store_that_drops_a_device_grants_polling_interval_is_caught() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:541:9: replace
+/// SURVIVOR: `storage_conformance.rs replace
 /// StorageConformance<F>::round_trip_authorization_code with ()`.
 ///
 /// Same shape, on the authorization code, and this is the most consequential of the three. The
@@ -531,7 +576,7 @@ async fn a_store_that_drops_an_authorization_codes_pkce_challenge_is_caught() {
 
 // ---------------------------------------------------------------------- judge_race
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:1115:19: replace > with < in
+/// SURVIVOR: `storage_conformance.rs replace > with < in
 /// judge_race`.
 ///
 /// The line is `if errors > 0`, the arm that reports concurrent takes failing with a
@@ -567,7 +612,7 @@ async fn a_store_that_surfaces_write_conflicts_to_concurrent_takers_is_caught() 
 
 // ---------------------------------------------------------------------- the match guards
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:1298:28: replace match guard
+/// SURVIVOR: `storage_conformance.rs replace match guard
 /// g.device_code == "dc-first" with true`.
 ///
 /// The guard is the whole of the `user_code_index/refusal_writes_nothing` check: after a put has
@@ -600,7 +645,7 @@ async fn a_refusal_that_has_already_repointed_the_index_is_caught() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:916:28: replace match guard
+/// SURVIVOR: `storage_conformance.rs replace match guard
 /// f.consent_id == mine.consent_id with true`.
 ///
 /// The guard checks that `find_consent` answered with the consent belonging to the SUBJECT it was
@@ -636,7 +681,7 @@ async fn a_find_consent_indexed_on_the_client_alone_is_caught() {
 
 // ---------------------------------------------------------------------- check_storage
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:1956:5: replace check_storage ->
+/// SURVIVOR: `storage_conformance.rs replace check_storage ->
 /// Vec<Violation> with vec![]`.
 ///
 /// [`oauth_as::storage_conformance::check_storage`] is a PUBLISHED entry point: the module
@@ -780,7 +825,7 @@ async fn a_consent_fixture_that_did_not_persist_fails_the_cascade_check_by_name(
 
 // ---------------------------------------------------------------------- the latch
 
-/// SURVIVOR: `crates/oauth-as/src/storage_conformance.rs:2122:58: replace == with != in
+/// SURVIVOR: `storage_conformance.rs replace == with != in
 /// Latch::done`.
 ///
 /// `Latch::done` wakes the waiting harness when the count reaches zero:

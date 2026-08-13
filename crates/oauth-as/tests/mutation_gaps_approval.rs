@@ -58,8 +58,8 @@ fn query<'a>(challenge: &'a str, extra: &[(&'a str, &'a str)]) -> AuthorizationR
 
 // ------------------------------------------------------- the step-up parameters on the query
 
-/// SURVIVORS: `crates/oauth-as/src/authorization.rs:152:17: delete match arm "acr_values"` and
-/// `:154:17: delete match arm "max_age"`, both in `AuthorizationRequest::from_pairs`.
+/// SURVIVORS: `authorization.rs delete match arm "acr_values"` and
+/// `delete match arm "max_age"`, both in `AuthorizationRequest::from_pairs`.
 ///
 /// Deleting either arm does not fail closed. The parameter falls through to the `_ => continue`
 /// that exists for the members this server does not model, so the request parses cleanly with the
@@ -145,7 +145,7 @@ async fn the_step_up_parameters_survive_the_query_string_parser() {
 
 // ------------------------------------------------------- UserApproval
 
-/// SURVIVORS: `crates/oauth-as/src/server.rs:366:9: replace UserApproval<'a>::subject -> &str with
+/// SURVIVORS: `server.rs replace UserApproval<'a>::subject -> &str with
 /// ""` and `with "xyzzy"`.
 ///
 /// [`UserApproval::subject`] is a public accessor with no caller inside this crate: issuance
@@ -201,7 +201,7 @@ async fn the_approval_reports_the_subject_it_was_given() {
     );
 }
 
-/// SURVIVOR: `crates/oauth-as/src/server.rs:375:9: replace <impl fmt::Debug for
+/// SURVIVOR: `server.rs replace <impl fmt::Debug for
 /// UserApproval<'_>>::fmt -> fmt::Result with Ok(Default::default())`.
 ///
 /// The hand-written `Debug` exists to keep a user identifier out of whatever caught a `{:?}` while
@@ -240,8 +240,8 @@ async fn the_approval_debug_keeps_the_request_and_redacts_the_user() {
 
 // ------------------------------------------------------- the authentication a grant carries
 
-/// SURVIVORS: `crates/oauth-as/src/server.rs:287:9: replace GrantedAuthentication::from_code ->
-/// Self with Default::default()` and `:302:9: ... from_refresh ...`.
+/// SURVIVORS: `server.rs replace GrantedAuthentication::from_code ->
+/// Self with Default::default()` and `... from_refresh ...`.
 ///
 /// These two carry the host's authentication report from the record a grant rests on onto the
 /// token that grant mints: from the authorization code at first issuance, and from the refresh
@@ -255,9 +255,12 @@ async fn the_approval_debug_keeps_the_request_and_redacts_the_user() {
 /// again. The client repeats the whole step-up dance, satisfies it again, and gets another token
 /// that proves nothing: a loop with no error in it anywhere.
 ///
-/// `from_refresh` is the more consequential of the two, because RFC 9470 section 5 is explicit
-/// that a rotation is not a new authentication: the chain has to carry the ORIGINAL one, and a
-/// default drops it on the first refresh a long-lived session performs.
+/// `from_refresh` is the more consequential of the two. RFC 9470 section 6.2 defines the CHANNEL —
+/// the `auth_time` and `acr` an introspecting caller reads — and it does not mandate what a
+/// rotation does with them; the mandate here is this crate's. A rotation is not a new
+/// authentication, so the chain has to carry the ORIGINAL one, and a default drops it on the first
+/// refresh a long-lived session performs, leaving that channel to answer a step-up challenge with
+/// silence.
 #[tokio::test]
 async fn the_authentication_a_grant_rests_on_reaches_the_tokens_it_mints() {
     let srv = support::server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
@@ -303,8 +306,9 @@ async fn the_authentication_a_grant_rests_on_reaches_the_tokens_it_mints() {
     assert_eq!(carried.auth_time, at(NOW));
     assert_eq!(carried.acr.as_deref(), Some("urn:acr:phr"));
 
-    // FROM THE REFRESH RECORD. RFC 9470 s5: a rotation is not a new authentication, so the chain
-    // carries the original one forward rather than forgetting it.
+    // FROM THE REFRESH RECORD. A rotation is not a new authentication, so the chain carries the
+    // original one forward rather than forgetting it, and RFC 9470 s6.2 is the channel that then
+    // has something to report.
     let refresh_token = issued
         .refresh_token
         .clone()
@@ -325,7 +329,8 @@ async fn the_authentication_a_grant_rests_on_reaches_the_tokens_it_mints() {
         .unwrap()
         .expect("the rotated token is in the store");
     let carried = stored.authentication.as_deref().expect(
-        "a rotation must carry the ORIGINAL authentication forward (RFC 9470 s5): dropping it on \
+        "a rotation must carry the ORIGINAL authentication forward, or the RFC 9470 s6.2 channel \
+         has nothing to report: dropping it on \
          the first refresh means a long-lived session silently stops being able to prove how its \
          user logged in",
     );

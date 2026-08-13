@@ -101,6 +101,8 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
 fn request_object_refusals_borrow_their_description() {
     use std::borrow::Cow;
 
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use oauth_as::{
         AuthorizationError, AuthorizationServer, Client, ClientAuth, ClientId, ErrorCode,
         GrantType, JarConfig, MemoryStorage, RegisteredRequestObjectKey, RequestObjectKeys,
@@ -140,11 +142,55 @@ fn request_object_refusals_borrow_their_description() {
     }))
     .expect("the fixture client must register");
 
-    // Segment one is not base64url. `!` is outside the alphabet in every base64 variant.
-    for object in ["!!!!.eyJhIjoxfQ.AAAA", "eyJhIjoxfQ.eyJhIjoxfQ.!!!!"] {
+    // ONE FIXTURE PER CALL SITE, and each has to REACH the site it names. `!` is outside the
+    // alphabet in every base64 variant, so each of these three is refused for the segment it
+    // spoils — but only if nothing earlier answers first, and that is what the previous pair of
+    // fixtures got wrong. Their second entry spelled the header `eyJhIjoxfQ` (`{"a":1}`), which is
+    // perfectly good base64url and perfectly good JSON, so it was refused at "the header has no
+    // alg" — already a `&'static str`, and reached before either of the other two constants. Both
+    // `SIGNATURE_NOT_BASE64URL` and `PAYLOAD_NOT_BASE64URL` could have been reverted to `format!`
+    // with this gate still green.
+    //
+    // So the header here is a real one, naming the registered algorithm and key, and the payload
+    // fixture is genuinely SIGNED over its spoiled payload: `src/par.rs` decodes the payload only
+    // after the signature verifies, so an unsigned fixture would stop at "the signature did not
+    // verify" and never reach the third constant either.
+    let kid = jwk.kid.clone();
+    let header_b64 =
+        URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"ES256","kid":"{kid}"}}"#).as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(br#"{"client_id":"app"}"#);
+    let bad_payload_signing_input = format!("{header_b64}.!!!!");
+    let bad_payload = format!(
+        "{bad_payload_signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(
+            key.sign_signing_input(&bad_payload_signing_input)
+                .expect("the fixture key signs")
+        )
+    );
+    let objects = [
+        (
+            "!!!!.eyJhIjoxfQ.AAAA".to_string(),
+            "the header is not base64url",
+        ),
+        (
+            format!("{header_b64}.{payload_b64}.!!!!"),
+            "the signature is not base64url",
+        ),
+        (bad_payload, "the payload is not base64url"),
+    ];
+    for (object, expected) in &objects {
         match rt.block_on(server.validate_signed_authorization_request("app", object)) {
             Err(AuthorizationError::Direct(error)) => {
                 assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+                // WHICH constant answered, not merely that some borrowed constant did. Every
+                // refusal on this path borrows, so `Cow::Borrowed` alone is satisfied by any
+                // earlier gate, and "this call site borrows its description" is exactly the claim
+                // that would then go untested.
+                assert_eq!(
+                    error.error_description.as_deref(),
+                    Some(*expected),
+                    "the fixture must reach the call site it was built for"
+                );
                 assert!(
                     matches!(error.error_description, Some(Cow::Borrowed(_))),
                     "a refusal whose description comes from a fixed set must borrow it, not \
@@ -427,24 +473,19 @@ fn jwt_signing_bound() {
     use oauth_as::jwt::{AccessTokenClaims, Audience, EcdsaP256Key, JwtConfig};
 
     let signer = JwtConfig::new(EcdsaP256Key::generate("sign"), "https://rs.example");
-    let claims = AccessTokenClaims {
-        iss: "https://as.example".to_string(),
-        exp: 4_000_000_000,
-        aud: Audience::One("https://rs.example".to_string()),
-        sub: "user-1".to_string(),
-        client_id: "app".to_string(),
-        iat: 1_700_000_000,
-        jti: "0123456789abcdef".to_string(),
-        scope: Some("read".to_string()),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        // The cfg MATCHES THE FIELD's, which is `any(dpop, mtls)` (see `AccessTokenClaims`), and
-        // not `mtls` alone: `cnf` carries the RFC 9449 s6 DPoP thumbprint as well as the RFC 8705
-        // s3.1 certificate one. Gated on `mtls` alone, this file did not compile at all in a
-        // `dpop`-without-`mtls` build.
-        #[cfg(any(feature = "dpop", feature = "mtls"))]
-        cnf: None,
-    };
+    // `AccessTokenClaims::new` fills empty `authorization_details` and `cnf: None`, which is what
+    // this fixture set explicitly before the type became non_exhaustive; `scope` is the one member
+    // it wants a value for, and the claims are built OUTSIDE the measured window either way.
+    let mut claims = AccessTokenClaims::new(
+        "https://as.example",
+        4_000_000_000,
+        Audience::One("https://rs.example".to_string()),
+        "user-1",
+        "app",
+        1_700_000_000,
+        "0123456789abcdef",
+    );
+    claims.scope = Some("read".to_string());
     // `sign_access_token` is async since the `Es256Signer` seam landed (the signing key may live
     // in a KMS), so the measurement runs it on a runtime built OUTSIDE the window.
     let rt = current_thread_runtime();

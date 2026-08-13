@@ -32,6 +32,7 @@ use support::{fault_server_with, ManualClock, CONFIDENTIAL_REDIRECT, CONFIDENTIA
 struct Sink {
     replays: Mutex<Vec<(bool, bool)>>,
     revocations: Mutex<Vec<(TokenTypeHint, bool)>>,
+    reuses: Mutex<Vec<(u64, bool)>>,
 }
 
 impl EventSink for Sink {
@@ -46,6 +47,15 @@ impl EventSink for Sink {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((tokens_revoked, containment_failed)),
+            Event::RefreshTokenReuseDetected {
+                records_revoked,
+                containment_failed,
+                ..
+            } => self
+                .reuses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((records_revoked, containment_failed)),
             Event::TokenRevoked {
                 token_type,
                 cascade_failed,
@@ -162,6 +172,52 @@ async fn a_failed_access_token_deletion_must_be_reported() {
     );
 }
 
+/// A store that CANNOT SAY whether there is a chain is not the same thing as a store that says
+/// there is none, and the replay branch separates the two arms deliberately. `Ok(None)` is a clean
+/// outcome: there is no family to revoke, so nothing failed. `Err` means the lookup itself broke,
+/// so the family revocation was never even ATTEMPTED and the attacker's refresh chain may still be
+/// live — while the fallback delete of the access token, which succeeds here, would otherwise make
+/// the response look complete. Folding the `Err` arm into `Ok(None)` is precisely the overstated
+/// containment this event exists to prevent, and it is invisible unless the lookup is made to fail
+/// rather than merely to come back empty.
+#[tokio::test]
+async fn a_refresh_lookup_that_could_not_answer_is_a_containment_failure() {
+    let sink = replay_with_broken_store(|store| {
+        // The lookup ERRORS. Everything downstream of it is left healthy on purpose: the access
+        // token is deleted successfully, so the only thing that can set `containment_failed` is
+        // the arm under test.
+        store.error_get_refresh.store(true, Ordering::SeqCst);
+    })
+    .await;
+    let replays = sink.replays.lock().unwrap();
+    assert_eq!(replays.len(), 1);
+    assert_eq!(
+        replays[0],
+        (false, true),
+        "the store could not say whether a chain existed, so no family was revoked and the \
+         operator must be told the compromise response is incomplete"
+    );
+}
+
+/// The other arm, kept alongside it because the two have DIFFERENT correct answers and asserting
+/// only one of them would let the server give that answer to both. A code that minted no refresh
+/// chain has nothing to revoke, so the fallback delete of its access token is a complete
+/// containment and the event must not cry failure.
+#[tokio::test]
+async fn a_refresh_lookup_that_found_nothing_is_not_a_containment_failure() {
+    let sink = replay_with_broken_store(|store| {
+        store.fail_get_refresh.store(true, Ordering::SeqCst);
+    })
+    .await;
+    let replays = sink.replays.lock().unwrap();
+    assert_eq!(replays.len(), 1);
+    assert_eq!(
+        replays[0],
+        (false, false),
+        "no chain to revoke is a clean outcome: the access token was deleted and nothing failed"
+    );
+}
+
 /// Putting the CONSUMED record back is what makes replay detection work more than once. It was
 /// fire-and-forget too: if it fails the record is gone, and the NEXT presentation of the same code
 /// reads as an unknown code, which is the answer a typo gets. The compromise stops being visible.
@@ -271,22 +327,14 @@ async fn a_failed_code_restore_after_a_client_mismatch_is_not_silent() {
     .await;
 
     let challenge = oauth_as::pkce::code_challenge_s256(support::RFC7636_VERIFIER);
-    let req = oauth_as::AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".to_string().into()),
-        client_id: Some("confidential-app".to_string().into()),
-        redirect_uri: Some(CONFIDENTIAL_REDIRECT.to_string().into()),
-        scope: Some("read".to_string().into()),
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".to_string().into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let req = oauth_as::AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", "confidential-app"),
+        ("redirect_uri", CONFIDENTIAL_REDIRECT),
+        ("scope", "read"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
     let validated = srv.validate_authorization_request(&req).await.unwrap();
     let response = srv
         .issue_authorization_code(oauth_as::server::UserApproval::granted(&validated, "alice"))
@@ -330,4 +378,131 @@ async fn a_failed_code_restore_after_a_client_mismatch_is_not_silent() {
         .await;
     assert_eq!(honest.unwrap_err().error, ErrorCode::InvalidGrant);
     let _ = ScopeSet::empty();
+}
+
+/// A chain that has been rotated once, so the token handed back is the SUPERSEDED one: presenting
+/// it is the reuse of OAuth 2.1 draft section 6.1. The store is still healthy at this point; the
+/// caller rigs it before the reuse.
+async fn rotated_away_refresh_token() -> (
+    oauth_as::AuthorizationServer<support::FaultStorage, ManualClock>,
+    Arc<Sink>,
+    String,
+) {
+    let sink = Arc::new(Sink::default());
+    let srv = fault_server_with(
+        ManualClock::at_epoch(),
+        vec![support::confidential_client()],
+    )
+    .await
+    .with_event_sink(Box::new(SinkHandle(sink.clone())));
+
+    let issued = support::mint_code_token(
+        &srv,
+        "confidential-app",
+        Some(CONFIDENTIAL_SECRET),
+        CONFIDENTIAL_REDIRECT,
+        "read",
+        "alice",
+    )
+    .await;
+    let rt1 = issued.refresh_token.expect("the code grant issues a chain");
+
+    srv.token(TokenRequest::RefreshToken {
+        client_id: ClientId::new("confidential-app"),
+        client_secret: Some(CONFIDENTIAL_SECRET.to_string()),
+        refresh_token: rt1.clone(),
+        scope: None,
+    })
+    .await
+    .expect("the first redemption of a live refresh token succeeds");
+
+    (srv, sink, rt1)
+}
+
+/// Present `rt` and require the wire answer to be `invalid_grant`, which it is on every outcome
+/// this file is about.
+async fn present(
+    srv: &oauth_as::AuthorizationServer<support::FaultStorage, ManualClock>,
+    rt: &str,
+) {
+    let outcome = srv
+        .token(TokenRequest::RefreshToken {
+            client_id: ClientId::new("confidential-app"),
+            client_secret: Some(CONFIDENTIAL_SECRET.to_string()),
+            refresh_token: rt.to_string(),
+            scope: None,
+        })
+        .await;
+    assert_eq!(
+        outcome.unwrap_err().error,
+        ErrorCode::InvalidGrant,
+        "the WIRE answer to a reused refresh token is invalid_grant however badly the store \
+         is behaving"
+    );
+}
+
+/// The baseline: a healthy store contains the reuse, and the event says so without hedging.
+#[tokio::test]
+async fn a_successful_reuse_containment_reports_success() {
+    let (srv, sink, rt1) = rotated_away_refresh_token().await;
+    present(&srv, &rt1).await;
+
+    let reuses = sink.reuses.lock().unwrap();
+    assert_eq!(reuses.len(), 1, "one reuse, one event");
+    let (records_revoked, containment_failed) = reuses[0];
+    assert!(
+        records_revoked > 0,
+        "the family revocation removed the grant's tokens: {records_revoked}"
+    );
+    assert!(!containment_failed, "nothing failed");
+}
+
+/// THE FINDING. `take_refresh_token` has ALREADY removed the spent record by the time the family
+/// revocation runs, so propagating that revocation's `Err` with `?` lost three things at once: the
+/// family was not revoked (the thief's rotated chain stayed live), the spent record was gone and
+/// never put back (so RFC 9700 section 4.14.2 reuse detection for that family was off from then on,
+/// and a later presentation of the same string read as an unknown token), and no event fired at
+/// all, so the host's only audit channel was never told any of it.
+///
+/// The second presentation at the end is the half that matters most and the half a test asserting
+/// only on the event would miss: it passes against a version that reports the failure honestly and
+/// still drops the evidence on the floor.
+#[tokio::test]
+async fn a_failed_reuse_containment_is_reported_and_keeps_the_alarm_armed() {
+    let (srv, sink, rt1) = rotated_away_refresh_token().await;
+    srv.store()
+        .fail_revoke_token_family
+        .store(true, Ordering::SeqCst);
+
+    present(&srv, &rt1).await;
+    {
+        let reuses = sink.reuses.lock().unwrap();
+        assert_eq!(
+            reuses.len(),
+            1,
+            "a reuse the server could not contain is the MORE urgent one to report, not the one \
+             to stay quiet about: {reuses:?}"
+        );
+        let (records_revoked, containment_failed) = reuses[0];
+        assert_eq!(
+            records_revoked, 0,
+            "the store refused the revocation, so nothing was removed"
+        );
+        assert!(
+            containment_failed,
+            "the operator must be told the compromised grant's tokens are still live"
+        );
+    }
+
+    // THE ALARM IS STILL ARMED. The spent record went back, so this presentation is still
+    // recognised as reuse rather than as an unknown token. Without the restore the server has
+    // forgotten the string ever existed and this second presentation is silent.
+    present(&srv, &rt1).await;
+    let reuses = sink.reuses.lock().unwrap();
+    assert_eq!(
+        reuses.len(),
+        2,
+        "detection for this family must survive a failed containment: {reuses:?}"
+    );
+    assert_eq!(reuses[1], (0, true));
 }

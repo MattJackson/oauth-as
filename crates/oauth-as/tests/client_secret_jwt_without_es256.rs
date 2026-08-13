@@ -8,8 +8,8 @@
 //! path: [`oauth_as::client_assertion::AssertionKeys::ClientSecret`] dispatches to
 //! `verify_hs256`, which never touches an [`oauth_as::jwt::Es256Verifier`] at all.
 //!
-//! So this file is compiled exactly where the claim can be checked: `client_assertion` on
-//! (`client_assertion = ["jwt"]`, which does NOT pull `jwt-p256`), `jwt-p256` off, and no host
+//! So this file is compiled exactly where the claim can be checked: `client-assertion` on
+//! (`client-assertion = ["jwt"]`, which does NOT pull `jwt-p256`), `jwt-p256` off, and no host
 //! verifier installed. That is a build in which the crate contains no curve arithmetic, and a
 //! `client_secret_jwt` client must still be able to authenticate.
 //!
@@ -19,7 +19,7 @@
 //! broken for symmetric clients; a build that accepts both would be pretending to check a
 //! signature.
 
-#![cfg(all(feature = "client_assertion", not(feature = "jwt-p256")))]
+#![cfg(all(feature = "client-assertion", not(feature = "jwt-p256")))]
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -94,14 +94,10 @@ fn request() -> TokenRequest {
 }
 
 fn context(assertion: &str) -> TokenRequestContext<'_> {
-    TokenRequestContext {
-        credential: ClientCredential {
-            client_assertion: Some(assertion),
-            client_assertion_type: Some(CLIENT_ASSERTION_TYPE),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
+    TokenRequestContext::new(ClientCredential::assertion(
+        Some(CLIENT_ASSERTION_TYPE),
+        assertion,
+    ))
 }
 
 /// The whole point of the file: a valid HMAC assertion authenticates in a build with no ES256

@@ -23,9 +23,9 @@ use oauth_as::{
 };
 
 use support::{
-    confidential_client, fault_server_with, mint_code_token, mint_code_token_keeping_code,
-    public_client, server_with, ManualClock, CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET,
-    PUBLIC_REDIRECT, RFC7636_VERIFIER,
+    confidential_client, far_future_window, fault_server_with, mint_code_token,
+    mint_code_token_keeping_code, public_client, server_with, ManualClock, CONFIDENTIAL_REDIRECT,
+    CONFIDENTIAL_SECRET, PUBLIC_REDIRECT, RFC7636_VERIFIER,
 };
 
 // ------------------------------------------------- a client with no registered redirect URI
@@ -54,43 +54,31 @@ fn no_redirect_client() -> Client {
 /// WITHOUT redirecting: RFC 6749 section 4.1.2.1 forbids redirecting an error when the redirect
 /// target has not been validated, and here there is no target at all.
 ///
-/// The failure mode this pins is specific. Collapsing the "no registrations" case into the
-/// "several registrations" case still produces `invalid_request`, so an assertion on the error code
-/// alone cannot tell them apart. The description is what tells an operator that the CLIENT
-/// REGISTRATION is wrong rather than the request, so it is asserted too.
+/// WHAT IS ASSERTED ABOUT THE DESCRIPTION CHANGED IN 0.9.1, and the test below this one is why.
+/// It used to say "client has no registered redirect_uri", on the grounds that an operator needs to
+/// know the REGISTRATION is wrong rather than the request. The authorization endpoint is
+/// unauthenticated, so that reader is not the only one: the string was an oracle sorting every
+/// client id into zero, one and several registered URIs from a request carrying nothing but a
+/// `client_id`. The description is now the same one the several-registrations case gets, and this
+/// test asserts only the shape the RFC requires: `invalid_request`, delivered WITHOUT a redirect.
 #[tokio::test]
 async fn a_client_with_no_registered_redirect_uri_is_refused_without_redirecting() {
     let clock = ManualClock::at_epoch();
     let srv = server_with(clock, vec![no_redirect_client()]).await;
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
-    let req = AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some("no-redirect-app".into()),
-        // Omitted, which is the only way to reach the branch: naming one would fail the exact-match
-        // check first, since there is nothing registered to match.
-        redirect_uri: None,
-        scope: None,
-        state: Some("s".into()),
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    // `redirect_uri` is omitted, which is the only way to reach the branch: naming one would fail
+    // the exact-match check first, since there is nothing registered to match.
+    let req = AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", "no-redirect-app"),
+        ("state", "s"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
 
     match srv.validate_authorization_request(&req).await {
         Err(AuthorizationError::Direct(e)) => {
             assert_eq!(e.error, ErrorCode::InvalidRequest);
-            assert_eq!(
-                e.error_description.as_deref(),
-                Some("client has no registered redirect_uri"),
-                "an empty registration is a different defect from an ambiguous one, and the \
-                 description is the only thing that distinguishes them"
-            );
         }
         other => panic!("expected a non-redirecting refusal, got {other:?}"),
     }
@@ -99,38 +87,63 @@ async fn a_client_with_no_registered_redirect_uri_is_refused_without_redirecting
 /// The neighbouring case, so the two cannot be collapsed into one another from the other side: with
 /// SEVERAL registrations the server would be guessing where to send a credential, and a wrong guess
 /// is the whole attack (RFC 6749 section 3.1.2.3).
+///
+/// ATTACK, and it is what the two assertions above and below now share a string for. The
+/// authorization endpoint is UNAUTHENTICATED: the user agent driving it has proved no relationship
+/// to the client id it names, which is what step 1 of `validate_authorization_request` says in as
+/// many words ("an unknown client_id and a malformed one collapse into one answer ... telling it
+/// which client ids exist helps nobody"). The very next check then answered a DIFFERENT question
+/// about the same registration in three distinguishable ways, so one request carrying nothing but
+/// `client_id=X` sorted every client this server knows into zero, one and several registered
+/// redirect URIs, and a fourth answer said the id does not exist at all. A registry map is what an
+/// attacker builds before choosing which client to attack; the count of a client's redirect URIs is
+/// not the operator's secret, but it is not the internet's business either, and no legitimate user
+/// agent reads either string, because both are repaired the same way: send a `redirect_uri`.
 #[tokio::test]
-async fn several_registered_redirect_uris_require_the_request_to_name_one() {
+async fn zero_and_several_registered_redirect_uris_are_refused_in_the_same_words() {
     let clock = ManualClock::at_epoch();
-    let srv = server_with(clock, vec![support::two_redirect_client()]).await;
     let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
-    let req = AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some("multi-redirect".into()),
-        redirect_uri: None,
-        scope: None,
-        state: None,
-        code_challenge: Some(challenge.into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
 
-    match srv.validate_authorization_request(&req).await {
-        Err(AuthorizationError::Direct(e)) => {
-            assert_eq!(e.error, ErrorCode::InvalidRequest);
-            assert_eq!(
-                e.error_description.as_deref(),
-                Some("redirect_uri is required when several are registered")
-            );
+    async fn refusal(
+        clock: ManualClock,
+        client: oauth_as::Client,
+        client_id: &str,
+        challenge: &str,
+    ) -> oauth_as::ErrorResponse {
+        let srv = server_with(clock, vec![client]).await;
+        let req = AuthorizationRequest::from_pairs([
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+        ]);
+        match srv.validate_authorization_request(&req).await {
+            Err(AuthorizationError::Direct(e)) => e,
+            other => panic!("expected a non-redirecting refusal, got {other:?}"),
         }
-        other => panic!("expected a non-redirecting refusal, got {other:?}"),
     }
+
+    let none = refusal(
+        clock.clone(),
+        no_redirect_client(),
+        "no-redirect-app",
+        &challenge,
+    )
+    .await;
+    let several = refusal(
+        clock,
+        support::two_redirect_client(),
+        "multi-redirect",
+        &challenge,
+    )
+    .await;
+
+    assert_eq!(none.error, ErrorCode::InvalidRequest);
+    assert_eq!(
+        none, several,
+        "how many redirect URIs a client registered must not be readable from an unauthenticated \
+         request: {none:?} against {several:?}"
+    );
 }
 
 // --------------------------------------------- replay revocation with no refresh chain to reach
@@ -506,6 +519,38 @@ async fn the_token_type_hint_decides_which_lookup_runs_first() {
         "with no hint the refresh store is consulted first"
     );
 
+    // THE COMMON CASE, and the one the three observations around it leave undetermined: a correct
+    // `refresh_token` hint. The impl reaches the refresh-first order through the catch-all arm it
+    // shares with "no hint", so nothing above distinguishes "the hint was honoured" from "the hint
+    // was dropped on the floor and the default happened to agree". Folding this hint into the
+    // ACCESS-first arm instead costs every ordinary logout an extra store round trip, in the one
+    // direction RFC 7009 section 2.1's SHOULD exists to avoid, and no other assertion in the repo
+    // would notice.
+    let third = mint_code_token(
+        &srv,
+        "confidential-app",
+        Some(CONFIDENTIAL_SECRET),
+        CONFIDENTIAL_REDIRECT,
+        "read",
+        "user-3",
+    )
+    .await;
+    let third_refresh = third.refresh_token.expect("chain must start");
+    srv.store().take_lookup_order();
+    srv.revoke(
+        &ClientId::new("confidential-app"),
+        Some(CONFIDENTIAL_SECRET),
+        &third_refresh,
+        Some(TokenTypeHint::RefreshToken),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        srv.store().take_lookup_order(),
+        vec!["get_refresh_token"],
+        "a correct refresh_token hint must consult the refresh store first, and then stop"
+    );
+
     // A WRONG hint must not stop the search: section 2.1 requires the server to keep looking, so
     // both stores are consulted, hinted one first, and the token is still revoked.
     let second = mint_code_token(
@@ -554,70 +599,58 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
     let store = MemoryStorage::new();
     let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
-    let token = |name: &str, family: Option<&str>| IssuedToken {
-        #[cfg(feature = "dpop")]
-        jkt: None,
-        #[cfg(feature = "mtls")]
-        x5t_s256: None,
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        access_token: name.to_string(),
-        client_id: ClientId::new("app"),
-        subject: Some("user-1".to_string()),
-        scope: ScopeSet::parse("read").unwrap(),
-        issued_at: now,
-        expires_at: now + Duration::from_secs(3600),
-        family_id: family.map(str::to_string),
-        #[cfg(feature = "consent")]
-        authentication: None,
+    let token = |name: &str, family: Option<&str>| {
+        let mut token = IssuedToken::new(
+            name,
+            ClientId::new("app"),
+            Some("user-1".to_string()),
+            ScopeSet::parse("read").unwrap(),
+            now,
+            now + Duration::from_secs(3600),
+        );
+        token.family_id = family.map(str::to_string);
+        token
     };
-    let refresh = |name: &str, family: &str| RefreshTokenRecord {
-        #[cfg(feature = "dpop")]
-        jkt: None,
-        #[cfg(feature = "mtls")]
-        x5t_s256: None,
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        refresh_token: name.to_string(),
-        client_id: ClientId::new("app"),
-        subject: Some("user-1".to_string()),
-        scope: ScopeSet::parse("read").unwrap(),
-        expires_at: None,
-        family_id: family.to_string(),
-        state: RefreshTokenState::Active,
-        #[cfg(feature = "consent")]
-        authentication: None,
+    let refresh = |name: &str, family: &str| {
+        RefreshTokenRecord::new(
+            name,
+            ClientId::new("app"),
+            Some("user-1".to_string()),
+            ScopeSet::parse("read").unwrap(),
+            family,
+        )
     };
 
     // Three records in the doomed family (two access tokens minted along the chain, one refresh
     // link), and three that must be untouched: another family's pair, and a family-less token from
     // a client-credentials grant.
-    store
+    let _ = store
         .put_token(token("at-1", Some("doomed")))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_token(token("at-2", Some("doomed")))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_refresh_token(refresh("rt-1", "doomed"))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_token(token("at-other", Some("other")))
         .await
         .unwrap();
-    store
+    let _ = store
         .put_refresh_token(refresh("rt-other", "other"))
         .await
         .unwrap();
-    store.put_token(token("at-none", None)).await.unwrap();
+    let _ = store.put_token(token("at-none", None)).await.unwrap();
 
     assert_eq!(
-        store.revoke_token_family("doomed").await.unwrap(),
+        store
+            .revoke_token_family("doomed", far_future_window())
+            .await
+            .unwrap(),
         3,
         "the count must be the records actually removed, across BOTH token kinds"
     );
@@ -636,8 +669,20 @@ async fn revoke_token_family_reports_the_number_of_records_it_removed() {
 
     // Idempotent, and honest about having removed nothing: this runs on evidence of compromise and
     // must not be turned into an error (or a fictional count) by a concurrent revocation.
-    assert_eq!(store.revoke_token_family("doomed").await.unwrap(), 0);
-    assert_eq!(store.revoke_token_family("never-existed").await.unwrap(), 0);
+    assert_eq!(
+        store
+            .revoke_token_family("doomed", far_future_window())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .revoke_token_family("never-existed", far_future_window())
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 /// A guard on the fixture the rest of this file leans on: `public_client` really is public, so the

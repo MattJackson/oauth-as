@@ -15,18 +15,65 @@
 
 use std::sync::{Arc, Mutex};
 
+// Same cfg as `client()` below, and for the same reason: these five names exist in this file only
+// to build that one fixture, so a build that does not reach the fixture does not reach them
+// either. Written out rather than folded into one `any(...)` list at the top of the file, because
+// the two groups answer different questions and a shared cfg would drift the moment one changed.
+#[cfg(any(
+    feature = "client-assertion",
+    feature = "consent",
+    feature = "token-exchange"
+))]
 use oauth_as::client::{Client, ClientAuth, ClientId};
+#[cfg(any(
+    feature = "client-assertion",
+    feature = "consent",
+    feature = "token-exchange"
+))]
 use oauth_as::grant::GrantType;
-use oauth_as::http::{Body, ConsentDecision};
+use oauth_as::http::{ApprovalDecision, Body};
+#[cfg(any(
+    feature = "client-assertion",
+    feature = "consent",
+    feature = "token-exchange"
+))]
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig, SystemClock};
 use oauth_as::store::MemoryStorage;
 
+// THE CFGS BELOW ARE REAL, not `#[allow(dead_code)]`, and the difference matters here.
+//
+// Only two of this file's tests (the two RFC 6750 s2.1 header probes) are unconditional; the rest
+// are gated on `client-assertion`, `consent` or `token-exchange`, and they are what use these
+// helpers. Under plain `--features http` every item below is genuinely unreachable, so the honest
+// statement is the cfg that says WHICH builds reach it. An `allow` would say "sometimes dead,
+// never mind", and would then keep quiet if a helper became dead in EVERY build.
+//
+// This was invisible until the per-feature CI matrix moved from `cargo build` (lib only) to
+// `cargo clippy --all-targets`: a `cargo build` never compiles a test target, so seven dead items
+// sat here under `-D warnings` without a single red run.
+
+#[cfg(any(
+    feature = "client-assertion",
+    feature = "consent",
+    feature = "token-exchange"
+))]
 const SECRET: &str = "a-high-entropy-registered-client-secret";
+#[cfg(any(
+    feature = "client-assertion",
+    feature = "consent",
+    feature = "token-exchange"
+))]
 const REDIRECT: &str = "https://app.example/cb";
 /// RFC 7636 appendix B's verifier, so the challenge below is a real S256 challenge.
+#[cfg(feature = "consent")]
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
+#[cfg(any(
+    feature = "client-assertion",
+    feature = "consent",
+    feature = "token-exchange"
+))]
 fn client() -> Client {
     Client {
         client_id: ClientId::new("app"),
@@ -47,6 +94,7 @@ fn client() -> Client {
     }
 }
 
+#[cfg(any(feature = "client-assertion", feature = "token-exchange"))]
 fn post(uri: &str, body: String) -> http::Request<Body> {
     http::Request::builder()
         .method("POST")
@@ -56,6 +104,7 @@ fn post(uri: &str, body: String) -> http::Request<Body> {
         .expect("a well-formed request")
 }
 
+#[cfg(any(feature = "client-assertion", feature = "token-exchange"))]
 async fn body_of(response: http::Response<Body>) -> serde_json::Value {
     let bytes = response.into_body().into_bytes();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
@@ -159,7 +208,7 @@ async fn registration_service(
         .with_registration_policy(Box::new(Recording(seen)));
     oauth_as::http::ServiceBuilder::new(Arc::new(srv))
         .with_subject_resolver(|_headers| Some("user-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("service")
 }
@@ -178,7 +227,7 @@ async fn registration_service(
 /// every log, proxy and WAF in front of this server sees the Basic client id. A server that
 /// resolves the ambiguity by precedence is a server whose behaviour differs from the next one's,
 /// which is exactly what section 2.3 removes.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 #[tokio::test]
 async fn an_assertion_presented_alongside_basic_credentials_is_refused() {
     use base64::engine::general_purpose::STANDARD;
@@ -204,7 +253,7 @@ async fn an_assertion_presented_alongside_basic_credentials_is_refused() {
     srv.register_client(asserting).await.unwrap();
     let service = oauth_as::http::ServiceBuilder::new(Arc::new(srv))
         .with_subject_resolver(|_headers| Some("user-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("service");
 
@@ -256,7 +305,7 @@ async fn an_assertion_presented_alongside_basic_credentials_is_refused() {
 
 /// Percent-encode the few characters the assertion type URN needs. Written out rather than pulled
 /// in, because one `:` and one `/` are the whole requirement.
-#[cfg(feature = "client_assertion")]
+#[cfg(feature = "client-assertion")]
 fn urlencode(raw: &str) -> String {
     raw.chars()
         .map(|c| match c {
@@ -271,7 +320,7 @@ fn urlencode(raw: &str) -> String {
 
 /// KILLS: `http.rs replace && with || in authorize_handler`.
 ///
-/// `if remember && issued.is_ok()` is what makes `ConsentDecision::ApproveAndRemember` the ONLY
+/// `if remember && issued.is_ok()` is what makes `ApprovalDecision::ApproveAndRemember` the ONLY
 /// way a consent record is written. Turned into `||`, a plain `Approve` records one too.
 ///
 /// The variant's own documentation is the specification this violates: remembering "is a statement
@@ -293,7 +342,7 @@ async fn an_approval_that_was_not_remembered_is_not_recorded() {
         .with_subject_resolver(|_headers| Some("user-1".to_string()))
         // Approve, and say nothing about remembering. This is the decision a host makes when the
         // user ticked nothing.
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("service");
 
@@ -362,7 +411,7 @@ async fn a_token_exchange_posted_as_a_form_reaches_the_grant() {
     let srv = Arc::new(srv);
     let service = oauth_as::http::ServiceBuilder::new(Arc::clone(&srv))
         .with_subject_resolver(|_headers| Some("user-1".to_string()))
-        .with_consent_resolver(|_request| ConsentDecision::Approve)
+        .with_approval_resolver(|_request| ApprovalDecision::Approve)
         .build()
         .expect("service");
 

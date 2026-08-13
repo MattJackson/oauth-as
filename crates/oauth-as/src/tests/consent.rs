@@ -39,9 +39,9 @@ fn record(scope: &str, resource: &[&str]) -> ConsentRecord {
 #[test]
 fn a_narrower_request_is_covered() {
     let r = record("read write", &[]);
-    assert!(r.covers(&scopes("read"), &[]));
-    assert!(r.covers(&scopes("read write"), &[]));
-    assert!(r.covers(&ScopeSet::empty(), &[]));
+    assert!(r.covers(&scopes("read"), &[], RequestedDetails::none()));
+    assert!(r.covers(&scopes("read write"), &[], RequestedDetails::none()));
+    assert!(r.covers(&ScopeSet::empty(), &[], RequestedDetails::none()));
 }
 
 /// One scope token more than was approved is NOT covered. This is the whole security content of
@@ -49,8 +49,8 @@ fn a_narrower_request_is_covered() {
 #[test]
 fn one_extra_scope_token_is_not_covered() {
     let r = record("read", &[]);
-    assert!(!r.covers(&scopes("read write"), &[]));
-    assert!(!r.covers(&scopes("admin"), &[]));
+    assert!(!r.covers(&scopes("read write"), &[], RequestedDetails::none()));
+    assert!(!r.covers(&scopes("admin"), &[], RequestedDetails::none()));
 }
 
 /// RFC 8707 s2 makes the resource the audience the token will be good at, so a consent that named
@@ -60,14 +60,60 @@ fn one_extra_scope_token_is_not_covered() {
 #[test]
 fn a_resource_the_consent_never_named_is_not_covered() {
     let none = record("read", &[]);
-    assert!(!none.covers(&scopes("read"), &["https://rs.example/".to_string()]));
+    assert!(!none.covers(
+        &scopes("read"),
+        &["https://rs.example/".to_string()],
+        RequestedDetails::none()
+    ));
 
     let one = record("read", &["https://rs.example/"]);
-    assert!(one.covers(&scopes("read"), &["https://rs.example/".to_string()]));
-    assert!(!one.covers(&scopes("read"), &["https://other.example/".to_string()]));
+    assert!(one.covers(
+        &scopes("read"),
+        &["https://rs.example/".to_string()],
+        RequestedDetails::none()
+    ));
+    assert!(!one.covers(
+        &scopes("read"),
+        &["https://other.example/".to_string()],
+        RequestedDetails::none()
+    ));
     // Naming one of two approved resources is a narrowing, which is covered.
     let two = record("read", &["https://rs.example/", "https://other.example/"]);
-    assert!(two.covers(&scopes("read"), &["https://other.example/".to_string()]));
+    assert!(two.covers(
+        &scopes("read"),
+        &["https://other.example/".to_string()],
+        RequestedDetails::none()
+    ));
+}
+
+/// RFC 9396 section 2 makes the ELEMENT the thing being authorized — an amount, a creditor account,
+/// an `identifier` — and a [`ConsentRecord`] records none of them. So a request carrying any is not
+/// covered, whatever its scope: answering otherwise would let a scope string stand in for a
+/// transaction, which is the one thing RFC 9396 exists because a scope string cannot do.
+#[cfg(feature = "rar")]
+#[test]
+fn a_request_carrying_authorization_details_is_never_covered() {
+    let details = crate::rar::AuthorizationDetails::parse(
+        r#"[{"type":"payment","identifier":"IBAN-1","amount":"50"}]"#,
+    )
+    .expect("the fixture parses");
+    let r = record("read", &[]);
+    // The scope half is satisfied; only the details half decides this.
+    assert!(r.covers(&scopes("read"), &[], RequestedDetails::none()));
+    assert!(
+        !r.covers(&scopes("read"), &[], RequestedDetails::of(&details)),
+        "a remembered consent recorded no authorization detail, so it covers none"
+    );
+}
+
+/// An EMPTY array is the same request as an absent parameter, and must not re-prompt a user for
+/// nothing: `authorization_details=[]` asks for no element at all.
+#[cfg(feature = "rar")]
+#[test]
+fn an_empty_details_array_is_the_same_as_asking_for_none() {
+    let empty = crate::rar::AuthorizationDetails::none();
+    let r = record("read", &[]);
+    assert!(r.covers(&scopes("read"), &[], RequestedDetails::of(&empty)));
 }
 
 /// Widening accumulates rather than replacing: a user who approves `write` today has not withdrawn
@@ -121,6 +167,33 @@ fn acr_values_is_a_space_delimited_ordered_list() {
         vec![Box::<str>::from("urn:mace:silver"), Box::<str>::from("phr")]
     );
     assert!(!req.is_empty());
+}
+
+/// The boundary of [`MAX_ACR_VALUES`], both sides of it. Exactly the cap is stored WHOLE, because
+/// this cap refuses rather than truncates: a shortened list would answer a resource server's
+/// challenge with a class the user never satisfied, or drop the one class the client could meet, and
+/// say nothing. One past the cap is `invalid_request`.
+///
+/// The allocation budget this bound exists for is measured in `tests/allocation_paths.rs`; what is
+/// checked here is the arithmetic of the edge and the error code.
+#[test]
+fn acr_values_is_bounded_and_refuses_rather_than_truncating() {
+    let at_cap = vec!["phr"; MAX_ACR_VALUES].join(" ");
+    let req = AuthenticationRequirement::from_pairs([("acr_values", at_cap.as_str())])
+        .expect("exactly the cap is a legal request");
+    assert_eq!(req.acr_values.len(), MAX_ACR_VALUES);
+
+    let over = vec!["phr"; MAX_ACR_VALUES + 1].join(" ");
+    let err = AuthenticationRequirement::from_pairs([("acr_values", over.as_str())])
+        .expect_err("one past the cap must be refused, not truncated");
+    assert_eq!(err.error, ErrorCode::InvalidRequest);
+
+    // The count is over NON-EMPTY segments, so runs of spaces are not classes and a parameter made
+    // of nothing but separators is not an oversized one.
+    let spaced = format!("{}{}", " ".repeat(1000), at_cap.replace(' ', "   "));
+    let req = AuthenticationRequirement::from_pairs([("acr_values", spaced.as_str())])
+        .expect("separators are not classes");
+    assert_eq!(req.acr_values.len(), MAX_ACR_VALUES);
 }
 
 /// `max_age=0` means re-authenticate NOW. It must not collapse into "absent", which is the reading
@@ -360,4 +433,54 @@ fn the_challenge_escapes_quotes_in_an_acr_value() {
     );
     // Nothing after the escaped value could be read as a new parameter.
     assert_eq!(challenge.matches("error=").count(), 1);
+}
+
+/// THE FINDING. A backslash escape is not available for a control character: RFC 9110 s5.6.4's
+/// `qdtext` excludes `%x00-%x08`, `%x0A-%x1F` and `%x7F`, and `quoted-pair` is `"\" ( HTAB / SP /
+/// VCHAR / obs-text )`, which does not admit them either. So a CR or an LF in an `acr` value cannot
+/// be escaped into a legal `quoted-string`; it can only be removed. `push_quoted` used to pass it
+/// through verbatim, which is header injection out of a value the doc calls escaped.
+///
+/// Reachable: the parameter type here is exactly `AuthenticationRequirement::acr_values`, which
+/// `from_raw` fills straight from the client-supplied `acr_values` query parameter with no
+/// character validation at all, and the point of this helper is that the resource server echoes the
+/// classes back into a header.
+#[test]
+fn the_challenge_cannot_carry_a_header_break() {
+    let challenge = step_up_challenge("Bearer", &["a\r\nX-Evil: 1".into()], None);
+    assert!(!challenge.contains('\r'), "{challenge:?}");
+    assert!(!challenge.contains('\n'), "{challenge:?}");
+    assert!(!challenge.contains('\u{7f}'), "{challenge:?}");
+    // The rest of the value survives: what is dropped is only what cannot be spelled.
+    assert!(
+        challenge.contains("acr_values=\"aX-Evil: 1\""),
+        "{challenge}"
+    );
+}
+
+/// The `scheme` is written into the challenge OUTSIDE any quoted string, so it is the one part of
+/// the output with no escaping available to it at all: a space or a `"` in it forges the whole rest
+/// of the header. RFC 9110 s11.1 makes it a `token`, and anything else is dropped.
+#[test]
+fn the_challenge_scheme_is_a_token() {
+    let challenge = step_up_challenge("Bea rer\r\nX-Evil: 1\"", &["phr".into()], None);
+    // `:` and SP are not `tchar` either, so what is left of the injected header name is the part
+    // that happened to be spellable. It is now inside the scheme, where it names nothing.
+    assert!(challenge.starts_with("BearerX-Evil1 error="), "{challenge}");
+    assert!(!challenge.contains('\r'), "{challenge:?}");
+    assert!(!challenge.contains('\n'), "{challenge:?}");
+    assert_eq!(challenge.matches('"').count(), 6, "{challenge}");
+}
+
+/// Every byte a legal `quoted-string` DOES admit survives, because dropping one would rename the
+/// class and challenge for something the host never defined. `obs-text` (`%x80-%xFF`) is included,
+/// which for a Rust `str` means every non-ASCII scalar value.
+#[test]
+fn the_challenge_keeps_everything_that_is_spellable() {
+    let value = "urn:acr:\tsecure level-3 \u{e9}\u{7ff}";
+    let challenge = step_up_challenge("Bearer", &[value.into()], None);
+    assert!(
+        challenge.contains(&format!("acr_values=\"{value}\"")),
+        "{challenge}"
+    );
 }

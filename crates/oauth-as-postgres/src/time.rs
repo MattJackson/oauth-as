@@ -15,6 +15,14 @@
 //! operator can look, which is why saturating at the ends of the range below is safe: a clamped
 //! value can at worst make the sweep reach a record early or late, never hand back a record whose
 //! deadline differs from the one the server wrote.
+//!
+//! THE REVOCATION BARRIER TABLE IS THE EXCEPTION. `oauth_as_revocation_barriers` has no `payload`:
+//! `recorded_at_ns` IS the value, compared directly by the `GREATEST(...)` upsert and by
+//! `barrier_covers`. For that table a clamp would change a refusal decision rather than a sweep
+//! boundary. It is safe anyway, for a reason this module does not otherwise depend on: no instant
+//! this crate produces falls outside 1677..2262, because barriers are derived from the host clock
+//! plus a configured window, and `to_nanos` saturates rather than wrapping. If either ever stops
+//! holding, this table is where it bites first.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

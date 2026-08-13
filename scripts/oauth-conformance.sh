@@ -24,8 +24,9 @@
 #     killed;
 #   * honor OAUTH_AS_CONFORMANCE_SEED=1 by seeding the deterministic conformance clients and
 #     auto-approval behavior described in crates/oauth-as-conformance/src/lib.rs.
-#   That shim DOES NOT EXIST YET; until it does, --check fails loudly rather than passing
-#   vacuously, and the README's maturity section says so in plain words.
+#   That shim EXISTS (crates/oauth-as/conformance-serve.sh) and is executable. The `-x` check
+#   below still gates on its presence rather than assuming it, so a tree that loses it fails
+#   loudly rather than passing vacuously.
 #
 # Backgrounded servers ALWAYS get their stdout/stderr redirected to a log file, never
 # captured via command substitution (a hard-won lesson: substitution hangs until the

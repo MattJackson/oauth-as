@@ -40,11 +40,19 @@
 //! That has one visible consequence, and it is a deliberate deviation worth stating rather than
 //! burying. RFC 7592 section 3 lists `registration_access_token` (and, for a confidential client,
 //! `client_secret`) as members of the client information response, which the read and update
-//! responses of sections 2.1 and 2.2 also use. This server cannot return either on a read or an
-//! update, because it does not have them: it kept a verifier, not the credential. Both are
-//! returned exactly once, by the registration that minted them, and after that the client holds
-//! the only copy. The alternative is storing two live bearer credentials in plaintext for the
-//! lifetime of every registration, which is the thing [`crate::client::SecretHash`] exists to stop.
+//! responses of sections 2.1 and 2.2 also use. This server cannot ECHO either one, because it does
+//! not have them: it kept a verifier, not the credential. A credential appears in a response
+//! exactly once, in the response that MINTED it, and after that the client holds the only copy. The
+//! alternative is storing two live bearer credentials in plaintext for the lifetime of every
+//! registration, which is the thing [`crate::client::SecretHash`] exists to stop.
+//!
+//! So a read (section 2.1) returns neither, and an update (section 2.2) returns no
+//! `registration_access_token` — this server never rotates that one, so there is never a new one to
+//! hand back. An update DOES return a `client_secret` in one case, and only that case: when the
+//! updated metadata moves the client from `token_endpoint_auth_method: none` to a method that needs
+//! a secret, [`AuthorizationServer::update_registration`] mints one, because a client that has just
+//! become confidential and was told nothing would be a client that can no longer authenticate at
+//! all. That is a mint, not an echo, and it obeys the same once-only rule as the rest.
 //!
 //! # What is NOT implemented, and why
 //!
@@ -60,7 +68,7 @@
 //!   server renders no branded consent screen, so storing them would be storing
 //!   attacker-supplied strings for no purpose.
 //! - `jwks` and `jwks_uri` (RFC 7591 section 2), and this one is a GAP rather than a decision.
-//!   The crate does RFC 7523 client assertions under the `client_assertion` feature, so a key
+//!   The crate does RFC 7523 client assertions under the `client-assertion` feature, so a key
 //!   registered here would be a key the token endpoint could use; modelling these two members is
 //!   most of what it would take to make `private_key_jwt` registrable, and it is not done. Until
 //!   it is, a `private_key_jwt` client is one the HOST provisions out of band, and asking to
@@ -70,6 +78,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash};
+use crate::events::ClientAuthFailure;
 use crate::grant::GrantType;
 use crate::scope::ScopeSet;
 use crate::server::{AuthorizationServer, Clock, ServerConfig};
@@ -306,6 +315,25 @@ impl std::fmt::Display for RegistrationFailure {
 }
 
 impl std::error::Error for RegistrationFailure {}
+
+/// The refusal a randomness failure becomes on these two endpoints.
+///
+/// RFC 7591 registration and RFC 7592 management are ORDINARY ROUTES (`POST /register`,
+/// `PUT /register/{id}`), so a `getrandom` that will not answer — an exhausted descriptor table, a
+/// seccomp policy, a container without the syscall — has to become a refusal here exactly as it
+/// does at the token and authorization endpoints. Through 0.9.0 these four draws used the
+/// panicking `random_hex`, on the strength of a comment asserting they were "outside the request
+/// path"; they never were.
+///
+/// [`RegistrationFailure::Storage`] is the crate's 500, and it is the honest answer for the same
+/// reason `crate::server::randomness_error` collapses onto RFC 6749 section 5.2 `server_error`: the
+/// caller must learn only that this server could not fulfil the request and that retrying later is
+/// the right response. The message says which internal condition it was, for the host's own logs.
+fn randomness_failure() -> RegistrationFailure {
+    RegistrationFailure::Storage(StorageError::new(
+        "the OS would not provide randomness for a registration artifact",
+    ))
+}
 
 /// What the host's [`RegistrationPolicy`] is told about one attempt.
 ///
@@ -754,6 +782,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ) -> Result<ClientInformation, RegistrationFailure> {
         let config = self.registration_config()?;
 
+        // THE HOST'S THROTTLE, before the host's policy and before anything is read or written.
+        //
+        // This endpoint is the one place in the crate where a caller's request becomes a PERMANENT
+        // row: a `Client` has no expiry and `Storage::sweep_expired` never reclaims one, so an
+        // unthrottled registration endpoint is not a burst a deployment rides out, it is growth
+        // that does not come back. RFC 7591 section 5 says the same thing in prose — an open
+        // registration endpoint is available to anyone on the internet — and a `RegistrationPolicy`
+        // is a decision about CONTENT, which is the wrong instrument for volume.
+        //
+        // The refusal is `Unauthorized`, the same answer the policy refusal below gives, and
+        // deliberately so: those two must not be distinguishable, or a caller learns from the wire
+        // whether it was the content or the rate that stopped them. No event is emitted, because
+        // there is no `client_id` to name and the audit vocabulary here is about credentials.
+        let limited = crate::events::Attempt::ClientRegistration;
+        if self.hooks().check(limited) == crate::events::RateLimitDecision::Deny {
+            return Err(RegistrationFailure::Unauthorized);
+        }
+
         // The host decides, FIRST, before anything is validated or written. With no policy
         // installed the answer is no: see [`RegistrationPolicy`] and RFC 7591 section 5. The
         // refusal is deliberately indistinguishable from a bad initial access token, because a
@@ -764,21 +810,51 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
         match self.hooks().registration_policy() {
             Some(policy) if policy.authorize(&attempt) == RegistrationDecision::Allow => {}
-            _ => return Err(RegistrationFailure::Unauthorized),
+            _ => {
+                // `None`: no client id has been minted yet, and none is minted for a refusal.
+                self.hooks()
+                    .emit(|| crate::events::Event::ClientRegistrationRefusedByPolicy {
+                        client_id: None,
+                    });
+                self.hooks()
+                    .record(limited, crate::events::AttemptOutcome::Failed);
+                return Err(RegistrationFailure::Unauthorized);
+            }
         }
 
-        let registered = validate(metadata, config)?;
+        // Reported as a FAILURE, which is what a limiter counting abuse rather than traffic wants:
+        // a caller submitting documents this server refuses is the shape of somebody probing for
+        // what the policy and the validator will accept.
+        let registered = match validate(metadata, config) {
+            Ok(registered) => registered,
+            Err(refusal) => {
+                self.hooks()
+                    .record(limited, crate::events::AttemptOutcome::Failed);
+                return Err(refusal);
+            }
+        };
 
         let now = crate::server::unix_seconds(self.now());
-        let client_id = ClientId::new(crate::server::random_hex(16));
-        let secret = (registered.token_endpoint_auth_method != AUTH_METHOD_NONE)
-            .then(|| crate::server::random_hex(32));
+        // `?` rather than a panic, for the reason `randomness_failure` gives: this is an
+        // unauthenticated HTTP route, and a library that aborts its host's request handler because
+        // the OS would not hand over sixteen bytes is worse than one that answers 500.
+        let client_id =
+            ClientId::new(crate::server::try_random_hex(16).ok_or_else(randomness_failure)?);
+        let secret = if registered.token_endpoint_auth_method != AUTH_METHOD_NONE {
+            Some(crate::server::try_random_hex(32).ok_or_else(randomness_failure)?)
+        } else {
+            None
+        };
         let secret_expires_at = secret.as_ref().map(|_| match config.client_secret_ttl {
             // RFC 7591 section 3.2.1: 0 means the secret never expires.
             None => 0,
-            Some(ttl) => now.unwrap_or_default() + ttl.as_secs(),
+            // `saturating_add`: plain `+` panics in debug and, worse, WRAPS in release, which
+            // would report a freshly minted secret as already expired. A host-set TTL is not
+            // validated anywhere, so the ceiling is the honest answer.
+            Some(ttl) => now.unwrap_or_default().saturating_add(ttl.as_secs()),
         });
-        let registration_access_token = crate::server::random_hex(32);
+        let registration_access_token =
+            crate::server::try_random_hex(32).ok_or_else(randomness_failure)?;
 
         let client = Client {
             client_id: client_id.clone(),
@@ -805,11 +881,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .await
             .map_err(RegistrationFailure::Storage)?;
 
-        // Emitted AFTER the write: a registration that failed to persist did not happen.
+        // Emitted AFTER the write: a registration that failed to persist did not happen. The
+        // outcome is reported on the same terms, and for the same reason: the row exists now.
         self.hooks()
             .emit(|| crate::events::Event::ClientRegistered {
                 client_id: client_id.as_str(),
             });
+        self.hooks()
+            .record(limited, crate::events::AttemptOutcome::Succeeded);
 
         Ok(ClientInformation {
             client_id: client_id.as_str().to_string(),
@@ -851,7 +930,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// known client with the wrong token are distinguishable by wall time. The comparison itself
     /// leaks nothing (see [`SecretHash::verify`]); equalising the two paths is the host's business,
     /// and this is a management endpoint the host is expected to throttle anyway.
-    async fn authenticate_registration(
+    ///
+    /// What the WIRE will not say, the AUDIT CHANNEL does. Each of the three refusals emits
+    /// [`crate::events::Event::ClientRegistrationAuthenticationFailed`] naming which one it was,
+    /// for the same reason the token plane separates its refusals: the host is not the attacker,
+    /// and it cannot notice somebody guessing registration access tokens if the only record of the
+    /// guess is a `401` that looks like every other `401`. That matters more here than on the token
+    /// plane, because RFC 7592 section 2.2 lets a landed guess rewrite `redirect_uris`.
+    /// `pub(crate)` for ONE caller and one reason: `crate::http`'s RFC 7592 `PUT` handler runs it
+    /// before it parses the request body, so an unauthenticated caller cannot buy a
+    /// `MAX_BODY_BYTES` JSON parse per request. `update_registration` below still authenticates for
+    /// itself, because a check performed by a caller is not a check the method may assume.
+    pub(crate) async fn authenticate_registration(
         &self,
         client_id: &ClientId,
         registration_access_token: &str,
@@ -860,24 +950,55 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         if !config.management_enabled {
             return Err(RegistrationFailure::Disabled);
         }
-        let client = self
+        let found = self
             .store()
             .get_client(client_id)
             .await
-            .map_err(RegistrationFailure::Storage)?
-            .ok_or(RegistrationFailure::Unauthorized)?;
-        let registration = client
-            .registration
-            .as_deref()
-            .cloned()
-            .ok_or(RegistrationFailure::Unauthorized)?;
+            .map_err(RegistrationFailure::Storage)?;
+        let client = match found {
+            Some(client) => client,
+            None => {
+                return Err(
+                    self.registration_auth_failed(client_id, ClientAuthFailure::UnknownClient)
+                )
+            }
+        };
+        let registration = match client.registration.as_deref() {
+            Some(registration) => registration.clone(),
+            // A client the host provisioned itself. Reported apart from an unknown id because it
+            // says the id was real, which is what an operator needs to see the probe for.
+            None => {
+                return Err(self
+                    .registration_auth_failed(client_id, ClientAuthFailure::NoDynamicRegistration))
+            }
+        };
         if !registration
             .registration_access_token_hash
             .verify(registration_access_token, self.hooks().secret_verifier())
         {
-            return Err(RegistrationFailure::Unauthorized);
+            return Err(self.registration_auth_failed(client_id, ClientAuthFailure::SecretMismatch));
         }
         Ok((client, registration))
+    }
+
+    /// Report one refused management authentication and answer with the single wire failure all
+    /// three share.
+    ///
+    /// The presented token is NOT a parameter, and that is deliberate rather than incidental: it
+    /// cannot be logged by a later edit to this function because it is not here to log. See the
+    /// rule in the [`crate::events`] module docs.
+    fn registration_auth_failed(
+        &self,
+        client_id: &ClientId,
+        failure: ClientAuthFailure,
+    ) -> RegistrationFailure {
+        self.hooks().emit(
+            || crate::events::Event::ClientRegistrationAuthenticationFailed {
+                client_id: client_id.as_str(),
+                failure,
+            },
+        );
+        RegistrationFailure::Unauthorized
     }
 
     /// RFC 7592 section 2.1: read a registration.
@@ -918,6 +1039,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// `client_id` cannot be changed (section 2.2), and the grant and scope ceilings of
     /// [`RegistrationConfig`] apply again, so an update cannot reach anything a fresh registration
     /// could not.
+    ///
+    /// The response carries a `client_secret` in exactly one case: an update that moves the client
+    /// from `token_endpoint_auth_method: none` to a method that needs one MINTS a secret, and this
+    /// is the only response other than the original registration that ever carries a live
+    /// credential. It is never an ECHO of an existing secret, which this server does not hold; see
+    /// the module docs.
     pub async fn update_registration(
         &self,
         client_id: &ClientId,
@@ -946,7 +1073,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
         match self.hooks().registration_policy() {
             Some(policy) if policy.authorize(&attempt) == RegistrationDecision::Allow => {}
-            _ => return Err(RegistrationFailure::Unauthorized),
+            _ => {
+                // The caller HAS authenticated here, with a registration access token this server
+                // just verified, and is being refused anyway. See the event's own docs on why that
+                // is a different thing from a failed authentication.
+                self.hooks()
+                    .emit(|| crate::events::Event::ClientRegistrationRefusedByPolicy {
+                        client_id: Some(client_id.as_str()),
+                    });
+                return Err(RegistrationFailure::Unauthorized);
+            }
         }
 
         let registered = validate(metadata, config)?;
@@ -955,7 +1091,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // mints one; this is the only path other than registration itself that can produce one.
         let wants_secret = registered.token_endpoint_auth_method != AUTH_METHOD_NONE;
         let had_secret = client.auth.is_confidential();
-        let new_secret = (wants_secret && !had_secret).then(|| crate::server::random_hex(32));
+        // `?` for the reason `randomness_failure` gives; RFC 7592 s2.2 is a routed `PUT` and this
+        // is the only path other than registration itself that mints a secret.
+        let new_secret = if wants_secret && !had_secret {
+            Some(crate::server::try_random_hex(32).ok_or_else(randomness_failure)?)
+        } else {
+            None
+        };
         let auth = match (&new_secret, wants_secret) {
             (Some(s), _) => ClientAuth::ConfidentialSecretHash {
                 hash: SecretHash::sha256(s),
@@ -970,7 +1112,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             (Some(_), _) => Some(match config.client_secret_ttl {
                 None => 0,
                 Some(ttl) => {
-                    crate::server::unix_seconds(self.now()).unwrap_or_default() + ttl.as_secs()
+                    // Same saturating add as the mint path above, for the same reason.
+                    crate::server::unix_seconds(self.now())
+                        .unwrap_or_default()
+                        .saturating_add(ttl.as_secs())
                 }
             }),
             (None, true) => registration.client_secret_expires_at,
@@ -993,10 +1138,39 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             name: registered.client_name.clone(),
             registration: Some(Box::new(updated_registration.clone())),
         };
-        self.store()
-            .put_client(updated.clone())
+        // COMPARE-AND-SWAP, not a blind put. This function read the registration at its top, then
+        // awaited a policy decision and a validation pass before arriving here, and a concurrent
+        // RFC 7592 section 2.3 delete anywhere in that window used to be UNDONE by this write: the
+        // client came back with its old credential and its old `registration_access_token_hash`,
+        // which makes deleting a compromised registration defeatable by whoever holds the stolen
+        // token. `client` is exactly what was read, so it is the expectation; a store that no
+        // longer holds it refuses, and the deletion stands.
+        //
+        // The refusal is `Unauthorized` rather than a storage error, because by the time this
+        // returns false the caller's registration access token names a registration that no
+        // longer exists. That is the same answer `authenticate_registration` gives for an unknown
+        // client, which is what this now is.
+        //
+        // NO AUDIT EVENT, and the absence is the fix rather than an omission. This used to report
+        // `ClientAuthFailure::UnknownClient` on the management plane, which is a claim that an
+        // AUTHENTICATION FAILED — and the authentication did not fail: reaching this line requires
+        // `authenticate_registration` above to have SUCCEEDED, so the caller presented a
+        // registration access token this server verified. The only ways here are a concurrent
+        // section 2.3 delete and a second concurrent update, neither of which is a credential
+        // guess. `Event::ClientRegistrationAuthenticationFailed` is the one signal a host has for
+        // somebody guessing registration access tokens (see its docs on what a landed guess buys an
+        // attacker), and a deployment whose own racing clients emit it is a deployment that has
+        // learned to ignore it. What an operator sees instead is exactly what happened: a
+        // `ClientRegistrationDeleted` (or another `ClientRegistrationUpdated`) from the request that
+        // won, and no `ClientRegistrationUpdated` from this one.
+        let applied = self
+            .store()
+            .compare_and_swap_client(&client, updated.clone())
             .await
             .map_err(RegistrationFailure::Storage)?;
+        if !applied {
+            return Err(RegistrationFailure::Unauthorized);
+        }
         self.hooks()
             .emit(|| crate::events::Event::ClientRegistrationUpdated {
                 client_id: client_id.as_str(),
@@ -1030,8 +1204,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ) -> Result<(), RegistrationFailure> {
         self.authenticate_registration(client_id, registration_access_token)
             .await?;
+        // The barrier deadline comes from the server's own token lifetimes: a deletion has to
+        // refuse not just the records that exist now but anything an issuance already in flight
+        // for this client is about to write. See `revocation_window`.
         self.store()
-            .delete_client(client_id)
+            .delete_client(client_id, self.revocation_window())
             .await
             .map_err(RegistrationFailure::Storage)?;
         self.hooks()
@@ -1044,14 +1221,35 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
 /// RFC 7592 section 3 `registration_client_uri`: `{registration_endpoint}/{client_id}`.
 ///
-/// The client id is a 32-character hex string this server minted, so it carries nothing that needs
-/// percent-encoding here.
+/// THE ID IS ESCAPED, and until the 0.9.1 audit this was a bare `format!` justified by the ids this
+/// server MINTS being 32 hex characters. That justification only ever covered the dynamic path:
+/// `read_registration` and `update_registration` mint this URL for whatever client the caller
+/// authenticated as, and a host that provisioned a client through `register_client` chose its own
+/// id. A space, a `?` or a `#` in one produced a `registration_client_uri` that is not a URL, and a
+/// slash produced one that names a different resource; the client uses the value verbatim, so the
+/// escaping has to happen where the URL is built.
+///
+/// RFC 3986 section 3.3: everything outside `unreserved` is percent-encoded, which is stricter than
+/// `pchar` allows and is the safe direction. `crate::http`'s `decode_path_segment` decodes the
+/// segment on the way back in, so the round trip is exact.
 fn registration_client_uri(
     config: &RegistrationConfig,
     server: &ServerConfig,
     client_id: &str,
 ) -> String {
-    format!("{}/{client_id}", config.endpoint(&server.issuer))
+    let endpoint = config.endpoint(&server.issuer);
+    let mut url = String::with_capacity(endpoint.len() + 1 + client_id.len());
+    url.push_str(&endpoint);
+    url.push('/');
+    for byte in client_id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                url.push(byte as char)
+            }
+            other => url.push_str(&format!("%{other:02X}")),
+        }
+    }
+    url
 }
 
 #[cfg(test)]

@@ -50,6 +50,17 @@ pub const JAR_ID: &str = "fuzz-jar";
 /// The one registered redirect URI. Anything else must be refused.
 pub const REDIRECT_URI: &str = "https://app.example/cb";
 
+/// Every scope a fixture client is ALLOWED to request.
+pub const ALLOWED_SCOPES: &str = "read write";
+
+/// The scope a fixture client is granted when a request names NONE (RFC 6749 s3.3 leaves that to
+/// the server, and this crate fills in the registration's default).
+///
+/// A PROPER SUBSET of [`ALLOWED_SCOPES`], and it has to stay one: targets assert that a signed
+/// `scope` claim is carried through rather than replaced by this, and if the two were equal that
+/// assertion would hold for a validator that always substituted the default.
+pub const DEFAULT_SCOPE: &str = "read";
+
 /// The RFC 7636 appendix B code verifier and the S256 challenge it hashes to. Quoted from the RFC
 /// so that a seed built from them is a seed built from the specification's own bytes.
 pub const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -121,7 +132,7 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fn scopes() -> ScopeSet {
-    ScopeSet::parse("read write").expect("fixture scopes are RFC 6749 s3.3 tokens")
+    ScopeSet::parse(ALLOWED_SCOPES).expect("fixture scopes are RFC 6749 s3.3 tokens")
 }
 
 fn client(id: &str, auth: ClientAuth, grant_types: Vec<GrantType>) -> Client {
@@ -131,7 +142,7 @@ fn client(id: &str, auth: ClientAuth, grant_types: Vec<GrantType>) -> Client {
         grant_types,
         redirect_uris: vec![REDIRECT_URI.to_string()],
         allowed_scopes: scopes(),
-        default_scopes: ScopeSet::parse("read").expect("fixture default scope"),
+        default_scopes: ScopeSet::parse(DEFAULT_SCOPE).expect("fixture default scope"),
         name: None,
         registration: None,
     }
@@ -225,7 +236,7 @@ pub fn fixture() -> &'static Fixture {
         // target would be fuzzing a 500 responder.
         let service = ServiceBuilder::new(std::sync::Arc::clone(server()))
             .with_subject_resolver(|_headers| Some("fuzz-subject".to_string()))
-            .with_consent_resolver(|_req| oauth_as::http::ConsentDecision::Approve)
+            .with_approval_resolver(|_req| oauth_as::http::ApprovalDecision::Approve)
             // CSRF TOKENS, and this one was FOUND rather than foreseen. Without them
             // `ServiceBuilder` leaves the RFC 8628 s3.3 verification page in its `Unwired` state,
             // which answers every GET with a deliberate 500 saying the host never supplied a CSRF
@@ -246,13 +257,28 @@ pub fn fixture() -> &'static Fixture {
             .build()
             .expect("the fixture configuration routes without collision");
 
-        // The two paths the RFC 8414 document does NOT name: its own location (RFC 8414 s3.1
-        // puts the well-known string between the host and the issuer's path, so it is not a
-        // member of the document it locates) and the device verification page, which is a
-        // `ServerConfig` value rather than an RFC 8414 member.
+        // The paths the RFC 8414 document does NOT name, which is the floor the derivation below
+        // cannot discover for itself:
+        //
+        // - the document's own location. RFC 8414 s3.1 puts the well-known string between the host
+        //   and the issuer's path, so it is not a member of the document it locates.
+        // - the device verification page, which is a `ServerConfig` value rather than an RFC 8414
+        //   member.
+        // - `/introspect`. THE ROUTE IS UNCONDITIONAL AND THE ADVERTISEMENT IS NOT, as of 0.9.1.
+        //   `ServiceBuilder::build` mounts the introspection route whether or not the host named
+        //   `ServerConfig::introspection_endpoint`, because the endpoint answers the token's own
+        //   client and always has; `from_config` publishes the member only where the host named it,
+        //   because advertising it claims a resource-server channel that does not exist until
+        //   0.9.2. This fixture does not name one, so the document omits it and the route serves
+        //   it. The fuzzer found exactly that gap -- `GET /introspect` answered non-404 while this
+        //   oracle called it unrouted -- and it was a defect in the ORACLE, not in the server.
+        //
+        // The lesson for anyone adding a route: if advertisement and routing can disagree, this
+        // list is where the disagreement has to be written down.
         let mut paths = vec![
             "/.well-known/oauth-authorization-server".to_string(),
             "/device".to_string(),
+            "/introspect".to_string(),
         ];
         // The metadata document is the authority on what is routed. Anything it advertises that
         // is on this issuer is a path, and the list above is only a floor.

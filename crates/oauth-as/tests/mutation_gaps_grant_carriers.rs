@@ -194,12 +194,9 @@ async fn a_device_poll_asking_for_authorization_details_is_refused_rather_than_i
                 client_secret: Some(DEVICE_SECRET.to_string()),
                 device_code: authorized.device_code.clone(),
             },
-            TokenRequestContext {
-                authorization_details: Some(
-                    r#"[{"type":"payment_initiation","actions":["initiate"]}]"#,
-                ),
-                ..Default::default()
-            },
+            TokenRequestContext::default().with_authorization_details(
+                r#"[{"type":"payment_initiation","actions":["initiate"]}]"#,
+            ),
         )
         .await
         .expect_err("a device grant granted no details, so there is nothing to narrow to");

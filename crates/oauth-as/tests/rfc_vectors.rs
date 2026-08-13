@@ -59,4 +59,54 @@ fn rfc7636_challenge_is_unpadded_base64url_of_a_32_byte_digest() {
     assert!(c
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+
+    // THE PART THIS TEST'S NAME AND DOC ALWAYS CLAIMED, and did not do until the 0.9.1 audit
+    // found it. The three assertions above are satisfied by ANY 43-character base64url string, so
+    // this test passed while proving nothing about the digest. That mattered more than it looks:
+    // `rfc7636_appendix_b_s256_derivation` compares the implementation against the constant at the
+    // top of this file, and `verify_s256` is the same code path, so corrupting
+    // `code_challenge_s256` and "updating" the constant to match would have shipped green through
+    // the whole in-crate suite. This crate's headline PKCE claim (`Cargo.toml`, `lib.rs`: "verified
+    // against the RFC's appendix B vector") rested on a guard that was inert.
+    //
+    // The digest below is RFC 7636 appendix B's own byte sequence, and the decoder is written out
+    // here on purpose: decoding with the crate's own base64 would compare the implementation
+    // against itself, which is the tautology the doc says this exists to avoid.
+    let decoded = decode_base64url(&c);
+    assert_eq!(
+        decoded, RFC7636_APPENDIX_B_DIGEST,
+        "the challenge must decode to appendix B's SHA-256 of the verifier, byte for byte"
+    );
+}
+
+/// RFC 7636 appendix B: `SHA-256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")`, as bytes.
+const RFC7636_APPENDIX_B_DIGEST: [u8; 32] = [
+    19, 211, 30, 150, 26, 26, 216, 236, 47, 22, 177, 12, 76, 152, 46, 8, 118, 168, 120, 173, 109,
+    241, 68, 86, 110, 225, 137, 74, 203, 112, 249, 195,
+];
+
+/// An unpadded base64url decoder written for this test alone.
+///
+/// Deliberately NOT the crate's decoder: the point is to check the crate's output against the RFC
+/// with something that shares no code with it. A bug common to both would otherwise cancel out and
+/// the comparison would pass.
+fn decode_base64url(s: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::new();
+    for ch in s.bytes() {
+        let value = ALPHABET
+            .iter()
+            .position(|a| *a == ch)
+            .unwrap_or_else(|| panic!("{ch:?} is not a base64url character"))
+            as u32;
+        acc = (acc << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
 }

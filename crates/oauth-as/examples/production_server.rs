@@ -64,7 +64,7 @@ use oauth_as::client::{Client, ClientAuth, ClientId, SecretHash};
 use oauth_as::events::{Event, EventSink};
 use oauth_as::grant::GrantType;
 use oauth_as::http::{
-    AuthorizationService, Body, ConsentDecision, ConsentRequest, Response, ServiceBuilder,
+    ApprovalDecision, ApprovalRequest, AuthorizationService, Body, Response, ServiceBuilder,
 };
 use oauth_as::rate_limit::{FixedWindowRateLimiter, RateLimitConfig};
 use oauth_as::scope::ScopeSet;
@@ -159,9 +159,10 @@ impl EventSink for StderrEventSink {
                 client_id,
                 family_id,
                 records_revoked,
+                containment_failed,
             } => eprintln!(
                 "ALERT refresh_token_reuse client={client_id} family={family_id} \
-                 revoked={records_revoked}"
+                 revoked={records_revoked} containment_failed={containment_failed}"
             ),
             Event::AuthorizationCodeReplayDetected {
                 client_id,
@@ -356,22 +357,22 @@ fn approval_key(client_id: &str, scope: &ScopeSet) -> String {
 ///
 /// # How this one works
 ///
-/// First arrival: no approval on file, so it returns [`ConsentDecision::Respond`] with a page
+/// First arrival: no approval on file, so it returns [`ApprovalDecision::Respond`] with a page
 /// naming the client and the scope and carrying a session-bound CSRF token. The user posts it to
 /// `/consent`, the host records a ONE-SHOT approval and redirects back to the identical
 /// authorization request, and this resolver finds the approval, SPENDS it, and approves.
 ///
 /// One-shot matters. An approval left on file would let a later cross-site navigation ride it
 /// without the user being asked, which reopens exactly the hole above. A host that wants "do not
-/// ask me again" turns on the `consent` feature and returns `ConsentDecision::ApproveAndRemember`
+/// ask me again" turns on the `consent` feature and returns `ApprovalDecision::ApproveAndRemember`
 /// instead, so that the remembering is recorded as the user's deliberate choice, is visible to
 /// them, and can be withdrawn, rather than being an accident of cache lifetime.
-fn consent_resolver(state: &Arc<HostState>, request: &ConsentRequest<'_>) -> ConsentDecision {
+fn consent_resolver(state: &Arc<HostState>, request: &ApprovalRequest<'_>) -> ApprovalDecision {
     let sid = match session_id(request.headers) {
         Some(sid) => sid,
         // The subject resolver already refused this case, so reaching it would mean the two seams
         // disagree about what a session is. Refusing is the only safe answer to that.
-        None => return ConsentDecision::Deny,
+        None => return ApprovalDecision::Deny,
     };
 
     let key = approval_key(request.client_id.as_str(), request.scope);
@@ -381,14 +382,14 @@ fn consent_resolver(state: &Arc<HostState>, request: &ConsentRequest<'_>) -> Con
             if let Some(index) = pending.iter().position(|k| *k == key) {
                 // SPENT here, not merely read: see the one-shot argument above.
                 pending.swap_remove(index);
-                return ConsentDecision::Approve;
+                return ApprovalDecision::Approve;
             }
         }
     }
 
     let token = match csrf_issue(state, request.headers) {
         Some(token) => token,
-        None => return ConsentDecision::Deny,
+        None => return ApprovalDecision::Deny,
     };
 
     // `request.uri` is the whole authorization request, so posting it back and redirecting to it
@@ -400,7 +401,7 @@ fn consent_resolver(state: &Arc<HostState>, request: &ConsentRequest<'_>) -> Con
         &request.uri.to_string(),
         &token,
     );
-    ConsentDecision::Respond(Box::new(html(StatusCode::OK, page)))
+    ApprovalDecision::Respond(Box::new(html(StatusCode::OK, page)))
 }
 
 /// The consent screen. Deliberately plain: what matters is that it names the client, lists the
@@ -486,7 +487,7 @@ fn consent_submit(state: &Arc<HostState>, headers: &HeaderMap, body: &[u8]) -> R
 
     if form.get("action").map(String::as_str) != Some("allow") {
         // A refusal records nothing. A host that would rather answer the CLIENT immediately
-        // returns `ConsentDecision::Deny` from the resolver instead, which is RFC 6749 s4.1.2.1
+        // returns `ApprovalDecision::Deny` from the resolver instead, which is RFC 6749 s4.1.2.1
         // `access_denied` at the client's registered redirect URI.
         return html(
             StatusCode::OK,
@@ -737,7 +738,11 @@ fn dev_login_handler(state: &Arc<HostState>, query: &str) -> Response {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = std::env::var("OAUTH_AS_ADDR").unwrap_or_else(|_| "127.0.0.1:8915".to_string());
+    // 8916, and not 8915, because `examples/protected_resource_fixture.rs` binds 8915 and
+    // `examples/conformance_server.rs` binds 8914. A reader running this AS alongside either of
+    // those, which is what their own docs tell them to do, must not hit a bind conflict here and
+    // must not be tempted to resolve one by moving the RFC 9728 fixture onto the issuer's origin.
+    let addr = std::env::var("OAUTH_AS_ADDR").unwrap_or_else(|_| "127.0.0.1:8916".to_string());
     // RFC 8414 s3.3: the issuer MUST be the URL the metadata document is fetched from. A real
     // deployment behind TLS sets this to its https origin from CONFIGURATION, never from a
     // request header: an issuer taken from `Host` is an issuer an attacker can choose, and every
@@ -795,12 +800,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // that can see a client address, should put its own limiter behind the same `RateLimiter`
         // trait and keep this one underneath as a backstop.
         //
-        // The window is shortened from the default because a shorter window narrows the
-        // fixed-window boundary artefact (a burst straddling the boundary can land up to twice the
-        // budget). The budgets themselves are left at the crate's defaults, which that module
-        // derives from the actual guessing arithmetic rather than picking round numbers.
+        // EVERY knob is left at the crate's default, and that is the point rather than laziness:
+        // a budget is the PAIR (capacity, window), so moving either half alone moves the rate.
+        // The defaults give AT MOST 20 WRONG user code entries per minute per process (200 units
+        // per 60 second window, each failure costing 1 + 9 = 10), which is the number
+        // `oauth_as::rate_limit`'s RFC 8628 s5.1 arithmetic is derived from: 200 guesses inside
+        // the 600 second code lifetime. Shortening the window to 30 seconds while leaving the
+        // capacity at 200 would have doubled that to 40 a minute and 400 a lifetime, and it would
+        // not have bought anything back: the fixed-window boundary artefact is a burst of up to
+        // twice the budget either way, it would simply land in half the time.
+        //
+        // A deployment that wants a TIGHTER ceiling moves the capacity, with
+        // `RateLimitConfig::with_device_user_code_budget`, and reads the module docs' scaling
+        // rule first: the expected-hit odds scale linearly with the capacity and with the size of
+        // the live-grant pool.
         .with_rate_limiter(Box::new(FixedWindowRateLimiter::with_config(
-            RateLimitConfig::default().with_window(Duration::from_secs(30)),
+            RateLimitConfig::default(),
         )));
     let server = Arc::new(server);
 
@@ -820,7 +835,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Obligation 5. Reads a server-minted session, never a caller-supplied header.
             .with_subject_resolver(move |headers| subject_resolver(&subject_state, headers))
             // Obligation 3. Never returns `Approve` on first sight of a request.
-            .with_consent_resolver(move |request| consent_resolver(&consent_state, request))
+            .with_approval_resolver(move |request| consent_resolver(&consent_state, request))
             // Obligation 4. Both halves, session bound, single use.
             .with_csrf_tokens(
                 move |headers| csrf_issue(&issue_state, headers),
@@ -992,7 +1007,7 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// An HTML response in the type [`ConsentDecision::Respond`] carries: a plain `http::Response`,
+/// An HTML response in the type [`ApprovalDecision::Respond`] carries: a plain `http::Response`,
 /// which is the one HTTP vocabulary every Rust server agrees on.
 fn html(status: StatusCode, body: String) -> Response {
     let mut response = Response::new(Body::from(body));

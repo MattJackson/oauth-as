@@ -27,17 +27,19 @@
 
 mod support;
 
+use oauth_as::consent::RequestedDetails;
 use oauth_as::server::UserApproval;
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
 use oauth_as::{
-    Authentication, ClientId, Event, EventSink, IntrospectionResponse, ScopeSet, Storage,
+    Authentication, ClientId, Clock, Event, EventSink, IntrospectionResponse, ScopeSet, Storage,
     TokenRequest, TokenTypeHint,
 };
 use support::{
-    confidential_client, mint_code_token, other_confidential_client, ManualClock,
-    CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET, OTHER_CONFIDENTIAL_SECRET, OTHER_REDIRECT,
+    confidential_client, far_future_window, mint_code_token, other_confidential_client,
+    ManualClock, CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET, OTHER_CONFIDENTIAL_SECRET,
+    OTHER_REDIRECT,
 };
 
 const APP: &str = "confidential-app";
@@ -513,8 +515,8 @@ async fn remembered_consent_is_per_client_and_per_user() {
         .await
         .unwrap()
         .expect("the consent just recorded");
-    assert!(remembered.covers(&scopes("read"), &[]));
-    assert!(!remembered.covers(&scopes("read write"), &[]));
+    assert!(remembered.covers(&scopes("read"), &[], RequestedDetails::none()));
+    assert!(!remembered.covers(&scopes("read write"), &[], RequestedDetails::none()));
 
     assert!(srv
         .remembered_consent(&ClientId::new(APP), "user-2")
@@ -626,7 +628,7 @@ async fn deleting_a_client_takes_its_consents_with_it() {
 
     assert!(srv
         .store()
-        .delete_client(&ClientId::new(APP))
+        .delete_client(&ClientId::new(APP), far_future_window())
         .await
         .unwrap());
 
@@ -664,4 +666,274 @@ async fn revoking_a_token_does_not_withdraw_the_consent() {
     .unwrap();
 
     assert_eq!(srv.consents_for_subject("user-1").await.unwrap().len(), 1);
+}
+
+/// A code minted on a STANDING approval must date from that approval, not from the moment it was
+/// minted, or a withdrawal landing mid-request is defeated.
+///
+/// FOUND BY THE 0.9.1 AUDIT, by pointing a lens at the audit's own fix, and it is the second
+/// resurrection the instant comparison opened. `put_authorization_code` is deliberately
+/// barrier-exempt (a code is not yet a grant), so nothing refuses the code itself; the refusal is
+/// supposed to happen at redemption, where `put_token` compares the grant instant the code carries
+/// against the barrier. Stamping that instant at ISSUANCE dates a months-old standing approval as
+/// if it had been made after the withdrawal, so the comparison admits the write.
+///
+/// THE ORDERING, which is an ordinary one and not a narrow race: the user opens the authorization
+/// page and the host reads their remembered consent; the user, on their phone, clicks "remove this
+/// application" and the withdrawal cascades away every live token and records its barrier; the
+/// first request resumes on the pre-withdrawal snapshot and mints a code. The window is however
+/// long the user's browser takes between the consent read and the approval, which for a consent
+/// screen is seconds to minutes.
+///
+/// The cost of getting it wrong is not one token. The refresh chain the code mints inherits the
+/// same instant, so it keeps rotating long after the barrier has been swept.
+///
+/// HOW THIS DISCRIMINATES: the withdrawal is recorded at entry + 30s and the code is minted at
+/// entry + 60s. Dated at entry the grant predates the barrier and redemption is refused; dated at
+/// issuance it postdates it and a token is issued. Confirmed RED by putting `UserApproval::granted`
+/// back in place of `granted_at`.
+#[tokio::test]
+async fn a_code_minted_on_a_standing_approval_does_not_outrank_a_withdrawal() {
+    let clock = ManualClock::at_epoch();
+    let entry = clock.now();
+    let srv = support::server_with(clock.clone(), vec![confidential_client()]).await;
+    let challenge = oauth_as::pkce::code_challenge_s256(support::RFC7636_VERIFIER);
+    let request = oauth_as::AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", APP),
+        ("redirect_uri", CONFIDENTIAL_REDIRECT),
+        ("scope", "read"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
+
+    // The standing approval, and the request that will be decided on the strength of it.
+    let consent = srv
+        .record_consent(&ClientId::new(APP), "user-1", &scopes("read"), &[], None)
+        .await
+        .unwrap();
+    let validated = srv.validate_authorization_request(&request).await.unwrap();
+
+    // The user withdraws, elsewhere, while this request is still in flight. The barrier is
+    // recorded from the server's clock, so it lands strictly between request entry and issuance.
+    clock.advance(Duration::from_secs(30));
+    srv.withdraw_consent(&consent.consent_id).await.unwrap();
+
+    // The first request resumes and mints its code, dated from when the decision was actually
+    // made. The withdrawal's cascade cannot have removed this code: it did not exist yet.
+    clock.advance(Duration::from_secs(30));
+    let response = srv
+        .issue_authorization_code(UserApproval::granted_at(&validated, "user-1", entry))
+        .await
+        .unwrap();
+
+    let redeemed = srv
+        .token(TokenRequest::AuthorizationCode {
+            client_id: ClientId::new(APP),
+            client_secret: Some(CONFIDENTIAL_SECRET.to_string()),
+            code: response.code,
+            redirect_uri: Some(CONFIDENTIAL_REDIRECT.to_string()),
+            code_verifier: Some(support::RFC7636_VERIFIER.to_string()),
+        })
+        .await;
+    assert!(
+        redeemed.is_err(),
+        "a code minted on an approval the user had already withdrawn was redeemed for a live \
+         token, and its refresh chain carries the same instant, so it rotates for as long as the \
+         chain lives: {redeemed:?}"
+    );
+}
+
+/// A consent that names nobody must be refused when it is CREATED, not when it is withdrawn.
+///
+/// FOUND BY THE 0.9.1 AUDIT. `Storage::revoke_consent` rejects an empty `client_id` or `subject`,
+/// and it reads them out of the STORED record rather than off its argument — so a record created
+/// with an empty subject could never be withdrawn by any input at all. The record stood, the
+/// cascade never ran, every token and refresh chain beneath it stayed live for its full lifetime,
+/// and `withdraw_consent` answered an error contradicting its own documented contract that
+/// withdrawing a consent that is already gone is `Ok(0)`.
+///
+/// A host reaches that state through the ordinary API: this crate never inspects a subject, because
+/// a subject is the host's own vocabulary for users, so a resolver that can yield the empty string
+/// is all it takes. Refusing at the one operation that UNDOES damage is the wrong end.
+#[tokio::test]
+async fn a_consent_with_an_empty_subject_is_refused_rather_than_left_unwithdrawable() {
+    let clock = ManualClock::at_epoch();
+    let srv = support::server_with(clock, vec![confidential_client()]).await;
+
+    let recorded = srv
+        .record_consent(&ClientId::new(APP), "", &scopes("read"), &[], None)
+        .await;
+
+    assert!(
+        recorded.is_err(),
+        "a consent naming no subject was created; nothing can ever withdraw it, so every token \
+         beneath it outlives the user's attempt to end it: {recorded:?}"
+    );
+    assert!(
+        srv.consents_for_subject("").await.unwrap().is_empty(),
+        "the refused consent was written anyway"
+    );
+}
+
+/// THE OUTCOME A REMEMBERED CONSENT DECIDES, over the router that decides it.
+///
+/// `ConsentRecord::covers` is a pure answer, so a unit test of it stops one step short of the thing
+/// that matters, which is whether a user was ASKED. This drives the seam the way a host does: the
+/// approval resolver skips its prompt exactly when the remembered record covers the request, which
+/// is the pattern `ApprovalRequest::remembered` documents, and the assertion is on what came back
+/// off the wire — a redirect carrying an authorization code means the prompt was skipped and the
+/// token will carry the detail; the prompt page means the user is being asked.
+///
+/// The request that must be asked about carries an RFC 9396 element the user never approved. It is
+/// a DIFFERENT element of the same registered type, which is the case a `require_supported_types`
+/// check cannot see (it inspects the `type` string alone) and the case the scope check cannot see
+/// either (the scope is identical, and is the scope the user did approve).
+#[cfg(all(feature = "http", feature = "rar"))]
+mod remembered_consent_and_authorization_details {
+    use std::sync::Arc;
+
+    use oauth_as::consent::RequestedDetails;
+    use oauth_as::http::{ApprovalDecision, Body, ServiceBuilder};
+    use oauth_as::store::MemoryStorage;
+    use oauth_as::{
+        AuthorizationServer, Client, ClientAuth, ClientId, GrantType, ScopeSet, ServerConfig,
+    };
+
+    const CLIENT: &str = "payments-client";
+    const REDIRECT: &str = "https://client.example/cb";
+    const SUBJECT: &str = "user-1";
+    /// RFC 7636 appendix B's challenge, so the request carries a real one.
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    /// One payment element, with the `identifier` that decides which payment it is.
+    fn payment(identifier: &str) -> String {
+        format!(r#"[{{"type":"payment","identifier":"{identifier}","amount":"50"}}]"#)
+    }
+
+    /// Percent-encode for a query string, keeping only the RFC 3986 section 2.3 unreserved
+    /// characters: an `authorization_details` value is JSON, which is made of the punctuation a
+    /// query string uses as structure.
+    fn encode(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() * 3);
+        for b in value.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    /// Ask the authorization endpoint for a code, with `details` as the raw
+    /// `authorization_details` parameter. Answers the status and the `Location`, which together
+    /// say whether the user was asked.
+    async fn authorize(
+        service: &oauth_as::http::AuthorizationService<MemoryStorage, oauth_as::SystemClock>,
+        details: &str,
+    ) -> (u16, String) {
+        let uri = format!(
+            "/authorize?response_type=code&client_id={CLIENT}&redirect_uri={}&scope=payments\
+             &code_challenge={CHALLENGE}&code_challenge_method=S256&authorization_details={}",
+            encode(REDIRECT),
+            encode(details),
+        );
+        let response = service
+            .handle(
+                http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("a well-formed request"),
+            )
+            .await;
+        let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (status, location)
+    }
+
+    #[tokio::test]
+    async fn a_remembered_consent_does_not_skip_the_prompt_for_a_detail_it_never_approved() {
+        let mut config = ServerConfig::new(
+            "https://as.example".to_string(),
+            "https://as.example/device".to_string(),
+        );
+        config.authorization_details_types_supported = Some(vec!["payment".to_string()]);
+        let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+        let scopes = ScopeSet::from_tokens(["payments"]).expect("scopes");
+        server
+            .register_client(Client {
+                client_id: ClientId::new(CLIENT),
+                auth: ClientAuth::Public,
+                grant_types: vec![GrantType::AuthorizationCode],
+                redirect_uris: vec![REDIRECT.to_string()],
+                allowed_scopes: scopes.clone(),
+                default_scopes: scopes.clone(),
+                name: None,
+                registration: None,
+            })
+            .await
+            .expect("register");
+        // The user approved this client once, for this scope, and asked not to be asked again.
+        server
+            .record_consent(&ClientId::new(CLIENT), SUBJECT, &scopes, &[], None)
+            .await
+            .expect("record the consent the user gave");
+
+        let service = ServiceBuilder::new(Arc::clone(&server))
+            .with_subject_resolver(|_headers| Some(SUBJECT.to_string()))
+            // THE HOST, written the way `ApprovalRequest::remembered` describes: skip the prompt
+            // exactly when the remembered grant covers what is being asked for NOW, and otherwise
+            // render a screen. Nothing else in this resolver decides anything.
+            .with_approval_resolver(|request| {
+                let covered = request.remembered.is_some_and(|remembered| {
+                    remembered.covers(
+                        request.scope,
+                        request.resource,
+                        RequestedDetails::of(request.authorization_details),
+                    )
+                });
+                match covered {
+                    true => ApprovalDecision::Approve,
+                    false => ApprovalDecision::Respond(Box::new(
+                        http::Response::builder()
+                            .status(200)
+                            .body(Body::from("the consent screen"))
+                            .expect("a well-formed page"),
+                    )),
+                }
+            })
+            .build()
+            .expect("service");
+
+        // A request carrying no detail at all is covered, which is what makes the assertion below
+        // about the DETAILS rather than about the remembered consent not working.
+        let (status, location) = authorize(&service, "[]").await;
+        assert_eq!(
+            status, 302,
+            "the remembered consent should skip this prompt"
+        );
+        assert!(
+            location.contains("code="),
+            "no code in {location:?}: the remembered consent did not cover a request it granted"
+        );
+
+        let (status, location) = authorize(&service, &payment("IBAN-ATTACKER")).await;
+        assert_eq!(
+            status, 200,
+            "the user was not asked about a payment element they never approved; the prompt was \
+             skipped and the code at {location:?} mints a token carrying it"
+        );
+        assert!(
+            !location.contains("code="),
+            "a code was issued for an authorization detail nobody approved: {location}"
+        );
+    }
 }

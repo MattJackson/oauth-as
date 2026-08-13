@@ -208,6 +208,31 @@ fn the_fixtures_carry_no_default_value_a_dropped_field_could_hide_behind() {
     }
 }
 
+/// Two fixtures whose DISTINCTNESS is what makes a check able to fail, in the way a value being
+/// non-default is elsewhere in this file. Neither is visible in the check that depends on it, so
+/// both are pinned here rather than left to be noticed if they ever collide.
+#[test]
+fn the_fixtures_that_must_differ_from_each_other_do() {
+    // Both handles go into ONE store in the sweep check, one dead and one live. Equal keys would
+    // make the second plant overwrite the first, and `sweep_expired/reclaims_pushed_requests`
+    // would then be asking about a record that was never there: a vacuous pass, which is the exact
+    // failure mode this harness exists to refuse.
+    #[cfg(feature = "par")]
+    assert_ne!(PUSHED_SWEPT, PUSHED_KEPT);
+    #[cfg(feature = "consent")]
+    {
+        // The per-subject listing check can only see a store filtering on the CLIENT if the two
+        // consents share a client and differ in subject. A `sample_consent` that ever derived the
+        // client id from the consent id would make that check pass against exactly the defect it
+        // was written for.
+        let mine = sample_consent("consent-mine", "subject-conformance");
+        let theirs = sample_consent("consent-theirs", "subject-other");
+        assert_eq!(mine.client_id, theirs.client_id);
+        assert_ne!(mine.subject, theirs.subject);
+        assert_ne!(mine.consent_id, theirs.consent_id);
+    }
+}
+
 /// A host is invited to filter or waive by check name, so the names have to be a complete and
 /// duplicate-free list or a waiver could silently cover more than the host meant.
 #[test]

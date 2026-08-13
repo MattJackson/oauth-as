@@ -23,6 +23,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+/// A revocation-barrier deadline far enough out that the barrier stands for the whole test.
+/// Local rather than shared: this file does not otherwise pull in the test support module.
+fn far_future() -> SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+}
+
+/// The whole window, for a test about the CASCADE rather than about when a grant was established.
+fn far_future_window() -> oauth_as::store::RevocationWindow {
+    oauth_as::store::RevocationWindow {
+        recorded_at: far_future(),
+        until: far_future(),
+    }
+}
+
 use oauth_as::{
     AuthorizationError, AuthorizationRequest, AuthorizationServer, AuthorizationServerMetadata,
     Client, ClientAuth, ClientId, Clock, ErrorCode, GrantType, MemoryStorage, ParConfig, ScopeSet,
@@ -411,10 +425,9 @@ async fn an_expired_request_uri_is_refused() {
 async fn requiring_par_refuses_the_same_request_in_the_query() {
     let clock = TestClock::new();
     let mut cfg = config();
-    cfg.par = Some(Box::new(ParConfig {
-        require_pushed_authorization_requests: true,
-        ..ParConfig::new()
-    }));
+    let mut par = ParConfig::new();
+    par.require_pushed_authorization_requests = true;
+    cfg.par = Some(Box::new(par));
     let server = server_with(cfg, clock).await;
     let challenge = challenge();
 
@@ -485,7 +498,18 @@ async fn only_the_pushed_parameters_are_used() {
 
 /// RFC 9126 s7.4: the client's policy may change between the push and the authorization request,
 /// so the request is validated again at the authorization endpoint rather than trusted because it
-/// was validated once. Here the registration is deleted outright while a handle is outstanding.
+/// was validated once.
+///
+/// THE HANDLE HAS TO SURVIVE FOR THIS TO MEAN ANYTHING, which is why the policy is CHANGED rather
+/// than the client DELETED. Deletion cascades the handle away (`MemoryStorage::delete_client`
+/// retains out every pushed request the client owns), so `take_pushed_authorization_request`
+/// answers `None` and the refusal is `invalid_request_uri` — an unknown-handle refusal that
+/// `validate_direct_authorization_request`, which IS the revalidation, is never reached to make.
+/// A test that only asked for `AuthorizationError::Direct(_)` could not tell those two apart, and
+/// the cascade alone would have satisfied it. Here the registration stays, its redirect URI list
+/// no longer contains the one that was pushed, and the refusal is the REVALIDATION's:
+/// `invalid_request`, direct rather than redirected, because a redirect URI this client is no
+/// longer registered for is not somewhere an error may be sent (RFC 6749 s4.1.2.1).
 #[tokio::test]
 async fn a_handle_is_revalidated_against_the_client_policy_of_the_moment() {
     let clock = TestClock::new();
@@ -501,20 +525,58 @@ async fn a_handle_is_revalidated_against_the_client_policy_of_the_moment() {
         .await
         .unwrap();
 
-    // RFC 7592 s2.3 deletion takes the client's outstanding artifacts with it, this one included.
-    assert!(server
-        .store()
-        .delete_client(&ClientId::new("app"))
-        .await
-        .unwrap());
+    // RFC 7592 s2.2: the registration is UPDATED while the handle is outstanding, moving the
+    // client off the redirect URI its pushed request names.
+    let mut moved = client("app");
+    moved.redirect_uris = vec!["https://app.example/moved".to_string()];
+    server.store().put_client(moved).await.unwrap();
 
     match server
         .validate_pushed_authorization_request("app", &pushed.request_uri)
         .await
     {
-        Err(AuthorizationError::Direct(_)) => {}
-        other => panic!("a deleted client's handle must not authorize: {other:?}"),
+        Err(AuthorizationError::Direct(error)) => assert_eq!(
+            error.error,
+            ErrorCode::InvalidRequest,
+            "the refusal must come from revalidating the pushed parameters, not from the handle \
+             being unknown: {error:?}"
+        ),
+        other => panic!("a superseded policy must not authorize: {other:?}"),
     }
+}
+
+/// The OTHER refusal, kept separate so neither can stand in for the other: RFC 7592 s2.3 deletion
+/// takes the client's outstanding artifacts with it, so the handle is not merely unusable, it is
+/// GONE, and the answer is the unknown-handle one of RFC 9126 s2.2.
+#[tokio::test]
+async fn deleting_the_client_takes_its_outstanding_handles_with_it() {
+    let clock = TestClock::new();
+    let server = server_with(config(), clock).await;
+    let challenge = challenge();
+
+    let pushed = server
+        .pushed_authorization_request(
+            &ClientId::new("app"),
+            Some("app-secret"),
+            &pushed_parameters(&challenge),
+        )
+        .await
+        .unwrap();
+
+    assert!(server
+        .store()
+        .delete_client(&ClientId::new("app"), far_future_window())
+        .await
+        .unwrap());
+    assert!(
+        server
+            .store()
+            .take_pushed_authorization_request(&pushed.request_uri)
+            .await
+            .unwrap()
+            .is_none(),
+        "the cascade must have reclaimed the handle itself, not merely orphaned it"
+    );
 }
 
 /// RFC 9126 s5: the endpoint is advertised exactly when it is served, and the policy member states
@@ -536,10 +598,9 @@ fn metadata_advertises_par_only_when_the_host_enabled_it() {
     assert_eq!(on.require_pushed_authorization_requests, Some(false));
 
     let mut required = config();
-    required.par = Some(Box::new(ParConfig {
-        require_pushed_authorization_requests: true,
-        ..ParConfig::new()
-    }));
+    let mut par = ParConfig::new();
+    par.require_pushed_authorization_requests = true;
+    required.par = Some(Box::new(par));
     let document =
         serde_json::to_value(AuthorizationServerMetadata::from_config(&required)).unwrap();
     assert_eq!(document["require_pushed_authorization_requests"], true);
@@ -576,5 +637,171 @@ async fn sweep_expired_reclaims_abandoned_handles() {
         server.store().sweep_expired(clock.now()).await.unwrap(),
         1,
         "an expired handle is reclaimed"
+    );
+}
+
+// ------------------------------------------------- the grant instant a client barrier compares
+
+/// A store that deletes the client from inside the read the push derives its write from, and moves
+/// the clock while doing it.
+///
+/// The clock advance is what makes the test discriminate. Without it, entry and write are the same
+/// instant, a barrier recorded between them cannot be expressed, and both the fixed and the
+/// defective orderings refuse — the "passes with the defect reintroduced" failure that has already
+/// caught three tests in this repo.
+struct DeleteDuringRead {
+    inner: MemoryStorage,
+    clock: TestClock,
+    /// The window the deletion records. Deliberately NOT `far_future_window()`: a far-future
+    /// `recorded_at` refuses every push unconditionally and would make this test pass either way.
+    window: oauth_as::store::RevocationWindow,
+    armed: Arc<Mutex<Option<ClientId>>>,
+}
+
+impl Storage for DeleteDuringRead {
+    /// The read `authenticate_client` makes. It answers truthfully, moves the clock past the
+    /// barrier, and then deletes — which is exactly where a concurrent RFC 7592 section 2.3
+    /// request would land: after the push began, before it writes.
+    async fn get_client(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<Arc<Client>>, oauth_as::StorageError> {
+        let found = self.inner.get_client(client_id).await?;
+        let armed = {
+            let mut slot = self.armed.lock().unwrap_or_else(|e| e.into_inner());
+            slot.take()
+        };
+        if let (Some(id), true) = (armed, found.is_some()) {
+            self.clock.advance(Duration::from_secs(60));
+            self.inner.delete_client(&id, self.window).await?;
+        }
+        Ok(found)
+    }
+
+    oauth_as::delegate_storage! {
+        to inner;
+        put_client, compare_and_swap_client, delete_client,
+        put_device_grant, get_device_grant, find_device_grant_by_user_code,
+        take_device_grant, compare_and_swap_device_grant,
+        put_authorization_code, compare_and_swap_authorization_code, take_authorization_code,
+        put_pushed_authorization_request, take_pushed_authorization_request,
+        put_token, get_token, delete_token,
+        put_refresh_token, get_refresh_token, take_refresh_token, revoke_token_family,
+        put_consent, compare_and_swap_consent, get_consent, find_consent,
+        consents_for_subject, revoke_consent,
+        claim_replay_id,
+        sweep_expired,
+    }
+}
+
+/// A push whose client is deleted mid-request must not mint a handle.
+///
+/// THE STRAIGHTFORWARD HALF, and what this test actually pins: whatever the ordering inside the
+/// endpoint, a `delete_client` landing while a push is in flight must leave no `request_uri`
+/// behind. A handle outliving its registration is the seventh resurrection site, and it is the
+/// expensive one: a host that re-provisions the same `client_id` inside the handle's 60 second
+/// lifetime — which the store contract explicitly permits — resolves it against the NEW
+/// registration, carrying the deleted client's `redirect_uri`, `scope` and `code_challenge`.
+///
+/// WHAT THIS TEST DOES NOT DISCRIMINATE, said plainly because a test that quietly proves less than
+/// its name suggests is the failure mode this suite keeps hitting. The 0.9.1 audit reported that
+/// `pushed_at` was stamped after `authenticate_client` and that a deletion in that window would be
+/// admitted by the barrier comparison. Reading the code settles it the other way:
+/// `validate_direct_authorization_request` re-reads the registration (`server.rs`, "unknown
+/// client_id"), so a deletion landing before that read is refused THERE, and one landing after it
+/// is later than `pushed_at` under either stamping and is refused by the barrier. There is no
+/// ordering that separates the two, and this test passes with the stamp in either position —
+/// verified by moving it and re-running.
+///
+/// The stamp was moved to request entry anyway, and the reason is worth writing down: it makes the
+/// refusal below true of the window its own comment names, and it stops the barrier's correctness
+/// depending on a second registration read that a later refactor would be entitled to remove as
+/// redundant. Defence in depth, not a fix for a reachable defect.
+#[tokio::test]
+async fn a_push_is_refused_when_the_client_is_deleted_mid_request() {
+    let clock = TestClock::new();
+    let entry = clock.now();
+    let armed: Arc<Mutex<Option<ClientId>>> = Arc::new(Mutex::new(None));
+    let store = DeleteDuringRead {
+        inner: MemoryStorage::new(),
+        clock: clock.clone(),
+        window: oauth_as::store::RevocationWindow {
+            recorded_at: entry + Duration::from_secs(30),
+            until: far_future(),
+        },
+        armed: armed.clone(),
+    };
+    let server = AuthorizationServer::with_clock(config(), store, clock.clone());
+    server.register_client(client("app")).await.unwrap();
+
+    // Armed only now, so the registration above is written through an unarmed store.
+    *armed.lock().unwrap() = Some(ClientId::new("app"));
+
+    let challenge = challenge();
+    let pushed = server
+        .pushed_authorization_request(
+            &ClientId::new("app"),
+            Some("app-secret"),
+            &pushed_parameters(&challenge),
+        )
+        .await;
+
+    assert!(
+        pushed.is_err(),
+        "a handle was minted for a registration deleted while the push was in flight: the push \
+         dates from the authentication, which happened before the deletion, so the barrier covers \
+         it — got {pushed:?}"
+    );
+    assert!(
+        clock.now() > entry + Duration::from_secs(30),
+        "the trigger did not advance the clock, so the write did not cross the barrier and this \
+         test proves nothing"
+    );
+}
+
+/// `expires_in` is a POSITIVE integer (RFC 9126 section 2.2), whatever TTL the host configured.
+///
+/// FOUND BY THE 0.9.1 AUDIT. `ParConfig::request_uri_ttl` is a plain public field with no
+/// validating constructor, so a sub-second `Duration` reported `expires_in: 0` — a handle a
+/// conforming client treats as already dead and abandons, from a push that answered `201`. A zero
+/// duration was worse still: `expires_at` equalled `now`, so the handle was refused on its first
+/// presentation, and nothing in either answer pointed at the TTL.
+///
+/// Clamped rather than rejected, for the reason `user_code_length` clamps: a misconfiguration must
+/// not become a runtime failure in front of a user.
+#[tokio::test]
+async fn a_sub_second_ttl_still_reports_a_usable_lifetime() {
+    let clock = TestClock::new();
+    let mut cfg = config();
+    let mut par = ParConfig::new();
+    par.request_uri_ttl = Duration::from_millis(500);
+    cfg.par = Some(Box::new(par));
+    let server = server_with(cfg, clock.clone()).await;
+
+    let challenge = challenge();
+    let pushed = server
+        .pushed_authorization_request(
+            &ClientId::new("app"),
+            Some("app-secret"),
+            &pushed_parameters(&challenge),
+        )
+        .await
+        .expect("a short TTL is a configuration choice, not a refusal");
+
+    assert!(
+        pushed.expires_in >= 1,
+        "RFC 9126 s2.2 makes expires_in a positive integer; a client told 0 abandons a handle the \
+         server is still honouring: {}",
+        pushed.expires_in
+    );
+
+    // And the handle the client was told about must actually resolve, which is the half that
+    // catches a clamp applied to the reported number but not to the recorded deadline.
+    assert!(
+        server
+            .validate_pushed_authorization_request("app", &pushed.request_uri)
+            .await
+            .is_ok(),
+        "the handle died before the lifetime its own response promised"
     );
 }

@@ -92,31 +92,45 @@
 //! - No refresh token is issued. RFC 8693 section 2.2.1 says one "will typically not be issued
 //!   when the exchange is of one temporary credential for a different temporary credential", and
 //!   issuing one would let an exchanged token outlive by rotation the grant it was derived from.
-//! - The issued token's lifetime is [`crate::server::ServerConfig::access_token_ttl`], the same as
-//!   every other grant's, and is NOT clamped to the subject token's remaining lifetime. Clamping
-//!   is arguably right and is deliberately not done here silently; a host that wants it should say
-//!   so, and there is no seam for it yet.
-//! - The `act` claim is returned to the HOST ([`ExchangedToken::act`]) but is not carried inside
-//!   this server's own tokens. The consequence is concrete and worth being blunt about: with this
-//!   crate's own tokens, a downstream resource learns the delegation from the host, not from the
-//!   token and not from RFC 7662 introspection. A host that signs its own tokens has the claim it
-//!   needs to put in them.
+//! - The issued token's lifetime is the LESSER of
+//!   [`crate::server::ServerConfig::access_token_ttl`] and the subject token's own remaining
+//!   lifetime. Through 0.9.0 it was the former alone, and that contradicted the bullet immediately
+//!   above: the exchanged token is an ordinary access token, so it is an acceptable subject token
+//!   in its turn, and self-exchange is permitted. A client could therefore re-exchange just before
+//!   each expiry and receive a fresh full TTL every time, renewing by exchange exactly the grant
+//!   lifetime that withholding a refresh token was meant to bound. Clamping makes time behave the
+//!   way scope, audience and RFC 9396 details already do here: an exchange may narrow, never widen.
+//! - The `act` claim reaches a resource server BY BOTH ROUTES as of 0.9.1: it is persisted on
+//!   [`crate::token::IssuedToken`] and reported by RFC 7662 introspection
+//!   ([`crate::token::IntrospectionResponse::act`]), and under the `jwt` feature it is an RFC 9068
+//!   claim in the signed access token ([`crate::jwt::AccessTokenClaims::act`]). This paragraph
+//!   described a GAP through 0.9.0 and is kept as the record of why it closed when it did.
 //!
-//!   THIS IS A GAP RATHER THAN A DESIGN, and the reason given for it through 0.9.0 is no longer
-//!   true. That reason was that [`crate::token::IssuedToken`] "is cloned on every token-plane
-//!   request, so adding a field to it is a cost every deployment pays":
+//!   BOTH ROUTES ARE NEEDED, which an earlier draft of this paragraph got wrong by claiming the
+//!   record alone had closed it. The two token formats reach a resource server differently: an
+//!   OPAQUE token carries nothing, so introspection is the only channel it has, while a JWT is
+//!   typically validated offline and introspected never. Persisting the claim and stopping there
+//!   would have moved the deficiency from one deployment shape to the other rather than ending it.
+//!
+//!   Two things stood in the way and both are spent. The first was allocation, on the reasoning
+//!   that [`crate::token::IssuedToken`] "is cloned on every token-plane request":
 //!   [`crate::store::Storage::get_token`] returns an `Arc<IssuedToken>` now, so the record's shape
-//!   costs a read nothing, and a `#[cfg(feature = "token-exchange")] Option<Box<ActClaim>>` would
-//!   cost a deployment without this feature exactly zero bytes and one with it 8 bytes per token
-//!   plus one allocation per DELEGATED token. On the merits, RFC 8693 section 1.1 delegation that
-//!   RFC 7662 introspection cannot see is a deficiency: introspection is the only channel an
-//!   opaque token has, which makes it the one place the claim would do any good.
+//!   costs a read nothing, and the field costs a deployment without this feature zero bytes and
+//!   one with it 8 bytes per token plus one allocation per DELEGATED token.
 //!
-//!   What now stands in the way is not allocation but the PERSISTENCE CONTRACT. `IssuedToken` is
-//!   the record every host's [`crate::store::Storage`] implementation writes and reads, so a new
-//!   field is a schema migration in every store this crate does not own, not a struct edit here.
-//!   That is a coordinated change with a release behind it rather than something to slip in, and
-//!   until it is made this paragraph is a statement of what a deployment does not get.
+//!   The second was the real one, the PERSISTENCE CONTRACT: `IssuedToken` is the record every
+//!   host's [`crate::store::Storage`] implementation writes and reads, so a new field is a
+//!   migration in stores this crate does not own rather than a struct edit here. That is a
+//!   coordinated change with a release behind it, and 0.9.1 is that release: it is already
+//!   breaking `Storage` for the revocation-barrier rule, so a host migrates once instead of twice.
+//!
+//!   Why it was worth doing rather than deferring again: this crate's default access token is
+//!   OPAQUE, so introspection is the ONLY channel a resource server has. A delegation it cannot
+//!   see is a delegation the resource server has to take the host's word for, which collapses RFC
+//!   8693 section 1.1 delegation back into impersonation from the one viewpoint the distinction
+//!   exists for. Through 0.9.1 introspection answers only the token's own client, so on the opaque
+//!   route that viewpoint is not yet served; the resource-server channel is 0.9.2 work, and the
+//!   claim is persisted now because the record is the half that cannot be added later.
 
 use std::fmt;
 use std::str::FromStr;
@@ -144,6 +158,27 @@ use crate::store::{Storage, StorageError};
 /// caller. This endpoint IS authenticated, which is why the finding is a rung lower, but a client
 /// that has merely leaked its secret should not get an amplifier along with it.
 pub const MAX_AUDIENCE_VALUES: usize = crate::server::MAX_RESOURCE_INDICATORS;
+
+/// The longest RFC 8693 section 4.1 `act` chain this server will mint: the number of ACTORS the
+/// nested claim may name, counting the current one.
+///
+/// A bound is required rather than tidy. Each delegation exchange nests the subject token's own
+/// `act` inside the new one, and the result is PERSISTED on [`crate::token::IssuedToken`] and
+/// serialized into every RFC 9068 access token and RFC 7662 introspection response the token
+/// produces. Exchanging one's own token is explicitly permitted, so without a bound an
+/// authenticated client can loop — exchange, then exchange the result — and each hop adds a link
+/// that every later read pays for, in the store and on the wire. That is a client choosing how much
+/// storage the server spends, which is the same shape as the repeatable-parameter bounds above.
+///
+/// Eight is chosen against real topologies rather than against the RFC, which sets no limit:
+/// section 1.1's delegation is a call graph, and a request that has legitimately crossed eight
+/// distinct delegating services has a shape an operator should be told about rather than one this
+/// server should quietly extend. A chain at the bound is refused with section 2.2.2's
+/// `invalid_request` rather than TRUNCATED, because truncation would silently discard exactly the
+/// audit history the nesting exists to keep, and a server that quietly forgets who acted earlier is
+/// worse than one that says it will not go further.
+pub const MAX_ACT_CHAIN_DEPTH: usize = 8;
+
 use crate::token::TokenType;
 
 pub use crate::grant::TOKEN_EXCHANGE_GRANT_URN;
@@ -313,6 +348,12 @@ pub struct ActClaim {
 /// is precisely the value a host is most likely to debug-print, because it is the request it just
 /// parsed.
 #[derive(Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`: the two `client-assertion` fields appear only under that feature, so a host
+/// that writes this as a literal is writing one of two different structs and does not get to choose
+/// which. [`TokenExchangeRequest::new`] already exists and already says the rest is "optional and
+/// set on the returned value"; the attribute is what makes that the only way in, rather than the
+/// documented way in that a literal quietly bypasses.
+#[non_exhaustive]
 pub struct TokenExchangeRequest<'a> {
     /// The client performing the exchange. It is authenticated, and it is the client the issued
     /// token belongs to.
@@ -329,10 +370,10 @@ pub struct TokenExchangeRequest<'a> {
     /// offers and not to shared secrets alone. Carrying only `client_secret` meant a confidential
     /// client registered for assertion authentication was answered `invalid_client` on a grant the
     /// RFC 8414 document advertises to it: the credential it presented had nowhere to travel.
-    #[cfg(feature = "client_assertion")]
+    #[cfg(feature = "client-assertion")]
     pub client_assertion_type: Option<&'a str>,
-    /// RFC 7523 section 2.2 `client_assertion`: the signed JWT itself.
-    #[cfg(feature = "client_assertion")]
+    /// RFC 7523 section 2.2 `client-assertion`: the signed JWT itself.
+    #[cfg(feature = "client-assertion")]
     pub client_assertion: Option<&'a str>,
     /// REQUIRED (section 2.1). The token representing the party on whose behalf the request is
     /// made.
@@ -383,9 +424,9 @@ impl<'a> TokenExchangeRequest<'a> {
         TokenExchangeRequest {
             client_id,
             client_secret: None,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion_type: None,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion: None,
             subject_token,
             subject_token_type,
@@ -415,7 +456,7 @@ impl fmt::Debug for TokenExchangeRequest<'_> {
         // is redacted exactly as the secret is. The TYPE is printed, because it is not a
         // credential (it is a fixed URN) and a mistyped one is the commonest way this
         // authentication method fails.
-        #[cfg(feature = "client_assertion")]
+        #[cfg(feature = "client-assertion")]
         out.field("client_assertion_type", &self.client_assertion_type)
             .field("client_assertion", &redact_opt(&self.client_assertion));
         out.field("subject_token", &"[redacted]")
@@ -566,6 +607,27 @@ fn sender_constrained_refusal(mechanism: &str) -> ErrorResponse {
     ))
 }
 
+/// How many actors an RFC 8693 section 4.1 `act` claim names, counting the outermost (current) one.
+///
+/// ITERATIVE rather than recursive, and that is the point of writing it out. The claim is a linked
+/// list this server READS BACK OUT OF ITS OWN STORE, and a store is something a host operates: a
+/// record deeper than the stack could take would be a crash on the token endpoint rather than a
+/// refusal, which is the failure mode `MAX_ACT_CHAIN_DEPTH` exists to prevent and not one to
+/// reintroduce in the counting. It also stops early, because the only question the caller asks is
+/// whether the bound has been reached.
+fn act_chain_depth(act: &ActClaim) -> usize {
+    let mut depth = 1;
+    let mut current = &act.act;
+    while let Some(next) = current {
+        depth += 1;
+        if depth >= MAX_ACT_CHAIN_DEPTH {
+            return depth;
+        }
+        current = &next.act;
+    }
+    depth
+}
+
 /// The exchange itself. Split out of the trait method so the audit emission above wraps every exit
 /// from it, exactly as `AuthorizationServer::emit_refusal` wraps the other four grants.
 async fn exchange<S: Storage, C: Clock>(
@@ -607,9 +669,9 @@ async fn exchange<S: Storage, C: Clock>(
     let bound = Bound {
         cred: ClientCredential {
             client_secret: request.client_secret,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion_type: request.client_assertion_type,
-            #[cfg(feature = "client_assertion")]
+            #[cfg(feature = "client-assertion")]
             client_assertion: request.client_assertion,
             // RFC 8705 is deliberately NOT threaded through here. A certificate authenticates AND
             // binds (section 3), and this surface has nowhere to record the binding, so accepting
@@ -708,23 +770,48 @@ async fn exchange<S: Storage, C: Clock>(
                     ),
                 );
             }
+            // ONE refusal for every way an actor token can be unusable, built once so the two
+            // sites below cannot drift apart. See the comment on the ownership check for why the
+            // mismatch is not allowed its own wording.
+            let unusable = || {
+                ErrorResponse::new(ErrorCode::InvalidRequest)
+                    .with_description("actor_token is not a live access token")
+            };
             let actor = server
                 .introspect(actor_token)
                 .await
                 .map_err(storage_error)?
-                .ok_or_else(|| {
-                    ErrorResponse::new(ErrorCode::InvalidRequest)
-                        .with_description("actor_token is not a live access token")
-                })?;
+                .ok_or_else(unusable)?;
             // The acting party must be the party that just authenticated. Section 4.1 has the
             // `act` claim "identify the acting party to whom authority has been delegated", and a
             // server that will write any name there on production of a bearer string is not
             // identifying anybody: it is transcribing. The client proved possession of its secret
             // one step ago; the holder of a third party's access token proved possession of a
             // string that leaks.
+            //
+            // THE REFUSAL IS THE SAME STRING AS THE ONE ABOVE, and that is the point rather than
+            // an economy. A description naming the ownership mismatch answers a question the
+            // caller was not entitled to ask: it says the string they presented IS a live access
+            // token, and that it belongs to somebody else. Any client holding this grant could
+            // then test arbitrary strings and learn which ones are live tokens of other clients,
+            // which is exactly the oracle `introspection_response` refuses to be for the same
+            // three cases ("unknown, expired, or somebody else's"), and which the subject token
+            // seventy lines above already collapses. A legitimate delegating client presents its
+            // OWN token here, so it never reads either string.
             if actor.client_id != client.client_id {
-                return Err(ErrorResponse::new(ErrorCode::InvalidRequest)
-                    .with_description("actor_token was not issued to the authenticated client"));
+                return Err(unusable());
+            }
+            // THE PRIOR CHAIN, and how much of it this server will carry. Counted BEFORE anything
+            // is built, so a refusal costs one walk of a bounded list and no allocation.
+            if let Some(prior) = &subject.act {
+                if act_chain_depth(prior) >= MAX_ACT_CHAIN_DEPTH {
+                    return Err(
+                        ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                            "the subject token's act chain is already at this server's maximum \
+                         delegation depth",
+                        ),
+                    );
+                }
             }
             let act = ActClaim {
                 // RFC 9068 section 2.2's answer for a grant with no resource owner is the client
@@ -736,11 +823,18 @@ async fn exchange<S: Storage, C: Clock>(
                     .clone()
                     .unwrap_or_else(|| actor.client_id.as_str().to_string()),
                 client_id: Some(actor.client_id.as_str().to_string()),
-                // Section 4.1's nesting expresses a chain of PRIOR actors. This server does not
-                // yet carry `act` inside its own tokens (see the module docs), so there is no
-                // prior actor for it to read back out and nest, and inventing one would be a
-                // claim about history this server did not witness.
-                act: None,
+                // Section 4.1's nesting expresses a chain of PRIOR actors, and this is where it
+                // comes from: whatever the SUBJECT token already recorded, moved one level in, so
+                // the new actor is the outermost and current one.
+                //
+                // This was `None` with a comment saying "this server does not yet carry `act`
+                // inside its own tokens", which 0.9.1 made false in the same file: the claim is
+                // persisted on `IssuedToken` and reported by introspection. Truncating on the
+                // strength of that stale comment turned A -> B -> C into `act={sub:C}`, where
+                // section 4.1 defines `{sub:C, act:{sub:B}}`, so a resource server auditing the
+                // chain was told the delegation started at B. Depth is bounded by
+                // `MAX_ACT_CHAIN_DEPTH`, checked above.
+                act: subject.act.clone(),
             };
             (ExchangeSemantics::Delegation, Some(act))
         }
@@ -767,6 +861,54 @@ async fn exchange<S: Storage, C: Clock>(
         return Err(ErrorResponse::new(ErrorCode::InvalidScope)
             .with_description("scope exceeds the exchanging client registration"));
     }
+    // RFC 9396 DETAILS, and the reason this refusal sits with the scope ceilings rather than near
+    // the propagation site: it is the SAME ceiling, and its absence was the whole defect.
+    //
+    // Scope gets two ceilings above. `authorization_details` got none: they were copied onto the
+    // issued token unchanged, justified by "it is exactly what the token the client just presented
+    // already carried". That is precisely the argument the second ceiling four lines up REJECTS for
+    // scope, and for the same reason, which is that the issued token belongs to the EXCHANGING
+    // client and not to the one the subject token was minted for.
+    //
+    // The asymmetry ran the wrong way. A RAR element is strictly more specific than the scope that
+    // accompanies it (RFC 9396 exists because a scope token cannot say "transfer 50 euros to IBAN
+    // X"), so the crate applied its weaker rule to its more dangerous grant. Concretely: a
+    // downstream service registered for `read`, holding a payments client's token because
+    // forwarding the caller's token is what this grant is FOR, could ask for `read`, satisfy both
+    // scope ceilings, and receive a token issued to ITSELF carrying the payment authorization, with
+    // a fresh lifetime that outlives the token it came from.
+    //
+    // There is nothing to narrow AGAINST: `Client` has `allowed_scopes` and no equivalent for
+    // detail types, so the per-client ceiling that would make this safe does not exist yet and
+    // adding it breaks a type hosts construct. So this refuses, and a host that has reasoned about
+    // its delegation topology can say so with `allow_authorization_details_exchange`.
+    //
+    // RFC 8693 section 2.2.2 names `invalid_request` for a subject token unacceptable on policy,
+    // which is what this is; `invalid_target` is for a requested RESOURCE the AS will not issue
+    // for, and the client requested no target here. The description names the mechanism because a
+    // legitimate client hitting this needs to know why, and it reveals nothing: the client is
+    // holding the token whose details these are.
+    //
+    // SCOPED TO A CROSS-CLIENT EXCHANGE, and that scoping is the argument rather than a
+    // convenience. Everything above turns on the issued token belonging to a DIFFERENT principal
+    // than the subject token. When the exchanging client IS the client the subject token was issued
+    // to, no boundary is crossed: it already holds those details, on a token it can already spend,
+    // and refusing would block a client from exchanging its own token for a narrower one, which is
+    // an ordinary and safe use of this grant. A blanket refusal here would have been over-broad,
+    // and the test that caught it was right to.
+    #[cfg(feature = "rar")]
+    if !subject.authorization_details.is_empty()
+        && subject.client_id != client.client_id
+        && !server.config().allow_authorization_details_exchange
+    {
+        return Err(
+            ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                "subject_token carries authorization_details and cannot be exchanged for a token \
+             issued to a different client, because this server has no per-client registration of \
+             the detail types that client may hold",
+            ),
+        );
+    }
 
     // 6. RESOURCE and AUDIENCE, the audience ceiling (RFC 8707 section 2, RFC 8693 section 2.1.1).
     //    `validate_resources` and `narrow_resources` are the SAME functions the authorization code
@@ -790,11 +932,24 @@ async fn exchange<S: Storage, C: Clock>(
             .with_description("too many audience values (RFC 8693 s2.1.1)"));
     }
     for audience in request.audience {
+        // SKIPPING THE SYNTAX CHECK IS NOT SKIPPING THE ALLOWLIST, and through 0.9.1 it was both.
+        // `ServerConfig::allowed_resources` is this server's RFC 8707 section 2 statement of what
+        // it is unwilling to issue for — the way an operator decommissions a resource server — and
+        // the `audience` spelling walked straight past it. An operator who removed R from that list
+        // went on handing out signed tokens whose `aud` names R, to any client holding a live token
+        // whose grant had recorded R, because `narrow_resources` below only asks whether the
+        // SUBJECT TOKEN carries the value and never whether the server still stands behind it.
+        server.target_is_permitted(audience)?;
         if !targets.iter().any(|t| t == audience) {
             targets.push(audience.clone());
         }
     }
-    let resource = AuthorizationServer::<S, C>::narrow_resources(&subject.resource, &targets)?;
+    // `narrow_and_permit`, not `narrow_resources`: the allowlist has to apply to what is ISSUED and
+    // not only to what was NAMED. The loop above covers an `audience` the request spelled out, but
+    // a request naming NEITHER `resource` nor `audience` inherits the subject token's whole
+    // recorded list untouched, and that list can name a resource server this deployment has since
+    // decommissioned. See `AuthorizationServer::narrow_and_permit`.
+    let resource = server.narrow_and_permit(&subject.resource, &targets)?;
 
     // 7. Issue. Through the SAME `issue` every other grant goes through, so the exchanged token is
     //    persisted, introspectable, revocable and (with the `jwt` feature) signed exactly like any
@@ -808,15 +963,34 @@ async fn exchange<S: Storage, C: Clock>(
             &client,
             &bound,
             GrantType::TokenExchange,
+            // INHERITED from the subject token, not restamped. The exchanged token derives its
+            // authority from that grant, so a revocation reaching the grant must reach everything
+            // exchanged out of it; stamping `now` here would let an exchange launder a token past
+            // the revocation of the decision it descends from.
+            //
+            // THE INSTANT IS INHERITED AND THE IDENTITY IS NOT, and that is a gap rather than a
+            // decision. A `RevocationBarrier` for a withdrawn consent, and the cascade underneath
+            // it, both ask for the (client_id, subject) pair of the grant being ended; the token
+            // issued below carries the subject and the instant but belongs to the EXCHANGING
+            // client, so a cross-client exchange lands outside the reach of the withdrawal of the
+            // consent it descends from. `Storage::revoke_consent` states the same thing from the
+            // other side, with what it costs and what closing it needs. The lifetime ceiling at the
+            // end of this call is what bounds it: the descendant cannot outlive the token it was
+            // exchanged out of, so the overrun is one access token lifetime and not a fresh grant.
+            subject.grant_established_at,
             subject.subject.clone(),
             scope,
             resource,
-            // RFC 9396: the exchanged token inherits the subject token's authorization
-            // details unchanged. That is never a widening, because it is exactly what the
-            // token the client just presented already carried; RFC 8693 defines no
-            // `authorization_details` request parameter of its own, so there is nothing here
-            // to narrow BY, and dropping them silently would hand back a token that says
-            // less than the one it came from without saying so.
+            // RFC 9396: the exchanged token inherits the subject token's authorization details
+            // unchanged, and reaching this line at all means the ceiling above let it. Either the
+            // subject token carried no details, or the host set
+            // `allow_authorization_details_exchange` and accepted what that gives up.
+            //
+            // The justification that used to sit here said propagation "is never a widening,
+            // because it is exactly what the token the client just presented already carried". That
+            // was false, and it was false in the same way for scope, where this file rejects the
+            // identical argument two ceilings earlier: the issued token belongs to the EXCHANGING
+            // client, so what the SUBJECT token was allowed to carry is not the question.
             crate::server::GrantedDetails::of_token(&subject),
             None,
             false,
@@ -825,6 +999,26 @@ async fn exchange<S: Storage, C: Clock>(
             // carrying the subject token's report forward would let an exchange launder a stale
             // authentication into a token that looks freshly stepped up.
             crate::server::GrantedAuthentication::default(),
+            // THE DELEGATION, recorded on the token itself. `act` is `Some` only for the
+            // delegation branch above; an impersonation exchange names no actor by definition.
+            // This is what lets RFC 7662 introspection answer "A acting for B" rather than "B",
+            // which for an OPAQUE token is the only channel that could.
+            crate::server::GrantedActor {
+                act: act.clone().map(Box::new),
+            },
+            // THE LIFETIME CEILING, and the reason it has to exist at all. The token issued here
+            // is an ordinary access token, so it is itself an acceptable SUBJECT token, and
+            // self-exchange is explicitly permitted a few ceilings above. Without a ceiling a
+            // client could re-exchange just before each expiry and receive a fresh full
+            // `access_token_ttl` every time, indefinitely, which renews the grant's lifetime
+            // without limit. That is precisely what the "no refresh token is issued" rule in this
+            // module's docs exists to prevent, defeated by the issued token's own type.
+            //
+            // `min(now + access_token_ttl, subject.expires_at)` is applied inside `issue`, so the
+            // stored expiry, the RFC 9068 `exp` claim and the `expires_in` below all state the one
+            // capped instant. An exchanged token can therefore be narrower in time as it is in
+            // scope, details and audience, and never wider.
+            Some(subject.expires_at),
         )
         .await?;
 

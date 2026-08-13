@@ -120,11 +120,19 @@ pub enum BearerMethod {
 /// REQUIRED), and the issuer identifier of at least one authorization server, without which the
 /// document tells a client nothing it can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// `#[non_exhaustive]`: this struct's field set VARIES WITH CARGO FEATURES, so a host that writes a
-/// full struct literal has a build that breaks the day anything in their dependency graph enables a
-/// feature they did not ask for. Construct with `new()` and assign the fields you want. This is the
-/// one attribute on this type that cannot be added after publication, because by then somebody's
-/// struct literal is in production.
+/// `#[non_exhaustive]`: RFC 9728 section 7.1 registers these members in an IANA registry that takes
+/// new entries, and this type gains a field for each one this crate learns to publish. A host that
+/// wrote a full struct literal would have a build that breaks on a PATCH release that only added a
+/// member. Construct with `new()` and assign the fields you want. This is the one attribute on this
+/// type that cannot be added after publication, because by then somebody's struct literal is in
+/// production.
+///
+/// Note that the justification is NOT the one
+/// [`crate::metadata::AuthorizationServerMetadata`] carries: that type's field set genuinely varies
+/// with cargo features, and this one's does not — there is no `#[cfg]` on any field here, because
+/// RFC 9728 is the whole of the `resource-metadata` feature and nothing else gates a member of it.
+/// Both types want the attribute; they want it for different reasons, and stating the wrong one
+/// invites somebody to remove the attribute on discovering the reason is untrue.
 #[non_exhaustive]
 pub struct ProtectedResourceConfig {
     /// Section 2 `resource`: the resource identifier, an absolute URI with no fragment. This is
@@ -219,7 +227,22 @@ impl ProtectedResourceConfig {
 /// Optional members are `Option` and are OMITTED when absent, never serialized as `null`, exactly
 /// as [`crate::metadata::AuthorizationServerMetadata`] does and for the same reason: section 2
 /// defines member types, and `null` is not one of them.
+///
+/// `#[non_exhaustive]` for the same reason [`ProtectedResourceConfig`] is, and it is the DOCUMENT
+/// that the reason is really about: RFC 9728 section 7.1 registers its members in an IANA registry
+/// that takes new entries, so this type gains a field whenever the crate learns to publish one, and
+/// a member added to a wire format is not a breaking change to anybody except a host who wrote the
+/// struct out by hand. The supported way to build one is
+/// [`ProtectedResourceMetadata::from_config`], which is also the only way to get a document that
+/// agrees with the [`ProtectedResourceConfig`] the host actually declared. `Deserialize` is derived
+/// and is unaffected, so a client-side or test-side consumer parsing a served document still works,
+/// and so does reading or matching on any field.
+///
+/// Added in 0.9.1, which is the last release it can be added in: 0.9.0 was an alpha published so
+/// the crate could be built against, and after a release meant for real use the attribute can never
+/// go on, because by then somebody's struct literal is in production.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProtectedResourceMetadata {
     /// REQUIRED (section 2). Section 3.3 makes this the member a client checks: it MUST be
     /// identical to the resource identifier the well-known suffix was inserted into, or the

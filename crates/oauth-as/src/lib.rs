@@ -21,8 +21,9 @@
 //!
 //! This crate is the AUTHORIZATION SERVER half of OAuth: it registers clients, runs grant state
 //! machines, issues and introspects tokens, and produces exactly the wire shapes the RFCs define.
-//! It is a LIBRARY, not a server binary: the host owns the HTTP listener, TLS, rate limiting, and
-//! persistence. The host hands request parameters to [`server::AuthorizationServer`] and
+//! It is a LIBRARY, not a server binary: the host owns the HTTP listener, TLS, persistence, and
+//! the rate-limiting policy (a per-process floor ships here — see [`rate_limit`] — but only the
+//! host has a caller identity to key on, and only a host installs it). The host hands request parameters to [`server::AuthorizationServer`] and
 //! serializes the returned response/error types (they carry their own `serde` shapes and HTTP
 //! status codes), or turns on the optional `http` feature and gets that wire surface written for
 //! it.
@@ -58,7 +59,7 @@
 //!   for hosts that want one; nothing else in the crate knows axum exists.
 //! - `jwt` (RFC 9068 `at+jwt` access tokens and an RFC 7517 JWKS document), `dpop` (RFC 9449
 //!   sender-constrained tokens), `mtls` (RFC 8705 certificate-bound tokens and client
-//!   authentication), `client_assertion` (RFC 7523 `private_key_jwt` and `client_secret_jwt`).
+//!   authentication), `client-assertion` (RFC 7523 `private_key_jwt` and `client_secret_jwt`).
 //! - `par` and `jar` (RFC 9126 pushed authorization requests, RFC 9101 signed request objects),
 //!   `rar` (RFC 9396 `authorization_details`), `token-exchange` (RFC 8693), `consent` (consent
 //!   records, withdrawal with a revocation cascade, and RFC 9470 step-up authentication),
@@ -86,7 +87,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use oauth_as::{
-    AuthorizationServer, ConsentDecision, MemoryStorage, ServerConfig, ServiceBuilder, Storage,
+    ApprovalDecision, AuthorizationServer, MemoryStorage, ServerConfig, ServiceBuilder, Storage,
 };
 
 # fn wire() -> Result<(), Box<dyn std::error::Error>> {
@@ -111,11 +112,11 @@ tokio::spawn(async move {
 // Both seams are REQUIRED: with no consent resolver the authorization endpoint answers 403
 // rather than deciding on the user's behalf. Returning `Approve` unconditionally, as here, is
 // an AUTO-APPROVING authorization server (RFC 6749 s10.12); a real host reads its own session
-// here and returns `ConsentDecision::Respond` with a consent screen. See
+// here and returns `ApprovalDecision::Respond` with a consent screen. See
 // `examples/production_server.rs` for both done properly, plus CSRF and audit.
 let service = ServiceBuilder::new(server)
     .with_subject_resolver(|_headers| Some("user-1".to_string()))
-    .with_consent_resolver(|_request| ConsentDecision::Approve)
+    .with_approval_resolver(|_request| ApprovalDecision::Approve)
     .build()?;
 # let _ = service;
 # Ok(())
@@ -133,10 +134,18 @@ let service = ServiceBuilder::new(server)
 //!   to see issuance, refusal, or the two compromise events (authorization code replay, refresh
 //!   token reuse) installs a sink. Events carry no credential of any kind; see the [`events`]
 //!   module docs for the rule and for why the refresh `family_id` is safe to carry.
-//! - RATE LIMITING ([`events::RateLimiter`]). THIS LIBRARY DOES NOT RATE LIMIT. It never sees a
-//!   request, so it has no caller, IP, session or user to count against. RFC 8628 section 5.1
-//!   makes the device user code's entropy adequate only IN COMBINATION WITH rate limiting of code
-//!   entry, so a deployment offering the device grant MUST install one.
+//! - RATE LIMITING ([`events::RateLimiter`]). This crate never sees a request, so it has no IP,
+//!   TLS peer, session or caller identity to key a counter on, and a throttle keyed on the things
+//!   this crate DOES see is the only kind it can write. It writes that one:
+//!   [`rate_limit::FixedWindowRateLimiter`] is a per-process, in-memory floor, and the device path
+//!   already consults it — [`server::AuthorizationServer::approve_device`] asks the installed
+//!   limiter on its first statement, BEFORE the user code is looked up, which is what RFC 8628
+//!   section 5.1 means when it makes the user code's entropy adequate only IN COMBINATION WITH
+//!   rate limiting of code entry. What remains the host's is the part a library cannot do: the
+//!   limiter must be INSTALLED ([`server::AuthorizationServer::with_rate_limiter`]) — nothing is
+//!   throttled until it is — and a multi-node deployment still owes a SHARED limiter behind the
+//!   same trait, because a per-process count of an attacker spread over `N` nodes is `N` times too
+//!   generous.
 //! - CLIENT SECRET STORAGE ([`client::SecretHash`], [`client::SecretVerifier`]). Hosts should
 //!   store a one-way verifier, not the secret. The built-in scheme needs no host code; a host
 //!   whose policy names argon2id or an HSM installs a verifier.
@@ -200,12 +209,16 @@ let service = ServiceBuilder::new(server)
 // sentence written here never did.
 pub mod authorization;
 pub mod client;
-#[cfg(feature = "client_assertion")]
-#[cfg_attr(docsrs, doc(cfg(feature = "client_assertion")))]
+#[cfg(feature = "client-assertion")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-assertion")))]
 pub mod client_assertion;
 #[cfg(feature = "consent")]
 #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
 pub mod consent;
+// Ungated: the macro it exports forwards the feature-gated methods under their own `#[cfg]`, so
+// this module is meaningful in every build and costs nothing in any of them (a `macro_rules!`
+// definition compiles to no code until it is used).
+pub mod delegate;
 pub mod device;
 #[cfg(feature = "dpop")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dpop")))]
@@ -247,10 +260,16 @@ pub mod server;
 #[cfg(all(feature = "test-util", feature = "jwt"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "test-util", feature = "jwt"))))]
 pub mod signer_conformance;
-// PRIVATE, and one item long: the clock-skew allowance that `client_assertion` and `dpop` both
-// PUBLISH. It lives here because those two are independent features and neither can own a
-// constant the other must still see; both re-export it, so the public paths are unchanged.
-#[cfg(any(feature = "client_assertion", feature = "dpop"))]
+// PRIVATE, and one item long: the clock-skew allowance that `client-assertion` and `dpop` both
+// PUBLISH. It lives here because those features are independent and none can own a constant the
+// others must still see; the two that published it re-export it, so the public paths are unchanged.
+//
+// `jar` joined them when RFC 9101 request objects started honouring `nbf`, which is the third
+// independent feature to need the same number. That is the argument this module was created by:
+// before it existed, `client-assertion` and `dpop` each carried their own
+// `Duration::from_secs(60)` and had drifted. A third private copy in `par.rs` would have been the
+// same mistake a third time.
+#[cfg(any(feature = "client-assertion", feature = "dpop", feature = "jar"))]
 mod skew;
 #[cfg(feature = "test-util")]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
@@ -267,11 +286,11 @@ pub use authorization::{
     ResponseType, ValidatedAuthorizationRequest,
 };
 pub use client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash, SecretVerifier};
-#[cfg(feature = "client_assertion")]
-#[cfg_attr(docsrs, doc(cfg(feature = "client_assertion")))]
+#[cfg(feature = "client-assertion")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-assertion")))]
 pub use client_assertion::{
     AssertionFailure, AssertionKeys, VerifiedAssertion, CLIENT_ASSERTION_TYPE, CLIENT_SECRET_JWT,
-    PRIVATE_KEY_JWT,
+    MAX_ASSERTION_LIFETIME, MIN_CLIENT_SECRET_JWT_KEY_LENGTH, PRIVATE_KEY_JWT,
 };
 #[cfg(feature = "consent")]
 #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
@@ -282,7 +301,9 @@ pub use consent::{
 pub use device::{DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState};
 #[cfg(feature = "dpop")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dpop")))]
-pub use dpop::{DpopFailure, VerifiedProof, DPOP_HEADER, DPOP_TOKEN_TYPE, MAX_PROOF_BYTES};
+pub use dpop::{
+    DpopFailure, VerifiedProof, DPOP_HEADER, DPOP_TOKEN_TYPE, MAX_PROOF_AGE, MAX_PROOF_BYTES,
+};
 pub use error::{ErrorCode, ErrorResponse};
 pub use events::{
     Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
@@ -292,9 +313,34 @@ pub use grant::GrantType;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub use http::{
-    AuthorizationService, Body, ConsentDecision, ConsentRequest, ConsentResolver, CsrfTokenHook,
-    ServiceBuilder, ServiceError, SubjectResolver, MAX_BODY_BYTES, MAX_FORM_PARAMETERS,
+    ApprovalDecision, ApprovalRequest, ApprovalResolver, AuthorizationService, Body, CsrfTokenHook,
+    Response, ServiceBuilder, ServiceError, SubjectResolver, MAX_BODY_BYTES, MAX_FORM_PARAMETERS,
 };
+// `AuthenticationReporter` is the RFC 9470 seam and exists only when `consent` does, so its
+// re-export carries the same PAIR of gates the item itself carries. A single `http` gate here
+// would not compile without `consent`, and an `all(...)` narrower than the item would hide it.
+#[cfg(all(feature = "http", feature = "consent"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "consent"))))]
+pub use http::AuthenticationReporter;
+// THE `jwt` MODULE'S ROOT PRESENCE, added in 0.9.1. Every other module's headline types are
+// re-exported here, and this list stepped from `metadata` straight to `mtls`, so the type of a
+// `pub` field on `ServerConfig` (`AccessTokenFormat`), the type `AuthorizationServer::jwks`
+// returns (`Jwks`), and the two traits the `jwt` feature exists to publish (`Es256Signer`,
+// `Es256Verifier`) had no path from the crate root at all. The gate below is EACH ITEM'S OWN
+// `#[cfg]`, not a convenient wider one: a re-export narrower than its item is an absence rather
+// than an error, and this crate has already shipped that bug once (see `token::Confirmation`).
+#[cfg(feature = "jwt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub use jwt::{
+    AccessTokenFormat, Audience, Es256Signer, Es256Verifier, Jwk, Jwks, JwtConfig, JwtError,
+    PublicJwk, SignerError, VerifyError,
+};
+// NARROWER on purpose: these three are the BUILT-IN backend, which `jwt` deliberately does not
+// carry (see the `jwt-p256` note in Cargo.toml). `KeyError` comes with them because it is what
+// `EcdsaP256Key`'s constructors return, and a host that cannot name it cannot match on it.
+#[cfg(feature = "jwt-p256")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
+pub use jwt::{EcdsaP256Key, KeyError, P256Verifier};
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
 #[cfg(feature = "mtls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mtls")))]
@@ -321,7 +367,9 @@ pub use rar::{
     AuthorizationDetail, AuthorizationDetails, MAX_AUTHORIZATION_DETAILS_BYTES,
     MAX_AUTHORIZATION_DETAILS_DEPTH, MAX_AUTHORIZATION_DETAILS_ELEMENTS,
 };
-pub use rate_limit::{FixedWindowRateLimiter, RateLimitConfig};
+pub use rate_limit::{
+    FixedWindowRateLimiter, RateLimitConfig, MAX_TRACKED_CLIENT_ID_LEN, MIN_WINDOW,
+};
 pub use registration::{
     ClientInformation, ClientMetadata, RegistrationAttempt, RegistrationConfig,
     RegistrationDecision, RegistrationErrorCode, RegistrationErrorResponse, RegistrationFailure,
@@ -341,7 +389,24 @@ pub use server::{
     AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ServerConfig, SystemClock,
     TokenRequest, TokenRequestContext, UserApproval, MAX_RESOURCE_INDICATORS, MIN_USER_CODE_LENGTH,
 };
-pub use store::{MemoryStorage, Storage, StorageError};
+// `RevocationBarrier` and `WriteOutcome` are here for the reason the comment above gives: a
+// re-export narrower than its item is an absence rather than an error. A host implementing
+// `Storage` MUST name `WriteOutcome`, because it is what `put_token`, `put_refresh_token` and
+// `put_pushed_authorization_request` return, and `RevocationBarrier` is what its own predicate
+// matches on. Both shipped at 0.9.1 reachable only through `oauth_as::store::`, which is exactly
+// the inconsistency this rule exists to prevent.
+//
+// `RevocationWindow` JOINED THEM, and it was the strongest case of the three while being the one
+// left out. It is a BY-VALUE parameter of `delete_client`, `revoke_token_family` and
+// `revoke_consent`, so a host cannot write those signatures at all without spelling it: a store may
+// satisfy `RevocationBarrier` entirely in SQL and never match on the type, but there is no way to
+// declare a parameter whose type you cannot name. This crate's own Postgres backend paid for the
+// omission four times over, writing `oauth_as::store::RevocationWindow` inline at each site.
+// `tests/host_api_shape.rs`'s `every_type_in_a_storage_signature_is_reexported_at_the_crate_root`
+// now derives the whole list from `Storage`'s signatures rather than leaving it to be noticed.
+pub use store::{
+    MemoryStorage, RevocationBarrier, RevocationWindow, Storage, StorageError, WriteOutcome,
+};
 // The GATE MATCHES THE TYPE's, which is `any(dpop, mtls)`: `IntrospectionResponse::cnf` is a
 // public field under that same pair, so an `mtls`-only host (RFC 8705 certificate-bound tokens,
 // which is the whole reason such a host exists) was handed a value it could not name here. It

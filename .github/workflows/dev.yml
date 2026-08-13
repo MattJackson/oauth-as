@@ -4,6 +4,29 @@
 # only on the qa branch, where speed matters less than thoroughness.
 #
 # NO continue-on-error anywhere: every step is load-bearing and a failure is RED.
+#
+# HOW THIRD-PARTY ACTIONS ARE PINNED HERE, and why the two classes are treated differently.
+#
+# A `uses:` reference is arbitrary code running with this job's token and this job's checkout. A
+# TAG is not an identity: the owner of the repository can move it to a different commit at any
+# time and every workflow that names it silently starts running the new code. A BRANCH (which is
+# what `@stable` and `@nightly` are on dtolnay/rust-toolchain) is the same thing without even the
+# pretence of stability. So every action NOT under the `actions/` organisation is pinned to a
+# full-length commit SHA, with the human-readable ref in a trailing comment so the next person can
+# see what it was meant to be and diff it.
+#
+# `actions/*` stay on major tags. They are published by GitHub itself, from the same trust root
+# that runs the workflow at all: if that account is compromised, a pinned SHA in this file buys
+# nothing, because the runner, the token service and the tag are all downstream of it. Pinning
+# them would cost a dependency-bump treadmill for no threat it removes.
+#
+# dtolnay/rust-toolchain NEEDS `toolchain:` spelled out once it is pinned by SHA: the action reads
+# the wanted toolchain from the REF it was invoked by, so `@<sha>` alone silently installs its
+# default (stable) whatever the job intended. The SHA below is a master commit, which that
+# action's README requires: its `stable`/`nightly`/`1.75` branch tips are outside master's history
+# and get garbage collected.
+#
+# When a pin needs moving: `gh api repos/<owner>/<repo>/commits/<ref> --jq .sha`.
 
 name: dev fast gate
 
@@ -16,6 +39,17 @@ concurrency:
   group: dev-${{ github.ref }}
   cancel-in-progress: true
 
+# LEAST PRIVILEGE FOR THE JOB TOKEN, at the workflow level so a new job inherits it.
+#
+# With no `permissions:` block at all, every job gets whatever the REPOSITORY SETTINGS say the
+# default GITHUB_TOKEN scope is, which is a value nobody reviewing this file can see and which
+# GitHub has historically defaulted to read/write on older repositories. Nothing in this workflow
+# writes anything: it lints, tests and measures. Stating that here means a reviewer can read the
+# token's power out of the reviewed tree instead of out of a settings page, and it means a step
+# that later needs more has to ask for it in a diff.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -26,11 +60,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # THE FEATURE LIST HAS THREE HAND-MAINTAINED MIRRORS, and this is what stops them drifting.
+      # The rule stated in the comment on the no-backend step below (anything added to [features]
+      # in crates/oauth-as/Cargo.toml belongs there too, unless it pulls an ES256 backend in) was
+      # enforced by nothing, and neither was the same list in qa.yml or the `f-*` mirrors in
+      # scripts/size-probe/Cargo.toml. A feature added to the crate and to none of them escapes the
+      # no-backend job, the size gate, or both, silently. That has already happened twice here; see
+      # the script's header for both escapes.
+      #
+      # The script derives the exclusion rather than listing it: a feature is excluded from the
+      # no-backend list exactly when its closure reaches `jwt-p256`. A fourth hand-maintained list
+      # would have made this worse rather than better.
+      #
+      # FIRST STEP, like qa.yml's workflow drift check: it needs no toolchain and no cache, so a
+      # drifted list is named in seconds rather than after the compile it was supposed to gate.
+      - name: feature lists must match the crate manifest (feature drift)
+        run: python3 scripts/feature-mirrors.py
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy (deny warnings)
@@ -48,11 +99,11 @@ jobs:
         run: cargo test -p oauth-as --locked --all-features
       # THE NO-BACKEND BUILD, which --all-features cannot reach. With `jwt-p256` compiled in,
       # `P256Verifier` is installed as the default and "no ES256 backend" is not a state the server
-      # can be in. This step is the only place it is, so it is the only place `client_assertion`
+      # can be in. This step is the only place it is, so it is the only place `client-assertion`
       # without a backend, `dpop` without a backend, and `jar` without a backend are ever executed.
       #
       # THE FEATURE SET IS "EVERYTHING EXCEPT THE BACKEND", and it is written that way on purpose
-      # rather than as a hand-picked list. It used to read `dpop,jar,client_assertion,par,test-util`
+      # rather than as a hand-picked list. It used to read `dpop,jar,client-assertion,par,test-util`
       # and the omission that mattered was `http`: `tests/wire_reachability.rs` is
       # `#![cfg(feature = "http")]`, so the ONE suite whose job is to prove that every capability
       # the RFC 8414 document advertises is reachable over the wire was compiled out of the ONE
@@ -69,7 +120,27 @@ jobs:
       - name: tests (every feature EXCEPT the ES256 backend)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,mtls,par,jar,client_assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+      # EVERY FEATURE EXCEPT `rar`, and this line exists because two test files had never run.
+      #
+      # RFC 9396 section 5 makes refusal a MUST for a detail type the server does not support, and
+      # the build supporting NONE of them is the build without `rar` -- which is `default = []`,
+      # the shipped default. The audit found the parameter accepted and ignored at three doors,
+      # fixed all three, and wrote the proofs into two files gated `not(feature = "rar")`.
+      #
+      # Neither ever ran. Every `cargo test` above is one of three feature sets: the default
+      # (`http` off, so the first file compiles to nothing), `--all-features` (has `rar`), and the
+      # no-backend line (has `rar`). The second file needs `jar` AND `jwt-p256` without `rar`, a
+      # combination no step names, so it was never even COMPILED. The clippy feature loop
+      # type-checks the first file but does not execute it, and a test that is type-checked is a
+      # test nobody has watched pass.
+      #
+      # The rule for this line: `--all-features` minus `rar`. Anything added to [features] belongs
+      # here too, unless it is `rar` itself.
+      - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
+        run: |
+          cargo test -p oauth-as --locked --features \
+            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,test-util
       # RUSTDOC, and it is a gate rather than a nicety. Nothing here ran rustdoc, and the cost of
       # that was measurable: 23 warnings at 0.9.0, including public documentation pointing readers
       # at pub(crate) items they cannot see, and two links to a type (`RouterBuilder`) renamed in
@@ -97,7 +168,18 @@ jobs:
       # it; the conformance job caught it after the push.
       #
       # These are the combinations a real consumer plausibly picks, not an exhaustive product.
-      - name: build feature combinations
+      #
+      # CLIPPY --all-targets, NOT `cargo build`, and the difference was worth seven live errors.
+      # This loop ran `cargo build` until 2026-08-12, which compiles the LIBRARY only: no test
+      # target, no example, no bench. So the one matrix whose entire job is to visit the corners of
+      # the feature space never compiled the files that hold most of the `#[cfg(feature = ...)]`
+      # code, and `-D warnings` at any point in it was a promise about a third of the crate. When
+      # this line was changed to clippy, `--no-default-features --features http` failed immediately
+      # with six dead-code errors in tests/mutation_gaps_http_credentials.rs and one in
+      # tests/wire_reachability.rs, all of which had been sitting on `dev` green. That is the third
+      # escape of this exact shape here: an MSRV violation and a per-feature `-D warnings` failure
+      # both got through earlier for the same reason, a gate compiling less than it appeared to.
+      - name: clippy feature combinations (all targets)
         run: |
           set -e
           # BOTH sides of the ES256 seam appear here on purpose: `jwt` is the trait surface with
@@ -105,14 +187,14 @@ jobs:
           # compiles with one can fail with the other. `test-util,jwt` is listed because the
           # signer conformance harness only exists when both are on.
           for f in "" "http" "jwt" "jwt-p256" "http,jwt" "http,jwt-p256" "jwt,rar" \
-                   "http,jwt,dpop" "jwt,mtls" "dpop,jar,client_assertion" \
-                   "jwt,client_assertion" "http,jwt,par,jar" "jwt,token-exchange" \
+                   "http,jwt,dpop" "jwt,mtls" "dpop,jar,client-assertion" \
+                   "jwt,client-assertion" "http,jwt,par,jar" "jwt,token-exchange" \
                    "consent" "resource-metadata" "test-util" "test-util,jwt"; do
             echo "::group::features: ${f:-<default>}"
             if [ -z "$f" ]; then
-              cargo build -p oauth-as --locked
+              cargo clippy -p oauth-as --locked --all-targets --no-default-features -- -D warnings
             else
-              cargo build -p oauth-as --locked --features "$f"
+              cargo clippy -p oauth-as --locked --all-targets --features "$f" -- -D warnings
             fi
             echo "::endgroup::"
           done
@@ -133,8 +215,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: gate self-test (must go RED against a nonconformant server)
         run: scripts/oauth-conformance.sh --selftest
       - name: live black-box conformance
@@ -164,8 +248,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
         with:
           # The probe is its own workspace (see scripts/size-probe/Cargo.toml on why), and its
           # per-configuration target directories live under target/size-report. Neither is what
@@ -175,5 +261,13 @@ jobs:
             .
             scripts/size-probe
           cache-directories: target/size-report
+      # RED FIRST, exactly like the conformance, interop and MCP-scanner gates in qa.yml, and this
+      # was the one shell gate in the repository without it. --selftest re-runs --check with the
+      # budget forced to 1 byte and requires exit 1: if the row set is empty, the probe did not
+      # build, the section parser did not understand the object format, or the comparison is not
+      # wired to the exit status, that run exits 0 and this step is RED. Only then does the green
+      # below mean the budgets were checked. It costs one extra link of the `default` row.
+      - name: prove the size gate can go RED
+        run: scripts/size-report.sh --selftest
       - name: linked size within budget
         run: scripts/size-report.sh --check

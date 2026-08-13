@@ -38,6 +38,28 @@ on:
         required: false
         type: string
 
+# LEAST PRIVILEGE FOR THE JOB TOKEN, at the workflow level so every job inherits read-only and
+# the ONE job that needs more has to say so. See dev.yml for the general reasoning. Here it also
+# means the `decide` job -- which runs unattended on every push to main, with no environment gate
+# and no human in the loop -- cannot write to the repository at all, whatever the repository's
+# default token scope happens to be set to.
+permissions:
+  contents: read
+
+# SERIALISED, and this is not decoration. This file has BOTH a `push: branches: [main]` trigger and
+# a `workflow_dispatch`, so two pushes in quick succession -- or a push plus a manual dispatch --
+# would otherwise run `decide` and `publish` concurrently. Both `decide` jobs read the same manifest
+# version, both get the same "not on crates.io" answer, and both arm. One `cargo publish` then wins
+# and the other run goes red AFTER the environment approval was granted, while both race to
+# `git push origin "$tag"`.
+#
+# `cancel-in-progress: false` because cancelling an in-flight publish is worse than queueing behind
+# it: a cancelled run may have already uploaded to crates.io, which is irreversible.
+#
+# This block was deleted by accident during the 0.9.1 audit, when the `permissions:` hunk above
+# replaced it rather than being added beside it. It went unnoticed until a lens pointed at the
+# audit's own changes; nothing else in the repository would have caught it, because a missing
+# concurrency group has no failing test.
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -57,13 +79,52 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       should_publish: ${{ steps.check.outputs.should_publish }}
     steps:
+      # THE BRANCH GUARD, in the workflow file rather than only in repository settings.
+      #
+      # workflow_dispatch can be aimed at ANY ref, so without this the escape hatch is a publish
+      # button that works from a feature branch. The intended stop is the crates-io-publish
+      # environment's "deployment branches" rule, but a workflow file cannot see or enforce that
+      # setting, and GitHub auto-creates the environment UNPROTECTED on first use, so relying on
+      # it alone means relying on a gate that may not exist. This step is the half that lives in
+      # the repository and is reviewed with the code.
+      #
+      # It is in `decide` (and repeated in `publish`) because `decide` is what every path runs
+      # first, so a refusal here stops the run before any version lookup or approval request.
+      #
+      # THROUGH `env:`, NOT `${{ }}` INSIDE THE SCRIPT. GitHub substitutes an expression textually
+      # before bash ever sees the line, so a value containing a quote and a semicolon becomes
+      # SHELL rather than a string, in a job that decides whether a permanent crates.io publish is
+      # armed. `github.ref` is not attacker-controlled on a `push: branches: [main]` trigger, but
+      # this workflow also has a `workflow_dispatch` that can be aimed at any ref, and the rule
+      # only works if it is the rule everywhere: this file already argued the same point two steps
+      # down about passing a version to Python as argv rather than interpolating it into source.
+      - name: Refuse to run from any ref other than main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::refusing to publish from $REF; main is the published branch and only refs/heads/main may publish. Promote the commit through dev and then qa, merge it to main (that push publishes on its own), and only re-dispatch this workflow manually with main selected in the branch box if the publish step itself failed after the gate passed."
+            exit 1
+          fi
+          echo "ref is refs/heads/main"
+
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
 
       - name: Read the manifest version and ask crates.io if it exists
         id: check
+        env:
+          # See the note on the branch guard above. `inputs.version` is the one genuinely
+          # user-supplied string in this file: a dispatcher types it into a text box, and
+          # `requested="${{ inputs.version }}"` put it into the script BEFORE bash parsed it, so
+          # `"; curl ... | sh; x="` would have run on the runner that holds the publish token.
+          REQUESTED: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -74,9 +135,8 @@ jobs:
 
           # If the dispatcher named a version, it must match. This is the only thing the manual
           # input does: it cannot choose WHAT to publish, only refuse a surprise.
-          requested="${{ inputs.version }}"
-          if [ -n "$requested" ] && [ "$requested" != "$manifest_version" ]; then
-            echo "::error::you asked to publish $requested but crates/oauth-as/Cargo.toml says $manifest_version"
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$manifest_version" ]; then
+            echo "::error::you asked to publish $REQUESTED but crates/oauth-as/Cargo.toml says $manifest_version"
             exit 1
           fi
 
@@ -84,22 +144,60 @@ jobs:
           # is a legitimate first publish -- distinguish it from a transport failure rather than
           # letting a network error read as "not published yet" and trigger a publish attempt.
           http_status="$(curl -sS -o /tmp/crate.json -w '%{http_code}' \
-            -H 'User-Agent: oauth-as-release-ci (https://github.com/${{ github.repository }})' \
+            -H "User-Agent: oauth-as-release-ci (https://github.com/$REPOSITORY)" \
             "https://crates.io/api/v1/crates/oauth-as")"
 
           case "$http_status" in
             200)
-              if python3 -c "
+              # A PARSE FAILURE IS FATAL, and that is the whole shape of this block.
+              #
+              # This used to be `if python3 -c '...sys.exit(0 if present else 1)'`, which conflates
+              # two different facts: "the body is valid and does not list this version" and "the
+              # body could not be read at all" both exit nonzero, and an `if` condition is exempt
+              # from `set -e`, so both landed in the else branch -- the "not published, go publish"
+              # path. A proxy error page or a truncated body served with HTTP 200 therefore ARMED A
+              # PUBLISH, which is the one outcome the 404-vs-other-status handling below exists to
+              # prevent. A permanent crates.io version must never be the result of an unreadable
+              # answer.
+              #
+              # So the script now prints a WORD on success and exits nonzero only when it cannot
+              # answer, and the three cases (present / absent / could not tell) are handled apart.
+              # The version is passed as argv rather than interpolated into the source, so a
+              # version string can never become Python syntax.
+              verdict=""
+              if ! verdict="$(python3 - "$manifest_version" <<'PY'
           import json, sys
-          d = json.load(open('/tmp/crate.json'))
-          sys.exit(0 if '$manifest_version' in {v['num'] for v in d['versions']} else 1)
-          "; then
-                echo "crates.io already has oauth-as $manifest_version -- nothing to publish"
-                echo "should_publish=false" >> "$GITHUB_OUTPUT"
-              else
-                echo "crates.io does NOT have oauth-as $manifest_version -- this push is a release"
-                echo "should_publish=true" >> "$GITHUB_OUTPUT"
+
+          try:
+              with open('/tmp/crate.json') as fh:
+                  doc = json.load(fh)
+              published = {v['num'] for v in doc['versions']}
+          except Exception as exc:  # unparseable body, wrong shape, empty file, truncation
+              print('cannot read the crates.io response: %r' % (exc,), file=sys.stderr)
+              raise SystemExit(2)
+
+          print('present' if sys.argv[1] in published else 'absent')
+          PY
+              )"; then
+                echo "::error::crates.io returned HTTP 200 but the body could not be parsed as the expected crate document; refusing to guess whether $manifest_version is already published. The body is echoed below."
+                head -c 2000 /tmp/crate.json || true
+                exit 1
               fi
+
+              case "$verdict" in
+                present)
+                  echo "crates.io already has oauth-as $manifest_version -- nothing to publish"
+                  echo "should_publish=false" >> "$GITHUB_OUTPUT"
+                  ;;
+                absent)
+                  echo "crates.io does NOT have oauth-as $manifest_version -- this push is a release"
+                  echo "should_publish=true" >> "$GITHUB_OUTPUT"
+                  ;;
+                *)
+                  echo "::error::internal: version check printed an unrecognised verdict '$verdict'"
+                  exit 1
+                  ;;
+              esac
               ;;
             404)
               echo "crates.io has no oauth-as crate at all -- first publish"
@@ -123,26 +221,106 @@ jobs:
     # notes at the end of this file.
     environment: crates-io-publish
     steps:
+      # THE BRANCH GUARD AGAIN, and it is here because the comment on the copy in `decide` said it
+      # was "repeated in `publish`" when it was not. A comment asserting a check into existence is
+      # the failure mode this repository keeps finding, so the choice was to add the step or fix
+      # the sentence, and the step is worth having: `decide` and `publish` are separate jobs, and
+      # a `needs:` edge carries an output, not a proof that the earlier job's guard ran the checks
+      # this one assumes. This is the job that holds CARGO_REGISTRY_TOKEN.
+      - name: Refuse to run from any ref other than main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::refusing to publish from $REF; main is the published branch and only refs/heads/main may publish."
+            exit 1
+          fi
+          echo "ref is refs/heads/main"
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
+      # FIRST, like dev.yml and qa.yml, and for the reason the script's own header gives: it needs
+      # no toolchain and no cache, so a feature list that has drifted from [features] is named in
+      # seconds. It was absent here entirely, which mattered more than anywhere else: publish.yml
+      # carried a FOURTH copy of the no-backend list that scripts/feature-mirrors.py could not see,
+      # so a feature added to the crate, to dev.yml and to qa.yml left the LAST gate before an
+      # irreversible crates.io publish running a stale matrix, silently and with every check green.
+      - name: feature lists must match the crate manifest (feature drift)
+        run: python3 scripts/feature-mirrors.py
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
 
-      - name: Full gate before publish (fmt, clippy, test)
+      # THE LAST GATE BEFORE A PERMANENT VERSION, so it runs the matrices rather than one of them.
+      #
+      # It used to be `clippy` and `test` at DEFAULT FEATURES ONLY, which is roughly a third of the
+      # suite immediately before an irreversible crates.io release: every feature-gated capability
+      # (dpop, mtls, par, jar, rar, token-exchange, consent, client-assertion) went unexercised.
+      # The argument for that was that `main` is only ever reached through `qa`, which runs
+      # everything. Nothing enforces it, and 0.9.1 found three defects that ONE matrix could not
+      # see while another could, so "the other branch checked it" is not a check.
+      #
+      # The narrow no-backend list is the third matrix and it is the one that keeps catching
+      # things: it is every feature EXCEPT the ES256 backend, which is the configuration a host
+      # with its key in a KMS actually builds.
+      - name: Full gate before publish (fmt, clippy, test, both broad matrices)
         run: |
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
           cargo test --workspace --locked
+          cargo test -p oauth-as --locked --all-features
+
+      # SPLIT OUT AND RENAMED to exactly the step name dev.yml and qa.yml use, because
+      # scripts/feature-mirrors.py finds this list by that name. While it was one line inside the
+      # step above, this was a fourth hand-maintained copy of the no-backend feature list that no
+      # check could see. The name is now the handle, so renaming it in one workflow and not the
+      # others is a loud failure in the script rather than a silent divergence here.
+      - name: tests (every feature EXCEPT the ES256 backend)
+        run: |
+          cargo test -p oauth-as --locked --features \
+            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+
+      # See dev.yml's copy for the argument. RFC 9396 section 5's refusals are proven by two files
+      # gated `not(feature = "rar")`, and no feature set anywhere ran them; one was never compiled.
+      # This is the last gate before an irreversible publish, so it runs here too.
+      - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
+        run: |
+          cargo test -p oauth-as --locked --features \
+            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,test-util
+
+      - name: docs must build clean, since docs.rs is the published surface
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p oauth-as --locked --all-features --no-deps
 
       - name: publish dry run (final check before the real thing)
         run: cargo publish --dry-run --locked -p oauth-as
 
-      - name: package file list (final human-reviewable record)
-        run: cargo package --list --locked -p oauth-as
+      # THE PACKAGE LIST, COMPARED rather than printed. This step ran `cargo package --list` and
+      # nothing looked at the output, so it could only fail if cargo itself errored -- while the
+      # step name called it "the final human-reviewable record" and the review it names happens
+      # after the publish, if at all. Dropping a stray file into crates/oauth-as/ (a scratch note,
+      # a key, a 40 MB fixture) shipped it to crates.io PERMANENTLY with every gate green.
+      #
+      # crates/oauth-as/package-manifest.txt is the committed expectation. Adding or removing a
+      # packaged file is now a two-line diff in a reviewed commit, which is what "reviewable"
+      # has to mean for something that cannot be undone. Regenerate with:
+      #   cargo package --list --locked -p oauth-as | LC_ALL=C sort > crates/oauth-as/package-manifest.txt
+      - name: package file list matches the committed manifest
+        run: |
+          set -euo pipefail
+          cargo package --list --locked -p oauth-as | LC_ALL=C sort > /tmp/package-list.txt
+          if ! diff -u crates/oauth-as/package-manifest.txt /tmp/package-list.txt; then
+            echo "::error::the files cargo would publish differ from crates/oauth-as/package-manifest.txt (- expected, + actual). A crates.io publish is PERMANENT, so an unreviewed file in the tarball cannot be taken back. If the change is intended, regenerate the manifest in the same commit; the command is in the comment above this step."
+            exit 1
+          fi
+          echo "the package contains exactly the files crates/oauth-as/package-manifest.txt records"
 
       - name: cargo publish
         env:
@@ -153,16 +331,20 @@ jobs:
       # precondition. Requiring the tag first would mean a failed publish leaves a tag claiming a
       # release that does not exist on crates.io.
       - name: Tag the published commit
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          tag="v${{ needs.decide.outputs.version }}"
+          tag="v$VERSION"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             echo "tag $tag already exists, leaving it alone"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "oauth-as $tag (published to crates.io by ${{ github.workflow }} run ${{ github.run_id }})"
+          git tag -a "$tag" -m "oauth-as $tag (published to crates.io by $WORKFLOW run $RUN_ID)"
           git push origin "$tag"
 
   # Runs when the push to main carried no version bump. Exists so the reason is visible in the
@@ -173,8 +355,10 @@ jobs:
     if: needs.decide.outputs.should_publish == 'false'
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          echo "crates/oauth-as/Cargo.toml is at ${{ needs.decide.outputs.version }}, which is already on crates.io."
+      - env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          echo "crates/oauth-as/Cargo.toml is at $VERSION, which is already on crates.io."
           echo "To release: bump the version in crates/oauth-as/Cargo.toml, take it through dev and qa, and promote to main."
 
 # WHAT THE OWNER MUST CONFIGURE BY HAND (none of this can be done from inside a workflow file):

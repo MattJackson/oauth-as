@@ -9,7 +9,7 @@
 //! here is the one that matters most, because an implementation that verifies the signature and
 //! forgets the `jti` passes every other test in both files while shipping a credential anybody who
 //! observed one request can send again.
-#![cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+#![cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 // Requires `jwt-p256`, the built-in ES256 backend, because every test below has to PRODUCE a
 // signature. `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at
 // all, so in that build there is nothing here that could run.
@@ -92,10 +92,85 @@ fn request(client_id: &str) -> TokenRequest {
 }
 
 fn context<'a>(assertion: &'a str) -> TokenRequestContext<'a> {
-    TokenRequestContext {
-        credential: ClientCredential::assertion(Some(CLIENT_ASSERTION_TYPE), assertion),
-        ..Default::default()
-    }
+    TokenRequestContext::new(ClientCredential::assertion(
+        Some(CLIENT_ASSERTION_TYPE),
+        assertion,
+    ))
+}
+
+/// Sign with a header the caller chooses, so a test can put a `crit` in it.
+fn sign_hs256_with_header(secret: &str, header: &[u8], claims: &serde_json::Value) -> String {
+    compact_jws(header, &serde_json::to_vec(claims).unwrap(), |input| {
+        hmac_sha256(secret.as_bytes(), input.as_bytes()).to_vec()
+    })
+}
+
+/// RFC 7515 section 4.1.11: a JWS whose header names an extension the recipient does not
+/// implement is INVALID, and the signature being genuine is exactly why that matters.
+///
+/// The assertion below is signed correctly with the right secret and carries valid claims. What it
+/// also carries is a `crit` naming `b64` (RFC 7797), which is the producer stating that the
+/// payload is NOT base64url-encoded and that understanding this is REQUIRED to process the JWS.
+/// A verifier that ignores `crit` therefore verifies a different message from the one the producer
+/// signed, which is the class RFC 8725 section 3.10 names.
+///
+/// Until the 0.9.1 audit this rule was implemented once, for request objects in `par.rs`, while
+/// client assertions and DPoP proofs — also attacker-supplied JWS, also parsed by `CompactJws` —
+/// checked `typ` and `alg` and nothing else. One hardened reader and two unhardened ones is the
+/// shape that produced this crate's earlier `claim_time` defect.
+#[tokio::test]
+async fn an_assertion_whose_header_names_an_unknown_crit_extension_is_refused() {
+    let srv = server();
+    srv.register_client(client(
+        "critter",
+        ClientAuth::ConfidentialAssertion {
+            keys: AssertionKeys::ClientSecret {
+                secret: ClientSecretKey::new(SECRET).expect("fixture secret clears the floor"),
+            },
+        },
+    ))
+    .await
+    .unwrap();
+
+    let assertion = sign_hs256_with_header(
+        SECRET,
+        br#"{"alg":"HS256","typ":"JWT","crit":["b64"],"b64":false}"#,
+        &claims("critter", "crit-1"),
+    );
+    let refused = srv
+        .token_with_context(request("critter"), context(&assertion))
+        .await
+        .expect_err("a crit naming an unimplemented extension must be refused");
+    assert_eq!(refused.error, ErrorCode::InvalidClient);
+}
+
+/// The other half of RFC 7515 section 4.1.11: an EMPTY `crit` is forbidden by the RFC itself,
+/// independently of which extensions a recipient implements. Without this, "no names I do not
+/// understand" would read as acceptable.
+#[tokio::test]
+async fn an_assertion_whose_header_has_an_empty_crit_is_refused() {
+    let srv = server();
+    srv.register_client(client(
+        "critter-empty",
+        ClientAuth::ConfidentialAssertion {
+            keys: AssertionKeys::ClientSecret {
+                secret: ClientSecretKey::new(SECRET).expect("fixture secret clears the floor"),
+            },
+        },
+    ))
+    .await
+    .unwrap();
+
+    let assertion = sign_hs256_with_header(
+        SECRET,
+        br#"{"alg":"HS256","typ":"JWT","crit":[]}"#,
+        &claims("critter-empty", "crit-2"),
+    );
+    let refused = srv
+        .token_with_context(request("critter-empty"), context(&assertion))
+        .await
+        .expect_err("an empty crit is forbidden by RFC 7515 s4.1.11");
+    assert_eq!(refused.error, ErrorCode::InvalidClient);
 }
 
 // ------------------------------------------------------------------------------- the happy path
@@ -260,6 +335,16 @@ async fn two_clients_may_use_the_same_jti_without_locking_each_other_out() {
     );
 }
 
+/// THE SWEEP INSTANT IS CHOSEN SO THAT ONLY THE `jti` IS DEAD, and that is the whole test.
+///
+/// `Storage::sweep_expired` returns ONE aggregate across every collection it walks, and the token
+/// request below also stored an access token with the default 3600 second TTL. A sweep at
+/// `now + 3600` therefore reports at least one removal whether or not the replay set was ever
+/// written to: making `claim_replay_id` a no-op left that assertion green. The assertion's `exp`
+/// is `now + 120` and the replay entry is remembered until exactly that, so at `now + 300` the
+/// claimed `jti` is the ONLY dead record in the store and the count is exactly one. The second
+/// sweep is what pins that reading: it reclaims the access token, so the two ones are two
+/// different records rather than the same one counted twice.
 #[tokio::test]
 async fn a_spent_jti_is_reclaimed_by_the_host_s_sweep() {
     // Nothing in this crate evicts anything on a timer (see the crate docs), so the replay set is
@@ -279,6 +364,7 @@ async fn a_spent_jti_is_reclaimed_by_the_host_s_sweep() {
     .await
     .unwrap();
     let assertion = sign_es256(&key, &claims("sweepable", "sweep-1"));
+    let issued_at = SystemTime::now();
     assert!(srv
         .token_with_context(request("sweepable"), context(&assertion))
         .await
@@ -286,12 +372,24 @@ async fn a_spent_jti_is_reclaimed_by_the_host_s_sweep() {
 
     let swept = srv
         .store()
-        .sweep_expired(SystemTime::now() + Duration::from_secs(3600))
+        .sweep_expired(issued_at + Duration::from_secs(300))
         .await
         .unwrap();
-    assert!(
-        swept > 0,
-        "a sweep past the assertion's own exp must reclaim its jti"
+    assert_eq!(
+        swept, 1,
+        "past the assertion's own exp and inside the access token's TTL, the claimed jti is the \
+         one record a sweep may reclaim"
+    );
+
+    let later = srv
+        .store()
+        .sweep_expired(issued_at + Duration::from_secs(3601))
+        .await
+        .unwrap();
+    assert_eq!(
+        later, 1,
+        "and the access token is still there to be reclaimed afterwards, which is what makes the \
+         count above the jti and not the token"
     );
 }
 
@@ -371,13 +469,7 @@ async fn presenting_a_secret_and_an_assertion_together_is_refused() {
     let mut credential = ClientCredential::assertion(Some(CLIENT_ASSERTION_TYPE), &assertion);
     credential.client_secret = Some(SECRET);
     let refused = srv
-        .token_with_context(
-            request("both"),
-            TokenRequestContext {
-                credential,
-                ..Default::default()
-            },
-        )
+        .token_with_context(request("both"), TokenRequestContext::new(credential))
         .await;
     assert_eq!(refused.unwrap_err().error, ErrorCode::InvalidClient);
 }
@@ -404,10 +496,7 @@ async fn an_assertion_with_the_wrong_or_missing_client_assertion_type_is_refused
         let refused = srv
             .token_with_context(
                 request("typed"),
-                TokenRequestContext {
-                    credential: ClientCredential::assertion(wrong, &assertion),
-                    ..Default::default()
-                },
+                TokenRequestContext::new(ClientCredential::assertion(wrong, &assertion)),
             )
             .await;
         assert_eq!(

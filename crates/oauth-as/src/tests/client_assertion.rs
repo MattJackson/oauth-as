@@ -628,3 +628,87 @@ fn an_assertion_with_no_readable_subject_yields_no_lookup_key() {
     let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
     assert_eq!(unverified_subject(&assertion), None);
 }
+
+// ----------------------------------------------------------------------------- the size bound
+
+/// A valid assertion padded with an ignored claim until it is `target` bytes long, or as close
+/// underneath as base64url's three-bytes-to-four expansion allows.
+///
+/// Padding with a CLAIM rather than with junk on the end keeps the fixture a real assertion: it is
+/// signed, it verifies, and RFC 7523 section 3 says nothing about extra claims, so the only thing
+/// distinguishing it from an ordinary one is its length.
+fn padded_assertion(target: usize) -> String {
+    let build = |filler: usize| {
+        let mut c = claims();
+        c["pad"] = json!("p".repeat(filler));
+        hs256(SECRET, &json!({"alg": "HS256", "typ": "JWT"}), &c)
+    };
+    let mut filler = 0;
+    while build(filler + 1).len() <= target {
+        filler += 1;
+    }
+    build(filler)
+}
+
+/// THE ATTACK: a megabyte in the `client_assertion` parameter, from a caller holding no credential.
+///
+/// `verify_assertion` is PUBLIC and this crate never sees a socket, so the only bound that ever
+/// applied to this string was `MAX_BODY_BYTES` in the optional `http` module — which
+/// `client-assertion` does not depend on, and which a host assembling its own request parsing does
+/// not have. Without a bound here the whole string is base64-decoded and run through two
+/// `serde_json::from_slice` calls before the registration's `alg` is even compared. The DPoP sibling
+/// has had exactly this cap since 0.9.1 for exactly these reasons.
+#[test]
+fn an_assertion_larger_than_the_cap_is_refused_before_it_is_parsed() {
+    let assertion = padded_assertion(MAX_ASSERTION_BYTES * 4);
+    assert!(assertion.len() > MAX_ASSERTION_BYTES);
+
+    assert_eq!(
+        verify(&secret_keys(), &assertion),
+        Err(AssertionFailure::Malformed),
+        "an assertion past the cap is refused on size, whatever it would have verified as"
+    );
+
+    // And the lookup that runs BEFORE verification is bounded too, which is the one that matters
+    // most: `unverified_subject` is called to find the registration, so it runs on a string about
+    // which nothing whatever is yet known.
+    assert_eq!(
+        unverified_subject(&assertion),
+        None,
+        "the pre-authentication lookup must not parse a string past the cap either"
+    );
+}
+
+/// The other side of the boundary. An assertion AT the cap is accepted and verifies, so the bound is
+/// `> MAX_ASSERTION_BYTES` rather than `>=`, and the check cannot have been implemented as a
+/// blanket refusal of anything large.
+#[test]
+fn an_assertion_at_the_cap_is_accepted() {
+    let assertion = padded_assertion(MAX_ASSERTION_BYTES);
+    assert!(
+        assertion.len() <= MAX_ASSERTION_BYTES && assertion.len() + 4 > MAX_ASSERTION_BYTES,
+        "the fixture must sit ON the boundary, not comfortably inside it; it is {} bytes",
+        assertion.len()
+    );
+
+    let verified =
+        verify(&secret_keys(), &assertion).expect("an assertion at the cap is inside it");
+    assert_eq!(verified.jti, "assertion-0001");
+    assert_eq!(unverified_subject(&assertion).as_deref(), Some(CLIENT));
+}
+
+/// The cap must not be so tight that a conforming client cannot fit: this is the section 3 claim set
+/// with nothing padded, under both signing methods.
+#[test]
+fn an_ordinary_assertion_is_far_inside_the_cap() {
+    let hs = hs256(SECRET, &json!({"alg": "HS256", "typ": "JWT"}), &claims());
+    let (key, _) = key_pair();
+    let es = es256(&key, &json!({"alg": "ES256", "typ": "JWT"}), &claims());
+    for assertion in [hs, es] {
+        assert!(
+            assertion.len() * 4 < MAX_ASSERTION_BYTES,
+            "a conforming assertion is {} bytes; a cap of {MAX_ASSERTION_BYTES} must leave room",
+            assertion.len()
+        );
+    }
+}

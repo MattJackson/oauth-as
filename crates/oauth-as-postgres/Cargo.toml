@@ -3,7 +3,7 @@
 
 [package]
 name = "oauth-as-postgres"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 # NOT the core crate's 1.75 floor, and that is a deliberate consequence of this being a SEPARATE
 # crate rather than a feature of `oauth-as`. sqlx and its tree declare their own, higher, floor.
@@ -28,13 +28,25 @@ default = []
 # the replay-id code, and `migrate()` does not create their tables.
 par = ["oauth-as/par"]
 consent = ["oauth-as/consent"]
-client_assertion = ["oauth-as/client_assertion"]
+client-assertion = ["oauth-as/client-assertion"]
 dpop = ["oauth-as/dpop"]
-# Fields on the persisted records are themselves feature-gated in the core. Nothing here needs
-# code for them (the payload is serde), but a host whose core has them on must switch them on
-# here too or the two crates disagree about the shape of a record.
+# Fields on the persisted records are themselves feature-gated in the core, and NOTHING under this
+# crate's `src/` or `tests/` is `#[cfg]`-ed on any of these three: the payload is serde over the
+# core's own types, so `store.rs` serialises whatever those types are in this build.
+#
+# THEY ARE PURE RE-EXPORTS, and the reason they exist is NOT that the two crates could otherwise
+# disagree about the shape of a record. They could not: cargo unifies features across a build
+# graph, so there is exactly one compiled `oauth-as` rlib and therefore exactly one `IssuedToken`.
+# (The comment here claimed otherwise until the 0.9.1 audit, which is worth recording because the
+# false claim is the plausible one.) What they buy is the ability to ENABLE the core feature from a
+# manifest that names only this crate: a host that wants RFC 8705 thumbprints, RFC 9396 details or
+# RFC 8693 delegation persisted has one line to write here rather than a second direct dependency
+# on `oauth-as` carrying the feature, which is the coupling this crate exists to spare it.
 mtls = ["oauth-as/mtls"]
 rar = ["oauth-as/rar"]
+# RFC 8693 delegation. It gates `IssuedToken::act`, so without this line a host doing token
+# exchange had no way to reach the field from a manifest naming only this crate.
+token-exchange = ["oauth-as/token-exchange"]
 
 # The integration tests need a REAL PostgreSQL. They are behind a feature, off by default, so that
 # `cargo test --workspace` on a machine with no database stays green and honest rather than
@@ -42,8 +54,19 @@ rar = ["oauth-as/rar"]
 # see tests/README-style module docs in tests/postgres.rs.
 #
 # It also switches ON the feature-gated halves of the trait, because a conformance run that
-# skipped them would be a green nobody should quote.
-pg-integration = ["consent", "par", "client_assertion", "dpop"]
+# skipped them would be a green nobody should quote. THE FIELD-ONLY FEATURES ARE HERE TOO, for the
+# same reason: through 0.9.1 this list stopped at the four method-gating features, so `act`,
+# `x5t_s256` and `authorization_details` were never in a payload that round-tripped against a real
+# server, and no test in this crate could even NAME them. See `tests/persisted_shape.rs`.
+pg-integration = [
+    "consent",
+    "par",
+    "client-assertion",
+    "dpop",
+    "mtls",
+    "rar",
+    "token-exchange",
+]
 
 [dependencies]
 oauth-as = { version = "0.9", path = "../oauth-as" }
@@ -69,9 +92,13 @@ serde_json = "1"
 # the test build cannot change what this crate has to implement.
 oauth-as = { version = "0.9", path = "../oauth-as", features = ["test-util"] }
 # The harness's `with_spawn` mode needs a multi-threaded runtime for the races to be real races
-# rather than an interleaving, and the two-connection test needs a barrier.
+# rather than an interleaving, and the two-connection test needs a barrier. `time` is for
+# `tests/revocation_races.rs`, which holds a write open while a revocation commits and has to give
+# the revocation a bounded opportunity to finish first; see that file on why the wait is not a
+# race it could lose.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "sync",
+    "time",
 ] }

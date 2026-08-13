@@ -205,7 +205,7 @@ fn every_registerable_auth_method_is_one_the_metadata_advertises() {
 /// will otherwise assume is a bug.
 ///
 /// RFC 8414 s2's `token_endpoint_auth_methods_supported` describes the TOKEN ENDPOINT. Under
-/// `client_assertion` it advertises `private_key_jwt` and `client_secret_jwt`, and under `mtls`
+/// `client-assertion` it advertises `private_key_jwt` and `client_secret_jwt`, and under `mtls`
 /// the two RFC 8705 methods, and all four of those are genuinely accepted there for a client the
 /// HOST provisioned out of band. None of the four can be reached through RFC 7591 dynamic
 /// registration, because a registration cannot carry what they need: [`ClientMetadata`] models no
@@ -228,15 +228,15 @@ fn a_method_the_metadata_advertises_may_still_be_unregisterable() {
         RegistrationErrorCode::InvalidClientMetadata
     );
 
-    // Gated on `jwt-p256` as well as `client_assertion`, because since the signing seam landed the
-    // two are no longer the same claim. `private_key_jwt` is ES256, and `client_assertion = ["jwt"]`
+    // Gated on `jwt-p256` as well as `client-assertion`, because since the signing seam landed the
+    // two are no longer the same claim. `private_key_jwt` is ES256, and `client-assertion = ["jwt"]`
     // buys the surface without a backend, so a build can have the feature and no way to check an
     // ES256 signature at all. `from_config` states only what the config alone establishes and
     // therefore omits the method in that build, which is the fail-safe direction: under-advertising
     // costs a client one unnecessary fallback, over-advertising sends it down a path that always
     // refuses. This test asserts the ADVERTISEMENT is honest, so it belongs in the build where the
     // advertisement is made.
-    #[cfg(all(feature = "client_assertion", feature = "jwt-p256"))]
+    #[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
     {
         let advertised = crate::metadata::AuthorizationServerMetadata::from_config(
             &ServerConfig::new("https://as.example", "https://as.example/device"),

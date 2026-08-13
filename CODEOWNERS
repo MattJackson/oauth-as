@@ -1,7 +1,7 @@
 # CODEOWNERS: see https://docs.github.com/articles/about-code-owners
 #
 # Every file in this repository requires review from the owner. main and qa are promotion
-# branches per CONTRIBUTING.md and GOAL.md; the owner decides promotion, so the owner is the
-# reviewer of record for everything that lands here.
+# branches per CONTRIBUTING.md; the owner decides promotion, so the owner is the reviewer of
+# record for everything that lands here.
 
 * @MattJackson

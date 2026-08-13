@@ -34,21 +34,47 @@
 //!    `scope` are the ones the generator put in the object, not defaults and not query values
 //!    (there are none, by construction).
 //! 5. A REFUSAL IS AN RFC 6749 s5.2 BODY, whatever the object contained.
+//!
+//! # Why the generator is WEIGHTED, and why it emits `exp`
+//!
+//! Invariants 1 to 4 all say "on success", so all four are worth exactly nothing unless the
+//! generator can actually produce a request object that VALIDATES. Two things stood in the way,
+//! and both were silent:
+//!
+//! * NO INPUT COULD EVER SUCCEED. `src/par.rs` REQUIRES `exp` on a request object (an object with
+//!   no expiry authorizes its exact request for as long as the client's key stays registered) and
+//!   the generator never emitted one. Every input in this target's whole history was refused with
+//!   "the request object has no exp", so the entire block below invariant 5's `return` had never
+//!   executed once. `exp` is generated now, with the wrong shapes alongside the right one.
+//! * THE CONJUNCTION WAS ASTRONOMICAL. Eight claims must be simultaneously correct, and at a
+//!   uniform one-in-five each that is one input in 390625 before the signing, alg, typ and
+//!   presented-client choices are counted as well. [`Claim`] therefore has a HAND-WRITTEN
+//!   `Arbitrary` that makes the correct value likely, which costs nothing: a mutation that is one
+//!   claim away from correct is exactly the input that tells these invariants apart.
 
 #![no_main]
 
-use arbitrary::Arbitrary;
+use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use oauth_as::scope::ScopeSet;
 use oauth_as::{AuthorizationError, ErrorCode};
 use oauth_as_fuzz::{
-    is_nqschar, jws_signed, jws_with_signature, request_object_key, runtime, server, ISSUER,
-    JAR_ID, PUBLIC_ID, REDIRECT_URI, RFC7636_CHALLENGE,
+    is_nqschar, jws_signed, jws_with_signature, request_object_key, runtime, server, DEFAULT_SCOPE,
+    ISSUER, JAR_ID, PUBLIC_ID, REDIRECT_URI, RFC7636_CHALLENGE,
 };
+
+/// The scope the generator SIGNS into the object when it chooses the correct value.
+///
+/// Deliberately NOT the fixture client's registered default (`read`), which is what a validator
+/// that dropped the signed claim would substitute. Two equal strings would have hidden exactly
+/// the substitution invariant 4 exists to catch, so this is the whole scope the client is allowed
+/// rather than the half it defaults to.
+const SIGNED_SCOPE: &str = "read write";
 
 /// One claim, spelled so the fuzzer can cheaply choose the CORRECT value. A generator that could
 /// only produce arbitrary strings would never once assemble a request that validates, and the
 /// claim walk past the first refusal would be dead code as far as the fuzzer is concerned.
-#[derive(Arbitrary, Debug)]
+#[derive(Debug)]
 enum Claim {
     Correct,
     Absent,
@@ -60,6 +86,21 @@ enum Claim {
     Empty,
 }
 
+/// Weighted three-quarters towards [`Claim::Correct`]. See "Why the generator is WEIGHTED" in
+/// the module docs: eight of these have to be correct at once for anything to validate, and a
+/// uniform choice makes that conjunction unreachable rather than rare.
+impl<'a> Arbitrary<'a> for Claim {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(match u.int_in_range(0..=15)? {
+            0..=11 => Claim::Correct,
+            12 => Claim::Absent,
+            13 => Claim::Other(String::arbitrary(u)?),
+            14 => Claim::NotAString,
+            _ => Claim::Empty,
+        })
+    }
+}
+
 impl Claim {
     fn value(&self, correct: &str) -> Option<serde_json::Value> {
         match self {
@@ -68,6 +109,43 @@ impl Claim {
             Claim::Other(s) => Some(s.as_str().into()),
             Claim::NotAString => Some(serde_json::json!([1, 2, 3])),
             Claim::Empty => Some("".into()),
+        }
+    }
+}
+
+/// The object's `exp`, which `src/par.rs` REQUIRES and bounds.
+///
+/// A separate type from [`Claim`] because it is a NumericDate rather than a string, and because
+/// the two ways it can be wrong that matter are not "absent" and "some other text": they are
+/// already past, and so far out that the object is a replayable bearer credential.
+#[derive(Arbitrary, Debug)]
+enum Exp {
+    /// A minute out: inside the server's replay ceiling, which is the only shape that validates.
+    Valid,
+    /// Absent. RFC 9101 does not require `exp`; this server does, because an object without one
+    /// authorizes its exact request for as long as the client's key stays registered.
+    Absent,
+    /// Already past.
+    Expired,
+    /// A day out, far beyond the ceiling: an object may not name its own replay window.
+    TooFar,
+    /// Present and not a NumericDate at all.
+    NotANumber,
+}
+
+impl Exp {
+    /// Resolved against the wall clock, because the fixture server runs on `SystemClock`.
+    fn value(&self) -> Option<serde_json::Value> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the fixture clock is after the epoch")
+            .as_secs();
+        match self {
+            Exp::Valid => Some((now + 60).into()),
+            Exp::Absent => None,
+            Exp::Expired => Some((now.saturating_sub(60)).into()),
+            Exp::TooFar => Some((now + 86_400).into()),
+            Exp::NotANumber => Some("soon".into()),
         }
     }
 }
@@ -96,6 +174,7 @@ struct Input {
     scope: Claim,
     code_challenge: Claim,
     code_challenge_method: Claim,
+    exp: Exp,
     state: Option<String>,
     iss: Claim,
     aud: Claim,
@@ -148,7 +227,7 @@ fn build(input: &Input) -> String {
         ("client_id", &input.claim_client_id, JAR_ID),
         ("response_type", &input.response_type, "code"),
         ("redirect_uri", &input.redirect_uri, REDIRECT_URI),
-        ("scope", &input.scope, "read"),
+        ("scope", &input.scope, SIGNED_SCOPE),
         ("code_challenge", &input.code_challenge, RFC7636_CHALLENGE),
         (
             "code_challenge_method",
@@ -161,6 +240,9 @@ fn build(input: &Input) -> String {
         if let Some(value) = claim.value(correct) {
             claims.insert(name.into(), value);
         }
+    }
+    if let Some(exp) = input.exp.value() {
+        claims.insert("exp".into(), exp);
     }
     if let Some(state) = &input.state {
         claims.insert("state".into(), state.as_str().into());
@@ -224,6 +306,11 @@ fuzz_target!(|input: Input| {
         input.alg.as_deref().unwrap_or("ES256") == "ES256",
         "a request object validated under an alg other than ES256 (RFC 8725 s3.1): {input:?}"
     );
+    assert!(
+        matches!(input.exp, Exp::Valid),
+        "a request object validated with an exp that is absent, past, unparseable or beyond the \
+         server's replay ceiling: {input:?}"
+    );
 
     // 2 and 3.
     assert!(
@@ -253,5 +340,34 @@ fuzz_target!(|input: Input| {
             Some(state.as_str()),
             "state was not carried through from the signed object"
         );
+    }
+    // 4, the half the header has always claimed and nothing asserted. `scope` decides what the
+    // token this request leads to is ALLOWED TO DO, so a validator that dropped the signed claim
+    // and fell back to the client's registered default would be issuing against a request the
+    // client did not sign, which is the whole failure this target's header exists for.
+    //
+    // When the object named a scope, the validated request must carry THAT scope. When it named
+    // none, RFC 6749 s3.3 leaves the choice to the server and the registered default is the
+    // correct answer; that case is asserted too, so "always use the default" fails on the first
+    // branch and "never use the default" fails on the second.
+    match input.scope.value(SIGNED_SCOPE) {
+        Some(serde_json::Value::String(s)) => {
+            let signed = ScopeSet::parse(&s)
+                .expect("a scope that validated must have been a well formed scope string");
+            assert_eq!(
+                validated.scope, signed,
+                "the validated request carries a scope the object did not sign: {input:?}"
+            );
+        }
+        None => {
+            let default = ScopeSet::parse(DEFAULT_SCOPE).expect("the fixture default scope");
+            assert_eq!(
+                validated.scope, default,
+                "an object naming no scope must fall back to the registration's default \
+                 (RFC 6749 s3.3): {input:?}"
+            );
+        }
+        // Anything else could not have validated as a scope, so there is nothing to compare.
+        Some(_) => {}
     }
 });

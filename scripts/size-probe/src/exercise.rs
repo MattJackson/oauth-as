@@ -208,7 +208,7 @@ pub fn run() -> u64 {
     {
         acc = acc.wrapping_add(crate::exercise_features::dpop());
     }
-    #[cfg(feature = "f-client_assertion")]
+    #[cfg(feature = "f-client-assertion")]
     {
         acc = acc.wrapping_add(crate::exercise_features::client_assertion());
     }

@@ -10,7 +10,7 @@
 //! one pointing at the other. Two numbers that must stay equal, and a comment saying so, is a
 //! drift waiting for whoever changes one of them.
 //!
-//! It cannot live in either module, because `client_assertion` and `dpop` are INDEPENDENT
+//! It cannot live in either module, because `client-assertion` and `dpop` are INDEPENDENT
 //! features and a build may have either alone. It lives here, private, and each of them
 //! re-exports it, so `oauth_as::client_assertion::CLOCK_SKEW_LEEWAY` and
 //! `oauth_as::dpop::CLOCK_SKEW_LEEWAY` both still resolve: unifying the definition is not a

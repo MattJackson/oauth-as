@@ -18,8 +18,18 @@
 //! It validates a PROOF (section 4.3) and produces a thumbprint. It does not speak HTTP: the host
 //! (or the optional `http` feature) reads the `DPoP` request header and hands the string in.
 //!
-//! Two things RFC 9449 defines that are NOT implemented here, called out rather than left to be
+//! Three things RFC 9449 defines that are NOT implemented here, called out rather than left to be
 //! discovered:
+//!
+//! - The `ath` CLAIM (section 4.3 step 11), which binds a proof to the specific access token it is
+//!   presented with. This function verifies a proof against a method and a URI; it takes no access
+//!   token, so it cannot check `ath` and does not. That is the right scope for an AS — at the
+//!   token endpoint there is no access token yet — but it MATTERS for the resource-server use
+//!   [`verify_proof`] documents below, because without it a proof is bound to a key and a request
+//!   line but not to a token: an RS built only on this accepts token A presented with a proof
+//!   carrying no `ath`, or one whose `ath` hashes a different token B, as long as both were issued
+//!   to the same key. An RS MUST check `ath` itself, against the token it is about to accept.
+//!   This omission was undocumented until the 0.9.1 audit; the gap was in the docs, not the code.
 //!
 //! - SERVER-PROVIDED NONCES (section 8), the `DPoP-Nonce` response header and the `use_dpop_nonce`
 //!   error. They need the AS to mint, remember and return a nonce on a REJECTED request, which is a
@@ -76,7 +86,7 @@ pub const MAX_PROOF_AGE: Duration = Duration::from_secs(300);
 /// How far a client's clock may be AHEAD of this server's before `iat` is refused. Granted in that
 /// direction only.
 ///
-/// The SAME constant `client_assertion` publishes for RFC 7523 assertions, re-exported rather than
+/// The SAME constant `client-assertion` publishes for RFC 7523 assertions, re-exported rather than
 /// duplicated: one value defined in `src/skew.rs`, which is where the reasoning for the number is.
 /// It used to be a second `pub const` here whose doc comment said "for the same reason as in
 /// `crate::client_assertion`", which is a comment admitting two numbers had to be kept equal by
@@ -108,6 +118,31 @@ pub use crate::skew::CLOCK_SKEW_LEEWAY;
 /// from anywhere.
 pub const MAX_PROOF_BYTES: usize = 4096;
 
+/// The longest `jti` [`verify_proof`] will accept on a proof, in bytes.
+///
+/// WHY A SECOND CAP, when [`MAX_PROOF_BYTES`] already bounds the whole string. That one bounds the
+/// WORK; this one bounds what is RETAINED, and they are different quantities. Everything else
+/// `verify_proof` reads is dropped when it returns, but the `jti` is the one value the caller is
+/// obliged to WRITE DOWN: `AuthorizationServer` puts it through
+/// [`crate::store::Storage::claim_replay_id`] with a deadline of `iat + MAX_PROOF_AGE`, which with
+/// the [`CLOCK_SKEW_LEEWAY`] a client may claim ahead is up to six minutes from now. Under a 4096
+/// byte proof cap alone, a single request affords a `jti` of nearly 3 KiB, held in the host's store
+/// three hundred times longer than the request that produced it took to refuse.
+///
+/// This is the ONE path in this crate on which a caller who has authenticated as nobody causes a
+/// durable store write. The RFC 7523 sibling in `client-assertion` also claims a `jti`, but it
+/// reaches that claim only after the assertion has verified under a REGISTERED client's key, so the
+/// writes it can be made to perform are bounded by credentials a host issued. A DPoP proof verifies
+/// under a key the caller generated for that request, which is no bound at all.
+///
+/// WHY 128, from what a `jti` is for. RFC 9449 section 4.2 asks only that the value be unique, and
+/// section 11.1 explains why: it is what single use is enforced on. A UUID is 36 characters, a
+/// base64url 128-bit random is 22, and the crate's own tests mint them shorter than that. 128 bytes
+/// is several times what any conforming client needs and still small enough that the retained set is
+/// bounded by request rate rather than by a length an attacker chose. A `jti` this cap refuses is
+/// not a `jti` any conforming client sends.
+pub const MAX_JTI_BYTES: usize = 128;
+
 /// Why a DPoP proof was refused.
 ///
 /// RFC 9449 section 5 makes `invalid_dpop_proof` the token-endpoint answer for all of these; the
@@ -116,8 +151,9 @@ pub const MAX_PROOF_BYTES: usize = 4096;
 #[non_exhaustive]
 pub enum DpopFailure {
     /// Not a compact JWS at all, or longer than [`MAX_PROOF_BYTES`], which is refused on size
-    /// before anything is decoded. Both are the same answer to the client, because both mean this
-    /// server will not read the string it was handed.
+    /// before anything is decoded, or carrying a `jti` longer than [`MAX_JTI_BYTES`]. All three are
+    /// the same answer to the client, because all three mean this server will not read, or will not
+    /// remember, the string it was handed.
     Malformed,
     /// The `typ` header is not `dpop+jwt`, so this JWT is something else.
     NotAProof,
@@ -137,6 +173,18 @@ pub enum DpopFailure {
     MissingJti,
     /// This `jti` has been seen before within the proof's acceptance window.
     Replayed,
+    /// A proof arrived where this server cannot bind the token it would issue, so it was refused
+    /// without being read at all.
+    ///
+    /// RFC 8693 token exchange is the case that exists today: the exchange has nowhere to record a
+    /// `cnf.jkt`, so honouring the proof would hand a client that asked for a sender-constrained
+    /// token a bearer token and say nothing. The refusal is correct; what this variant fixes is the
+    /// REPORT. It was [`DpopFailure::Malformed`], whose `Display` is "the DPoP proof is not a well
+    /// formed JWT", about a string this server never parsed: that sends an operator to the client's
+    /// author over a JWS that is probably perfectly good, when the answer is a capability of the
+    /// server the operator controls. The same mistake, the same way round, is what
+    /// `AssertionFailure::ReplayCheckUnavailable` was added for one file over.
+    NotAcceptedHere,
 }
 
 impl fmt::Display for DpopFailure {
@@ -152,6 +200,9 @@ impl fmt::Display for DpopFailure {
             DpopFailure::StaleProof => "the DPoP proof iat is missing or outside the window",
             DpopFailure::MissingJti => "the DPoP proof carries no jti",
             DpopFailure::Replayed => "the DPoP proof jti has already been used",
+            DpopFailure::NotAcceptedHere => {
+                "this server cannot bind a token on this request, so the DPoP proof was refused"
+            }
         })
     }
 }
@@ -209,6 +260,13 @@ pub fn htu_of(url: &str) -> &str {
 /// whose resource server is in the same tree as its AS should not have to reimplement section 4.3
 /// to do it. Nothing is retained here, so claiming the returned `jti` (see
 /// [`crate::store::Storage::claim_replay_id`]) remains the caller's obligation either way.
+///
+/// A RESOURCE SERVER HAS ONE MORE CHECK TO MAKE, and this function cannot make it: section 4.3
+/// step 11 requires that a proof presented WITH an access token carry an `ath` equal to the
+/// base64url SHA-256 of that token. There is no access token in this signature, so `ath` is not
+/// verified here. Checking it is the caller's obligation, exactly as claiming the `jti` is, and
+/// skipping it leaves a proof bound to a key and a request line but not to a token. See the
+/// module docs.
 pub fn verify_proof(
     verifier: &dyn Es256Verifier,
     proof: &str,
@@ -224,6 +282,13 @@ pub fn verify_proof(
     }
 
     let jws = CompactJws::parse(proof).map_err(|_| DpopFailure::Malformed)?;
+
+    // (0b) RFC 7515 s4.1.11 `crit`, on the same parser every other JWS verifier here uses. A proof
+    // whose header names an extension this server does not implement is INVALID, not merely
+    // unusual. See `CompactJws::reject_unknown_crit`.
+    if jws.reject_unknown_crit().is_err() {
+        return Err(DpopFailure::Malformed);
+    }
 
     // (3) `typ` is `dpop+jwt`, and compared exactly. Case folding it would accept `DPOP+JWT`, which
     // no conforming client sends and which only widens what a captured JWT can be presented as; the
@@ -274,7 +339,7 @@ pub fn verify_proof(
     // here would still ACCEPT the proof at that instant, against an empty replay cache: exactly
     // one free replay of a captured proof, which is the whole thing the `jti` exists to refuse.
     // The two predicates have to agree at the boundary, and the sweep's is the exclusive one.
-    // `client_assertion` has never had this gap because its acceptance was exclusive already.
+    // `client-assertion` has never had this gap because its acceptance was exclusive already.
     // Every one of these additions is CHECKED, and the reason is that `iat` is a `u64` lifted
     // straight out of attacker-written JSON on a request that has authenticated nobody. Plain `+`
     // on a `SystemTime` PANICS on overflow, and this crate is a library: the panic unwinds into the
@@ -302,6 +367,13 @@ pub fn verify_proof(
     let jti = jws.claim_str("jti").unwrap_or_default();
     if jti.is_empty() {
         return Err(DpopFailure::MissingJti);
+    }
+    // And bounded, because this is the one value leaving this function that the caller has to
+    // REMEMBER: see [`MAX_JTI_BYTES`] for why the proof-wide cap does not cover it. `Malformed`
+    // rather than `MissingJti`, because there is nothing missing: the proof is one this server will
+    // not read on size, which is what `Malformed` already says.
+    if jti.len() > MAX_JTI_BYTES {
+        return Err(DpopFailure::Malformed);
     }
 
     Ok(VerifiedProof {

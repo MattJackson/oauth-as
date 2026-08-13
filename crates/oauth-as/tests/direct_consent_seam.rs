@@ -11,7 +11,7 @@
 //! routes), so the auto-approving authorization server was the one a host got by doing nothing.
 //!
 //! The seam is [`oauth_as::server::UserApproval`]. It is not a proof and cannot be: the `http`
-//! resolver's `ConsentDecision::Approve` is not a proof either, and a host can wire `|_| Approve`
+//! resolver's `ApprovalDecision::Approve` is not a proof either, and a host can wire `|_| Approve`
 //! there just as it can call `UserApproval::granted` here. What both do is the same thing, which
 //! is the whole of what a library at this boundary can do: make the approval a SENTENCE THE HOST
 //! WROTE rather than a default it inherited.
@@ -23,22 +23,17 @@ use oauth_as::{AuthorizationRequest, ErrorCode, Storage};
 use support::{public_client, server_with, ManualClock, PUBLIC_REDIRECT, RFC7636_VERIFIER};
 
 fn request(scope: &str) -> AuthorizationRequest<'static> {
-    AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some("public-app".into()),
-        redirect_uri: Some(PUBLIC_REDIRECT.into()),
-        scope: Some(scope.to_string().into()),
-        state: None,
-        code_challenge: Some(oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER).into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    }
+    AuthorizationRequest::from_pairs([
+        ("response_type", "code".to_string()),
+        ("client_id", "public-app".to_string()),
+        ("redirect_uri", PUBLIC_REDIRECT.to_string()),
+        ("scope", scope.to_string()),
+        (
+            "code_challenge",
+            oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER),
+        ),
+        ("code_challenge_method", "S256".to_string()),
+    ])
 }
 
 /// A code is minted only from a [`UserApproval`], which names the subject AND the request it is an

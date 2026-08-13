@@ -1,11 +1,13 @@
 [package]
 name = "oauth-as"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 # MEASURED, not declared. 1.74 fails on return-position impl Trait in the Storage trait (RPITIT,
 # stabilised in 1.75); 1.75 compiles and tests clean. Going lower would mean Box<dyn Future> in
 # Storage, a heap allocation on every storage call, paid forever by every consumer to support
-# toolchains older than December 2023. See KICKOFF.md's MSRV entry.
+# toolchains older than December 2023. A dependency that raises its own `rust-version` raises this
+# floor with it, which is why `--locked` is used on every gate: `base64ct` and `zeroize` have both
+# done exactly that, and an unlocked resolve would move the floor without a line of code changing.
 rust-version = "1.75"
 description = "An embeddable OAuth 2.1 Authorization Server library: spec-mirroring types (RFC 6749, RFC 8628, RFC 7636), a full device-authorization-grant state machine, and a storage trait the host implements. Deliberately host-agnostic with a tiny dependency set; nothing is allocated until the host constructs an AuthorizationServer, so an embedding host pays zero memory until its config enables the feature."
 license = "MIT OR Apache-2.0"
@@ -22,8 +24,8 @@ categories = ["authentication", "web-programming"]
 # because it is the only worked demonstration of wiring the optional http service.
 #
 # `benches` is excluded so that adding a benchmark suite left `cargo package --list` BYTE FOR BYTE
-# unchanged, which is the property the release review in GOAL.md Gate 9 rests on: a reviewer who
-# read that list once should not have to re-read it because somebody added a timing harness. The
+# unchanged, which is the property the pre-publish review rests on: a reviewer who has read
+# `cargo package --list` once should not have to re-read it because somebody added a timing harness. The
 # suite is also the one part of this repository a consumer genuinely cannot use, since the numbers
 # only mean anything measured against the machine and the profile stated beside them in
 # benches/README.md, and a tarball is not the place a reader finds either.
@@ -88,7 +90,9 @@ axum = ["http", "dep:axum", "dep:tokio"]
 # `rustls`.
 #
 # With no backend installed, the crate REFUSES: no signer means no token is minted, and no
-# verifier means no DPoP proof, request object or client assertion is accepted. That is this
+# verifier means no DPoP proof, request object or `private_key_jwt` client assertion is accepted.
+# `client_secret_jwt` is HS256 over the registered secret (RFC 7518 section 3.2), there is no
+# elliptic curve on that path, and it is accepted with no backend at all. That is this
 # crate's established posture (an absent consent resolver refuses, an absent registration policy
 # refuses) and the reason generalises: a server that cannot check a signature must never behave as
 # though it had checked one.
@@ -133,7 +137,7 @@ jar = ["jwt"]
 # up with an algorithm-confusion bug in whichever half nobody reviewed. Neither feature adds a
 # dependency: ES256 verification goes through the `Es256Verifier` seam (enable `jwt-p256`, or
 # install your own), and HMAC-SHA-256 is twenty lines over the `sha2` that PKCE already required.
-client_assertion = ["jwt"]
+client-assertion = ["jwt"]
 # RFC 9449 DPoP: sender-constrained access tokens, bound to a key the client proves possession of on
 # every request. Without it every token this crate issues is a bearer token, so a stolen one is
 # usable by whoever stole it; this changes what a leak costs. IMPLIES `jwt` for the reason above.
@@ -205,14 +209,22 @@ test-util = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # OPTIONAL, and pulled in by every feature that actually parses or emits JSON: `http`, `jwt`
-# (and therefore `jar`, `dpop`, `client_assertion`), `mtls`, `rar`.
+# (and therefore `jar`, `dpop`, `client-assertion`), `mtls`, `rar`.
 #
 # It was unconditional through 0.9.0, and MEASURED, that was three crates (itoa, ryu, memchr)
 # compiled by every default build that reaches none of them: the crate's own JSON use sites are
 # all behind those features, and `#[derive(Serialize)]` needs `serde` only, never a format crate.
 # Zero LINKED bytes were at stake, because the linker already dropped what nothing called; what
-# was at stake is the sentence a default consumer can check, which is now three dependencies
-# rather than five, and three fewer crates in their audit.
+# was at stake is the sentence a default consumer can check, which is now FOUR direct dependencies
+# rather than five, and four fewer crates in their audit.
+#
+# Both figures RE-DERIVED on 2026-08-09, because this comment said "three rather than five" and
+# that was wrong by one. `cargo tree -p oauth-as --no-default-features -e normal --depth 1` lists
+# exactly four: base64, getrandom, serde, sha2. Whole tree, same invocation without `--depth 1`
+# and de-duplicated: 19 packages, so 18 besides oauth-as itself. The counterfactual measured the
+# same way, `--features rar` (which is `["dep:serde_json"]` and nothing else): five direct and 23
+# packages. Four fewer, not three, because serde_json itself counts alongside itoa, ryu and
+# memchr.
 serde_json = { version = "1", optional = true }
 getrandom = "0.3"
 sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
@@ -331,14 +343,35 @@ required-features = ["axum", "resource-metadata"]
 # (benches/harness/mod.rs) rather than criterion or divan. That was measured, not preferred:
 # criterion 0.8 declares rust-version 1.86 and criterion 0.5 resolves an edition-2024 `clap_lex`
 # that cargo 1.75 cannot parse, and divan 0.1.21 declares 1.80 and resolves the same crate. Either
-# one turns `cargo +1.75 test -p oauth-as --locked`, GOAL.md Gate 6's own CHECK command, from
-# green to red for a charting library. The full reasoning and the measured package counts are in
-# the module docs of benches/harness/mod.rs.
+# one would drag a DEV-dependency floor above the 1.75 the library builds at, for a charting
+# library. The full reasoning and the measured package counts are in the module docs of
+# benches/harness/mod.rs.
 #
 # `test = false` on every one of them too. Without it, `cargo test --workspace` runs the bench
 # binaries in test mode on every commit, which would add minutes to the gate in CONTRIBUTING.md
-# for no assertion. Rot protection instead comes from `cargo bench --no-run`, which CI runs and
-# which compiles every target here without timing anything.
+# for no assertion.
+#
+# WHAT ACTUALLY PROTECTS THESE TARGETS FROM ROT, corrected on 2026-08-09: `cargo clippy
+# --workspace --all-targets --locked -- -D warnings`, which runs in the steps named `clippy (deny
+# warnings)` and `clippy (all features)` in .github/workflows/dev.yml and qa.yml, and inside `Full
+# gate before publish (...)` in publish.yml.
+#
+# CITED BY STEP NAME, and the line numbers that stood here until 2026-08-12 were ALL WRONG -- every
+# one of the five, in all three files. The root manifest says in as many words that CI should be
+# named by step rather than by line because line numbers go stale silently, and this comment was
+# the counterexample sitting in the same tree: nothing checks a line number, so it rots on the
+# first unrelated edit and then reads as precision. A step name is a string a `grep` can find and a
+# rename is a deliberate act.
+#
+# `--all-targets` includes `[[bench]]` targets, so a bench that stops
+# compiling after a signature moves is a RED on every push. It TYPE-CHECKS them; it never RUNS
+# them, so a bench that compiles and measures nothing meaningful would not be caught.
+#
+# This comment claimed until 2026-08-09 that rot protection came from `cargo bench --no-run`,
+# "which CI runs". It does not, and never did: `grep -rn 'cargo bench' .github/ scripts/` returns
+# NOTHING. Whether a bench step belongs in CI at all is an owner decision, not one this manifest
+# should make by asserting a step into existence, so nothing was added; the recommendation is
+# recorded in the report that found this.
 [[bench]]
 name = "token"
 harness = false

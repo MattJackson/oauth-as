@@ -42,6 +42,6 @@ touch the harness, write "n/a".
       applies.
 - [ ] No em dashes, no en dashes, no non-ASCII characters, anywhere in the diff.
 - [ ] Every new source file carries the SPDX header and copyright line.
-- [ ] No AI or agent attribution anywhere in the commit messages or this description.
+- [ ] No `Co-Authored-By:` trailer for tooling, in the commit messages or this description.
 - [ ] If protocol behaviour changed, `scripts/oauth-conformance.sh --check` was run locally.
 - [ ] This targets `dev`. (`main` and `qa` are promotion branches; the owner decides promotion.)

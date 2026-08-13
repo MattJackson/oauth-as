@@ -61,6 +61,16 @@ pub enum CodeChallengeMethod {
 /// 7636 PKCE parameters). The host parses its query string into this; every member is optional
 /// because every member can be absent in a real (invalid) request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `#[non_exhaustive]`: `rar` adds `authorization_details` and `consent` adds two more, and the
+/// doc above explains why they live here rather than being read off the query separately, which
+/// means this type is where every future authorization parameter lands as well.
+///
+/// [`AuthorizationRequest::from_pairs`] is the path a host actually wants: it takes the decoded
+/// query pairs and applies the section 3.1 rules about unknown and repeated parameters, which a
+/// struct literal assembled by hand does not. For a request built in code rather than parsed, start
+/// from `Default::default()` and assign; every field is public and every field is legitimately
+/// absent, so there is nothing a literal could express that this cannot.
+#[non_exhaustive]
 pub struct AuthorizationRequest<'a> {
     /// Must be `code`.
     pub response_type: Option<Cow<'a, str>>,
@@ -93,7 +103,15 @@ pub struct AuthorizationRequest<'a> {
     /// can answer them the way RFC 9396 section 5 prescribes. Parsing happens in
     /// [`crate::rar::AuthorizationDetails::parse`], under this crate's bounds, and only the
     /// validated form carries the result.
-    #[cfg(feature = "rar")]
+    ///
+    /// NOT FEATURE GATED, which is the same decision [`crate::ErrorCode::InvalidAuthorizationDetails`]
+    /// records for the error code and taken for the same reason. Without `rar` this crate supports
+    /// no authorization detail type at all, so RFC 9396 section 5's condition is met by EVERY
+    /// request that carries the parameter and every one of them has to be refused. A field that
+    /// disappeared with the feature left the parameter nowhere to land, and a parameter that lands
+    /// nowhere is a parameter accepted and ignored, which is the one outcome section 5 forbids.
+    /// So the field exists in every build; what changes with the feature is whether the value is
+    /// honoured or refused, and that is decided during validation, not during parsing.
     pub authorization_details: Option<Cow<'a, str>>,
     /// RFC 9470 section 4 / OpenID Connect Core section 3.1.2.1 `acr_values`: the authentication
     /// context classes the client will accept, space delimited, in order of preference.
@@ -147,7 +165,10 @@ impl<'a> AuthorizationRequest<'a> {
                 "state" => &mut req.state,
                 "code_challenge" => &mut req.code_challenge,
                 "code_challenge_method" => &mut req.code_challenge_method,
-                #[cfg(feature = "rar")]
+                // Ungated, with the field: a build without `rar` has to KNOW the parameter was
+                // sent in order to refuse it (RFC 9396 s5). Falling through to `_ => continue`
+                // here is what made this the accept-and-ignore path for `GET /authorize` and, via
+                // `crate::par`, for the RFC 9126 push as well.
                 "authorization_details" => &mut req.authorization_details,
                 #[cfg(feature = "consent")]
                 "acr_values" => &mut req.acr_values,
@@ -223,6 +244,15 @@ pub struct ValidatedAuthorizationRequest {
     pub client_id: ClientId,
     /// The exact registered redirect URI this request resolved to.
     pub redirect_uri: String,
+    /// Whether the authorization REQUEST named the redirect URI itself, as opposed to omitting it
+    /// and being filled in from the client's single registration (RFC 6749 section 3.1.2.3).
+    ///
+    /// Carried onto [`AuthorizationCodeRecord::redirect_uri_was_explicit`], because RFC 6749
+    /// section 4.1.3 makes the token endpoint's `redirect_uri` parameter REQUIRED "if the
+    /// `redirect_uri` parameter was included in the authorization request" and not otherwise. The
+    /// resolved URI above cannot answer that: it is filled in either way, so by the time the token
+    /// endpoint sees the record the two cases are indistinguishable without this.
+    pub redirect_uri_was_explicit: bool,
     /// The scope that will be granted on approval.
     pub scope: ScopeSet,
     /// The request's `state`, to be echoed on either outcome.
@@ -289,6 +319,13 @@ impl ValidatedAuthorizationRequest {
     pub(crate) fn new(
         client_id: ClientId,
         redirect_uri: String,
+        // An ARGUMENT rather than a setter with a default, unlike the two `set_*` methods below.
+        // Those record something the request may simply not have carried; this one is a fact about
+        // every authorization request there is, and the token endpoint's refusal turns on it. A
+        // default would be a value the caller could forget to correct, in the one place where
+        // getting it wrong either refuses a conforming client or waives a check RFC 6749 section
+        // 4.1.3 requires.
+        redirect_uri_was_explicit: bool,
         scope: ScopeSet,
         state: Option<String>,
         code_challenge: String,
@@ -299,6 +336,7 @@ impl ValidatedAuthorizationRequest {
         ValidatedAuthorizationRequest {
             client_id,
             redirect_uri,
+            redirect_uri_was_explicit,
             scope,
             state,
             code_challenge,
@@ -501,17 +539,78 @@ pub enum AuthorizationCodeState {
         /// The refresh token issued, if any.
         refresh_token: Option<String>,
     },
+    /// Consumed, AND presented again afterwards. A detected replay, recorded DURABLY.
+    ///
+    /// # Why this is a state and not a boolean on the side
+    ///
+    /// It exists to be read by a redemption that is still running. The interleaving it closes:
+    /// redeemer A takes the code, writes `Consumed { access_token: None, .. }` before issuing (so
+    /// that a store failure cannot disarm the alarm), and then SUSPENDS on the host's
+    /// [`crate::jwt::Es256Signer`], which is a network round trip when that signer fronts a KMS.
+    /// Replayer B arrives in that window, finds `Consumed { access_token: None }`, and correctly
+    /// concludes there is nothing to revoke, because nothing has been issued YET. B refuses the
+    /// replay and puts the record back.
+    ///
+    /// If what B puts back is `Consumed`, it is byte for byte what A wrote, so when A wakes and
+    /// records what it minted, A cannot tell that anything happened. The replay was detected, the
+    /// audit event fired, and A's freshly minted access token and refresh chain are live. The
+    /// alarm rang and nothing was contained.
+    ///
+    /// `Replayed` is the trace A can see. A's second write is a compare-and-swap against the
+    /// `Consumed` it wrote itself (see [`crate::store::Storage::compare_and_swap_authorization_code`]),
+    /// so this state makes it fail, and A undoes its own issuance.
+    ///
+    /// It carries the same two fields because a THIRD presentation is still a replay and must
+    /// still revoke whatever is by then known to have been minted.
+    Replayed {
+        /// The access token issued, if the redemption that consumed this code got as far as
+        /// producing one before the replay was detected.
+        access_token: Option<String>,
+        /// The refresh token issued, if any.
+        refresh_token: Option<String>,
+    },
+}
+
+impl AuthorizationCodeState {
+    /// What this code minted, for the two states that can name it.
+    ///
+    /// One accessor rather than two matches at each call site: the replay path treats `Consumed`
+    /// and `Replayed` identically when deciding what to revoke, and the only difference between
+    /// them is which one a concurrent redemption is allowed to overwrite.
+    pub fn minted(&self) -> Option<(Option<&str>, Option<&str>)> {
+        match self {
+            AuthorizationCodeState::Issued => None,
+            AuthorizationCodeState::Consumed {
+                access_token,
+                refresh_token,
+            }
+            | AuthorizationCodeState::Replayed {
+                access_token,
+                refresh_token,
+            } => Some((access_token.as_deref(), refresh_token.as_deref())),
+        }
+    }
 }
 
 impl fmt::Debug for AuthorizationCodeState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AuthorizationCodeState::Issued => f.write_str("Issued"),
+            // Both carry the same two credentials and redact them the same way. The VARIANT NAME
+            // is the part an operator reading a debug dump needs, because it is the difference
+            // between a redemption and a detected replay.
             AuthorizationCodeState::Consumed {
                 access_token,
                 refresh_token,
+            }
+            | AuthorizationCodeState::Replayed {
+                access_token,
+                refresh_token,
             } => f
-                .debug_struct("Consumed")
+                .debug_struct(match self {
+                    AuthorizationCodeState::Replayed { .. } => "Replayed",
+                    _ => "Consumed",
+                })
                 // Presence/absence stays visible for the same reason it does for the refresh token
                 // below, and here it carries more: `None` is how a redemption whose issuance failed
                 // is told apart from one that completed.
@@ -528,6 +627,19 @@ impl fmt::Debug for AuthorizationCodeState {
     }
 }
 
+/// The serde default for [`AuthorizationCodeRecord::redirect_uri_was_explicit`]: `true`, which is
+/// the fail-closed reading of a record written before the field existed. See the field.
+fn redirect_uri_was_explicit_default() -> bool {
+    true
+}
+
+/// The serde default for [`AuthorizationCodeRecord::issued_at`]: the epoch, because it is the
+/// fail-closed answer. Every barrier is recorded after it, so a code with no stated decision
+/// instant is REFUSED by a standing revocation rather than admitted by one. See the field.
+fn grant_instant_default() -> SystemTime {
+    SystemTime::UNIX_EPOCH
+}
+
 /// A persisted authorization code (RFC 6749 section 4.1.2).
 ///
 /// `Debug` is hand-written (see below): `code` is itself a bearer credential (RFC 6749 section
@@ -535,13 +647,37 @@ impl fmt::Debug for AuthorizationCodeState {
 /// why replay revokes what it minted, see [`AuthorizationCodeState`]'s doc comment), so it must
 /// not appear in a debug format either.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `#[non_exhaustive]`: `rar` and `consent` each add a field. Like the two token records this is a
+/// value a [`crate::store::Storage`] implementor is HANDED and gives back, through the derived
+/// serde impls, which are generated in this crate and keep working from outside it; nothing in
+/// `oauth-as-postgres` names a field of it. [`AuthorizationCodeRecord::new`] is for anyone building
+/// one directly.
+#[non_exhaustive]
 pub struct AuthorizationCodeRecord {
     /// The code string (the storage key).
     pub code: String,
     /// The client the code was issued to; presentation by any other client is `invalid_grant`.
     pub client_id: ClientId,
-    /// The redirect URI the authorization request used; the token request must present the same.
+    /// The redirect URI the authorization request used; a token request that presents one must
+    /// present this one.
     pub redirect_uri: String,
+    /// Whether the authorization request NAMED that URI, rather than omitting it and being filled
+    /// in from the client's single registration (RFC 6749 section 3.1.2.3).
+    ///
+    /// RFC 6749 section 4.1.3 makes the token endpoint's `redirect_uri` parameter REQUIRED "if the
+    /// `redirect_uri` parameter was included in the authorization request", and conditional means
+    /// conditional in both directions: through 0.9.1 the token endpoint required it always, so a
+    /// client entitled by section 3.1.2.3 to omit it at the authorization endpoint — the ordinary
+    /// shape for a client with exactly one registered URI — was refused at the token endpoint, and
+    /// refused with a message blaming a mismatch that had not happened. `redirect_uri` above cannot
+    /// stand in for this, because it is filled in either way.
+    ///
+    /// `#[serde(default)]` with a `true` default, so a record persisted by 0.9.0 still
+    /// deserializes. TRUE is the fail-closed direction: it keeps the check that release performed
+    /// (the parameter is required) for records minted before this field existed, rather than
+    /// silently waiving section 4.1.3's requirement for every grant that survived the upgrade.
+    #[serde(default = "redirect_uri_was_explicit_default")]
+    pub redirect_uri_was_explicit: bool,
     /// The scope the user approved.
     pub scope: ScopeSet,
     /// The authenticated resource owner.
@@ -562,8 +698,35 @@ pub struct AuthorizationCodeRecord {
     /// token request that redeems it NARROW this set and never widen it, and "what was
     /// granted" is not knowable at the token endpoint any other way. Empty means the client
     /// asked for no rich authorization detail.
+    ///
+    /// `#[serde(default)]`, which [`crate::token::IssuedToken::authorization_details`] states in
+    /// full: a code written by a build without `rar` carries no such key, this is not an `Option`
+    /// so serde supplies no default of its own, and without one every code in flight becomes
+    /// unreadable the moment anything in the host's dependency graph turns the feature on.
     #[cfg(feature = "rar")]
+    #[serde(default)]
     pub authorization_details: crate::rar::AuthorizationDetails,
+    /// The instant this code was MINTED, which is the instant the user's authorization decision
+    /// was made. Carried into [`crate::token::IssuedToken::grant_established_at`] on redemption so
+    /// that a revocation can tell a code that predates it from one minted afterwards.
+    ///
+    /// `expires_at` cannot stand in for this: a code minted a minute before a withdrawal expires
+    /// minutes AFTER it, so comparing the deadline would let exactly the in-flight redemption a
+    /// barrier exists to refuse through.
+    ///
+    /// `#[serde(default)]`, and the default is the epoch, which is the FAIL-CLOSED direction.
+    /// This field is new in 0.9.1, so a code a 0.9.0 node wrote — or is still writing, during a
+    /// rolling upgrade — carries no such key, and without a default the read fails outright and
+    /// every code that release minted becomes unredeemable the moment this one starts. With it,
+    /// the record deserializes and dates from before every barrier that could ever be recorded, so
+    /// a standing revocation REFUSES it rather than admitting it. A far-future default would
+    /// deserialize just as happily and ADMIT every code 0.9.0 wrote, which is exactly the
+    /// resurrection this field exists to close, reintroduced through the upgrade path. The
+    /// There is deliberately NO backfill migration: a backfill cannot reach a 0.9.0 node still
+    /// writing field-less payloads during a rolling upgrade, which is the window that matters, so
+    /// the serde default covers strictly more than one would.
+    #[serde(default = "grant_instant_default")]
+    pub issued_at: SystemTime,
     /// Expiry instant; the code is dead at and after this instant.
     pub expires_at: SystemTime,
     /// Whether the code has been redeemed, and what it produced.
@@ -573,18 +736,73 @@ pub struct AuthorizationCodeRecord {
     ///
     /// Recorded on the CODE because that is the only path by which the authentication the user
     /// actually performed can reach the token the code mints: the token endpoint has no user in
-    /// front of it and cannot ask. Without it, RFC 9470 section 5's `auth_time` and `acr` could
+    /// front of it and cannot ask. Without it, RFC 9470 section 6's `auth_time` and `acr` could
     /// only ever be guessed at.
     #[cfg(feature = "consent")]
     pub authentication: Option<Box<crate::consent::Authentication>>,
 }
 
+impl AuthorizationCodeRecord {
+    /// A freshly minted, unredeemed code: `state` is [`AuthorizationCodeState::Issued`], because
+    /// the `Consumed` form records what a redemption produced and there is nothing to record until
+    /// one happens.
+    ///
+    /// Every argument is a value the record is worthless without, and each is one the RFC names as
+    /// the thing a later token request is checked against: the `redirect_uri` it must present again
+    /// (RFC 6749 section 4.1.3), the `code_challenge` it must produce a verifier for (RFC 7636
+    /// section 4.6), the subject and scope it is redeeming on behalf of, and the instant after
+    /// which none of that is true any more. The method is `S256` and not an argument, because
+    /// [`CodeChallengeMethod`] has one variant and it is one for a reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        code: impl Into<String>,
+        client_id: ClientId,
+        redirect_uri: impl Into<String>,
+        scope: ScopeSet,
+        subject: impl Into<String>,
+        code_challenge: impl Into<String>,
+        expires_at: SystemTime,
+    ) -> Self {
+        AuthorizationCodeRecord {
+            // FAIL-CLOSED, as `IssuedToken::new` and `RefreshTokenRecord::new` are: a record built
+            // by hand has not said when its decision was made, and the epoch predates every
+            // revocation, so a standing barrier refuses what it redeems into.
+            issued_at: SystemTime::UNIX_EPOCH,
+            code: code.into(),
+            client_id,
+            redirect_uri: redirect_uri.into(),
+            // FAIL-CLOSED, like `issued_at` above: a record built by hand has not said whether the
+            // authorization request named its redirect URI, and `true` keeps RFC 6749 section
+            // 4.1.3's requirement rather than waiving it on a guess.
+            redirect_uri_was_explicit: true,
+            scope,
+            subject: subject.into(),
+            code_challenge: code_challenge.into(),
+            code_challenge_method: CodeChallengeMethod::S256,
+            resource: Vec::new(),
+            #[cfg(feature = "rar")]
+            authorization_details: crate::rar::AuthorizationDetails::none(),
+            expires_at,
+            state: AuthorizationCodeState::Issued,
+            #[cfg(feature = "consent")]
+            authentication: None,
+        }
+    }
+}
+
+/// Hand-written so the one-time `code` never prints (RFC 6749 section 4.1.2 makes it a credential
+/// in its own right). EVERY other field prints, on the rule
+/// [`crate::token::IssuedToken`]'s `Debug` states in full. `issued_at` in particular: it is what
+/// a [`crate::store::RevocationBarrier`] is compared against on redemption, its fail-closed default
+/// is the epoch, and without it printing an operator cannot tell a code refused by a standing
+/// barrier from one refused for any other reason.
 impl fmt::Debug for AuthorizationCodeRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("AuthorizationCodeRecord");
         out.field("code", &"[redacted]")
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
+            .field("redirect_uri_was_explicit", &self.redirect_uri_was_explicit)
             .field("scope", &self.scope)
             .field("subject", &self.subject)
             .field("code_challenge", &self.code_challenge)
@@ -594,14 +812,17 @@ impl fmt::Debug for AuthorizationCodeRecord {
         // operator investigating a grant needs to see.
         #[cfg(feature = "rar")]
         out.field("authorization_details", &self.authorization_details);
-        out.field("expires_at", &self.expires_at)
-            .field("state", &self.state)
-            .finish()
+        out.field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("state", &self.state);
+        #[cfg(feature = "consent")]
+        out.field("authentication", &self.authentication);
+        out.finish()
     }
 }
 
 /// `?` if the URI has no query yet, `&` if it does.
-fn query_separator(uri: &str) -> char {
+pub(crate) fn query_separator(uri: &str) -> char {
     if uri.contains('?') {
         '&'
     } else {

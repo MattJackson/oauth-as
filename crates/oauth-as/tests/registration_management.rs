@@ -358,22 +358,14 @@ async fn deleting_a_registration_invalidates_everything_it_was_issued() {
 
     let verifier = support::RFC7636_VERIFIER;
     let challenge = oauth_as::pkce::code_challenge_s256(verifier);
-    let request = AuthorizationRequest {
-        resource: Vec::new(),
-        #[cfg(feature = "rar")]
-        authorization_details: Default::default(),
-        response_type: Some("code".into()),
-        client_id: Some(info.client_id.clone().into()),
-        redirect_uri: Some("https://app.example/cb".into()),
-        scope: Some("read".into()),
-        state: Some("s".into()),
-        code_challenge: Some(challenge.clone().into()),
-        code_challenge_method: Some("S256".into()),
-        #[cfg(feature = "consent")]
-        acr_values: None,
-        #[cfg(feature = "consent")]
-        max_age: None,
-    };
+    let request = AuthorizationRequest::from_pairs([
+        ("response_type", "code"),
+        ("client_id", info.client_id.as_str()),
+        ("redirect_uri", "https://app.example/cb"),
+        ("scope", "read"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ]);
     let validated = srv.validate_authorization_request(&request).await.unwrap();
     let issued = srv
         .issue_authorization_code(UserApproval::granted(&validated, "user-1"))

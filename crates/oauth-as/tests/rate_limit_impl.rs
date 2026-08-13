@@ -29,9 +29,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::{
-    Attempt, AttemptOutcome, AuthorizationServer, Client, ClientAuth, ClientId, Clock,
-    DeviceApprovalError, ErrorCode, FixedWindowRateLimiter, GrantType, MemoryStorage,
-    RateLimitConfig, RateLimitDecision, RateLimiter, ScopeSet, ServerConfig, TokenRequest,
+    Attempt, AttemptOutcome, AuthorizationRequest, AuthorizationServer, Client, ClientAuth,
+    ClientId, Clock, DeviceApprovalError, ErrorCode, FixedWindowRateLimiter, GrantType,
+    MemoryStorage, RateLimitConfig, RateLimitDecision, RateLimiter, ScopeSet, ServerConfig,
+    TokenRequest,
 };
 
 const DEVICE_SECRET: &str = "s3cret-value-for-tests";
@@ -214,17 +215,25 @@ async fn successful_entries_cost_far_less_budget_than_wrong_ones() {
     );
 }
 
-/// RFC 9700 section 4.13, credential stuffing at the token endpoint. The client-authentication
-/// budget is keyed PER `client_id` (RFC 6749 section 2.2 makes the identifier explicitly not a
-/// secret, so a limiter may key on it), so one client being stuffed must not lock every other
-/// client out of the token endpoint.
+/// THE LOCKOUT GATE, end to end. `client_id` is public (RFC 6749 section 2.2), the throttle is
+/// consulted BEFORE the credential is examined, and it is given nothing but that identifier — so
+/// the impostor and the real client are indistinguishable at the moment of the decision. If a
+/// client's failures could drive its counter to the capacity, an attacker sending wrong secrets at
+/// a public identifier would take that client's token endpoint away for the rest of the window for
+/// the price of one request every couple of seconds. That is the denial of service the module docs
+/// promise this type is not, so half of every client's budget is reserved for attempts.
+///
+/// Asserted at the outcome that matters: a TOKEN, not an `Ok` from the throttle.
 #[tokio::test]
-async fn client_authentication_is_budgeted_per_client() {
+async fn a_stuffed_client_id_is_not_locked_out_of_its_own_token_endpoint() {
+    // 20 units, 1 + 4 per failure, so failures may occupy at most half of it: the penalty climbs by
+    // 4 and clamps at 10, so THREE wrong secrets saturate the failure half (4, 8, then 12 clamped
+    // to 10) and every wrong secret after that costs only its attempt unit. Four are sent so that
+    // the run is past the clamp rather than exactly on it.
     let cfg = RateLimitConfig::default().with_client_authentication_budget(20, 4);
     let limiter = Arc::new(FixedWindowRateLimiter::with_config(cfg));
     let srv = server_with(limiter.clone()).await;
 
-    // 20 units, 1 + 4 per failure: four wrong secrets for `other-app` exhaust it.
     for _ in 0..4 {
         let err = srv
             .token(TokenRequest::ClientCredentials {
@@ -237,9 +246,58 @@ async fn client_authentication_is_budgeted_per_client() {
         assert_eq!(err.error, ErrorCode::InvalidClient);
     }
 
-    // Exhausted: the throttle now refuses BEFORE the store is touched, and it says the same
-    // `invalid_client` a wrong secret says, so it is not an oracle telling the attacker they had
-    // found a live registration.
+    let token = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("other-app"),
+            client_secret: Some(OTHER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .expect(
+            "the real client must still get a token after somebody sprayed wrong secrets at its \
+             public client_id: a budget failures can exhaust is a lockout an attacker triggers for \
+             free",
+        );
+    assert!(!token.access_token.is_empty());
+}
+
+/// RFC 9700 section 4.13, credential stuffing at the token endpoint. The client-authentication
+/// budget is keyed PER `client_id` (RFC 6749 section 2.2 makes the identifier explicitly not a
+/// secret, so a limiter may key on it), so one client being stuffed must not lock every other
+/// client out of the token endpoint — and the reserve that stops the stuffing becoming a lockout
+/// must not stop the budget being finite either.
+#[tokio::test]
+async fn client_authentication_is_budgeted_per_client() {
+    let cfg = RateLimitConfig::default().with_client_authentication_budget(20, 4);
+    let limiter = Arc::new(FixedWindowRateLimiter::with_config(cfg));
+    let srv = server_with(limiter.clone()).await;
+
+    // Four wrong secrets: 4 attempt units, and a failure penalty that reached its 10-unit clamp on
+    // the third of them (4, 8, then 12 clamped to 10).
+    for _ in 0..4 {
+        let err = srv
+            .token(TokenRequest::ClientCredentials {
+                client_id: ClientId::new("other-app"),
+                client_secret: Some("wrong".to_string()),
+                scope: None,
+            })
+            .await
+            .expect_err("a wrong secret is refused");
+        assert_eq!(err.error, ErrorCode::InvalidClient);
+    }
+
+    // 20 - 10 reserved-for-attempts, less the 4 the failed attempts themselves cost, is 6 more
+    // authentications. The seventh is refused, so the ceiling is still a ceiling: an attacker who
+    // wants this client off the air has to produce that volume for real.
+    for i in 0..6 {
+        srv.token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("other-app"),
+            client_secret: Some(OTHER_SECRET.to_string()),
+            scope: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("authentication {i} is inside the reserved half: {e:?}"));
+    }
     let err = srv
         .token(TokenRequest::ClientCredentials {
             client_id: ClientId::new("other-app"),
@@ -247,7 +305,10 @@ async fn client_authentication_is_budgeted_per_client() {
             scope: None,
         })
         .await
-        .expect_err("the throttled client is refused even with the RIGHT secret");
+        .expect_err("the budget is still finite once the reserved half is spent by real traffic");
+    // The throttle refuses BEFORE the store is touched, and it says the same `invalid_client` a
+    // wrong secret says, so it is not an oracle telling the attacker they had found a live
+    // registration.
     assert_eq!(err.error, ErrorCode::InvalidClient);
 
     // A DIFFERENT client is untouched: its budget is its own.
@@ -280,10 +341,67 @@ async fn a_spray_of_unknown_client_ids_cannot_grow_the_limiter_without_bound() {
             .await;
     }
 
-    assert!(
-        limiter.tracked_clients() <= 8,
-        "the limiter must not grow a map keyed on attacker-supplied identifiers: {}",
-        limiter.tracked_clients()
+    // Pinned at the cap and not merely UNDER it: `<= 8` is satisfied by 0, which is what a limiter
+    // that had stopped counting altogether would report, and a bound gate that passes when the
+    // thing it bounds is not happening is not a gate.
+    assert_eq!(
+        limiter.tracked_clients(),
+        8,
+        "the limiter must fill its cap and stop, not grow a map keyed on attacker-supplied \
+         identifiers and not quietly stop counting"
+    );
+    assert_eq!(
+        limiter.tracked_authorization_clients(),
+        0,
+        "and the token endpoint's spray never touched the authorization map, which is why that map \
+         needs a gate of its own"
+    );
+}
+
+/// The OTHER map, and the one an attacker reaches without authenticating anything: the
+/// authorization endpoint keys its budget on the `client_id` that arrived in the query string, so
+/// `validate_authorization_request` is a bounded map an unauthenticated caller can spray at. The
+/// gate above cannot see this one — `tracked_clients` reports only the client-authentication map —
+/// which is exactly why this one exists.
+#[tokio::test]
+async fn a_spray_of_unknown_client_ids_at_the_authorization_endpoint_is_bounded_too() {
+    // The authorization budget has no builder, so a host moves it by assigning the public field.
+    // That is the path exercised here, deliberately.
+    let cfg = {
+        let mut cfg = RateLimitConfig::default().with_max_tracked_clients(8);
+        // Wide enough that the spray is not stopped by the throttle before it can test the bound:
+        // this gate is about MEMORY, not about refusal.
+        cfg.authorization_request_capacity = u64::MAX;
+        cfg.authorization_request_failure_cost = 0;
+        cfg
+    };
+    let limiter = Arc::new(FixedWindowRateLimiter::with_config(cfg));
+    let srv = server_with(limiter.clone()).await;
+
+    for i in 0..5_000 {
+        let client_id = format!("sprayed-{i}");
+        let request = AuthorizationRequest::from_pairs([
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://client.example/cb"),
+            ("state", "s"),
+        ]);
+        // Every one of these is refused (no such client), which is the point: the caller needed no
+        // credential to make the limiter allocate.
+        let _ = srv.validate_authorization_request(&request).await;
+    }
+
+    assert_eq!(
+        limiter.tracked_authorization_clients(),
+        8,
+        "the authorization map must fill its cap and stop: past it, unrecognised identifiers share \
+         one overflow counter rather than each getting an entry"
+    );
+    assert_eq!(
+        limiter.tracked_clients(),
+        0,
+        "and nothing here went near the client-authentication map, so the two caps are the two \
+         caps and not one counted twice"
     );
 }
 

@@ -7,6 +7,7 @@
 # Run it:
 #   scripts/size-report.sh                 the whole table
 #   scripts/size-report.sh --check         the same, and FAIL if a row is over budget
+#   scripts/size-report.sh --selftest      prove --check can go RED, by forcing a budget to 1 byte
 #   scripts/size-report.sh --rows a,b,c    just those rows (names from the table below)
 #   scripts/size-report.sh --tsv           machine readable, one row per line
 #
@@ -74,7 +75,7 @@ TARGET_ROOT="${SIZE_REPORT_TARGET_ROOT:-$REPO_ROOT/target/size-report}"
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
 # Every oauth-as feature, mirrored in the probe as `f-<name>`. --all-features is this list.
-ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client_assertion,f-consent,f-token-exchange,f-resource-metadata,f-test-util"
+ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client-assertion,f-consent,f-token-exchange,f-resource-metadata,f-test-util"
 
 # ---------------------------------------------------------------------------------------------
 # THE ROWS.
@@ -104,7 +105,7 @@ ROWS=(
   "jar|f-jar||RFC 9101 signed request objects (implies jwt)"
   "rar|f-rar||RFC 9396 authorization_details, parsed, type-checked and narrowed"
   "dpop|f-dpop||RFC 9449 proof verification (implies jwt)"
-  "client_assertion|f-client_assertion||RFC 7523 private_key_jwt and client_secret_jwt (implies jwt)"
+  "client-assertion|f-client-assertion||RFC 7523 private_key_jwt and client_secret_jwt (implies jwt)"
   "consent|f-consent||consent records, withdrawal cascade and RFC 9470 step-up"
   "token-exchange|f-token-exchange||RFC 8693 token exchange"
   "resource-metadata|f-resource-metadata||the RFC 9728 document type"
@@ -139,41 +140,143 @@ budget_for() {
   case "$HOST_TRIPLE:$1" in
     # ALL SIX MEASURED 2026-08-09 on aarch64-apple-darwin, rustc 1.97.0, by this script.
     #
-    # the protocol core, every grant driven end to end. Measured 199,953 bytes.
-    aarch64-apple-darwin:default) echo 210944 ;;
+    # the protocol core, every grant driven end to end. Measured 221,945 bytes at 0.9.1,
+    # RE-MEASURED from 199,953 at 0.9.0. The +21,992 is the RESURRECTION RULE and it is
+    # unconditional because revocation is: a `RevocationBarrier`, the predicate every write
+    # consults, four new `Storage` methods, `AuthorizationCodeState::Replayed` with its serde arms,
+    # and the undo path issuance needs when a revocation lands between its two writes.
+    #
+    # RAISED DELIBERATELY, which this file's own rule permits only when the growth buys something
+    # and the reason is written next to the number. What it buys: in 0.9.0 a detected refresh-token
+    # reuse or authorization-code replay could be raced by an issuance already in flight across the
+    # ES256 signing await, so the AS revoked a family and the token it was containing stayed live.
+    # That was a HIGH severity known defect shipped in the published alpha, open under any remote
+    # signer, and closing it is the entire reason 0.9.1 exists. 21.5 KiB is what a revocation that
+    # cannot be undone costs.
+    #
+    # THE CHANGE WAS FIXED FIRST, before the number moved: the barrier collection was a `HashMap`
+    # keyed by a compound enum while every read of it is a linear scan over three scopes at once,
+    # so the map bought nothing and cost a hashbrown instantiation. Making it a `Vec` took 2,204
+    # bytes off this row and put the `http` row back under its budget without touching that one.
+    #
+    # RE-MEASURED 2026-08-13 at 0.9.1 FINAL: 234,489. The figures above (221,945 / 199,953) were
+    # taken mid-release and are superseded; the honest before-and-after is 209,376 at the rebuilt
+    # v0.9.0 tag against 234,489 now, so the resurrection rule cost this row 25,113 bytes.
+    #
+    # RAISED 2026-08-13, from 234,496, and NOT because the code grew.
+    #
+    # It was left at 234,496 earlier the same day on the argument that a passing row does not get
+    # its number moved. It passed by SEVEN BYTES. It then went RED on CI, on macos-26-arm64 — the
+    # same aarch64-apple-darwin triple — at 234,656, over by 161.
+    #
+    # THE MEASUREMENT IS NOT PATH INDEPENDENT, WHICH IS THE REAL DEFECT. The probe links panic
+    # `Location` strings, and they are ABSOLUTE, because oauth-as is an out-of-workspace path
+    # dependency of the probe. So the byte count includes the length of the checkout directory.
+    # Measured, same tree and same toolchain, only the directory differing: 218,989 from `/tmp/oa`
+    # against 219,229 from a 73-character worktree. 240 bytes of pure path length. A GitHub runner
+    # checks out at `/Users/runner/work/oauth-as/oauth-as`, which is longer than a typical local
+    # path, and that is the 161 bytes.
+    #
+    # A gate whose verdict depends on where the repository happens to sit is not a gate. Seven
+    # bytes of margin could never survive it, and leaving it there was the wrong call: the row was
+    # not passing on its merits, it was passing on this machine.
+    #
+    # THE NUMBER IS THE STOPGAP. THE FIX IS `--remap-path-prefix` in the probe profile, so the
+    # embedded paths are constant and the measurement is reproducible anywhere. That is 0.9.2 work
+    # because it changes every row at once and every budget has to be re-taken with it. Until then
+    # this row carries ~4 KiB, which is the same order as every other row here and enough to
+    # absorb the path-length variance rather than be decided by it.
+    aarch64-apple-darwin:default) echo 238592 ;;
     # + the HTTP service with a request dispatched to every route. Measured 397,429. Roughly
     # doubling the core is what a wire surface costs: a router, a form and query parser, a body
     # reader, and one response serializer per endpoint.
-    aarch64-apple-darwin:http) echo 417792 ;;
+    # RAISED 2026-08-13 at 0.9.1 FINAL, from 417,792. Measured 438,009, over by 20,217.
+    #
+    # WHAT BOUGHT IT, attributed rather than asserted. The v0.9.0 tag was rebuilt in a worktree on
+    # this machine and toolchain and measured with its OWN probe: `http` was 404,943 there, so this
+    # row grew 33,066 bytes across the release. The `default` row grew 25,113 over the same span,
+    # which is the resurrection rule and is unconditional. So 25,113 of this row's growth is the
+    # core arriving, and roughly 8,000 is the HTTP surface's own: per-request `tokio::spawn`, the
+    # build-time route normalisation that made matching byte-exact on the raw wire path, the two
+    # new `ApprovalRequest` fields, and the RAR refusal sites.
+    #
+    # CAVEAT ON THE COMPARISON, because it changes what the number means: each tree was measured
+    # with its own `scripts/size-probe`, and 0.9.1's probe exercises more surface than 0.9.0's did.
+    # Some of the growth is therefore the probe reaching code that was always there. The bytes are
+    # real for a host that reaches the same code; they are not all NEW code.
+    aarch64-apple-darwin:http) echo 442368 ;;
     # + the Router adapter AND a tokio multi-thread runtime with a bound listener, because that is
     # what a host turns this feature on to do. Measured 614,661; the 212 KiB over the `http` row is
     # almost entirely the runtime, which is the host's cost and not this crate's.
-    aarch64-apple-darwin:axum) echo 646144 ;;
+    # RAISED 2026-08-13 at 0.9.1 FINAL, from 646,144. Measured 677,639, over by 31,495. Against the
+    # rebuilt v0.9.0 (623,963) this row grew 53,676: the 25,113 of core, the ~8,000 of HTTP surface
+    # accounted for on that row, and the balance is the axum adapter compiled against both.
+    aarch64-apple-darwin:axum) echo 681984 ;;
     # + RFC 9068 signing over a HOST-SUPPLIED `Es256Signer`, the RFC 7517 JWKS, and the JWK
     # parsing the verification seam rests on. NO curve implementation: this is what a host with
     # its key in a KMS pays. Measured 244,013, RE-MEASURED 2026-08-09 when the seam split `jwt`
     # from `jwt-p256`; the row was 274,254 when `jwt` implied p256, so the split took 29.5 KiB off
     # a host that brings its own backend. The budget comes DOWN with the measurement, because a
     # budget left at the old number would stop being a gate on this row at all.
-    aarch64-apple-darwin:"jwt (seam only)") echo 256000 ;;
+    # RE-MEASURED 2026-08-10 at 0.9.1: 256,491, up 12,478 from 244,013. The rise is the default
+    # row's rise minus what this row already carried, which is the same resurrection rule seen
+    # through a feature that adds signing on top of it.
+    aarch64-apple-darwin:"jwt (seam only)") echo 271360 ;;
     # + the built-in p256 backend, which is what every consumer of `jwt` had before the seam.
     # Measured 274,725 against the pre-seam `jwt` row's 274,254: the seam costs a host that keeps
     # the built-in backend 471 bytes, which is the `Arc<dyn Es256Signer>` vtable and the boxed
     # future's shim. It does NOT include PKCS#8 key loading, which is a separate `jwt-pkcs8`
     # feature and, measured, a separate 30,536 bytes paid only by a host that calls the two
     # constructors behind it.
-    aarch64-apple-darwin:jwt-p256) echo 288768 ;;
+    # RE-MEASURED 2026-08-10 at 0.9.1: 291,669, up 16,944 from 274,725. Same cause as the two rows
+    # above; the p256 backend itself did not move.
+    aarch64-apple-darwin:jwt-p256) echo 308224 ;;
     # the conformance server's own feature set. Measured 440,476, down from 461,974 before the
     # signing seam: `http,jwt` is now the HTTP surface plus the seam, with no curve.
-    aarch64-apple-darwin:"http,jwt") echo 462848 ;;
+    # RAISED 2026-08-13 at 0.9.1 FINAL, from 462,848. Measured 472,520, over by 9,672. Against the
+    # rebuilt v0.9.0 (440,287) it grew 32,233, which is the core's 25,113 plus the HTTP surface's
+    # own. The signing seam did not move: the `jwt` and `jwt-p256` rows both still PASS, and were
+    # deliberately not raised.
+    aarch64-apple-darwin:"http,jwt") echo 476160 ;;
     # every feature, every one exercised. Measured 1,170,306, RE-MEASURED 2026-08-09 for the
     # signing seam. It was 1,165,636: the +4,670 is the seam itself (two traits, the object-safe
     # bridge, the verifier indirection at three call sites) plus the `signer_conformance` harness,
     # which `test-util` now carries alongside the `Storage` one. This is the ceiling on what this
     # crate can cost anyone, and it is the row a new subsystem shows up in first.
-    aarch64-apple-darwin:all-features) echo 1229824 ;;
+    # RAISED 2026-08-13 at 0.9.1 FINAL, from 1,229,824. Measured 1,372,273, over by 142,449 — by far
+    # the largest overrun in the table, and the one that had to be attributed before it was allowed.
+    #
+    # IT IS ALMOST ALL `test-util`. Against the rebuilt v0.9.0 this row grew 203,014 bytes, and the
+    # `test-util` row alone grew 121,819 of that (360,936 -> 482,755). Subtract the 25,113 of core
+    # every row took and `test-util` is 96,706 bytes bigger on its own account. That is the
+    # `Storage` conformance harness gaining twenty-seven checks, each with a planted fault: the
+    # checks a host runs against its own store to find out whether it honours the resurrection rule.
+    # The remaining ~81,000 is spread across the other thirteen features plus the cross-feature
+    # monomorphisation that only `all-features` links at all.
+    #
+    # THIS IS THE ROW A HOST NEVER SHIPS. `test-util` is a dev-dependency feature and it is now the
+    # largest single feature in the crate, larger than the whole HTTP surface. No production binary
+    # enables it, and no other budgeted row includes it. Paying 96 KiB in a test binary to tell a
+    # stranger's store that it silently loses revocations is the trade this release exists to make.
+    #
+    # It is still the ceiling on what this crate can cost anyone, and still the row a new subsystem
+    # shows up in first — but read it knowing the harness dominates it.
+    aarch64-apple-darwin:all-features) echo 1378304 ;;
     *) echo "" ;;
   esac
+}
+
+# --selftest forces every budget to an impossible value so the gate has to go red. The wrapper is
+# separate from budget_for() so that the recorded numbers above stay the only place a real budget
+# is written down, which is what the house rule about raising one depends on.
+budget_for_mode() {
+  if [ -n "$SELFTEST_BUDGET" ]; then
+    # Only for a row that HAS a real budget, so the self-test cannot invent a gated row and then
+    # congratulate itself for failing on it.
+    if [ -n "$(budget_for "$1")" ]; then printf '%s' "$SELFTEST_BUDGET"; fi
+    return
+  fi
+  budget_for "$1"
 }
 
 # The rows `--check` gates. Not every row: a gate over twenty numbers is a gate that goes red for
@@ -214,7 +317,12 @@ measure() {
   local key
   key="$(printf '%s' "${features:-none}" | tr ',' '_')"
   local target_dir="$TARGET_ROOT/$key"
-  local args=(build --release --quiet --target-dir "$target_dir")
+  # --locked, and it is not optional for a gate whose budgets are BYTE-EXACT. The probe has its
+  # own committed scripts/size-probe/Cargo.lock; without --locked cargo is free to resolve a newer
+  # patch of any dependency at any time, so a budget measured against one resolve is being checked
+  # against a different one, and the gate goes red for a reason that is not a change to this
+  # repository. A budget against a moving target is not a budget.
+  local args=(build --release --quiet --locked --target-dir "$target_dir")
   if [ -z "$features" ]; then
     args+=(--no-default-features)
   else
@@ -245,16 +353,56 @@ human() {
 
 MODE="table"
 ONLY=""
+SELFTEST_BUDGET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE="check" ;;
+    --selftest) MODE="selftest" ;;
     --tsv) MODE="tsv" ;;
     --rows) ONLY="$2"; shift ;;
+    # Internal, set only by --selftest re-invoking this script. Forces every budget to this many
+    # bytes so a green run has to go red. Not documented in --help because it is not a knob:
+    # anybody who used it by hand would be turning the gate off.
+    --force-budget) SELFTEST_BUDGET="$2"; shift ;;
     -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "size-report: unknown argument $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+# THE SELF-TEST, and this script was the ONE shell gate in this repository without one.
+#
+# scripts/oauth-conformance.sh, scripts/oauth-interop.sh and scripts/oauth-mcp-lint.sh all run a
+# --selftest in CI before their --check is believed, on the house rule that a gate nobody has
+# watched go red is worth nothing. This gate had no such proof, and it has more moving parts than
+# any of them: a per-platform budget table, an awk section parser that reports zero on a format it
+# does not understand, and a `--rows` filter. Any one of those quietly emptying the gated set
+# would leave `--check` printing "every gated feature set is within its recorded budget" over
+# nothing at all.
+#
+# WHAT IT PROVES, precisely: that a --check run whose budgets are impossible to meet exits 1 and
+# names the row. That covers the whole chain -- the row set is non-empty, the probe built, the
+# instrument returned a positive byte count, the comparison happened, and the failure reaches the
+# exit status -- because a break anywhere in it produces a 0 instead.
+#
+# ONE ROW, not seven: this re-links the probe, and the proof is about the mechanism rather than
+# about any particular feature set. `default` is the cheapest and is gated in every run.
+if [ "$MODE" = "selftest" ]; then
+  echo "size-report: SELF-TEST. Re-running --check with every budget forced to 1 byte."
+  echo "size-report: the run below MUST fail. If it passes, this gate cannot go red and every"
+  echo "size-report: green it has ever produced means nothing."
+  echo
+  if "${BASH_SOURCE[0]}" --check --rows default --force-budget 1; then
+    echo >&2
+    echo "size-report: SELF-TEST FAILED: --check exited 0 against a 1 byte budget." >&2
+    echo "size-report: the gate is not comparing anything. Fix it before trusting a green." >&2
+    exit 1
+  fi
+  echo
+  echo "size-report: self-test passed: --check went RED against an impossible budget, naming the"
+  echo "size-report: row. The comparison, the measurement and the exit status all work."
+  exit 0
+fi
 
 if [ "$MODE" = "check" ]; then
   missing=0
@@ -316,7 +464,7 @@ for spec in "${ROWS[@]}"; do
   total="$(measure "$features${baseline_features:+,$baseline_features}")"
   delta=$((total - base))
 
-  budget="$(budget_for "$name")"
+  budget="$(budget_for_mode "$name")"
   case "$MODE" in
     tsv)
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$features" "$base" "$total" "$delta" "$description"

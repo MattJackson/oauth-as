@@ -127,30 +127,20 @@ async fn an_access_token_is_not_a_request_object() {
 
     // An RFC 9068 access token, signed with that same key.
     let signer = JwtConfig::new(key.clone(), "https://rs.example");
-    let token = signer
-        .sign_access_token(&AccessTokenClaims {
-            iss: "https://as.example".to_string(),
-            exp: 4_000_000_000,
-            aud: Audience::One("https://as.example".to_string()),
-            sub: "app".to_string(),
-            client_id: "app".to_string(),
-            iat: 1_700_000_000,
-            jti: "jti".to_string(),
-            scope: Some("read".to_string()),
-            #[cfg(feature = "rar")]
-            authorization_details: Default::default(),
-            // Not confirmation bound: this fixture is testing that an access token is
-            // not a request object, and a binding would say nothing about that.
-            //
-            // The cfg MATCHES THE FIELD's, which is `any(dpop, mtls)` (see `AccessTokenClaims`),
-            // and not `mtls` alone: `cnf` carries the RFC 9449 s6 DPoP thumbprint as well as the
-            // RFC 8705 s3.1 certificate one. Gated on `mtls` alone, this file did not compile at
-            // all in a `dpop`-without-`mtls` build.
-            #[cfg(any(feature = "dpop", feature = "mtls"))]
-            cnf: None,
-        })
-        .await
-        .unwrap();
+    // Not confirmation bound: this fixture is testing that an access token is not a request
+    // object, and a binding would say nothing about that. `AccessTokenClaims::new` leaves `cnf`
+    // at `None`, which is what that means.
+    let mut claims = AccessTokenClaims::new(
+        "https://as.example",
+        4_000_000_000,
+        Audience::One("https://as.example".to_string()),
+        "app",
+        "app",
+        1_700_000_000,
+        "jti",
+    );
+    claims.scope = Some("read".to_string());
+    let token = signer.sign_access_token(&claims).await.unwrap();
 
     match server
         .validate_signed_authorization_request("app", &token)
@@ -169,13 +159,9 @@ async fn an_access_token_is_not_a_request_object() {
 #[tokio::test]
 async fn requiring_a_signed_request_object_refuses_the_plain_query_request() {
     let key = EcdsaP256Key::generate("client-key");
-    let server = server(
-        &key,
-        Some(JarConfig {
-            require_signed_request_object: true,
-        }),
-    )
-    .await;
+    let mut jar = JarConfig::new();
+    jar.require_signed_request_object = true;
+    let server = server(&key, Some(jar)).await;
 
     let challenge = oauth_as::pkce::code_challenge_s256(VERIFIER);
     let pairs = query_request(&challenge);
