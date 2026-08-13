@@ -26,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 # jsonwebtoken verifies the RFC 7515 Appendix A RS256/ES256 vectors and, in black-box mode,
 # verifies RFC 9068 access tokens against the AS's advertised jwks_uri.
 jsonwebtoken = "9"
