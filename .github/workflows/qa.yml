@@ -1404,7 +1404,7 @@ jobs:
       # here: without it the failure is a log line, and with it it is a test case.
       - name: upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
