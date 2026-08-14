@@ -49,9 +49,59 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATE_MANIFEST = os.path.join(ROOT, "crates", "oauth-as", "Cargo.toml")
 PROBE_MANIFEST = os.path.join(ROOT, "scripts", "size-probe", "Cargo.toml")
 SIZE_REPORT = os.path.join(ROOT, "scripts", "size-report.sh")
+
+# THE VERSION IN Cargo.toml HAS THREE LOCKFILE MIRRORS, AND ONE OF THEM HAS NOW BEEN MISSED TWICE.
+#
+# Every gate runs `--locked`, deliberately: a budget or a proof measured against one dependency
+# resolve is worthless if checked against another. The cost is that a satellite lockfile naming a
+# STALE version of this crate makes cargo refuse to do anything at all --
+#
+#     error: cannot update the lock file .../fuzz/Cargo.lock because --locked was passed
+#
+# -- so the job does not fail on its merits, it fails to start. At 0.9.1 that was `fuzz/Cargo.lock`
+# still saying 0.9.0, fixed in 551a8de. At 0.9.2 it was `fuzz/Cargo.lock` still saying 0.9.1: the
+# root and the probe were remembered by hand, the third was not, and qa's fuzz job could not build
+# on the release commit. Nothing checked it either time.
+#
+# It is worse than an ordinary red build because of WHERE it lands. `dev.yml` and `publish.yml`
+# have no fuzz job, so both were fully green; the only signal was a red job on a branch the publish
+# path does not consult, and reaching `main` publishes.
+LOCKFILES = [
+    os.path.join(ROOT, "Cargo.lock"),
+    os.path.join(ROOT, "fuzz", "Cargo.lock"),
+    os.path.join(ROOT, "scripts", "size-probe", "Cargo.lock"),
+]
 # The two halves of "this probe row actually measures something": the gated exerciser, and the
 # call site that keeps fat LTO from deleting it. See `check_size_probe`.
 PROBE_SRC = os.path.join(ROOT, "scripts", "size-probe", "src")
+
+# EVERY FEATURE, THE FILE THAT EXERCISES IT, AND THE SYMBOL THAT MUST BE REACHED.
+#
+# Written out rather than inferred, because inferring it is what let two holes open (see
+# `check_size_probe`). A feature missing from this table FAILS: "this check has no opinion about
+# that feature" is exactly the state that let an unexercised row measure zero and pass its budget.
+#
+# Two conventions, both legitimate. `http`, `axum` and the `jwt` family are exercised by dedicated
+# modules whose single entry point `exercise.rs` calls; everything else gets a gated `pub fn` in
+# `exercise_features.rs` that `exercise.rs` calls by name.
+PROBE_EXERCISERS = {
+    "http": ("exercise_http.rs", "exercise_http::plane()"),
+    "axum": ("exercise_http.rs", "exercise_http::plane()"),
+    "jwt": ("exercise_jwt.rs", "exercise_jwt::plane()"),
+    "jwt-p256": ("exercise_jwt.rs", "exercise_jwt::plane()"),
+    "jwt-pkcs8": ("exercise_jwt.rs", "exercise_jwt::plane()"),
+    "mtls": ("exercise_features.rs", "exercise_features::mtls()"),
+    "par": ("exercise_features.rs", "exercise_features::par()"),
+    "jar": ("exercise_features.rs", "exercise_features::jar()"),
+    "rar": ("exercise_features.rs", "exercise_features::rar()"),
+    "dpop": ("exercise_features.rs", "exercise_features::dpop()"),
+    "client-assertion": ("exercise_features.rs", "exercise_features::client_assertion()"),
+    "consent": ("exercise_features.rs", "exercise_features::consent()"),
+    "token-exchange": ("exercise_features.rs", "exercise_features::token_exchange()"),
+    "resource-metadata": ("exercise_features.rs", "exercise_features::resource_metadata()"),
+    "cimd": ("exercise_features.rs", "exercise_features::cimd()"),
+    "test-util": ("exercise_features.rs", "exercise_features::test_util()"),
+}
 WORKFLOWS = [
     os.path.join(ROOT, ".github", "workflows", "dev.yml"),
     os.path.join(ROOT, ".github", "workflows", "qa.yml"),
@@ -311,32 +361,100 @@ def check_size_probe(crate_features):
     dispatch = probe_src.get("exercise.rs", "")
     exercisers = probe_src.get("exercise_features.rs", "")
 
+    # EVERY FEATURE MUST NAME ITS EXERCISER, AND THE EXERCISER MUST BE CALLED. No feature is
+    # exempt, and there is no arm of this check that ends in "then skip it".
+    #
+    # The first version of this check had two holes, both proven by experiment, and both are the
+    # SAME DEFECT IT WAS WRITTEN TO CATCH one level up: a gate that quietly stops applying.
+    #
+    #   HOLE A: it read `if defined and dispatch_missing`. When the regex missed, the check was
+    #   SKIPPED rather than FAILED. The regex required the `#[cfg]` attribute to be immediately
+    #   followed by `pub fn`, so putting an ordinary doc comment between them disabled it. Proven:
+    #   the cimd dispatch was deleted (script went red, correctly), then one `///` line was added
+    #   above `pub fn cimd()` and the script printed "all mirrored" and exited 0 with the exerciser
+    #   dead-code-eliminated.
+    #
+    #   HOLE B: the module convention -- http, axum and the jwt family, exercised from
+    #   exercise_http.rs and exercise_jwt.rs -- had NO dispatch check at all, because no
+    #   `pub fn <name>()` exists in exercise_features.rs for them, so `defined` was always None.
+    #   The only surviving test was "does the string `feature = "f-axum"` appear anywhere in
+    #   src/*.rs", which a COMMENT satisfies. Proven: the entire `#[cfg(feature = "f-axum")]` block
+    #   -- the tokio runtime, the bound listener, the axum::serve future, everything the axum row
+    #   exists to link -- was replaced with `acc = acc.wrapping_add(1);` and the script still said
+    #   "all mirrored".
+    #
+    # Neither hole could be caught by the size gate either, WHEN THIS WAS WRITTEN: `size-report.sh`
+    # compared a delta against an upper bound and had no FLOOR, so a row whose exerciser vanished
+    # measured close to zero and was comfortably inside any budget.
+    #
+    # THAT HALF IS NOW FIXED, and the division of labour is worth stating exactly, because each of
+    # these two checks is the other's blind spot and neither is a substitute:
+    #
+    #   * size-report.sh grew a floor_for() beside its budget_for(): every gated row now has a
+    #     minimum as well as a maximum, so a row that COLLAPSES is red. PROVEN 2026-08-13 by
+    #     replacing the body of `exercise_http::plane()` with a `return 0` -- leaving the `#[cfg]`,
+    #     the `pub fn` and the call site all in place, so THIS script still printed "all mirrored"
+    #     -- whereupon the `http` row fell from 423,715 bytes to 220,946 and the gate reported
+    #     "UNDER its floor of 407.0 KiB (195,822 bytes short)". The pre-floor script, run against
+    #     the identical tree, printed "every gated feature set is within its recorded budget" and
+    #     exited 0.
+    #
+    #   * The floor does NOT rescue a single feature going quiet inside a row that carries fifteen
+    #     others. MEASURED in the same session: gutting `exercise_features::rar()` moved the
+    #     `all-features` row by 1,868 bytes, 0.13%, because the features around it already
+    #     instantiate the JSON machinery RAR shares. No floor can see that. Only the check BELOW
+    #     can, which is why it is a string check and why it stays.
+    #
+    # So: this check catches a per-feature exerciser that is missing or unreachable; the floor
+    # catches a whole row that stopped measuring. A feature whose exerciser is present, called,
+    # and hollow is caught by NEITHER, and the honest place to close that is a gated row per
+    # feature in size-report.sh -- a decision about CI minutes, recorded there, not taken here.
+    #
+    # So the rule is now explicit rather than inferred. `PROBE_EXERCISERS` names, for every
+    # feature, the file that exercises it and the symbol that must be reachable, and a feature
+    # absent from that table is a FAILURE rather than a feature this check has nothing to say
+    # about. Adding a feature therefore means adding a line here, which is the point: the table is
+    # small, it is checked, and it cannot silently stop applying.
     for name in sorted(set(crate_features) - {"default"}):
-        gate = '#[cfg(feature = "f-%s")]' % name
-        if gate not in all_probe_src and ('feature = "f-%s"' % name) not in all_probe_src:
+        entry = PROBE_EXERCISERS.get(name)
+        if entry is None:
             fail(
-                "scripts/size-probe/src/: feature %r is mirrored as `f-%s` in the probe manifest "
-                "but no source file gates anything on it, so the row measures a build that does "
-                "not touch the feature. Under `lto = \"fat\"` that is close to zero, and the size "
-                "gate PASSES on a row that budgets nothing -- the exact lie the probe exists to "
-                "prevent." % (name, name)
+                "scripts/feature-mirrors.py: feature %r has no entry in PROBE_EXERCISERS, so "
+                "nothing here checks that its size row measures anything. Add one naming the file "
+                "that exercises it and the symbol that must be reached. A feature this check has "
+                "no opinion about is a row that can quietly measure zero." % name
             )
             continue
-        # Second convention only: a gated exerciser that nothing calls is dead code fat LTO
-        # removes, which is the same lie with an extra step. Deleting the dispatch line was
-        # invisible to this script before 0.9.2, proven by experiment.
-        fn = name.replace("-", "_")
-        defined = re.search(
-            r'#\[cfg\(feature\s*=\s*"f-%s"\)\]\s*\npub fn %s\s*\('
-            % (re.escape(name), re.escape(fn)),
-            exercisers,
-        )
-        if defined and ("exercise_features::%s(" % fn) not in dispatch:
+        source_file, symbol = entry
+        source = probe_src.get(source_file)
+        if source is None:
             fail(
-                "scripts/size-probe/src/exercise.rs: `exercise_features::%s()` is defined and "
-                "nothing calls it. Under `lto = \"fat\"` an uncalled function is deleted, so the "
-                "%r row measures the feature at close to zero and reports it as a PASS, because "
-                "nothing is smaller than a budget." % (fn, name)
+                "scripts/size-probe/src/%s: named as %r's exerciser and does not exist."
+                % (source_file, name)
+            )
+            continue
+        gate = 'feature = "f-%s"' % name
+        # The gate may sit INSIDE the exerciser file, or on the `mod` declaration in main.rs --
+        # `exercise_http` and `exercise_jwt` are whole modules compiled only under their feature,
+        # so the gate that governs them is `#[cfg(feature = "f-http")] mod exercise_http;`. Both
+        # spellings mean the same thing: nothing in that file is linked without the feature.
+        declaration = probe_src.get("main.rs", "")
+        if gate not in source and gate not in declaration:
+            fail(
+                "scripts/size-probe/src/%s: nothing is gated on `%s`, there or on its `mod` "
+                "declaration in main.rs, so the %r row builds a binary that never touches the "
+                "feature. Under `lto = \"fat\"` that measures close to zero and PASSES any budget "
+                "-- the exact lie the probe exists to prevent." % (source_file, gate, name)
+            )
+        # The symbol must be REACHED, from the dispatcher, by name. For the exercise_features.rs
+        # convention that is the call in exercise.rs; for the module convention it is the module's
+        # own entry point, which exercise.rs calls unconditionally.
+        if symbol not in all_probe_src.replace(source, "", 1) and symbol not in dispatch:
+            fail(
+                "scripts/size-probe/src/: %r's exerciser %r is defined and nothing calls it. "
+                "Under `lto = \"fat\"` an uncalled function is deleted, so the row measures the "
+                "feature at close to zero and reports it as a PASS, because nothing is smaller "
+                "than a budget." % (name, symbol)
             )
     for name, entries in sorted(probe.items()):
         for entry in entries:
@@ -369,6 +487,44 @@ def check_size_probe(crate_features):
             )
 
 
+def check_lockfiles():
+    """Every satellite lockfile must name the version `crates/oauth-as/Cargo.toml` declares.
+
+    See `LOCKFILES` for why this exists. Short version: `--locked` makes a stale one fail the job
+    before it starts rather than on its merits, and it has now been missed twice in two releases.
+    """
+    text = read(CRATE_MANIFEST)
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not match:
+        fail(
+            "crates/oauth-as/Cargo.toml has no top-level version= for this check to read; it "
+            "cannot pass vacuously, so this is a failure."
+        )
+        return
+    declared = match.group(1)
+    for path in LOCKFILES:
+        if not os.path.exists(path):
+            fail("%s does not exist, and this check is named for it." % path)
+            continue
+        found = re.search(
+            r'\[\[package\]\]\nname = "oauth-as"\nversion = "([^"]+)"', read(path)
+        )
+        if not found:
+            fail(
+                "%s has no `oauth-as` package entry, so nothing here can tell whether it is "
+                "stale. A lockfile this check cannot read is one it cannot vouch for." % path
+            )
+            continue
+        if found.group(1) != declared:
+            fail(
+                "%s pins oauth-as %s while crates/oauth-as/Cargo.toml declares %s. Every gate "
+                "runs --locked, so cargo will REFUSE TO BUILD rather than fail on the merits: "
+                "`cannot update the lock file ... because --locked was passed`. Run "
+                "`cargo update --manifest-path <that manifest> -p oauth-as`."
+                % (path, found.group(1), declared)
+            )
+
+
 def main():
     crate_features = features_of(CRATE_MANIFEST)
     if len(crate_features) < 2:
@@ -377,6 +533,7 @@ def main():
             "itself is broken and must be fixed before its result means anything"
             % len(crate_features)
         )
+    check_lockfiles()
     check_workflows(crate_features)
     check_no_rar_step(crate_features)
     check_size_probe(crate_features)

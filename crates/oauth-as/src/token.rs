@@ -367,9 +367,8 @@ pub struct IntrospectionResponse {
     /// an OPAQUE token learns what the token actually authorizes, which is the whole reason
     /// the parameter exists.
     ///
-    /// Through 0.9.1 introspection answers only the token's own client, so a resource server
-    /// cannot yet read this member; the resource-server channel is 0.9.2 work (see
-    /// [`crate::metadata::AuthorizationServerMetadata::introspection_endpoint`]).
+    /// A resource server reads this member since 0.9.2, when it is registered in
+    /// [`crate::ServerConfig::resource_servers`] and the token is addressed to it.
     ///
     /// Omitted rather than empty when the grant carried none, for the same reason `aud` is:
     /// an empty array reads as "authorized for nothing in particular", which is a statement,
@@ -621,8 +620,12 @@ pub struct IssuedToken {
     /// caller reads "no restriction stated" from introspection and "restricted to the
     /// configured audience" from the token, for one token. Both are true statements about
     /// different things: this field is the GRANT'S narrowing, and the configured audience is the
-    /// deployment's standing one. Non-empty, they agree exactly. Through 0.9.1 that caller is the
-    /// token's own client: the resource-server introspection channel lands in 0.9.2.
+    /// deployment's standing one. Non-empty, they agree exactly.
+    ///
+    /// SINCE 0.9.2 THIS FIELD ALSO DECIDES WHO MAY ASK. It is what a registered resource server is
+    /// matched against, so a token whose grant named no resource is introspectable by its own
+    /// client alone; see [`crate::ServerConfig::resource_servers`]. A resource server that is
+    /// answered sees only its OWN identifiers here, not the whole set.
     pub resource: Vec<String>,
     /// The RFC 9396 authorization details this token carries (section 7: the AS returns the
     /// details as granted and assigned to the access token). This is what RFC 7662
@@ -700,9 +703,9 @@ pub struct IssuedToken {
     /// Recorded on the AS side, and not only inside a signed JWT, for the same reason `jkt`
     /// next door is: this crate's default access token is OPAQUE, and RFC 8705 section 3.2
     /// has a resource server learn the binding by INTROSPECTING, which it can only be told
-    /// if it was persisted. The channel that will carry it to a resource server is 0.9.2 work;
-    /// the field is persisted now because the RECORD, not the response, is the thing that cannot
-    /// be added later.
+    /// if it was persisted. The channel that carries it to a resource server arrived in 0.9.2;
+    /// the field was persisted before that, because the RECORD, not the response, is the thing
+    /// that cannot be added later.
     ///
     /// `Option<Box<_>>` rather than the 32-byte thumbprint inline, on the same measurement
     /// as `jkt`: this record is written and read on every token-plane request and
@@ -730,8 +733,8 @@ pub struct IssuedToken {
     /// the one thing section 1.1 delegation exists to avoid: the whole point is that the resource
     /// can tell "A acting for B" from "B".
     ///
-    /// The channel that will carry it to a resource server is 0.9.2 work; the field is persisted
-    /// now because the RECORD, not the response, is the thing that cannot be added later.
+    /// The channel that carries it to a resource server arrived in 0.9.2; the field was persisted
+    /// before that, because the RECORD, not the response, is the thing that cannot be added later.
     ///
     /// It was left off through 0.9.0 for two reasons, and both are now spent. The first was
     /// allocation, and [`crate::store::Storage::get_token`] returning an `Arc<IssuedToken>` ended
@@ -753,8 +756,9 @@ pub struct IssuedToken {
     /// BOXED, so the common `None` costs one null pointer on a record that is written and read on
     /// every token-plane request rather than the whole struct; `tests/allocation.rs` holds this
     /// type to a size budget precisely so that a convenience like an inline `SystemTime` plus an
-    /// `Option<String>` cannot be paid for silently. It is what RFC 9470 section 6.2 is answered
-    /// from at introspection time.
+    /// `Option<String>` cannot be paid for silently. It is what BOTH halves of RFC 9470 section 6
+    /// are answered from: 6.2 at introspection time, and 6.1 at issuance, where the same report
+    /// becomes the `auth_time` and `acr` claims of the signed access token.
     #[cfg(feature = "consent")]
     pub authentication: Option<Box<crate::consent::Authentication>>,
 }
@@ -821,7 +825,8 @@ impl IssuedToken {
 /// not answer. `jkt` and `x5t_s256` are public-key and certificate THUMBPRINTS, which a resource
 /// server is given on the wire in the RFC 7800 `cnf` claim, so neither is secret; `act` is the RFC
 /// 8693 section 4.1 delegation chain, which introspection publishes; `authentication` is the RFC
-/// 9470 report, which introspection publishes as `auth_time` and `acr`.
+/// 9470 report, which introspection publishes as `auth_time` and `acr` (section 6.2) and which a
+/// signed access token carries under the same two names (section 6.1).
 impl fmt::Debug for IssuedToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("IssuedToken");

@@ -192,6 +192,63 @@ async fn the_pushed_authorization_request_endpoint_refuses_authorization_details
     );
 }
 
+/// DOOR FOUR: `POST /device_authorization`. RFC 9396 section 3 names the device authorization
+/// request of RFC 8628 explicitly as a place `authorization_details` may be used, so a client that
+/// reads the RFC will send it here, and this build honours no detail type at all.
+///
+/// The parameter never reaches the core from this door: `device_authorization_with_credential`
+/// takes a scope and nothing else, so there is no argument for it to arrive in and nothing for the
+/// core to refuse. The router is where the request actually is, so the router is where the refusal
+/// has to be — which is exactly the shape of the `GET /authorize` door above before it was fixed.
+#[tokio::test]
+async fn the_device_authorization_endpoint_refuses_authorization_details() {
+    let service = service().await;
+    let response = service
+        .handle(post(
+            "/device_authorization",
+            &format!("client_id=app&scope=read&authorization_details={DETAILS_ESCAPED}"),
+        ))
+        .await;
+    let body = body_text(response);
+    assert!(
+        body.contains("invalid_authorization_details"),
+        "RFC 9396 s3 and s5: the device authorization request carries this parameter too, and a \
+         user code minted for a permission this server dropped is a permission the client believes \
+         it asked for: {body}"
+    );
+}
+
+/// DOOR FIVE: `POST /token` under the RFC 8693 token exchange grant, which answers from its own
+/// arm of the router and returns BEFORE the token endpoint's shared parameter handling. Door two
+/// therefore does not cover it: the same POST to the same URL refuses for `authorization_code` and
+/// accepted-and-dropped for `grant_type=...:token-exchange`.
+///
+/// The subject token is deliberately not a real one, for the reason door two gives: the refusal
+/// under test must come BEFORE the exchange is attempted, so `invalid_grant` here would mean the
+/// parameter was never looked at.
+#[cfg(feature = "token-exchange")]
+#[tokio::test]
+async fn the_token_exchange_grant_refuses_authorization_details() {
+    let service = service().await;
+    let response = service
+        .handle(post(
+            "/token",
+            &format!(
+                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange\
+                 &client_id=app&subject_token=not-a-real-token\
+                 &subject_token_type=urn:ietf:params:oauth:token-type:access_token\
+                 &authorization_details={DETAILS_ESCAPED}"
+            ),
+        ))
+        .await;
+    let body = body_text(response);
+    assert!(
+        body.contains("invalid_authorization_details"),
+        "RFC 9396 s5: this grant has nowhere to put an authorization detail, so dropping it hands \
+         the client a token that says nothing about what it asked for: {body}"
+    );
+}
+
 /// The boundary, so none of the above is a ban on the ordinary request: the SAME requests without
 /// the parameter must be unaffected. A refusal that also refused requests carrying nothing would
 /// be a worse defect than the drop it replaced.

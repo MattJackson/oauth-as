@@ -440,6 +440,128 @@ async fn a_client_deletion_and_a_consent_withdrawal_do_not_deadlock() {
     );
 }
 
+/// THE SAME HAZARD ONE LEVEL DOWN: THE ORDER THE WRITE TAKES ITS OWN BARRIER LOCKS IN.
+///
+/// The test above forces two revocations against each other and is closed by the TABLE ORDER of
+/// their cascades. It exercises two transactions, and it stays green under the defect this test is
+/// about, which is why this one exists rather than an extra assertion there.
+///
+/// `lock_barrier_scopes` takes every key one write needs in ONE statement over an array, and
+/// `unnest` acquires them one at a time — so a writer part-way through the array HOLDS the keys it
+/// already took and WAITS for the next. Through 0.9.1 the comment on that function argued no such
+/// hold-and-wait existed, and therefore that the order within the array did not matter. It does.
+/// Three transactions close a cycle when `consent` is taken before `client`:
+///
+/// 1. `delete_client` takes `client:C` (its first act) and then cascades into `oauth_as_consents`.
+/// 2. `revoke_consent` claims its consent ROW first (`DELETE ... RETURNING`) and only then asks
+///    for `consent:(C, S)` — the one revocation that holds a row lock while waiting for an
+///    advisory one.
+/// 3. `put_token` for that (C, S) holds `consent:(C, S)` shared and waits for `client:C`.
+///
+/// 3 waits on 1, 2 waits on 3, and 1 waits on 2's row. PostgreSQL breaks it with `40P01`, and the
+/// loser can be either revocation, which reaches the caller as `server_error` with the grant still
+/// live.
+///
+/// # Why this is forced rather than raced
+///
+/// The interleaving needs `revoke_consent` to hold the consent row BEFORE `delete_client` reaches
+/// that table, while `delete_client` already holds `client:C`. An uncommitted duplicate of
+/// `delete_client`'s own BARRIER row is what buys that: `record_barrier` upserts against
+/// `UNIQUE (scope, client_id, family_id, subject)`, so a third connection holding an uncommitted
+/// `('client', C)` barrier stops `delete_client` at exactly the point after its advisory lock and
+/// before its cascade. The other two transactions are then started into that gap in order, and the
+/// blocking row is released last.
+///
+/// With `client` acquired first there is no step 3: the writer waits for `client:C` holding
+/// NOTHING, `revoke_consent` gets its advisory lock immediately and commits, and `delete_client`
+/// finds the consent row already gone. The assertion is that all three calls return `Ok`, because
+/// what a deadlock costs here is a revocation, not a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "consent")]
+async fn a_writer_waiting_for_the_client_barrier_cannot_hold_the_consent_one() {
+    const SCHEMA: &str = "oauth_as_race_barrier_key_order";
+    const CLIENT: &str = "race-barrier-key-order";
+    const SUBJECT: &str = "subject-barrier-key-order";
+    const CONSENT: &str = "consent-barrier-key-order";
+    const TOKEN: &str = "barrier-key-order-token";
+    support::fresh_schema(SCHEMA).await;
+    let planter = support::store(SCHEMA, 1).await;
+    let deleter = support::store(SCHEMA, 1).await;
+    let withdrawer = support::store(SCHEMA, 1).await;
+    let writer = support::store(SCHEMA, 1).await;
+    let holders = support::pool(SCHEMA, 1).await;
+
+    // The row `revoke_consent` claims, and the row `delete_client`'s cascade goes on to wait for.
+    // No registration row is planted: `delete_client` runs its whole cascade whether or not the
+    // client exists (it answers `Ok(false)` in that case, which is not what this asserts on), and
+    // the cascade is the only part of it this cycle passes through.
+    planter
+        .put_consent(ConsentRecord {
+            consent_id: CONSENT.into(),
+            client_id: ClientId::new(CLIENT),
+            subject: SUBJECT.into(),
+            scope: scopes(),
+            resource: Vec::new(),
+            granted_at: SystemTime::now(),
+            authentication: None,
+        })
+        .await
+        .expect("put_consent");
+
+    // `delete_client`'s own barrier row, uncommitted, so its `record_barrier` blocks here — after
+    // it holds `client:C` and before it reaches `oauth_as_consents`. Written out rather than
+    // through `blocker` because a barrier carries two timestamps, not one.
+    let mut barrier_row = holders.begin().await.expect("begin the barrier row hold");
+    let far = to_nanos(SystemTime::now() + Duration::from_secs(600));
+    sqlx::query(
+        "INSERT INTO oauth_as_revocation_barriers \
+             (scope, client_id, family_id, subject, expires_at_ns, recorded_at_ns) \
+         VALUES ('client', $1, '', '', $2, $2)",
+    )
+    .bind(CLIENT)
+    .bind(far)
+    .execute(&mut *barrier_row)
+    .await
+    .expect("plant the blocking barrier row");
+
+    // FIRST: it must hold `client:C` before anything else moves.
+    let delete = tokio::spawn(async move {
+        deleter
+            .delete_client(&ClientId::new(CLIENT), window_now())
+            .await
+    });
+    tokio::time::sleep(REVOCATION_GRACE).await;
+    // SECOND: with the defect it now holds `consent:(C, S)` and waits for `client:C`; without it
+    // it holds nothing and waits for `client:C`.
+    let write = tokio::spawn(async move {
+        writer
+            .put_token(access_token(TOKEN, CLIENT, Some(SUBJECT), None))
+            .await
+    });
+    tokio::time::sleep(REVOCATION_GRACE).await;
+    // THIRD: claims the consent ROW, then asks for `consent:(C, S)`.
+    let withdraw =
+        tokio::spawn(async move { withdrawer.revoke_consent(CONSENT, window_now()).await });
+    tokio::time::sleep(REVOCATION_GRACE).await;
+
+    // Releases `delete_client` into its cascade, which is the last edge of the cycle.
+    barrier_row
+        .rollback()
+        .await
+        .expect("release the blocking barrier row");
+
+    let deleted = delete.await.expect("the deleter did not panic");
+    let withdrawn = withdraw.await.expect("the withdrawer did not panic");
+    let written = write.await.expect("the writer did not panic");
+    assert!(
+        deleted.is_ok() && withdrawn.is_ok() && written.is_ok(),
+        "a client deletion, a consent withdrawal and an issuance for the same (client, subject) \
+         deadlocked over the barrier advisory locks, so an operation failed and its caller was \
+         told `server_error`: delete_client => {deleted:?}, revoke_consent => {withdrawn:?}, \
+         put_token => {written:?}"
+    );
+}
+
 /// A PUSHED REQUEST WRITTEN BEHIND THE DELETION OF THE CLIENT THAT PUSHED IT.
 ///
 /// RFC 9126 section 2.2 binds a `request_uri` to its client, so a surviving handle is one nobody

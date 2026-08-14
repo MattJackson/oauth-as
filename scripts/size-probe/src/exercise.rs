@@ -224,6 +224,10 @@ pub fn run() -> u64 {
     {
         acc = acc.wrapping_add(crate::exercise_features::resource_metadata());
     }
+    #[cfg(feature = "f-cimd")]
+    {
+        acc = acc.wrapping_add(crate::exercise_features::cimd());
+    }
     #[cfg(feature = "f-test-util")]
     {
         acc = acc.wrapping_add(crate::exercise_features::test_util());

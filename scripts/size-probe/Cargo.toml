@@ -94,6 +94,9 @@ f-client-assertion = ["lib", "f-jwt-p256", "oauth-as/client-assertion"]
 f-consent = ["lib", "oauth-as/consent"]
 f-token-exchange = ["lib", "oauth-as/token-exchange"]
 f-resource-metadata = ["lib", "oauth-as/resource-metadata"]
+# The VALIDATOR, exercised the way a host uses it: a client identifier parsed and a document
+# validated. There is no fetch to measure, because the crate performs none.
+f-cimd = ["lib", "oauth-as/cimd"]
 f-test-util = ["lib", "oauth-as/test-util"]
 
 # The profile the report is measured under, and the reasoning for each line.

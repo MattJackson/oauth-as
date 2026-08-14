@@ -119,6 +119,25 @@ pub enum ClientAuthFailure {
     /// investigate. A run of these after a rotation deadline is expected; a run of them before one
     /// means the deployment's clock or its issued lifetimes are wrong.
     SecretExpired,
+    /// The registration is PUBLIC and the endpoint the caller reached admits confidential clients
+    /// only: RFC 7662 section 2.1 introspection, and the RFC 6749 section 4.4 client credentials
+    /// grant.
+    ///
+    /// Not a wrong credential — no credential was ever in play. A public registration has no
+    /// secret, so "authenticated as a public client" is a sentence true of every caller on the
+    /// internet, and naming a client id is not authentication.
+    ///
+    /// IT EXISTS SO THAT THE WIRE DOES NOT HAVE TO SAY IT. Through 0.9.1 both endpoints answered
+    /// this case with an `invalid_client` CARRYING A DESCRIPTION ("introspection requires a
+    /// confidential client"), while an unknown client id and a confidential client with the wrong
+    /// secret both got a BARE `invalid_client` — so the description sorted "this id is registered,
+    /// and it is public" from everything else, which is the enumeration
+    /// [`ClientAuthFailure::UnknownClient`] and [`ClientAuthFailure::SecretMismatch`] are collapsed
+    /// on the wire to prevent. The description is gone; the fact is here instead, in the channel
+    /// where the reader is not the attacker. It is also the sentence an operator actually needs,
+    /// because the usual cause is a resource server registered with the wrong
+    /// `token_endpoint_auth_method` rather than an attack.
+    NotConfidential,
     /// MANAGEMENT PLANE ONLY. The `client_id` names a client the HOST provisioned itself, which
     /// carries no RFC 7591 registration record and therefore no registration access token that
     /// could ever verify.
@@ -175,6 +194,10 @@ impl std::fmt::Display for ClientAuthFailure {
             ClientAuthFailure::RateLimited => "the host's rate limiter refused the attempt",
             ClientAuthFailure::SecretExpired => {
                 "the registration's client_secret_expires_at has passed"
+            }
+            ClientAuthFailure::NotConfidential => {
+                "that client id is registered as a public client, and this endpoint admits \
+                 confidential clients only"
             }
             ClientAuthFailure::NoDynamicRegistration => {
                 "that client id exists but was provisioned by the host, so it has no registration \
@@ -388,12 +411,16 @@ pub enum Event<'a> {
     /// authorization codes are delivered. A landed guess is therefore not "an attacker can act as
     /// this client"; it is "an attacker can have this client's codes sent to a URI they chose".
     ///
-    /// Emitted for all three refusals of a management request, which the wire deliberately cannot
+    /// Emitted for all four refusals of a management request, which the wire deliberately cannot
     /// tell apart (they are one `401`, because distinguishing them is an enumeration oracle over
-    /// the client table): an unknown `client_id`
+    /// the client table): an attempt this host's [`RateLimiter`] denied before the store was
+    /// touched ([`ClientAuthFailure::RateLimited`]), an unknown `client_id`
     /// ([`ClientAuthFailure::UnknownClient`]), a host-provisioned client that has no registration
     /// at all ([`ClientAuthFailure::NoDynamicRegistration`]), and a registration access token that
     /// did not verify ([`ClientAuthFailure::SecretMismatch`]).
+    ///
+    /// The limited one is emitted but NOT recorded as an attempt: the attempt never happened, so
+    /// there is no outcome to report and charging it would bill the caller twice for one try.
     ///
     /// Carries no credential: not the presented token, not a prefix of it, not its length. See the
     /// module docs for the rule.
@@ -401,7 +428,7 @@ pub enum Event<'a> {
         /// The `client_id` the request named, which may name no registration. Not a secret
         /// (RFC 6749 section 2.2).
         client_id: &'a str,
-        /// Which of the three indistinguishable-on-the-wire refusals this actually was.
+        /// Which of the four indistinguishable-on-the-wire refusals this actually was.
         failure: ClientAuthFailure,
     },
     /// A registration was rewritten through RFC 7592 section 2.2.
@@ -465,8 +492,27 @@ pub trait EventSink: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Attempt<'a> {
-    /// A client is authenticating at a token-plane endpoint. The `client_id` is included because
-    /// RFC 6749 section 2.2 makes it explicitly not a secret, so a limiter may key on it.
+    /// A client is authenticating at a token-plane endpoint, or at the RFC 7592 registration
+    /// management plane. The `client_id` is included because RFC 6749 section 2.2 makes it
+    /// explicitly not a secret, so a limiter may key on it.
+    ///
+    /// ONE BUDGET FOR A CLIENT'S TWO BEARER CREDENTIALS, deliberately. The client secret and the
+    /// registration access token answer the same question — may this caller keep presenting
+    /// credentials as this `client_id` — and separate budgets would let an attacker stuffing the
+    /// management plane stay under a limiter watching the token endpoint, while the credential
+    /// they are guessing at is the more powerful of the two (RFC 7592 section 2.3 deletes the
+    /// registration and everything it was issued).
+    ///
+    /// IT ALSO CARRIES A RESOURCE SERVER'S INTROSPECTION TRAFFIC, and a limiter keying on this
+    /// needs to know that, because it is the one caller whose volume is not a function of anything
+    /// this server issued. A registration named in
+    /// [`crate::server::ServerConfig::resource_servers`] authenticates here once per RFC 7662
+    /// introspection, which is once per call at the protected resource it guards. There is
+    /// deliberately no introspection-specific variant: adding one to this `#[non_exhaustive]` enum
+    /// would land in the wildcard arm of every limiter already written, and a wildcard that
+    /// answers [`RateLimitDecision::Allow`] would silently stop throttling the endpoint on
+    /// upgrade. See "Resource servers introspect once per API call" in [`crate::rate_limit`] for
+    /// how to give one `client_id` a capacity of its own instead.
     ClientAuthentication {
         /// The presented identifier, which may name no registration.
         client_id: &'a str,

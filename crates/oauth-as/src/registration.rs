@@ -526,14 +526,26 @@ fn redirect_uri_is_registerable(value: &str) -> bool {
 }
 
 /// The metadata as this server will actually record it.
-#[derive(Debug)]
-struct Registered {
-    redirect_uris: Vec<String>,
-    grant_types: Vec<GrantType>,
-    response_types: Vec<String>,
-    token_endpoint_auth_method: String,
-    scope: ScopeSet,
-    client_name: Option<String>,
+///
+/// `pub(crate)` rather than private because [`crate::cimd`] validates a
+/// draft-ietf-oauth-client-id-metadata-document-01 client with THIS function rather than a second
+/// copy of it. The members of a client identifier metadata document come from the same OAuth
+/// Dynamic Client Registration Metadata registry (-01 section 4.1), so the rules are the same
+/// rules, and this crate has already paid once for a rule that existed twice and drifted.
+///
+/// `Clone`, `PartialEq` and `Eq` exist for [`crate::cimd::ValidatedClientIdDocument`], which is the
+/// only thing that holds one of these beyond the call that produced it. They are NOT feature gated,
+/// and that was checked rather than assumed: `scripts/size-report.sh`'s `default` row is byte for
+/// byte identical with and without them, because LTO deletes three impls a default build never
+/// reaches. Gating them would have been noise for a measured zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Registered {
+    pub(crate) redirect_uris: Vec<String>,
+    pub(crate) grant_types: Vec<GrantType>,
+    pub(crate) response_types: Vec<String>,
+    pub(crate) token_endpoint_auth_method: String,
+    pub(crate) scope: ScopeSet,
+    pub(crate) client_name: Option<String>,
 }
 
 /// Validate one RFC 7591 section 2 metadata document against what this deployment will register.
@@ -541,7 +553,7 @@ struct Registered {
 /// Every refusal here is a registration this server would otherwise have written down and then
 /// been unable to honour. That is the standard the rules are set to: not "is this plausible" but
 /// "will the endpoints that later read this record be able to act on it".
-fn validate(
+pub(crate) fn validate(
     metadata: &ClientMetadata,
     config: &RegistrationConfig,
 ) -> Result<Registered, RegistrationFailure> {
@@ -775,30 +787,106 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// On success the returned [`ClientInformation`] carries the ONLY copy of the client secret
     /// (for a confidential registration) and of the RFC 7592 registration access token. Neither is
     /// recoverable afterwards, by the client or by the host: see the module docs.
+    ///
+    /// # THIS FUTURE IS NOT CANCELLATION SAFE, and what a drop costs
+    ///
+    /// A dropped future stops at whatever `await` it was suspended in and never resumes, and this
+    /// crate cannot make it finish: there is no destructor that can run an `async` store call. The
+    /// token plane states this contract on [`AuthorizationServer::token`] and
+    /// [`AuthorizationServer::revoke`]. The management plane pays something different for a drop,
+    /// and until 0.9.2 said nothing at all about it.
+    ///
+    /// What it costs here follows from the once-only rule above: the credentials are minted
+    /// BEFORE [`crate::store::Storage::put_client`] and handed back only in the return value after
+    /// it. A drop at or after that write leaves a row this server will honour whose registration
+    /// access token — and, for a confidential registration, whose client secret — existed only in
+    /// the dropped frame. Nothing recovers either one: this server kept verifiers, not
+    /// credentials, so there is nothing to re-send; RFC 7592
+    /// management of that registration needs the access token that is gone, so section 2.3 cannot
+    /// delete it either; and a [`crate::client::Client`] has no expiry and is never reclaimed by
+    /// [`crate::store::Storage::sweep_expired`]. The caller sees a request that did not answer and
+    /// retries, which registers a SECOND client. The first is permanent litter that only a host
+    /// deleting it out of band removes.
+    ///
+    /// The order is not the defect and reversing it would be worse: returning the credentials
+    /// before the write would hand a caller a live-looking secret for a registration that then
+    /// failed to persist.
+    ///
+    /// WHAT A HOST MUST DO, exactly as on the token plane: drive this from a task the connection
+    /// cannot cancel — spawn the call and await the join handle — so a disconnecting client aborts
+    /// the response and not the work. This crate's axum adapter already does that for every route,
+    /// this one included, because it spawns inside a single `fallback`; see [`crate::http`]. A
+    /// host that mounts [`crate::http::AuthorizationService::handle`] itself, or calls this method
+    /// directly, owns it.
     pub async fn register_dynamic_client(
         &self,
         metadata: &ClientMetadata,
         initial_access_token: Option<&str>,
     ) -> Result<ClientInformation, RegistrationFailure> {
-        let config = self.registration_config()?;
+        self.admit_registration()?;
+        self.register_admitted_client(metadata, initial_access_token)
+            .await
+    }
 
-        // THE HOST'S THROTTLE, before the host's policy and before anything is read or written.
-        //
-        // This endpoint is the one place in the crate where a caller's request becomes a PERMANENT
-        // row: a `Client` has no expiry and `Storage::sweep_expired` never reclaims one, so an
-        // unthrottled registration endpoint is not a burst a deployment rides out, it is growth
-        // that does not come back. RFC 7591 section 5 says the same thing in prose — an open
-        // registration endpoint is available to anyone on the internet — and a `RegistrationPolicy`
-        // is a decision about CONTENT, which is the wrong instrument for volume.
-        //
-        // The refusal is `Unauthorized`, the same answer the policy refusal below gives, and
-        // deliberately so: those two must not be distinguishable, or a caller learns from the wire
-        // whether it was the content or the rate that stopped them. No event is emitted, because
-        // there is no `client_id` to name and the audit vocabulary here is about credentials.
-        let limited = crate::events::Attempt::ClientRegistration;
-        if self.hooks().check(limited) == crate::events::RateLimitDecision::Deny {
+    /// THE HOST'S THROTTLE, before the host's policy and before anything is read or written — and,
+    /// for an HTTP caller, before the request BODY is parsed.
+    ///
+    /// This endpoint is the one place in the crate where a caller's request becomes a PERMANENT
+    /// row: a `Client` has no expiry and `Storage::sweep_expired` never reclaims one, so an
+    /// unthrottled registration endpoint is not a burst a deployment rides out, it is growth that
+    /// does not come back. RFC 7591 section 5 says the same thing in prose — an open registration
+    /// endpoint is available to anyone on the internet — and a [`RegistrationPolicy`] is a decision
+    /// about CONTENT, which is the wrong instrument for volume.
+    ///
+    /// The refusal is `Unauthorized`, the same answer the policy refusal gives, and deliberately
+    /// so: those two must not be distinguishable, or a caller learns from the wire whether it was
+    /// the content or the rate that stopped them. No event is emitted, because there is no
+    /// `client_id` to name and the audit vocabulary here is about credentials.
+    ///
+    /// `pub(crate)` for ONE caller and one reason, exactly as
+    /// [`AuthorizationServer::authenticate_registration`] is: `crate::http`'s RFC 7591 `POST`
+    /// handler runs it before it parses the request body, so an anonymous caller cannot buy a
+    /// `MAX_BODY_BYTES` JSON parse per request. RFC 7591 s3.1 registration MAY be anonymous, so
+    /// unlike the RFC 7592 management plane there is no credential to look at first — but the
+    /// throttle is not a credential, it is keyed on nothing at all, and nothing stopped it being
+    /// asked first. That it was not is the whole of the defect.
+    ///
+    /// [`AuthorizationServer::register_dynamic_client`] still runs it for itself, so a host calling
+    /// that method directly is throttled on the same terms. It is NOT re-run underneath the HTTP
+    /// handler, which is the difference from the management plane's arrangement: this budget is
+    /// GLOBAL and its shipped default is 60 per window, so a second charge for one request would
+    /// quietly halve a host's configured ceiling. The split into
+    /// `register_admitted_client` is what keeps the count at one, and
+    /// `tests/http_refusal_honesty.rs` counts it.
+    ///
+    /// The `registration_config` check comes FIRST and is repeated below, so that a deployment with
+    /// registration disabled answers `Disabled` exactly as it did before rather than spending a
+    /// throttle budget on an endpoint it does not serve.
+    pub(crate) fn admit_registration(&self) -> Result<(), RegistrationFailure> {
+        self.registration_config()?;
+        if self
+            .hooks()
+            .check(crate::events::Attempt::ClientRegistration)
+            == crate::events::RateLimitDecision::Deny
+        {
             return Err(RegistrationFailure::Unauthorized);
         }
+        Ok(())
+    }
+
+    /// RFC 7591 section 3.1 from the policy check onwards, for a caller
+    /// [`AuthorizationServer::admit_registration`] has already admitted.
+    ///
+    /// Split out so the throttle can be asked before an HTTP body is parsed and asked ONCE; see
+    /// that method. Every branch here is the one it was when this was the back half of
+    /// `register_dynamic_client`.
+    pub(crate) async fn register_admitted_client(
+        &self,
+        metadata: &ClientMetadata,
+        initial_access_token: Option<&str>,
+    ) -> Result<ClientInformation, RegistrationFailure> {
+        let config = self.registration_config()?;
+        let limited = crate::events::Attempt::ClientRegistration;
 
         // The host decides, FIRST, before anything is validated or written. With no policy
         // installed the answer is no: see [`RegistrationPolicy`] and RFC 7591 section 5. The
@@ -921,17 +1009,28 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
     /// Authenticate an RFC 7592 section 2 management request.
     ///
-    /// Every failure is [`RegistrationFailure::Unauthorized`]: an unknown client, a statically
-    /// provisioned client that has no registration access token, and a wrong token are one answer
-    /// on the wire, because telling them apart is an enumeration oracle over the client table.
+    /// Every failure is [`RegistrationFailure::Unauthorized`]: an attempt the host's rate limiter
+    /// denied, an unknown client, a statically provisioned client that has no registration access
+    /// token, and a wrong token are one answer on the wire, because telling them apart is an
+    /// enumeration oracle over the client table — and, for the limiter's own refusal, because a
+    /// distinct answer would tell an attacker they had found a live registration and merely hit
+    /// the ceiling.
     ///
     /// The same timing caveat that `AuthorizationServer::authenticate_client` documents applies:
     /// this returns before any hashing when the client is unknown, so an unknown client and a
     /// known client with the wrong token are distinguishable by wall time. The comparison itself
-    /// leaks nothing (see [`SecretHash::verify`]); equalising the two paths is the host's business,
-    /// and this is a management endpoint the host is expected to throttle anyway.
+    /// leaks nothing (see [`SecretHash::verify`]); equalising the two paths is the host's
+    /// business.
     ///
-    /// What the WIRE will not say, the AUDIT CHANNEL does. Each of the three refusals emits
+    /// THE HOST'S [`crate::events::RateLimiter`] IS ASKED FIRST, before the store is touched, and
+    /// the attempt is [`crate::events::Attempt::ClientAuthentication`] keyed on this `client_id`:
+    /// the same budget the token endpoint spends, because this is the same client's other
+    /// credential and the more powerful one. Until 0.9.2 this said the host "is expected to
+    /// throttle anyway", which was advice the host could not take through this crate: no `Attempt`
+    /// reached the seam from any of the three management verbs. See the body for why the budget is
+    /// shared rather than new.
+    ///
+    /// What the WIRE will not say, the AUDIT CHANNEL does. Each of the four refusals emits
     /// [`crate::events::Event::ClientRegistrationAuthenticationFailed`] naming which one it was,
     /// for the same reason the token plane separates its refusals: the host is not the attacker,
     /// and it cannot notice somebody guessing registration access tokens if the only record of the
@@ -940,7 +1039,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// `pub(crate)` for ONE caller and one reason: `crate::http`'s RFC 7592 `PUT` handler runs it
     /// before it parses the request body, so an unauthenticated caller cannot buy a
     /// `MAX_BODY_BYTES` JSON parse per request. `update_registration` below still authenticates for
-    /// itself, because a check performed by a caller is not a check the method may assume.
+    /// itself, because a check performed by a caller is not a check the method may assume — so an
+    /// HTTP `PUT` spends TWO units of the throttle's budget rather than one. That is stated rather
+    /// than tuned away: at the shipped default of 6000 per client per minute it is not a ceiling
+    /// any real management traffic reaches, and removing the second check to save a unit would
+    /// trade a bound for an assumption.
     pub(crate) async fn authenticate_registration(
         &self,
         client_id: &ClientId,
@@ -950,6 +1053,40 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         if !config.management_enabled {
             return Err(RegistrationFailure::Disabled);
         }
+        // THE HOST'S THROTTLE, before the store is touched, exactly as
+        // `AuthorizationServer::authenticate_client` asks before it looks a client up.
+        //
+        // This is a bearer credential being GUESSED AT, which is the thing RFC 9700 section 4.13
+        // is about, and the credential here is the more powerful of the two a dynamic registration
+        // holds: the client secret authenticates as the client, while this one REWRITES (RFC 7592
+        // s2.2) and DELETES (s2.3) the registration, cascading through every token and refresh
+        // chain it was issued. Through 0.9.1 the three management verbs took no `Attempt` at all,
+        // so a host that installed a limiter had this plane open while believing otherwise, and
+        // the note on this function told that host it "is expected to throttle anyway" without
+        // giving it anywhere to do so through this crate's own seam.
+        //
+        // `Attempt::ClientAuthentication` rather than a variant of its own, and rather than
+        // `Attempt::ClientRegistration` (which names RFC 7591 and the permanent row it writes).
+        // Two reasons. It is the same question — may this caller keep presenting credentials as
+        // this `client_id` — and one client's two credentials sharing one budget is the answer
+        // that cannot be walked around by moving from one endpoint to the other. And it adds NO
+        // new denial of service: the budget is already keyed on a `client_id` RFC 6749 s2.2 makes
+        // public, so anybody who could exhaust it here could already exhaust it by spraying wrong
+        // secrets at the token endpoint.
+        let attempt = crate::events::Attempt::ClientAuthentication {
+            client_id: client_id.as_str(),
+        };
+        if self.hooks().check(attempt) == crate::events::RateLimitDecision::Deny {
+            // No `record`: the attempt never happened, so there is no outcome to report. The
+            // refusal is the SAME `Unauthorized` a wrong token gets (see below), because a
+            // distinct answer would tell an attacker they had found a live registration and
+            // merely hit the ceiling.
+            return Err(self.registration_auth_failed(
+                client_id,
+                ClientAuthFailure::RateLimited,
+                false,
+            ));
+        }
         let found = self
             .store()
             .get_client(client_id)
@@ -958,9 +1095,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let client = match found {
             Some(client) => client,
             None => {
-                return Err(
-                    self.registration_auth_failed(client_id, ClientAuthFailure::UnknownClient)
-                )
+                return Err(self.registration_auth_failed(
+                    client_id,
+                    ClientAuthFailure::UnknownClient,
+                    true,
+                ))
             }
         };
         let registration = match client.registration.as_deref() {
@@ -968,29 +1107,48 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // A client the host provisioned itself. Reported apart from an unknown id because it
             // says the id was real, which is what an operator needs to see the probe for.
             None => {
-                return Err(self
-                    .registration_auth_failed(client_id, ClientAuthFailure::NoDynamicRegistration))
+                return Err(self.registration_auth_failed(
+                    client_id,
+                    ClientAuthFailure::NoDynamicRegistration,
+                    true,
+                ))
             }
         };
         if !registration
             .registration_access_token_hash
             .verify(registration_access_token, self.hooks().secret_verifier())
         {
-            return Err(self.registration_auth_failed(client_id, ClientAuthFailure::SecretMismatch));
+            return Err(self.registration_auth_failed(
+                client_id,
+                ClientAuthFailure::SecretMismatch,
+                true,
+            ));
         }
+        // The limiter counts FAILURES rather than traffic (see `crate::rate_limit`), so a
+        // management call that authenticated has to say so or a legitimate client's own polling
+        // would be charged at the rate a guessing attack is.
+        self.hooks()
+            .record(attempt, crate::events::AttemptOutcome::Succeeded);
         Ok((client, registration))
     }
 
     /// Report one refused management authentication and answer with the single wire failure all
-    /// three share.
+    /// four share.
     ///
     /// The presented token is NOT a parameter, and that is deliberate rather than incidental: it
     /// cannot be logged by a later edit to this function because it is not here to log. See the
     /// rule in the [`crate::events`] module docs.
+    ///
+    /// `attempted` says whether the limiter ALLOWED this attempt and it then failed, which is the
+    /// only case there is an outcome to report: a refusal by the limiter itself never happened, so
+    /// reporting it would charge the caller twice for one attempt and, on a failure-weighted
+    /// budget like [`crate::rate_limit::FixedWindowRateLimiter`], charge the heavier of the two
+    /// prices for work nobody did.
     fn registration_auth_failed(
         &self,
         client_id: &ClientId,
         failure: ClientAuthFailure,
+        attempted: bool,
     ) -> RegistrationFailure {
         self.hooks().emit(
             || crate::events::Event::ClientRegistrationAuthenticationFailed {
@@ -998,6 +1156,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 failure,
             },
         );
+        if attempted {
+            self.hooks().record(
+                crate::events::Attempt::ClientAuthentication {
+                    client_id: client_id.as_str(),
+                },
+                crate::events::AttemptOutcome::Failed,
+            );
+        }
         RegistrationFailure::Unauthorized
     }
 
@@ -1045,6 +1211,41 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// is the only response other than the original registration that ever carries a live
     /// credential. It is never an ECHO of an existing secret, which this server does not hold; see
     /// the module docs.
+    ///
+    /// # THIS FUTURE IS NOT CANCELLATION SAFE, and this is the drop a client cannot retry around
+    ///
+    /// See [`AuthorizationServer::register_dynamic_client`] for why a dropped future cannot be
+    /// finished by this crate. The expensive drop point here is the one case above: the mint.
+    ///
+    /// When this call mints a secret it writes the [`crate::client::SecretHash`] of it through
+    /// [`crate::store::Storage::compare_and_swap_client`], and returns the secret itself only in
+    /// the value at the end of this function. A drop after that swap RESOLVES and before the
+    /// response reaches the client leaves the store holding a verifier for a string that exists
+    /// nowhere. The client's retry does not repair it and cannot: the stored registration is now
+    /// confidential, so on the second pass `had_secret` is true and the arm that KEEPS THE
+    /// EXISTING VERIFIER is taken rather than the mint. That arm is right for what it was written
+    /// for — a metadata edit must not log a client out of the token endpoint — and nothing on the
+    /// wire distinguishes that case from this one. The registration can never authenticate at the
+    /// token endpoint again.
+    ///
+    /// The way out is RFC 7592 section 2.3, and it is the only one: this call never rotates the
+    /// registration access token, so the client still holds it and can DELETE the registration and
+    /// register afresh. A host whose [`RegistrationPolicy`] admits an initial access token only
+    /// once has to provision the client again itself.
+    ///
+    /// Reversing the order would be worse rather than better: handing the secret back before the
+    /// swap would give a client a credential for a write that a concurrent section 2.3 delete is
+    /// entitled to refuse — which is exactly what the compare-and-swap exists to allow. So the
+    /// order stands and the contract is stated instead.
+    ///
+    /// The cheaper drop points, for completeness: anywhere before the swap costs nothing, because
+    /// nothing has been written; between the swap and the return, an update with no mint loses
+    /// only the [`crate::events::Event::ClientRegistrationUpdated`], so an audit trail can miss an
+    /// update that did happen.
+    ///
+    /// WHAT A HOST MUST DO is what [`AuthorizationServer::register_dynamic_client`] says: spawn
+    /// this and await the join handle. The axum adapter does. A host driving this future from the
+    /// connection is choosing the cost above, at whatever rate its clients disconnect.
     pub async fn update_registration(
         &self,
         client_id: &ClientId,
@@ -1197,6 +1398,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// [`Storage::delete_client`]: a client that no longer exists must not still have live access
     /// tokens, refresh chains or outstanding authorization codes. Section 2.3 requires exactly
     /// that, and it is the half of deletion that is easy to skip and impossible to notice.
+    ///
+    /// # THIS FUTURE IS NOT CANCELLATION SAFE, and what a drop costs
+    ///
+    /// This is the cheap one of the three; see [`AuthorizationServer::register_dynamic_client`]
+    /// for the contract and [`AuthorizationServer::update_registration`] for the expensive one. A
+    /// drop before [`crate::store::Storage::delete_client`] leaves the registration standing, and
+    /// the client still holds the registration access token, so the request is simply repeatable.
+    /// A drop after it loses the [`crate::events::Event::ClientRegistrationDeleted`], so a host
+    /// can find a registration gone with no audit record of who removed it. A retry after that
+    /// answers `Unauthorized`, because the token now names a registration that does not exist —
+    /// and pays what an unknown id pays: a
+    /// [`crate::events::Event::ClientRegistrationAuthenticationFailed`] carrying
+    /// [`crate::events::ClientAuthFailure::UnknownClient`], charged to the limiter as a failure.
+    /// So a client retrying a deletion that in fact completed reads, to an operator, exactly like
+    /// somebody guessing at a registration access token. That is the audit cost of a drop here,
+    /// and it is the whole of it: nothing is left half-written.
     pub async fn delete_registration(
         &self,
         client_id: &ClientId,

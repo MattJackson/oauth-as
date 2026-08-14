@@ -864,6 +864,25 @@ async fn a_public_client_cannot_exchange() {
         "a grant that converts one principal's authority into another's cannot rest on a name",
     );
     assert_eq!(error.error, ErrorCode::InvalidClient);
+    // AND IT SAYS NOTHING MORE. Through 0.9.1 this refusal carried "token exchange requires a
+    // confidential client" while an unknown client id got a bare `invalid_client`, so the
+    // description sorted registered ids from unregistered ones for a caller presenting no
+    // credential at all. The third site of one shape; see `tests/introspection.rs`.
+    assert_eq!(error.error_description, None);
+
+    let unknown_id = ClientId::new("no-such-exchanger");
+    let unknown = srv
+        .exchange_token(&TokenExchangeRequest::new(
+            &unknown_id,
+            &subject.access_token,
+            TokenTypeIdentifier::AccessToken,
+        ))
+        .await
+        .expect_err("an unregistered client_id cannot exchange either");
+    assert_eq!(
+        error, unknown,
+        "a registered public client and an unregistered id must be one indistinguishable answer"
+    );
 }
 
 /// Who may exchange is a deployment decision, recorded where this crate records every other such

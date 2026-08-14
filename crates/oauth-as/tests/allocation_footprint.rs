@@ -466,20 +466,34 @@ fn empty_store_is_free() {
 // That difference is itself worth knowing, and it is the argument for `Arc` in the store beyond
 // the read-path allocation saving it was introduced for.
 
-/// Observed 1009 on EVERY feature set: `DeviceGrant` has no `#[cfg]` field.
-const DEVICE_GRANT_BUDGET: usize = 1025;
+// RE-DERIVED 2026-08-13, every base figure below, when `ScopeSet` stopped being a `BTreeSet` and
+// became a sorted `Vec` (see `oauth_as::scope::ScopeSet`). A `BTreeSet` allocates a leaf node the
+// moment it holds anything and that node is the same size for one token as for eleven, so every
+// record in the store was carrying roughly 232-256 bytes of tree to hold a scope set of two short
+// words. The per-feature deltas did NOT move — they are fields, not containers — and they still sum
+// exactly to the all-features observation for every record, which is the property this file relies
+// on to bound an untested combination this tightly.
+//
+// The budgets come DOWN with the measurement rather than being left where they were. A budget left
+// at 1,025 for a record that now measures 753 is 272 bytes of room for a field to arrive in
+// unnoticed, which is the whole thing this file exists to prevent.
 
-/// Observed 1066 default, 1130 all-features. Stored by value, so each optional field counts twice:
-/// `rar`'s `AuthorizationDetails` (a `Vec`, 24) and `consent`'s `Option<Box<Authentication>>` (8).
-const AUTHORIZATION_CODE_BUDGET: usize = 1082
+/// Observed 753 on EVERY feature set: `DeviceGrant` has no `#[cfg]` field. Was 1009.
+const DEVICE_GRANT_BUDGET: usize = 769;
+
+/// Observed 834 default, 898 all-features (was 1066 / 1130). Stored by value, so each optional
+/// field counts twice: `rar`'s `AuthorizationDetails` (a `Vec`, 24) and `consent`'s
+/// `Option<Box<Authentication>>` (8).
+const AUTHORIZATION_CODE_BUDGET: usize = 850
     + if cfg!(feature = "rar") { 48 } else { 0 }
     + if cfg!(feature = "consent") { 16 } else { 0 };
 
-/// Observed 688 default, 752 all-features. Stored behind an `Arc`, so each optional field counts
-/// once: `rar` 24, `dpop`'s `Option<Box<str>>` 16, `mtls`'s `Option<Box<CertificateThumbprint>>` 8,
-/// `consent` 8, and `token-exchange`'s `Option<Box<ActClaim>>` 8. Those five sum to 64, which is
-/// exactly the gap between the two observations, so no combination is bounded by more than sixteen.
-const ACCESS_TOKEN_BUDGET: usize = 704
+/// Observed 432 default, 496 all-features (was 688 / 752). Stored behind an `Arc`, so each optional
+/// field counts once: `rar` 24, `dpop`'s `Option<Box<str>>` 16, `mtls`'s
+/// `Option<Box<CertificateThumbprint>>` 8, `consent` 8, and `token-exchange`'s `Option<Box<ActClaim>>`
+/// 8. Those five sum to 64, which is exactly the gap between the two observations, so no combination
+/// is bounded by more than sixteen.
+const ACCESS_TOKEN_BUDGET: usize = 448
     + if cfg!(feature = "rar") { 24 } else { 0 }
     + if cfg!(feature = "dpop") { 16 } else { 0 }
     + if cfg!(feature = "mtls") { 8 } else { 0 }
@@ -490,22 +504,28 @@ const ACCESS_TOKEN_BUDGET: usize = 704
         0
     };
 
-/// Observed 723 default, 779 all-features. The same four optional fields as `IssuedToken`, in the
-/// same shapes, and stored behind an `Arc` the same way. No `act`: a refresh record belongs to a
-/// chain and RFC 8693 issues no refresh token, so there is no delegation to carry.
-const REFRESH_TOKEN_BUDGET: usize = 739
+/// Observed 491 default, 547 all-features (was 723 / 779). The same four optional fields as
+/// `IssuedToken`, in the same shapes, and stored behind an `Arc` the same way. No `act`: a refresh
+/// record belongs to a chain and RFC 8693 issues no refresh token, so there is no delegation to
+/// carry.
+const REFRESH_TOKEN_BUDGET: usize = 507
     + if cfg!(feature = "rar") { 24 } else { 0 }
     + if cfg!(feature = "dpop") { 16 } else { 0 }
     + if cfg!(feature = "mtls") { 8 } else { 0 }
     + if cfg!(feature = "consent") { 8 } else { 0 };
 
-/// Observed 573. `ConsentRecord` has no `#[cfg]` field of its own (the whole module is behind
-/// `consent`), so this is one number and not a sum.
+/// Observed 341 (was 573). `ConsentRecord` has no `#[cfg]` field of its own (the whole module is
+/// behind `consent`), so this is one number and not a sum.
 #[cfg(feature = "consent")]
-const CONSENT_RECORD_BUDGET: usize = 589;
+const CONSENT_RECORD_BUDGET: usize = 357;
 
 /// Observed 831 with `par` alone and 975 with `rar` and `consent` also on. It is stored by value,
 /// so `rar`'s one `Option<String>` costs 48 and `consent`'s two cost 96.
+///
+/// UNMOVED by the `ScopeSet` change that took 232-256 bytes off every other record here, and that
+/// is a fact about the type rather than an oversight: a pushed request holds the RAW request
+/// parameters it was handed, so its `scope` is the wire `Option<String>` and there is no set to
+/// shrink. It is now the largest record in the store by some margin.
 #[cfg(feature = "par")]
 const PUSHED_REQUEST_BUDGET: usize = 847
     + if cfg!(feature = "rar") { 48 } else { 0 }

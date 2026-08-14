@@ -389,8 +389,28 @@ impl ValidatedAuthorizationRequest {
     }
 }
 
+/// Hand-written so the one-time `code` never prints. `state` and `iss` print in full: `state` is
+/// the client's own opaque value echoed back and `iss` is this server's public identifier.
+impl fmt::Debug for AuthorizationResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizationResponse")
+            .field("code", &"[redacted]")
+            .field("state", &self.state)
+            .field("iss", &self.iss)
+            .finish()
+    }
+}
+
 /// The success redirect parameters (RFC 6749 section 4.1.2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is HAND-WRITTEN (above) and does not print the `code`. The RECORD form of the same
+/// value, [`AuthorizationCodeRecord`], has been hand-redacted since it was written, for the reason
+/// stated there -- RFC 6749 section 4.1.2 makes a code a credential in its own right -- and this
+/// type, which carries the same string to the client, was left deriving until 0.9.2. A host that
+/// logs the response it is about to redirect with would have written a live, unredeemed code into
+/// its logs; PKCE binds the code to a DIFFERENT client, not to a reader who has the log and the
+/// verifier, and for a confidential client it does not bind at all.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationResponse {
     /// The single-use authorization code.
     pub code: String,

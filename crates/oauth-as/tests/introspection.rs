@@ -11,12 +11,16 @@
 
 mod support;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use oauth_as::{ClientId, ErrorCode, IntrospectionResponse, TokenType, TokenTypeHint};
+use oauth_as::{
+    AuthorizationServer, ClientAuthFailure, ClientId, ErrorCode, Event, EventSink,
+    IntrospectionResponse, MemoryStorage, ServerConfig, TokenType, TokenTypeHint,
+};
 use support::{
     confidential_client, device_only_client, mint_code_token, other_confidential_client,
-    server_with, ManualClock, CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET,
+    public_client, server_with, ManualClock, CONFIDENTIAL_REDIRECT, CONFIDENTIAL_SECRET,
     OTHER_CONFIDENTIAL_SECRET,
 };
 
@@ -201,6 +205,99 @@ async fn introspection_requires_client_authentication() {
         .await
         .expect_err("an unregistered client_id must not be authenticated");
     assert_eq!(err.error, ErrorCode::InvalidClient);
+}
+
+/// RFC 7662 s4, applied to the ERROR channel rather than to the response body.
+///
+/// A caller who reaches this endpoint with a client id and nothing else learns whether that id is
+/// registered, if the three refusals differ. They must not: the crate collapses "no such client"
+/// and "wrong secret" into one bare `invalid_client` on purpose, and a description saying "this
+/// one is public" would sort registered ids from unregistered ones just as well. Compared BYTE FOR
+/// BYTE (the whole `ErrorResponse`), not merely on `error`, because the description is exactly
+/// where the previous distinction lived.
+#[tokio::test]
+async fn a_public_client_is_refused_indistinguishably_from_an_unknown_one() {
+    let clock = ManualClock::at_epoch();
+    let srv = server_with(clock, vec![confidential_client(), public_client()]).await;
+
+    let public = srv
+        .introspection_response(&ClientId::new("public-app"), None, "some-token")
+        .await
+        .expect_err("a public client may not introspect");
+    let unknown = srv
+        .introspection_response(&ClientId::new("no-such-client"), None, "some-token")
+        .await
+        .expect_err("an unknown client may not introspect");
+    let wrong_secret = srv
+        .introspection_response(
+            &ClientId::new("confidential-app"),
+            Some("not-the-real-secret"),
+            "some-token",
+        )
+        .await
+        .expect_err("a wrong secret may not introspect");
+
+    assert_eq!(public.error, ErrorCode::InvalidClient);
+    assert_eq!(
+        public.error_description, None,
+        "a description here says the id is registered AND public; the other two carry none"
+    );
+    assert_eq!(
+        public, unknown,
+        "a registered public client and an unregistered id must be one answer"
+    );
+    assert_eq!(public, wrong_secret);
+    assert_eq!(
+        serde_json::to_value(&public).unwrap(),
+        serde_json::json!({"error": "invalid_client"}),
+        "and the difference must not survive serialization either"
+    );
+}
+
+/// `Box<dyn EventSink>` takes ownership and this test also has to read what was recorded, so what
+/// is installed is a handle over a shared vector. Same shape as `tests/events.rs`'s recorder.
+#[derive(Default)]
+struct Failures(Mutex<Vec<(String, ClientAuthFailure)>>);
+
+struct FailuresHandle(Arc<Failures>);
+
+impl EventSink for FailuresHandle {
+    fn on_event(&self, event: Event<'_>) {
+        if let Event::ClientAuthenticationFailed { client_id, failure } = event {
+            self.0
+                 .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((client_id.to_string(), failure));
+        }
+    }
+}
+
+/// The reason did not vanish, it MOVED: the host's audit channel is told which of the two it was,
+/// because the operator is not the attacker and the usual cause here is a resource server
+/// registered with the wrong `token_endpoint_auth_method` rather than an attack. Without this, the
+/// fix above would have traded an oracle for a refusal nobody can diagnose.
+#[tokio::test]
+async fn the_public_client_refusal_reaches_the_audit_channel() {
+    let recorded = Arc::new(Failures::default());
+    let srv = AuthorizationServer::with_clock(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        MemoryStorage::new(),
+        ManualClock::at_epoch(),
+    )
+    .with_event_sink(Box::new(FailuresHandle(recorded.clone())));
+    srv.register_client(public_client()).await.unwrap();
+
+    srv.introspection_response(&ClientId::new("public-app"), None, "some-token")
+        .await
+        .expect_err("a public client may not introspect");
+
+    let seen = recorded.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen,
+        vec![("public-app".to_string(), ClientAuthFailure::NotConfidential)],
+        "the operator must be told exactly what the wire deliberately does not say"
+    );
 }
 
 /// A token that has been revoked (RFC 7009) is exactly as inactive as one that was never issued.

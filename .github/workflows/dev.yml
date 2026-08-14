@@ -60,13 +60,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # THE FEATURE LIST HAS THREE HAND-MAINTAINED MIRRORS, and this is what stops them drifting.
+      # THE FEATURE LIST HAS FOUR HAND-MAINTAINED MIRRORS, and this is what stops them drifting.
       # The rule stated in the comment on the no-backend step below (anything added to [features]
       # in crates/oauth-as/Cargo.toml belongs there too, unless it pulls an ES256 backend in) was
-      # enforced by nothing, and neither was the same list in qa.yml or the `f-*` mirrors in
-      # scripts/size-probe/Cargo.toml. A feature added to the crate and to none of them escapes the
-      # no-backend job, the size gate, or both, silently. That has already happened twice here; see
-      # the script's header for both escapes.
+      # enforced by nothing, and neither was the same list in qa.yml, the same list AGAIN in
+      # publish.yml, or the `f-*` mirrors in scripts/size-probe/Cargo.toml. A feature added to the
+      # crate and to none of them escapes the no-backend job, the size gate, or both, silently.
+      # That has already happened twice here; see the script's header for both escapes.
+      #
+      # The script has since grown past the feature lists themselves, because each of these was a
+      # way for the same class of miss to survive: it reads the no-rar list as well as the
+      # no-backend one in all three workflows, the ALL_FEATURES line in scripts/size-report.sh, a
+      # sixteen-entry table of which exerciser reaches each size-probe row, and the three lockfiles
+      # that must all name this version (every gate runs `--locked`, so a stale satellite lockfile
+      # fails the job before it starts rather than on its merits).
       #
       # The script derives the exclusion rather than listing it: a feature is excluded from the
       # no-backend list exactly when its closure reaches `jwt-p256`. A fourth hand-maintained list
@@ -90,7 +97,8 @@ jobs:
         run: cargo test --workspace --locked
       # ALL FEATURES TOO, and this is not belt and braces. Thirteen of this crate's capabilities
       # are behind off-by-default cargo features, so a default-features run exercises a minority
-      # of the code: at 0.9.0 that is roughly 320 tests against roughly 710. A regression in
+      # of the code: MEASURED on the 0.9.2 tree with `cargo test -p oauth-as` against the same
+      # command plus `--all-features`, that is 494 tests against 1335. A regression in
       # DPoP, mTLS, PAR, RAR, token exchange or consent would otherwise reach `qa` unnoticed,
       # which defeats the point of having a fast gate at all.
       - name: clippy (all features)
@@ -120,7 +128,7 @@ jobs:
       - name: tests (every feature EXCEPT the ES256 backend)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,cimd,test-util
       # EVERY FEATURE EXCEPT `rar`, and this line exists because two test files had never run.
       #
       # RFC 9396 section 5 makes refusal a MUST for a detail type the server does not support, and
@@ -140,7 +148,33 @@ jobs:
       - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,test-util
+            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,cimd,test-util
+      # THE MUTUALLY-EXCLUSIVE PAIRS, which no other step in any workflow REACHES.
+      #
+      # Four tests were gated on feature combinations that every running configuration
+      # contradicted: `all(dpop, not(mtls))` and `all(mtls, not(dpop))` in
+      # introspection_feature_bounds.rs, and `not(jwt)` under `#![cfg(http)]` in
+      # http_advertised_reachability.rs. Default, --all-features, no-backend and no-rar all have
+      # dpop and mtls together or neither, and every set with http also has jwt. The clippy
+      # combination loop COMPILES them, which is why they type-checked forever; clippy does not RUN
+      # tests, so nothing ever executed them. Proven by making each panic and watching all four
+      # configurations stay green.
+      #
+      # They are not decoration. They are the cases the top-level guards CANNOT reach: a
+      # certificate-bound token read as a plain bearer by a dpop-only build, the mirror image for
+      # mtls, and a jwks_uri advertised by a build that cannot serve one. Each is a silent
+      # downgrade, which is the failure those files exist to prevent.
+      #
+      # Scoped to the two files rather than a fourth full matrix: what is missing is REACH, not
+      # coverage, and a full run of each would cost minutes to execute tests the other steps
+      # already ran.
+      - name: the changelog must date the version being built
+        run: python3 scripts/changelog-dated.py
+      - name: tests (the feature pairs no other step reaches)
+        run: |
+          cargo test -p oauth-as --locked --features dpop --test introspection_feature_bounds
+          cargo test -p oauth-as --locked --features mtls --test introspection_feature_bounds
+          cargo test -p oauth-as --locked --features http --test http_advertised_reachability
       # RUSTDOC, and it is a gate rather than a nicety. Nothing here ran rustdoc, and the cost of
       # that was measurable: 23 warnings at 0.9.0, including public documentation pointing readers
       # at pub(crate) items they cannot see, and two links to a type (`RouterBuilder`) renamed in
@@ -189,7 +223,7 @@ jobs:
           for f in "" "http" "jwt" "jwt-p256" "http,jwt" "http,jwt-p256" "jwt,rar" \
                    "http,jwt,dpop" "jwt,mtls" "dpop,jar,client-assertion" \
                    "jwt,client-assertion" "http,jwt,par,jar" "jwt,token-exchange" \
-                   "consent" "resource-metadata" "test-util" "test-util,jwt"; do
+                   "consent" "resource-metadata" "cimd" "test-util" "test-util,jwt"; do
             echo "::group::features: ${f:-<default>}"
             if [ -z "$f" ]; then
               cargo clippy -p oauth-as --locked --all-targets --no-default-features -- -D warnings

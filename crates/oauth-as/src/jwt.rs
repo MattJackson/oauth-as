@@ -698,8 +698,9 @@ impl Audience {
 /// [`JwtConfig::sign_access_token`], refuses to sign a claim set whose audience names nobody. See
 /// [`Audience::names_a_resource_server`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-/// `#[non_exhaustive]`: `rar` adds `authorization_details` and either sender-constraining feature
-/// adds `cnf`, and the `cnf` doc below records what it cost to get that gate wrong once already.
+/// `#[non_exhaustive]`: `rar` adds `authorization_details`, either sender-constraining feature
+/// adds `cnf`, `token-exchange` adds `act` and `consent` adds `auth_time` and `acr`, and the `cnf`
+/// doc below records what it cost to get that gate wrong once already.
 /// A host DOES construct this, because [`JwtConfig::sign_access_token`] takes one, so
 /// [`AccessTokenClaims::new`] takes the claims RFC 9068 section 2.2 makes REQUIRED and leaves the
 /// conditional ones as public fields, which is the same split the paragraph above describes.
@@ -737,6 +738,40 @@ pub struct AccessTokenClaims {
         skip_serializing_if = "crate::rar::AuthorizationDetails::is_empty"
     )]
     pub authorization_details: crate::rar::AuthorizationDetails,
+    /// RFC 9470 section 6.1 with RFC 9068 section 2.2.1: when the resource owner behind this token
+    /// authenticated, as seconds since the Unix epoch (OpenID Connect Core section 2 `auth_time`).
+    ///
+    /// This is the claim an offline resource server measures a `max_age` against. Section 6 of RFC
+    /// 9470 has exactly two subsections because a token reaches a resource server in exactly two
+    /// ways: 6.2 is RFC 7662 introspection, which is all an OPAQUE token has, and 6.1 is this,
+    /// which is all a resource server verifying signatures locally ever sees. Reporting the
+    /// authentication only through introspection left the deployment step-up is aimed at — the
+    /// resource server that sent the section 3 challenge and validates the answer offline — with
+    /// nothing to check but the client's word.
+    ///
+    /// Present exactly when the host REPORTED an authentication for the grant (see
+    /// [`crate::consent::Authentication`]), and omitted rather than sent as `null` when it did
+    /// not, for the reason `cnf` below is: a member present and null reads to a careless resource
+    /// server as a freshness it has already checked.
+    ///
+    /// Answered from the SAME stored report, through the same conversion, that RFC 7662
+    /// introspection answers from, so the two channels cannot state different things about one
+    /// token.
+    #[cfg(feature = "consent")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
+    /// RFC 9470 section 6.1 with RFC 9068 section 2.2.1: the authentication context class the host
+    /// reported for the grant (OpenID Connect Core section 2 `acr`). Opaque to this crate; see
+    /// [`crate::consent::Authentication::acr`].
+    ///
+    /// Absent when the host reported an authentication but no class, which is a different
+    /// statement from reporting a class of `""`: the first is "we did not say", and only the
+    /// second would claim a class was satisfied.
+    #[cfg(feature = "consent")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr: Option<String>,
     /// RFC 7800 `cnf`, which RFC 9068 section 2.2.1 lists as the claim carrying how a token is
     /// sender constrained. RFC 9449 section 6.1 puts the DPoP key thumbprint here as `jkt` and
     /// RFC 8705 section 3.1 puts the certificate thumbprint here as `x5t#S256`.
@@ -805,6 +840,12 @@ impl AccessTokenClaims {
             scope: None,
             #[cfg(feature = "rar")]
             authorization_details: crate::rar::AuthorizationDetails::none(),
+            // The required-set constructor: what the host reported about the login is not one of
+            // the seven, and RFC 9470 s6.1 has this server state it only when it has one.
+            #[cfg(feature = "consent")]
+            auth_time: None,
+            #[cfg(feature = "consent")]
+            acr: None,
             #[cfg(any(feature = "dpop", feature = "mtls"))]
             cnf: None,
             // The required-set constructor: a delegation is not one of the seven.
@@ -1192,13 +1233,14 @@ impl Eq for JwtConfig {}
 /// feature existed: a 256-bit random string that means nothing without asking the AS. It is the
 /// right default because it leaks nothing, is revocable in the only sense that matters (the AS
 /// stops honouring it immediately), and costs one introspection call per protected request.
-/// Through 0.9.1 introspection answers only the token's own client, so a deployment whose resource
-/// servers must validate independently wants [`AccessTokenFormat::Jwt`] until the resource-server
-/// channel lands in 0.9.2.
+/// Since 0.9.2 a registered resource server can make that call itself
+/// ([`crate::ServerConfig::resource_servers`]), so opaque is a real choice for a deployment with
+/// resource servers rather than a client-only one. A deployment whose resource servers must
+/// validate WITHOUT talking to the AS at all still wants [`AccessTokenFormat::Jwt`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AccessTokenFormat {
-    /// Opaque random access tokens (RFC 7662 introspection reads them; through 0.9.1 only for the
-    /// token's own client).
+    /// Opaque random access tokens (RFC 7662 introspection reads them, for the token's own client
+    /// and for a resource server the token is addressed to).
     #[default]
     Opaque,
     /// RFC 9068 `at+jwt` access tokens, signed with ES256. The record is still persisted, so
@@ -1467,7 +1509,16 @@ impl PublicJwk {
 /// Holding the unverified form as its own value is deliberate: it makes "parsed" and "verified"
 /// two different things a caller cannot confuse, and it keeps [`CompactJws::signing_input`]
 /// borrowing the received bytes, so that verification happens over what actually arrived.
-#[derive(Debug)]
+/// `Debug` is HAND-WRITTEN (below). `signing_input` is `header.payload` verbatim and `signature`
+/// is the decoded octets, so a derived one reconstructs the whole token from its parts: printing a
+/// parsed RFC 7523 client assertion or RFC 9449 DPoP proof yields everything needed to rebuild a
+/// bearer credential that is live until its `exp`. `jti` single-use bounds a proof that was
+/// ACCEPTED; one that was refused and then logged is still replayable elsewhere.
+///
+/// The decoded `header` and `payload` DO print. They are what a host debugging a refused assertion
+/// actually needs -- which `alg`, which `iss`, which `aud` -- and neither carries key material;
+/// what makes the token spendable is the signature over the exact input bytes, and that is what is
+/// withheld.
 pub struct CompactJws<'a> {
     /// `BASE64URL(header) "." BASE64URL(payload)`: the JWS Signing Input of RFC 7515 section 5.1
     /// step 5, borrowed from the input.
@@ -1478,6 +1529,17 @@ pub struct CompactJws<'a> {
     pub payload: serde_json::Map<String, serde_json::Value>,
     /// The decoded signature octets.
     pub signature: Vec<u8>,
+}
+
+impl fmt::Debug for CompactJws<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompactJws")
+            .field("signing_input", &"[redacted]")
+            .field("header", &self.header)
+            .field("payload", &self.payload)
+            .field("signature", &"[redacted]")
+            .finish()
+    }
 }
 
 impl<'a> CompactJws<'a> {

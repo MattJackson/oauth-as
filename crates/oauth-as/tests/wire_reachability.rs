@@ -284,12 +284,13 @@ fn public_client() -> Client {
 
 fn base_config() -> ServerConfig {
     let mut config = ServerConfig::new(ISSUER, VERIFICATION_URI);
-    // OPTED IN, because as of 0.9.1 `introspection_endpoint` is advertised only when the host
-    // names it. The endpoint is still ROUTED unconditionally; what changed is the promise in the
-    // discovery document, since a resource server -- RFC 7662's primary caller -- cannot use this
-    // endpoint until the capability lands in 0.9.2, and advertising it said otherwise. Setting it
-    // here keeps this sweep covering the endpoint AND exercises the opt-in, which is the half a
-    // host actually chooses.
+    // OPTED IN, because `introspection_endpoint` is advertised only when the host names it. The
+    // endpoint is still ROUTED unconditionally; what is conditional is the promise in the
+    // discovery document, because whether a resource server -- RFC 7662's primary caller -- can
+    // use this endpoint depends on whether the deployment registered any
+    // (`ServerConfig::resource_servers`), which only the host knows. Setting it here keeps this
+    // sweep covering the endpoint AND exercises the opt-in, which is the half a host actually
+    // chooses.
     config.introspection_endpoint = Some(format!("{ISSUER}/introspect"));
     // RFC 8628 s3.5's `slow_down` is correct behaviour and is tested elsewhere; here it would
     // turn the device grant's SUCCESS proof into a timing race, and a wire suite that has to

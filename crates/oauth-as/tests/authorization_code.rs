@@ -1215,4 +1215,26 @@ async fn a_redirect_uri_the_authorization_endpoint_could_never_reproduce_is_not_
     srv.register_client(client_with("https://app.example/cb"))
         .await
         .expect("a conforming redirect_uri is unaffected");
+
+    // WHICH DOOR IS STILL OPEN, pinned here because `crate::http`'s `redirect` names it: the
+    // registration APIs both validate, but `Storage::put_client` takes a `Client` as given and is
+    // public on a public trait, so a host that provisions by writing rows puts a `redirect_uris`
+    // entry into circulation that nothing in this crate ever saw. That is not a hole to close from
+    // here — a store is the host's, and refusing writes to it would make this crate the arbiter of
+    // rows it did not create — but it IS the reachable path to the `HeaderValue::from_str` fallback
+    // in `redirect`, and the comment there is only true while this assertion is.
+    srv.store()
+        .put_client(client_with("https://app.example/cb?next=a b"))
+        .await
+        .expect("the store takes what it is given: this is the unvalidated door");
+    assert_eq!(
+        srv.store()
+            .get_client(&ClientId::new("bad-uri-app"))
+            .await
+            .unwrap()
+            .expect("written")
+            .redirect_uris,
+        vec!["https://app.example/cb?next=a b".to_string()],
+        "a redirect_uri no validator in this crate approved is now live"
+    );
 }

@@ -132,7 +132,8 @@ jobs:
   # THAT CLAIM WAS FALSE until 0.9.0 and the correction is the point of the extra steps below.
   # This job ran three commands, all at DEFAULT features, while dev.yml ran seven; a promotion to
   # qa therefore ran a STRICTLY WEAKER gate than the branch it was promoted from. Default features
-  # is roughly 320 of this crate's 710 tests, so every feature-gated suite, and every no-backend
+  # is 494 of this crate's 1335 tests as measured on the 0.9.2 tree, so every feature-gated suite,
+  # and every no-backend
   # suite with it, reached the promotion branch unexecuted. If a step is added to dev.yml's
   # lint-and-test job it belongs here too, or this comment goes back to being untrue.
   #
@@ -147,8 +148,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # THE DRIFT CHECK ITSELF, because the comment above has now been untrue twice and a rule
-      # nothing enforces is a note. It asks three questions of dev.yml and this file, and each of
-      # the three exists because the previous version of this check missed something real:
+      # nothing enforces is a note. It asks FIVE questions of dev.yml, this file and publish.yml,
+      # and each of the five exists because the previous version of this check missed something
+      # real:
       #
       #   1. Does qa have every JOB dev has? It did not compare jobs at all until 2026-08-12, and
       #      the `size` job escaped through exactly that hole: it was on dev and missing here
@@ -160,6 +162,17 @@ jobs:
       #      could run something strictly weaker than `- name: tests` there and the check would
       #      report agreement, which is the same "passes for a reason other than the one it names"
       #      shape this whole file keeps finding.
+      #   4. Does each shared step carry the same `env:`, `with:`, `uses:`, `shell:` and
+      #      `working-directory:`? THE COMMAND IS NOT THE WHOLE STEP: `RUSTDOCFLAGS: "-D warnings"`
+      #      lives in `env:`, a toolchain pin and an action's inputs in `with:`, the action itself
+      #      (and its SHA pin) in `uses:`. Deleting any of them leaves the `run:` line reading
+      #      correctly while the gate does nothing, and an audit lens proved both halves of that
+      #      against earlier versions of this check.
+      #   5. Do the steps dev.yml SHARES BY NAME WITH publish.yml run the same commands, under the
+      #      same `env:`, `shell:` and `working-directory:`? Nothing compared publish.yml at all
+      #      until 0.9.2, and it is the last gate before an irreversible crates.io version: it
+      #      carries its own copies of the no-backend and no-rar matrices, and weakening either one
+      #      left every gate in this repository green.
       #
       # Extra jobs and extra steps in qa are fine (qa is allowed to be stronger); missing ones are
       # not, because the promotion order is dev -> qa -> main and main publishes, so a weaker qa
@@ -283,9 +296,41 @@ jobs:
                       "two cannot be doing the same work under the same name." % name
                   )
                   continue
+              # EVERY SHARED STEP, INCLUDING ACTION STEPS, and this comparison sits ABOVE the
+              # `run:` skip on purpose. It was written below it, which made the `with:` half
+              # UNREACHABLE: `with:` only ever appears on a `uses:` step, and a `uses:` step has no
+              # `run:`, so it was skipped one line before the comparison it was added for. The
+              # commit that added it claimed "a toolchain downgrade from stable to 1.75 is
+              # invisible to a `run:` comparison ... all four keys are now compared" -- and an
+              # audit lens then downgraded qa's toolchain to 1.75 and watched the check pass. A
+              # check that answers a narrower question than its own comment claims is the exact
+              # defect this file keeps finding elsewhere.
+              #
+              # `uses:` is compared too, so an action pinned to a different SHA in the two files is
+              # caught: the pin is the supply-chain control, and two different pins under one step
+              # name means qa is not running what dev ran.
+              for key in ("env", "with", "uses", "shell", "working-directory"):
+                  if dev_step.get(key) != qa_step.get(key):
+                      problems.append(
+                          "step '%s' has a different `%s:` in the two workflows. The command is "
+                          "not the whole step: RUSTDOCFLAGS lives in `env:`, a toolchain pin and "
+                          "an action's inputs in `with:`, the action itself in `uses:`. Any of "
+                          "them can turn a gate into a no-op while the `run:` line still reads "
+                          "correctly.\n  dev.yml: %r\n  qa.yml : %r"
+                          % (name, key, dev_step.get(key), qa_step.get(key))
+                      )
               if dev_run is None:
                   continue
               compared += 1
+              # THE COMMAND IS NOT THE WHOLE STEP, and reading only `run:` let the sharpest
+              # sabotage through. `RUSTDOCFLAGS: "-D warnings"` lives in `env:`, so deleting it
+              # from the step NAMED `rustdoc (deny warnings)` left this check reporting that the
+              # two workflows agree -- a step whose name says "deny warnings" quietly not denying
+              # them. `with:` is the same shape for an action step (a `toolchain:` downgrade is
+              # invisible to a `run:` comparison), and `shell:` changes what a body even means.
+              #
+              # Compared as a whole rather than key by key: a NEW key added to one side and not the
+              # other is the same class of drift and needs no separate rule.
               if normalised(dev_run) != normalised(qa_run):
                   problems.append(
                       "step '%s' runs DIFFERENT commands in the two workflows. A shared step name "
@@ -300,6 +345,64 @@ jobs:
                     "proved nothing. Fix the check.")
               raise SystemExit(1)
 
+          # AND THE SAME COMPARISON AGAINST publish.yml, WHICH NOTHING CHECKED AT ALL.
+          #
+          # This check ran dev against qa and stopped. publish.yml is the LAST gate before an
+          # irreversible crates.io version, and it carries its own copies of the two most
+          # load-bearing test matrices -- the no-ES256-backend set and the no-rar set. Sabotaging
+          # either one to `cargo build`, or adding `--lib` so only unit tests run, left every gate
+          # in the repository green: `feature-mirrors.py` reads the FEATURE LISTS out of that file
+          # but never the command carrying them, and this check never opened it.
+          #
+          # A weakened step in dev or qa costs a re-run. A weakened step here costs a permanent
+          # version on crates.io that was never tested the way its own workflow claims.
+          #
+          # Only steps SHARED BY NAME are compared: publish.yml deliberately runs a subset (it has
+          # no doc tests, no clippy combination loop, no conformance or size job), and that
+          # narrowing is argued in its own header. What must not happen is a step keeping a name
+          # from dev.yml while doing less than dev.yml does under it.
+          # `run:` STEPS ONLY, and keyed by name across every job in the file.
+          #
+          # Two reasons this is narrower than the dev/qa comparison above. An ACTION step
+          # legitimately differs by job purpose -- publish.yml's `decide` job installs the toolchain
+          # without `rustfmt, clippy` because it only reads a manifest and asks crates.io, and that
+          # is correct rather than drift. And a step NAME repeats across jobs in publish.yml, so a
+          # name-keyed dict would silently compare dev's step against whichever copy happened to be
+          # last. Collecting every occurrence and requiring ALL of them to agree removes that
+          # ambiguity instead of hiding it.
+          publish = load(".github/workflows/publish.yml")
+          publish_runs = {}
+          for job in (publish.get("jobs") or {}).values():
+              for step in job.get("steps") or []:
+                  if isinstance(step, dict) and step.get("name") and step.get("run"):
+                      publish_runs.setdefault(step["name"], []).append(step)
+          shared_with_publish = sorted(
+              name for name in publish_runs if name in dev_steps and dev_steps[name].get("run")
+          )
+          for name in shared_with_publish:
+              dev_step = dev_steps[name]
+              for pub_step in publish_runs[name]:
+                  if normalised(dev_step["run"]) != normalised(pub_step["run"]):
+                      problems.append(
+                          "step '%s' runs DIFFERENT commands in dev.yml and publish.yml. "
+                          "publish.yml is the last gate before a permanent crates.io version, so a "
+                          "step that keeps dev's name while doing less than dev does is the one "
+                          "drift that cannot be undone.\n  dev.yml    : %s\n  publish.yml: %s"
+                          % (name, normalised(dev_step["run"]), normalised(pub_step["run"]))
+                      )
+                  for key in ("env", "shell", "working-directory"):
+                      if dev_step.get(key) != pub_step.get(key):
+                          problems.append(
+                              "step '%s' has a different `%s:` in dev.yml and publish.yml, and "
+                              "publish.yml is the file whose result cannot be undone."
+                              % (name, key)
+                          )
+          if not shared_with_publish:
+              print("::error::the publish.yml comparison matched ZERO step names, so it proved "
+                    "nothing. Either the steps were renamed or this check is reading the wrong "
+                    "file; a comparison over an empty set is the bug it exists to catch.")
+              raise SystemExit(1)
+
           if problems:
               for problem in problems:
                   print("::error::%s" % problem)
@@ -311,10 +414,17 @@ jobs:
           PY
       # The FEATURE LIST drift check, which is a different question from the step-name one above:
       # that one asks whether qa runs the same steps as dev, this one asks whether the feature
-      # lists inside those steps still describe the crate's [features] table. Both workflows carry
-      # a copy of the no-backend list and scripts/size-probe/Cargo.toml carries a third, so the
-      # script checks all three against crates/oauth-as/Cargo.toml; running it here as well as in
-      # dev.yml is what the step-name check above requires, and it costs a second.
+      # lists inside those steps still describe the crate's [features] table. ALL THREE workflows
+      # carry a copy of the no-backend list -- dev.yml, this file and publish.yml, and publish.yml
+      # went unread until 2026-08-12 -- and each also carries the no-rar list, so the script checks
+      # two step lists across three files against crates/oauth-as/Cargo.toml. It checks four more
+      # things while it is there: the `f-<feature>` mirrors in scripts/size-probe/Cargo.toml, the
+      # ALL_FEATURES line in scripts/size-report.sh that measures them, a sixteen-entry table
+      # saying which exerciser actually reaches each probe row (a row that measures nothing passes
+      # its budget for the wrong reason), and the three lockfiles that must all name this version,
+      # because every gate runs `--locked` and a stale satellite lockfile fails the job before it
+      # starts rather than on its merits. Running it here as well as in dev.yml is what the
+      # step-name check above requires, and it costs a second.
       - name: feature lists must match the crate manifest (feature drift)
         run: python3 scripts/feature-mirrors.py
       - name: Install Rust toolchain
@@ -338,14 +448,40 @@ jobs:
       - name: tests (every feature EXCEPT the ES256 backend)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,cimd,test-util
       # See dev.yml's copy of this step for the full argument. Short version: RFC 9396 section 5's
       # refusals are proven by two files gated `not(feature = "rar")`, and no feature set named
       # anywhere ran them. One was never compiled at all. The rule is `--all-features` minus `rar`.
       - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,test-util
+            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,cimd,test-util
+      # THE MUTUALLY-EXCLUSIVE PAIRS, which no other step in any workflow REACHES.
+      #
+      # Four tests were gated on feature combinations that every running configuration
+      # contradicted: `all(dpop, not(mtls))` and `all(mtls, not(dpop))` in
+      # introspection_feature_bounds.rs, and `not(jwt)` under `#![cfg(http)]` in
+      # http_advertised_reachability.rs. Default, --all-features, no-backend and no-rar all have
+      # dpop and mtls together or neither, and every set with http also has jwt. The clippy
+      # combination loop COMPILES them, which is why they type-checked forever; clippy does not RUN
+      # tests, so nothing ever executed them. Proven by making each panic and watching all four
+      # configurations stay green.
+      #
+      # They are not decoration. They are the cases the top-level guards CANNOT reach: a
+      # certificate-bound token read as a plain bearer by a dpop-only build, the mirror image for
+      # mtls, and a jwks_uri advertised by a build that cannot serve one. Each is a silent
+      # downgrade, which is the failure those files exist to prevent.
+      #
+      # Scoped to the two files rather than a fourth full matrix: what is missing is REACH, not
+      # coverage, and a full run of each would cost minutes to execute tests the other steps
+      # already ran.
+      - name: the changelog must date the version being built
+        run: python3 scripts/changelog-dated.py
+      - name: tests (the feature pairs no other step reaches)
+        run: |
+          cargo test -p oauth-as --locked --features dpop --test introspection_feature_bounds
+          cargo test -p oauth-as --locked --features mtls --test introspection_feature_bounds
+          cargo test -p oauth-as --locked --features http --test http_advertised_reachability
       - name: rustdoc (deny warnings)
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -368,7 +504,7 @@ jobs:
           for f in "" "http" "jwt" "jwt-p256" "http,jwt" "http,jwt-p256" "jwt,rar" \
                    "http,jwt,dpop" "jwt,mtls" "dpop,jar,client-assertion" \
                    "jwt,client-assertion" "http,jwt,par,jar" "jwt,token-exchange" \
-                   "consent" "resource-metadata" "test-util" "test-util,jwt"; do
+                   "consent" "resource-metadata" "cimd" "test-util" "test-util,jwt"; do
             echo "::group::features: ${f:-<default>}"
             if [ -z "$f" ]; then
               cargo clippy -p oauth-as --locked --all-targets --no-default-features -- -D warnings
@@ -650,6 +786,17 @@ jobs:
               "a_refresh_record_cannot_land_behind_a_family_revocation",
               "a_token_cannot_land_behind_a_consent_withdrawal",
               "a_pushed_request_cannot_land_behind_a_client_deletion",
+              # The three-transaction advisory-lock cycle. `lock_barrier_scopes` argued that lock
+              # ORDER could not matter because "nothing that holds one ever waits", which is false
+              # the moment there is more than one key: a writer holding key N and blocked on key
+              # N+1 is holding one and waiting. What actually closes the cycle is that the `client`
+              # scope is pushed FIRST and `unnest` acquires in array order -- an invariant neither
+              # of the crate's two written deadlock arguments names. Reproduced live against
+              # PostgreSQL 16, and with the order reversed the LOSER IS THE REVOCATION:
+              # `revoke_consent` returns 40P01 while the `put_token` it was meant to stop returns
+              # `Applied`. Pinned here because a test that exists and is not pinned is a test that
+              # can be deleted while this job stays green, which is the whole point of this list.
+              "a_writer_waiting_for_the_client_barrier_cannot_hold_the_consent_one",
               # `migrate()` claims to be safe to run from several nodes at once, which was false
               # until 0.9.1: `CREATE ... IF NOT EXISTS` races on the catalogue and crash-loops the
               # losing replica. A claim in a doc comment that no job exercises is a claim nobody
@@ -1171,21 +1318,88 @@ jobs:
           FUZZ_SECONDS: 40
         run: |
           set -euo pipefail
+          # THE TARGET SET IS ASSERTED BEFORE ANYTHING IS FUZZED, and this is the whole reason
+          # the step is shaped the way it is rather than as one `for` loop.
+          #
+          # WHAT WAS WRONG. The loop used to be `for target in $(cargo +nightly fuzz list); do`.
+          # A command substitution in a `for` word list is NOT a `set -e` trigger -- `set -e`
+          # looks at the exit status of the `for` compound, and the compound's status is the
+          # status of its last iteration, of which there are none. So an EMPTY list is zero
+          # iterations and a green step, and the job reported "fuzz targets (short bounded run)"
+          # having fuzzed nothing at all. PROVEN, not reasoned about: the step body was run
+          # verbatim against a `cargo` that prints nothing for `fuzz list` and exits 0, and it
+          # exited 0 with no output. Renaming the `[[bin]]` entries, moving fuzz/, or a
+          # cargo-fuzz change to `list`'s output all produce exactly that.
+          #
+          # THE EXPECTED SET COMES FROM fuzz/Cargo.toml, not from a number written here. A
+          # hard-coded count is another hand-maintained mirror of a fact that already exists in
+          # the tree, and this repository has enough of those; scripts/feature-mirrors.py exists
+          # because of what they cost. The manifest's `[[bin]]` entries ARE the target list --
+          # cargo-fuzz derives its own answer from the same table -- so the two must agree, and
+          # NAMES are compared rather than a count, which also catches a rename that happens to
+          # preserve the count.
+          #
+          # AND THE EXPECTED SET IS ITSELF CHECKED FOR EMPTINESS, because a check that compares
+          # two lists is only as good as its ability to notice that both are empty. If this awk
+          # ever reads nothing -- the manifest moved, the table changed shape -- then without
+          # this guard "expected == actual" would be trivially true and the step would be green
+          # for the second time for the same reason.
+          expected="$(awk '
+            /^\[\[bin\]\]/ { inbin = 1; next }
+            /^\[/          { inbin = 0 }
+            inbin && $1 == "name" { gsub(/["]/, "", $3); print $3 }
+          ' fuzz/Cargo.toml | LC_ALL=C sort)"
+          if [ -z "$expected" ]; then
+            echo "::error::read ZERO [[bin]] targets from fuzz/Cargo.toml. That is this check's own input, so it cannot compare anything and must not pass. Either the manifest moved or its [[bin]] table changed shape; fix the awk in this step in the same commit."
+            exit 1
+          fi
+          expected_n="$(printf '%s\n' "$expected" | wc -l | tr -d ' ')"
+          actual="$(cargo +nightly fuzz list | LC_ALL=C sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::cargo fuzz list and fuzz/Cargo.toml disagree about which targets exist. A fuzz job that fuzzes a different set from the one the manifest declares -- in particular the empty set -- is a green that means nothing. Expected/actual diff follows."
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+            exit 1
+          fi
+          echo "fuzzing $expected_n targets, exactly the [[bin]] set fuzz/Cargo.toml declares"
+          # --locked, BY THE ONLY ROUTE cargo-fuzz leaves open. `cargo fuzz run` has no --locked
+          # flag (checked against cargo-fuzz 0.13: the build options it forwards are the feature,
+          # sanitizer and -Z ones and nothing else), so it builds without one and is free to
+          # re-resolve and REWRITE fuzz/Cargo.lock in place. A stale fuzz lockfile has broken this
+          # job twice, and a silently rewritten one is worse: the run is then not against the
+          # dependency set the repository committed. So the resolve is asserted up front with a
+          # command that DOES take --locked, and the lockfile is asserted unchanged afterwards.
+          cargo +nightly metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
           # The output corpus goes to a scratch directory and the COMMITTED seeds are passed as a
           # read-only extra input. Writing into fuzz/corpus/ would leave the working tree dirty
           # and would grow the repository with machine-generated inputs nobody reviewed.
           out="$RUNNER_TEMP/fuzz-corpus"
-          for target in $(cargo +nightly fuzz list); do
+          # COUNTED as it goes, and the count asserted at the end. The name comparison above
+          # already proves the list is right; this proves the loop actually ran over it, which is
+          # a different claim and is the one the old `for` could not make.
+          fuzzed=0
+          while IFS= read -r target; do
             echo "::group::$target"
             mkdir -p "$out/$target"
+            # </dev/null so the fuzzer cannot eat the target list this loop is reading from.
             cargo +nightly fuzz run "$target" "$out/$target" "fuzz/corpus/$target" -- \
               -dict=fuzz/dictionaries/oauth.dict \
               -max_total_time="$FUZZ_SECONDS" \
               -max_len=8192 \
               -rss_limit_mb=4096 \
-              -print_final_stats=1
+              -print_final_stats=1 </dev/null
+            fuzzed=$((fuzzed + 1))
             echo "::endgroup::"
-          done
+          done <<< "$expected"
+          if [ "$fuzzed" != "$expected_n" ]; then
+            echo "::error::fuzzed $fuzzed targets but fuzz/Cargo.toml declares $expected_n. The loop did not run over the set that was verified."
+            exit 1
+          fi
+          if ! git diff --quiet -- fuzz/Cargo.lock; then
+            echo "::error::the fuzz run REWROTE fuzz/Cargo.lock, so the targets were fuzzed against a dependency resolve the repository never committed. cargo fuzz run takes no --locked flag; commit the regenerated lockfile if the change is intended."
+            git diff --stat -- fuzz/Cargo.lock >&2
+            exit 1
+          fi
+          echo "fuzzed all $expected_n targets for ${FUZZ_SECONDS}s each, against the committed lockfile"
       # A crash leaves a reproducer in fuzz/artifacts/<target>/. It is the whole value of a red
       # here: without it the failure is a log line, and with it it is a test case.
       - name: upload crash artifacts

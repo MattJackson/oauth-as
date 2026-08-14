@@ -1,6 +1,6 @@
 [package]
 name = "oauth-as"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 # MEASURED, not declared. 1.74 fails on return-position impl Trait in the Storage trait (RPITIT,
 # stabilised in 1.75); 1.75 compiles and tests clean. Going lower would mean Box<dyn Future> in
@@ -188,6 +188,20 @@ consent = []
 # feature landed, and the comment here said in as many words that this line would have to gain
 # `dep:serde_json` on the day that changed; this is that day).
 rar = ["dep:serde_json"]
+# draft-ietf-oauth-client-id-metadata-document-01 client identifier metadata documents: a client
+# identifies itself with an HTTPS URL, and the metadata that would otherwise have come from an RFC
+# 7591 registration is fetched from that URL instead.
+#
+# VALIDATION ONLY, AND THE HOST FETCHES. This crate makes no outbound HTTP request, by design and
+# for the same reason it holds no signer, no clock and no consent resolver: a library embedded in
+# somebody else's server does not open sockets on its own initiative. The host GETs the document
+# and hands this crate the bytes; this crate decides whether they are a client. What that split
+# leaves with the host (redirects, status codes, DNS resolution and rebinding, TLS, and the
+# caching rules) is written out in `src/cimd.rs` rather than implied, because a validated
+# document is not a correctly fetched one.
+#
+# `dep:serde_json` because the document is JSON, on the same line as `rar` above.
+cimd = ["dep:serde_json"]
 # A RUNNABLE conformance harness for the `Storage` contract, for a HOST to call from its
 # own test suite against its own implementation (crates/oauth-as/src/storage_conformance.rs).
 #

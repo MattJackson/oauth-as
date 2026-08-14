@@ -682,12 +682,13 @@ impl<S: Storage + 'static, C: Clock + 'static> ServiceBuilder<S, C> {
         )?;
         // RFC 7662. The one route derived from the CONFIGURATION rather than from the document,
         // and deliberately: `from_config` publishes `introspection_endpoint` only where the host
-        // named it, because this server answers introspection for the token's own client and for
-        // nobody else (see the field's doc in `crate::metadata`). Withdrawing the ROUTE with the
-        // promise would take away the half that works -- a client asking about its own token --
-        // which is a functional regression rather than an honesty fix. Serving a path the document
-        // does not name misleads nobody; the rule this module opens with is about the other
-        // direction.
+        // named it, because whether this server answers a RESOURCE SERVER depends on whether the
+        // deployment registered any (`ServerConfig::resource_servers`), and only the host knows
+        // that. See the field's doc in `crate::metadata` for why 0.9.2 building the channel did
+        // NOT make the member unconditional. Withdrawing the ROUTE with the promise would take
+        // away the half that always works -- a client asking about its own token -- which is a
+        // functional regression rather than an honesty fix. Serving a path the document does not
+        // name misleads nobody; the rule this module opens with is about the other direction.
         let introspect = Some(endpoint_path(
             &issuer,
             "introspection_endpoint",
@@ -1022,6 +1023,17 @@ enum Route<'a> {
     /// RFC 7592: the `client_id` segment, RAW as it arrived. Decoded at the match arms by
     /// `decode_path_segment`, and only after the route has been decided, for the reason the
     /// resolver's own comment gives: the path is matched in wire form.
+    ///
+    /// THE DECODED VALUE IS NOT VALIDATED, and it goes to the host's
+    /// [`crate::store::Storage::get_client`]. `%2F` decodes to a real `/` here, `%2E%2E` to `..`,
+    /// `%00` to a NUL, and invalid UTF-8 to U+FFFD. Routing is unaffected — the raw path is what
+    /// was matched, so nothing mounted under the registration endpoint can be reached this way —
+    /// and this crate does not refuse the value, because an identifier's syntax is the host's
+    /// (RFC 6749 s2.2) and a host whose ids are HTTPS URLs has a `/` in every one. It is also not
+    /// a shape unique to this route: the authorization and token endpoints hand `get_client` an
+    /// arbitrary unauthenticated string too, so validating here would close nothing. The
+    /// obligation is stated where the value lands, on [`crate::store::Storage::get_client`], and
+    /// `tests/storage_client_id_contract.rs` pins it.
     Manage(&'a str),
     #[cfg(feature = "par")]
     Par,
@@ -1408,12 +1420,27 @@ where
 /// IN-FLIGHT WORK IS NO LONGER BOUNDED BY CONNECTIONS. That is the point of the spawn and it is
 /// also its cost: a client that hangs up stops waiting but no longer stops the work, so axum's and
 /// hyper's connection limits, and any accept-side bound the host set, no longer bound the tasks
-/// this service is running. The bound becomes request RATE times handler latency. In this crate
-/// that is already narrow, because the rate limiter runs INSIDE
-/// [`AuthorizationService::handle`] and refuses before the store is touched, and because a handler
-/// does a bounded number of store calls with no unbounded waits of its own. A host that wants a
-/// hard ceiling anyway should take a semaphore permit before the spawn, or spawn into a `JoinSet`
-/// it owns, and answer 503 when it cannot get one.
+/// this service is running. The bound becomes request RATE times handler latency, and NEITHER
+/// FACTOR IS THIS CRATE'S TO SET.
+///
+/// The rate half is the stronger one: the limiter runs INSIDE [`AuthorizationService::handle`] and
+/// refuses before the store is touched, so a refused request costs a spawn and nothing more. It is
+/// still not a global ceiling — the budgets [`crate::rate_limit`] ships for the endpoints that
+/// name a client are keyed per `client_id`, which RFC 6749 section 2.2 makes public, so a caller
+/// spraying identifiers gets a budget apiece up to
+/// [`crate::rate_limit::DEFAULT_MAX_TRACKED_CLIENTS`] counters before the rest share an overflow
+/// counter.
+///
+/// The latency half is the host's outright. A handler makes a bounded NUMBER of store calls, but
+/// each one is the host's [`crate::store::Storage`] and this crate sets no timeout anywhere, on
+/// anything; the token path additionally awaits [`crate::jwt::Es256Signer`], which that trait's
+/// own docs say may be a network round trip to a KMS. Nor is the latency all waiting:
+/// a host-installed [`crate::client::SecretVerifier`] runs its KDF INLINE on the executor thread
+/// polling the request — that trait prices argon2id at ordinary parameters at roughly 200 ms, paid
+/// per token request and on the unknown-client path too — so it occupies a worker rather than
+/// yielding it. A host that wants a hard
+/// ceiling should take a semaphore permit before the spawn, or spawn into a `JoinSet` it owns, and
+/// answer 503 when it cannot get one.
 ///
 /// A PANIC in a handler no longer unwinds into hyper. It arrives here as a `JoinError` and is
 /// answered with an empty 500, which is what the panicking connection produced anyway, minus the
@@ -1957,6 +1984,36 @@ fn resource_indicators(pairs: &[Pair<'_>]) -> Vec<String> {
         .collect()
 }
 
+/// RFC 9396 s5 for the two doors whose grant has NOWHERE to carry an authorization detail, in any
+/// build: the RFC 8628 device authorization request and the RFC 8693 token exchange grant.
+///
+/// Every other door refuses in the core, gated on `not(feature = "rar")`, because the core has an
+/// argument the parameter arrives in and can therefore see it. These two do not:
+/// `device_authorization_with_credential` takes a scope and nothing else, and
+/// [`crate::token_exchange::TokenExchangeRequest`] derives what it issues from the SUBJECT token,
+/// so the parameter dies in this router unless this router answers it. That made the same POST to
+/// the same `/token` URL refuse for `authorization_code` and silently drop for
+/// `grant_type=...:token-exchange`.
+///
+/// UNGATED, unlike the core's refusals, and the difference is what is being refused. There the
+/// answer turns on whether the build supports any detail TYPE; here it turns on the GRANT, which
+/// has no field for a detail whether the type is supported or not. `AuthorizationServer::token`
+/// already refuses to mint detail for a device grant under `rar` for exactly this reason; this is
+/// that refusal moved to the door the client knocks on, where it can still be told which parameter
+/// was wrong instead of receiving codes and discovering the omission at the resource server.
+///
+/// Checked BEFORE the credential and before the grant, like the DPoP proof this router refuses on
+/// the same grant: a client asking for something this server cannot do is a wiring mistake, and
+/// the refusal is only useful if it names the parameter rather than whatever was checked first.
+fn refuse_authorization_details(pairs: &[Pair<'_>]) -> Option<ErrorResponse> {
+    param(pairs, "authorization_details").map(|_| {
+        // The VALUE is never echoed (RFC 6749 s5.2 restricts the charset, and this one is
+        // attacker-supplied JSON); naming the parameter is what the developer who sent it needs.
+        ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails)
+            .with_description("this server does not accept authorization_details on this grant")
+    })
+}
+
 /// Parse an optional `scope` parameter. A malformed scope is `invalid_scope` (RFC 6749 s5.2)
 /// rather than `invalid_request`: the parameter was supplied, it is its VALUE that is not a
 /// scope.
@@ -2497,6 +2554,15 @@ async fn token_exchange_response<S: Storage, C: Clock>(
             .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidRequest).with_description(refusal))
     }
 
+    // RFC 9396 s5, before anything else is parsed. This grant issues from the SUBJECT token, so
+    // `TokenExchangeRequest` has no member an authorization detail could travel in and the
+    // parameter would die here silently; the token endpoint's shared handling, which refuses it,
+    // is downstream of the arm that called this function and never runs for this grant. See
+    // `refuse_authorization_details`.
+    if let Some(refusal) = refuse_authorization_details(form) {
+        return error_response(&refusal, via_header, &state.challenge);
+    }
+
     let subject_token = match required(form, "subject_token") {
         Ok(v) => v,
         Err(e) => return error_response(&e, via_header, &state.challenge),
@@ -2573,6 +2639,14 @@ async fn device_authorization_handler<S: Storage, C: Clock>(
         Ok(form) => form,
         Err(TooManyParameters) => return too_many_parameters(),
     };
+
+    // RFC 9396 s3 names the device authorization request as a place this parameter may be used,
+    // and s5 requires refusing one this server will not honour. See
+    // `refuse_authorization_details`: a `DeviceGrant` has no field for a detail, so accepting one
+    // here mints a user code for a permission that can never reach the token.
+    if let Some(refusal) = refuse_authorization_details(&form) {
+        return error_response(&refusal, via_header, &state.challenge);
+    }
 
     let mut creds = match credentials(headers, &form) {
         Ok(c) => c,
@@ -2825,13 +2899,30 @@ async fn register_handler<S: Storage, C: Clock>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Response {
+    // THROTTLE FIRST, on the one endpoint of this service where there may be no credential to
+    // look at instead. RFC 7591 s3.1 registration may be ANONYMOUS, so the trick
+    // `update_registration_handler` uses below — authenticate, then parse — has nothing to work
+    // with here; what it does have is `Attempt::ClientRegistration`, which is keyed on nothing and
+    // therefore answerable before a single byte of the body means anything. Parsing up to
+    // `MAX_BODY_BYTES` of a stranger's JSON before asking the only gate this endpoint has is the
+    // shape `MAX_FORM_PARAMETERS`'s own comment argues against: a refusal is work an attacker sets
+    // the rate of.
+    //
+    // Unlike the management plane's arrangement, the check is NOT repeated inside the server
+    // method: `admit_registration` and `register_admitted_client` are the two halves of
+    // `register_dynamic_client` precisely so that one HTTP request is one charge. The registration
+    // budget is global and small (60 per window by default), so a second charge would halve a
+    // host's configured ceiling rather than cost it a rounding error.
+    if let Err(e) = state.server.admit_registration() {
+        return registration_error(&e);
+    }
     let metadata = match client_metadata(body) {
         Ok(m) => m,
         Err(response) => return *response,
     };
     match state
         .server
-        .register_dynamic_client(&metadata, bearer_token(headers))
+        .register_admitted_client(&metadata, bearer_token(headers))
         .await
     {
         Ok(info) => {
@@ -3211,13 +3302,28 @@ fn unwired(why: &'static str) -> Response {
 /// instruction, and every other credential-bearing constructor in this file already sends it.
 ///
 /// THE FALLBACK IS REACHABLE, contrary to what this comment said until the 0.9.1 audit. The
-/// appended parameters are percent-encoded by [`crate::authorization`], but the REGISTERED
-/// redirect URI is pushed verbatim, and only the RFC 7591 dynamic path validates it
-/// ([`crate::registration`]'s `redirect_uri_is_registerable`) — a host calling
-/// `register_client` directly supplies a bare `Vec<String>`. A URI with a space in it therefore
-/// reaches `HeaderValue::from_str` and fails it, AFTER the code has been minted and persisted.
-/// The 500 is the honest answer at that point; the fix belongs at registration, and the failure
-/// is named here so that whoever meets it once knows where to look.
+/// appended parameters are percent-encoded by [`crate::authorization`], but the REGISTERED redirect
+/// URI is pushed verbatim, so a URI with a space in it reaches `HeaderValue::from_str` and fails
+/// it, AFTER the code has been minted and persisted.
+///
+/// WHICH DOOR IS OPEN was named wrongly here until 0.9.2, and the correction matters because it
+/// tells the reader where to look. This said "only the RFC 7591 dynamic path validates it — a host
+/// calling `register_client` directly supplies a bare `Vec<String>`".
+/// [`crate::server::AuthorizationServer::register_client`] DOES validate, through the same
+/// predicate the dynamic path uses (`crate::authorization::is_valid_resource_indicator`), and
+/// `tests/authorization_code.rs` has held it to that since 0.9.1. Both of this crate's
+/// registration entry points are therefore closed.
+///
+/// What is open is BELOW them: [`crate::store::Storage::put_client`] and
+/// [`crate::store::Storage::compare_and_swap_client`] take a [`crate::client::Client`] as given,
+/// they are public on a public trait, and `AuthorizationServer::store` hands the host the store to
+/// call them on. A host that provisions clients by writing rows — directly, or by migrating a
+/// legacy table, or by implementing `Storage` over a database it also writes from elsewhere — puts
+/// a `redirect_uris` entry into circulation that no validator in this crate ever saw. That is the
+/// path that ends here.
+///
+/// The 500 is the honest answer at that point; the fix belongs at provisioning, and the failure is
+/// named here so that whoever meets it once knows where to look.
 fn redirect(location: String) -> Response {
     match HeaderValue::from_str(&location) {
         Ok(value) => {

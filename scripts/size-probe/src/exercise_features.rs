@@ -330,6 +330,43 @@ pub fn resource_metadata() -> u64 {
     std::hint::black_box(acc)
 }
 
+#[cfg(feature = "f-cimd")]
+pub fn cimd() -> u64 {
+    use oauth_as::cimd::{CimdPolicy, ClientIdUrl, ValidatedClientIdDocument};
+
+    // The whole surface a host reaches: parse the identifier, validate a document against it, and
+    // turn the result into a client. A REFUSAL is driven too, because the refusal paths are most
+    // of the code here and a probe that walks only the happy path measures half the feature.
+    let policy = CimdPolicy::new();
+    let mut acc: u64 = 0;
+    let url = match ClientIdUrl::parse("https://client.probe.example/oauth/client", &policy) {
+        Ok(url) => url,
+        Err(e) => return std::hint::black_box(e.to_string().len() as u64),
+    };
+    acc = acc.wrapping_add(url.as_str().len() as u64);
+    let body = br#"{"client_id":"https://client.probe.example/oauth/client",
+                   "redirect_uris":["https://client.probe.example/cb"],
+                   "grant_types":["authorization_code"],"response_types":["code"],
+                   "token_endpoint_auth_method":"none"}"#;
+    match ValidatedClientIdDocument::validate(&url, body, &policy) {
+        Ok(document) => {
+            let client = document.to_client();
+            acc = acc.wrapping_add(client.client_id.as_str().len() as u64);
+            acc = acc.wrapping_add(client.redirect_uris.len() as u64);
+        }
+        Err(e) => acc = acc.wrapping_add(e.to_string().len() as u64),
+    }
+    // A document claiming somebody else's identifier, which is the refusal the whole mechanism
+    // exists for and the one branch that must never be dead.
+    let elsewhere = ClientIdUrl::parse("https://other.probe.example/client", &policy)
+        .expect("a well formed identifier");
+    match ValidatedClientIdDocument::validate(&elsewhere, body, &policy) {
+        Ok(_) => acc = acc.wrapping_add(1),
+        Err(e) => acc = acc.wrapping_add(e.to_string().len() as u64),
+    }
+    std::hint::black_box(acc)
+}
+
 #[cfg(feature = "f-test-util")]
 pub fn test_util() -> u64 {
     use oauth_as::storage_conformance::StorageConformance;

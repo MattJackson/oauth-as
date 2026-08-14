@@ -233,13 +233,20 @@ fn code_challenge_s256_allocates_only_its_return_value() {
 /// per RFC 6749 section 3.3 token, and the crate's own [`crate::client::Client`] fixtures store
 /// `ScopeSet`, not a borrowed view, so this is a genuine cost, not something a `Cow` could remove.
 /// What this test pins is that the cost stays LINEAR in token count with a small constant, not
-/// something worse hiding in `BTreeSet` bookkeeping.
+/// something worse hiding in the set's own bookkeeping.
 fn scope_set_parse_is_linear_in_token_count() {
     let (set, d) = measure(|| ScopeSet::parse("read write admin").unwrap());
     assert_eq!(set.len(), 3);
-    // Observed: 1 String allocation per token plus a small constant for BTreeSet's own node(s).
-    // Bound is 2 allocations per token plus 4, which comfortably covers today's 4-for-3-tokens
-    // while still catching an accidental extra clone per token.
+    // Observed: 1 String allocation per token plus ONE for the vector, which `ScopeSet::parse`
+    // sizes from a token count taken before it builds anything. Bound is 2 allocations per token
+    // plus 4, which comfortably covers today's 4-for-3-tokens while still catching an accidental
+    // extra clone per token.
+    //
+    // The BYTES moved even though the count did not: 294 down to 86 at three tokens, and 284 down
+    // to 28 at one, when `ScopeSet` stopped being a `BTreeSet` (see `crate::scope::ScopeSet`). A
+    // tree allocated a 256-byte leaf node to hold a single short word. Not asserted here, because
+    // `allocation_footprint.rs` is where per-record heap is gated and this gate is about the shape
+    // of the loop.
     assert!(
         d.allocs <= 3 * 2 + 4,
         "ScopeSet::parse(3 tokens) should stay near linear in token count, got {d:?}"
@@ -727,7 +734,10 @@ fn refused_token_request_allocation_bound() {
     // ZERO, on EVERY feature set. It was 1 allocation of 49 bytes before `error_description`
     // became a `Cow<'static, str>`: the whole of it was copying the string constant
     // "client_credentials requires a confidential client" onto the heap so it could be owned by a
-    // response about to be serialized and dropped.
+    // response about to be serialized and dropped. As of 0.9.2 there is no string here at all: the
+    // description was a client-existence oracle and the refusal is now bare, so this gate holds for
+    // a second reason on top of the `Cow`. It is still asserted through the `Cow`, because that is
+    // the property that must survive a later release deciding some other refusal deserves words.
     //
     // Through 0.9.0 `dpop` was an EXCEPTION carried here rather than budgeted silently:
     // `token_with_context` reached the RFC 9449 proof check through a `Box::pin` (168 bytes,
@@ -813,16 +823,42 @@ fn core_public_types_stay_within_their_size_budget() {
     // and this is the field that closes the resurrection defect at all six write sites
     // `tests/revocation_resurrection.rs` pins. MEASURED: 936 before, 984 after, on `--all-features`.
     const REVOCATION_BARRIERS: usize = 48;
-    let server_budget = 832 + REVOCATION_BARRIERS + PAR + JAR + RAR + TOKEN_ENDPOINT;
+    // `ServerConfig::resource_servers`: one `Option<Box<[_]>>`, 16 bytes, and UNCONDITIONAL,
+    // because RFC 7662 introspection consults it on every call in every build. Declared on its own
+    // line for the reason above: a field should cost somebody a line. What it buys is the
+    // resource-server introspection channel — the caller RFC 7662 was written for, per its
+    // abstract and section 1 alike — which
+    // through 0.9.1 this server had no way to answer at all: a resource server was told
+    // `{"active": false}` about every live token it held.
+    //
+    // The SHAPE was argued before the number was raised, which is the order this gate exists to
+    // force. A `Vec` cost 24 and was measured at `AuthorizationServer` 1008; a boxed slice is a
+    // fat pointer, 16, and the list is written once at construction and only ever iterated, so
+    // nothing wanted the growable form. Neither shape allocates when unused. MEASURED on
+    // `--all-features`: 984 before the field, 1008 as a `Vec`, 1000 as this.
+    const RESOURCE_SERVERS: usize = 16;
+    // draft-ietf-oauth-client-id-metadata-document: `Option<Box<CimdPolicy>>` on ServerConfig, one
+    // word, and NO storage of its own. There is nothing for this feature to keep: the crate does
+    // not fetch, so it holds no document and no cache, and the client a validated document becomes
+    // is installed by the host in the host's own store. This line is the whole of what a host that
+    // enables `cimd` pays in resident memory.
+    #[cfg(feature = "cimd")]
+    const CIMD: usize = 8;
+    #[cfg(not(feature = "cimd"))]
+    const CIMD: usize = 0;
+    let server_budget =
+        832 + REVOCATION_BARRIERS + RESOURCE_SERVERS + PAR + JAR + RAR + TOKEN_ENDPOINT + CIMD;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
         size_of::<AuthorizationServer<MemoryStorage>>()
     );
     // ServerConfig carries ~9 String/Option<String> endpoint fields plus Option<Vec<String>> and
-    // several Duration/bool/usize fields (RFC-shaped defaults, all host-overridable).
+    // several Duration/bool/usize fields (RFC-shaped defaults, all host-overridable), and since
+    // 0.9.2 the `resource_servers` boxed slice above, whose 16 bytes are attributed there.
+    // MEASURED: 464 before that field, 488 as a `Vec`, 480 as a boxed slice.
     assert!(
-        size_of::<ServerConfig>() <= 448 + RAR,
+        size_of::<ServerConfig>() <= 448 + RESOURCE_SERVERS + RAR + CIMD,
         "ServerConfig grew past its size budget: {}",
         size_of::<ServerConfig>()
     );
@@ -841,7 +877,8 @@ fn core_public_types_stay_within_their_size_budget() {
         size_of::<ErrorResponse>()
     );
     // IssuedToken carries the opaque token string, a ClientId, an Option<String> subject, a
-    // ScopeSet (a BTreeSet, 1 pointer-ish word), and two SystemTime instants.
+    // ScopeSet (a sorted `Vec<Scope>` since 0.9.2, so 24 bytes, three words), and two SystemTime
+    // instants.
     //
     // Each optional sender-constraining mechanism adds ONE field, and each is budgeted
     // SEPARATELY and ADDITIVELY rather than by raising a single number: a deployment that

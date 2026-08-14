@@ -481,6 +481,42 @@ pub trait Storage: Send + Sync {
     /// ever READ. A store that keeps its clients as `Arc<Client>` answers with a pointer clone; a
     /// store that materialises one per query wraps what it built. See the module docs for the
     /// measurement and for why this does not touch the `take_*` atomicity contract.
+    ///
+    /// # `client_id` IS ATTACKER-CHOSEN, AND THIS CRATE VALIDATES NOTHING ABOUT IT
+    ///
+    /// [`ClientId::new`] wraps a `String` and checks nothing, deliberately: RFC 6749 section 2.2
+    /// leaves the identifier's syntax to the server, and a host provisioning its own clients names
+    /// them whatever its own scheme names them. What that means HERE is that the value arriving in
+    /// this method is a string an unauthenticated stranger picked, on several routes at once:
+    ///
+    /// - `GET /authorize?client_id=...`, straight out of the query, filtered only for empty.
+    /// - `POST /token`, out of the form body or an RFC 7617 `Authorization` header.
+    /// - `GET`, `PUT` and `DELETE {registration_endpoint}/{client_id}` (RFC 7592), out of ONE
+    ///   percent-decoded path segment. The router matches the prefix on the RAW path and refuses a
+    ///   raw `/`, so no request can reach an endpoint mounted underneath the registration one — but
+    ///   the segment is decoded AFTER that decision, so `%2F` becomes a real `/` here, `%2E%2E`
+    ///   becomes `..`, `%00` becomes a NUL, and bytes that are not UTF-8 become U+FFFD (the decode
+    ///   is lossy: see `crate::http`).
+    ///
+    /// So the identifier reaching this method may contain a path separator, a dot-dot segment, a
+    /// NUL, a control character, a newline or a replacement character, and it may be up to the
+    /// length of a URL or a request body. That is not a defect being described: `get_client` is a
+    /// LOOKUP, and refusing to look a value up is not this crate's decision to make when the host's
+    /// own naming scheme is the only thing that says what an identifier may look like — a host
+    /// whose ids are RFC 9728-style HTTPS URLs has `/` in every one of them.
+    ///
+    /// WHAT THE STORE MUST DO: treat this as an opaque key and nothing else. A `HashMap`, a
+    /// parameterised SQL query and a key-value `GET` are all safe as written; `MemoryStorage` and
+    /// `oauth-as-postgres` are both in that class. A store that interpolates this into a PATH (one
+    /// file per client), into an object key, into an LDAP filter or into SQL text is the case this
+    /// paragraph exists for, and it must encode or reject the identifier ITSELF. Rejecting is
+    /// always safe: answer `Ok(None)` for an id your scheme could not have minted, which is the
+    /// truth — this crate treats that as an unknown client and refuses on the same terms it refuses
+    /// any other.
+    ///
+    /// The same rule applies to every other method on this trait that takes a host-visible
+    /// identifier; it is stated here because this is the one an unauthenticated request reaches
+    /// first and from the most routes.
     fn get_client(
         &self,
         client_id: &ClientId,

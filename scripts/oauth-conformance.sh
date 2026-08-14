@@ -73,6 +73,60 @@ run_blackbox() {
       -- --ignored --test-threads=1 )
 }
 
+# HOW MANY CHECKS THERE ARE SUPPOSED TO BE, counted from the source rather than typed here.
+#
+# A hard-coded number is another hand-maintained mirror, and this repository already carries
+# enough of those to have been bitten by them repeatedly. Counting `async fn` in the two test
+# binaries means adding a check raises the floor automatically and DELETING one lowers it in the
+# same commit that removes it -- which is visible in review, where a silently shrinking suite is
+# not.
+expected_blackbox_checks() {
+  grep -cE '^async fn ' "$ROOT/crates/oauth-as-conformance/tests/blackbox_http.rs"
+}
+expected_client_drive_checks() {
+  grep -cE '^async fn ' "$ROOT/crates/oauth-as-conformance/tests/client_drive.rs"
+}
+
+# THE GATE HAD NO FLOOR, AND THE BADGE RESTED ON IT.
+#
+# `run_blackbox` reported success on whatever it happened to run, and nothing counted. An audit
+# lens deleted SEVEN of the eight black-box checks and BOTH third-party client drives, then ran
+# `--selftest` and `--check`: both printed PASS. Nine of ten independent checks were gone and the
+# gate said conformance PASS, while README.md serves an "independent conformance 8/8" badge on
+# the strength of it.
+#
+# The self-test did not catch it either, because RED-B only required the suite to fail against a
+# deliberately nonconformant stub AND the log to mention "RFC 8414 metadata violations" -- a
+# condition ONE surviving check satisfies.
+#
+# Every sibling gate in this repository already has a floor: the fuzz job compares `cargo fuzz
+# list` against the [[bin]] table and counts iterations, oauth-interop.sh requires each of three
+# grants to be named failing individually, and oauth-mcp-lint.sh requires MCP-PKCE-001 and
+# MCP-CSRF-001 by name. This was the one that enumerated nothing.
+assert_blackbox_floor() {
+  local log="$1" want_bb want_cd got
+  want_bb="$(expected_blackbox_checks)"
+  want_cd="$(expected_client_drive_checks)"
+  if [ "$want_bb" -lt 1 ] || [ "$want_cd" -lt 1 ]; then
+    fail "counted $want_bb black-box and $want_cd client-drive checks in the source. A floor
+derived from an empty count is not a floor, so this is fatal rather than a pass."
+  fi
+  # `test result: ok. N passed` once per binary, in the order the two --test flags name them.
+  got="$(grep -cE '^test result: ok\. [0-9]+ passed' "$log" || true)"
+  if [ "$got" -ne 2 ]; then
+    fail "expected a passing result line from BOTH test binaries, saw $got. A binary that ran
+nothing reports nothing, which is the shape this floor exists to catch."
+  fi
+  local ran
+  ran="$(grep -oE '^test result: ok\. [0-9]+ passed' "$log" | grep -oE '[0-9]+' | paste -sd+ - | bc)"
+  if [ "$ran" -lt "$((want_bb + want_cd))" ]; then
+    fail "the black-box suite ran $ran checks against $((want_bb + want_cd)) defined in the
+source ($want_bb black-box, $want_cd client drive). A conformance gate that reports PASS on a
+suite somebody shortened is not a gate, and README.md quotes its result as a badge."
+  fi
+  note "black-box floor: $ran checks ran, $((want_bb + want_cd)) defined in the source"
+}
+
 start_stub_as() {
   # A deliberately NONCONFORMANT AS: answers every path with an empty JSON object, so the
   # RFC 8414 metadata validation must reject it. Used only by --selftest RED-B.
@@ -162,10 +216,14 @@ within 120s. The launch contract is documented in crates/oauth-as-conformance/sr
   fi
 
   note "black-box + third-party client drive against $BASE_URL"
-  if ! run_blackbox; then
+  if ! run_blackbox >"$TMPDIR_CONF/blackbox.log" 2>&1; then
+    cat "$TMPDIR_CONF/blackbox.log"
     echo "---- AS log ----"; cat "$TMPDIR_CONF/as.log"; echo "----------------"
     fail "black-box conformance failed against the live AS"
   fi
+  cat "$TMPDIR_CONF/blackbox.log"
+  # A green suite that ran fewer checks than the source defines is the failure this catches.
+  assert_blackbox_floor "$TMPDIR_CONF/blackbox.log"
   note "conformance PASS"
 }
 

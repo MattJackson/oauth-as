@@ -166,8 +166,10 @@
 //! on it leaks nothing. Again two numbers:
 //!
 //! - AT MOST 6000 authentications per minute per client per process, which is 100 a second: above
-//!   the rate at which a single client's token traffic on a single node is already an architecture
-//!   discussion, so the ceiling should not be reached by a healthy deployment.
+//!   the rate at which a single client's TOKEN traffic on a single node is already an architecture
+//!   discussion, so the ceiling should not be reached by a healthy deployment. THAT SENTENCE IS
+//!   ABOUT A CLIENT AND IS NOT TRUE OF A RESOURCE SERVER; see the next section, which is the one
+//!   to read before setting [`crate::server::ServerConfig::resource_servers`].
 //! - THE FIRST 15 FAILED authentications per minute per client cost 200 each (`1 + 199`), which
 //!   spends half the budget: that is the RFC 9700 section 4.13 credential-stuffing weighting, and
 //!   the point at which it stops is the failure reserve described in the next section. The penalty
@@ -184,6 +186,67 @@
 //! refusing than by continuing. The budget is per client id rather than global specifically so one
 //! client being stuffed cannot lock every other client out of the token endpoint.
 //!
+//! ## Resource servers introspect once per API call, and that changes the shape of this budget
+//!
+//! THE 6000 ABOVE IS DERIVED FROM A CLIENT'S TOKEN TRAFFIC, and through 0.9.1 that was the only
+//! traffic this budget carried: RFC 7662 introspection was self-only, so a client introspected
+//! tokens it had itself been issued and the volume tracked issuance. 0.9.2 opened the endpoint to
+//! a RESOURCE SERVER registered in [`crate::server::ServerConfig::resource_servers`], and a
+//! resource server does not authenticate once per grant. It authenticates ONCE PER CALL AT THE
+//! PROTECTED RESOURCE IT GUARDS, because that is what validating a bearer token on each request
+//! means. The rate is set by that API's clients, all of them, and none of them are visible here.
+//!
+//! So for a resource server's `client_id` the ceiling is not a number a healthy deployment stays
+//! under by construction. It is the protected resource's REQUEST CEILING, and 100 requests a
+//! second at an API is not an architecture discussion, it is an ordinary weekday. A deployment
+//! that registers resource servers and leaves this at the default has capped each protected
+//! resource at 100 requests a second per node without meaning to.
+//!
+//! WHAT BEING OVER IT LOOKS LIKE, which is the part worth reading twice, because it does not look
+//! like a throttle from either end. The refusal is
+//! [`crate::error::ErrorCode::InvalidClient`] — the same bare answer a wrong secret gets, and
+//! deliberately so, because a distinct code would tell an attacker they had found a live client
+//! id, which is exactly the distinction the whole credential path collapses. The resource
+//! server therefore reads its own credential as rejected, and if it fails closed — which it
+//! should — every call at the protected resource is refused for the remainder of the window. Not
+//! one client's token issuance: AUTHORIZATION FOR EVERY REQUEST, at a resource whose own traffic
+//! caused it.
+//!
+//! THE AUDIT CHANNEL IS WHERE THE TWO SEPARATE, and it is the reason an operator serving resource
+//! servers should not run without an [`crate::events::EventSink`].
+//! [`crate::events::Event::ClientAuthenticationFailed`] carries
+//! [`crate::events::ClientAuthFailure::RateLimited`] for a throttle and
+//! [`crate::events::ClientAuthFailure::SecretMismatch`] for a credential that did not verify. On
+//! the wire they are one answer; here they are two, and only one of them is fixed by rotating a
+//! secret.
+//!
+//! WHAT TO SET. Two things, and the second matters more than the first:
+//!
+//! - Size the budget for the API rather than for a client, with
+//!   [`RateLimitConfig::with_client_authentication_capacity_for`], which raises ONE registration
+//!   and leaves every other `client_id` where it was. Peak requests a second at the protected
+//!   resource, times 60, times a margin, divided by the node count if the limiter is per node —
+//!   which this one is. Raising `client_authentication_capacity` globally instead would multiply
+//!   the wrong-secret volume every OTHER registration admits, and each wrong secret can cost the
+//!   host an argon2id.
+//! - CACHE THE INTROSPECTION RESPONSE AT THE RESOURCE SERVER. RFC 7662 section 4 recommends
+//!   exactly this, bounded by a caching period the deployment finds acceptable, and it is the only
+//!   measure that changes the traffic shape rather than the ceiling: a cache keyed on the token
+//!   with a lifetime of even a few seconds turns "once per API call" back into something
+//!   proportional to the number of distinct live tokens. It costs the delay before a revocation
+//!   is observed, which is the trade RFC 7662 section 4 names.
+//!
+//! WHY THERE IS NO SEPARATE `Attempt` VARIANT FOR INTROSPECTION, since a budget of its own is the
+//! other obvious answer. [`Attempt`] is `#[non_exhaustive]`, so ADDING one would compile
+//! everywhere — and every host [`RateLimiter`] written against 0.9.x has a wildcard arm it would
+//! land in. A host whose wildcard answers [`RateLimitDecision::Allow`], which is the common shape
+//! for "budgets I have not configured", would silently stop throttling introspection ALTOGETHER on
+//! upgrade: an endpoint that was bounded would become unbounded, without a compiler error, a
+//! configuration change, or a line in a log. That is a strictly worse failure than a ceiling that
+//! is set too low and says so, and no amount of documentation reaches a wildcard arm that is
+//! already written. The budget stays shared; what a resource server gets is a capacity of its own
+//! within it.
+//!
 //! ## Why failures cannot spend a client's whole budget
 //!
 //! [`RateLimiter::check`] is asked BEFORE the credential is examined, and the only thing it is
@@ -196,7 +259,11 @@
 //! to its capacity, an attacker who sent 30 wrong secrets a minute — one request every two seconds,
 //! from anywhere, needing nothing but a public identifier — would take that client's every
 //! authenticated endpoint away for the rest of the window. Token, introspection, revocation, device
-//! authorization and PAR all go through the same check. The "IT IS NOT A LOCKOUT" bullet above
+//! authorization and PAR all go through the same check. THAT LIST IS THE CLIENT'S OWN ENDPOINTS,
+//! which is what it meant when it was written; since 0.9.2 "introspection" on it is also the
+//! RESOURCE SERVER's channel, so for a registration named in
+//! [`crate::server::ServerConfig::resource_servers`] the endpoint taken away is the protected
+//! resource. The "IT IS NOT A LOCKOUT" bullet above
 //! would have been false, and it would have been false at a cost to the attacker of nothing.
 //!
 //! So HALF OF EVERY CLIENT'S BUDGET IS RESERVED FOR ATTEMPTS AND CANNOT BE SPENT BY FAILURES
@@ -285,6 +352,13 @@ pub const DEFAULT_DEVICE_USER_CODE_FAILURE_COST: u64 = 9;
 
 /// 6000 cost units per window per `client_id`: 6000 authentications a minute, of which the first 15
 /// failures cost 200 each. See the module docs for the RFC 9700 section 4.13 reasoning.
+///
+/// DERIVED FROM A CLIENT'S TOKEN TRAFFIC, so it is the wrong starting point for a RESOURCE SERVER
+/// registered in [`crate::server::ServerConfig::resource_servers`]: that registration
+/// authenticates once per RFC 7662 introspection and therefore once per call at the protected
+/// resource, and 100 a second is an ordinary API rather than an architecture discussion. Raise
+/// that ONE registration with [`RateLimitConfig::with_client_authentication_capacity_for`] and see
+/// "Resource servers introspect once per API call" in the module docs.
 pub const DEFAULT_CLIENT_AUTHENTICATION_CAPACITY: u64 = 6000;
 
 /// The EXTRA cost of a failed client authentication, on top of [`ATTEMPT_COST`], so a wrong
@@ -385,7 +459,34 @@ pub struct RateLimitConfig {
     /// Extra cost charged when a user code entry FAILS.
     pub device_user_code_failure_cost: u64,
     /// Cost units per window for [`Attempt::ClientAuthentication`], per `client_id`.
+    ///
+    /// A RESOURCE SERVER'S INTROSPECTION TRAFFIC IS CHARGED HERE, which is why this number needs
+    /// rereading in any deployment that sets [`crate::server::ServerConfig::resource_servers`]: an
+    /// RFC 7662 introspection is one client authentication, and a resource server makes one per
+    /// protected API call. Raise it for that ONE registration with
+    /// [`RateLimitConfig::with_client_authentication_capacity_for`] rather than for everybody. See
+    /// "Resource servers introspect once per API call" in the module docs.
     pub client_authentication_capacity: u64,
+    /// Per-`client_id` exceptions to `client_authentication_capacity`, for registrations whose
+    /// honest traffic is not shaped like a client's.
+    ///
+    /// EMPTY BY DEFAULT and empty means "no exceptions": a `HashMap` that has never had an entry
+    /// inserted allocates nothing, and the lookup is skipped entirely when it is empty, so a
+    /// deployment that does not use this pays one `is_empty` per check.
+    ///
+    /// The reserve moves with the exception. Everything
+    /// [`CLIENT_AUTHENTICATION_FAILURE_CEILING_DIVISOR`] guarantees is derived from whichever
+    /// capacity applies to the identifier being charged, so a raised registration gets a raised
+    /// reserve rather than a failure penalty that saturates after a fiftieth of its budget.
+    ///
+    /// TWO THINGS IT DOES NOT DO, both of them properties of [`FixedWindowRateLimiter`]'s bound
+    /// rather than of this field. An entry for an identifier longer than
+    /// [`MAX_TRACKED_CLIENT_ID_LEN`] never applies, because such an identifier never gets a counter
+    /// of its own. And an entry does not apply in a window where the tracked map was already full
+    /// when this identifier first arrived: it shares the OVERFLOW counter then, on the shared
+    /// capacity, because a budget several identifiers share cannot carry one identifier's
+    /// exception. Both degrade toward the ordinary capacity, never away from it.
+    pub client_authentication_capacity_overrides: HashMap<Box<str>, u64>,
     /// Extra cost charged when a client authentication FAILS.
     pub client_authentication_failure_cost: u64,
     /// Cost units per window for [`Attempt::AuthorizationRequest`], per `client_id`.
@@ -408,6 +509,7 @@ impl Default for RateLimitConfig {
             device_user_code_capacity: DEFAULT_DEVICE_USER_CODE_CAPACITY,
             device_user_code_failure_cost: DEFAULT_DEVICE_USER_CODE_FAILURE_COST,
             client_authentication_capacity: DEFAULT_CLIENT_AUTHENTICATION_CAPACITY,
+            client_authentication_capacity_overrides: HashMap::new(),
             client_authentication_failure_cost: DEFAULT_CLIENT_AUTHENTICATION_FAILURE_COST,
             authorization_request_capacity: DEFAULT_AUTHORIZATION_REQUEST_CAPACITY,
             authorization_request_failure_cost: DEFAULT_AUTHORIZATION_REQUEST_FAILURE_COST,
@@ -444,6 +546,44 @@ impl RateLimitConfig {
         self
     }
 
+    /// Give ONE `client_id` its own [`Attempt::ClientAuthentication`] capacity, leaving every other
+    /// registration on `client_authentication_capacity`.
+    ///
+    /// WHAT THIS IS FOR, and it is one thing: a registration whose honest volume is a function of
+    /// somebody else's traffic rather than of its own. The case that exists today is a RESOURCE
+    /// SERVER declared in [`crate::server::ServerConfig::resource_servers`], which authenticates
+    /// here once per RFC 7662 introspection and therefore once per call at the protected resource
+    /// it guards — a rate set by that API's clients, not by any grant this server issued.
+    ///
+    /// It exists so that the sizing advice can be given about one registration. Raising
+    /// `client_authentication_capacity` globally would raise it for every client id an attacker
+    /// can name, and the per-client ceiling is what bounds how many WRONG SECRETS one id can push
+    /// through the host's secret verifier in a window: at the defaults 3000, and each one may cost
+    /// an argon2id. A twentyfold global raise is a twentyfold raise in that, for every
+    /// registration, to buy headroom one of them needed.
+    ///
+    /// ```
+    /// use oauth_as::rate_limit::{FixedWindowRateLimiter, RateLimitConfig};
+    ///
+    /// // 100 API calls a second at the protected resource is 6000 introspections a minute, which
+    /// // is the whole default budget. Give that one registration room and leave the rest alone.
+    /// let limiter = FixedWindowRateLimiter::with_config(
+    ///     RateLimitConfig::default().with_client_authentication_capacity_for("orders-api", 120_000),
+    /// );
+    /// ```
+    ///
+    /// A capacity of 0 refuses that identifier outright, which is a legitimate way to take one
+    /// registration off the air; it is not read as "unlimited".
+    pub fn with_client_authentication_capacity_for(
+        mut self,
+        client_id: impl Into<Box<str>>,
+        capacity: u64,
+    ) -> Self {
+        self.client_authentication_capacity_overrides
+            .insert(client_id.into(), capacity);
+        self
+    }
+
     /// Set how many distinct `client_id` values get their own counter within a window.
     pub fn with_max_tracked_clients(mut self, max: usize) -> Self {
         self.max_tracked_clients = max;
@@ -463,6 +603,31 @@ impl RateLimitConfig {
     /// reserve that moved with it rather than one frozen at construction.
     fn client_authentication_failure_ceiling(&self) -> u64 {
         self.client_authentication_capacity / CLIENT_AUTHENTICATION_FAILURE_CEILING_DIVISOR
+    }
+
+    /// The capacity that applies to ONE identifier that got a counter of its own: its
+    /// `client_authentication_capacity_overrides` entry if it has one, and the shared capacity
+    /// otherwise.
+    ///
+    /// ONLY EVER ASKED FOR A TRACKED IDENTIFIER. An identifier charged against the shared overflow
+    /// counter is charged the shared capacity whatever its override says, because that counter is
+    /// not its own — see the field's docs.
+    fn client_authentication_capacity_for(&self, client_id: &str) -> u64 {
+        if self.client_authentication_capacity_overrides.is_empty() {
+            return self.client_authentication_capacity;
+        }
+        self.client_authentication_capacity_overrides
+            .get(client_id)
+            .copied()
+            .unwrap_or(self.client_authentication_capacity)
+    }
+
+    /// The failure reserve for one tracked identifier, derived from whichever capacity applies to
+    /// it so that an override moves the reserve with it. See
+    /// [`RateLimitConfig::client_authentication_failure_ceiling`].
+    fn client_authentication_failure_ceiling_for(&self, client_id: &str) -> u64 {
+        self.client_authentication_capacity_for(client_id)
+            / CLIENT_AUTHENTICATION_FAILURE_CEILING_DIVISOR
     }
 
     /// The authorization-endpoint failure reserve, on the same terms and re-derived at every use so
@@ -581,7 +746,9 @@ struct Window {
 /// One [`Mutex`] and one [`HashMap`] per limiter, allocated when the host constructs it and never
 /// otherwise: a host that does not install this pays nothing, and [`crate::events::Hooks`] is
 /// unchanged by its existence. Each check is one lock, one integer division and at most two hash
-/// lookups. The lock is held only for the arithmetic, never across a store call or an await.
+/// lookups — three when `client_authentication_capacity_overrides` is non-empty, and the extra one
+/// is skipped entirely by an `is_empty` when it is not. The lock is held only for the arithmetic,
+/// never across a store call or an await.
 #[derive(Debug)]
 pub struct FixedWindowRateLimiter {
     config: RateLimitConfig,
@@ -699,23 +866,39 @@ impl FixedWindowRateLimiter {
         // variant is the step a compiler cannot prompt anyone to take.
         //
         // WHAT IS UNTHROTTLED TODAY, since this comment is the only place the crate enumerates it:
-        // RFC 7592 registration MANAGEMENT. `read_registration`, `update_registration` and
-        // `delete_registration` take no `Attempt` at all, so the only thing standing in front of
-        // them is the registration access token the caller was handed at registration time. The
-        // authorization endpoint and RFC 7591 registration were named here until 0.9.1 and are NOT
-        // in that position any more: they have `Attempt::AuthorizationRequest` and
-        // `Attempt::ClientRegistration` below, called from `server.rs` and `registration.rs`
-        // respectively. A comment naming the wrong endpoints is worse than none, because this is
-        // where a reader comes to find out which ones are exposed.
+        // NOTHING that takes a credential or writes a record. Every endpoint that does is behind
+        // one of the four variants below.
+        //
+        // The list has shrunk twice and both entries are recorded here rather than deleted,
+        // because this is where a reader comes to find out which endpoints are exposed and a
+        // comment that has silently drifted is worse than none. The authorization endpoint and RFC
+        // 7591 registration left the list in 0.9.1 (`Attempt::AuthorizationRequest` and
+        // `Attempt::ClientRegistration`). RFC 7592 registration MANAGEMENT left it in 0.9.2:
+        // `read_registration`, `update_registration` and `delete_registration` share one
+        // `authenticate_registration`, which now asks with `Attempt::ClientAuthentication` keyed
+        // on the `client_id` being managed. It spends the SAME per-client budget as the token
+        // endpoint, deliberately: it is the same client's other bearer credential, and the
+        // destructive one (RFC 7592 s2.3 deletes the registration and everything it was issued).
+        //
+        // What that leaves genuinely unthrottled is the endpoints that take no credential and
+        // write nothing: the RFC 8414 metadata document, the RFC 7517 JWKS, and the RFC 9728
+        // resource metadata. They are static documents, and a limiter in front of a static
+        // document is the host's CDN's job rather than this crate's.
         match attempt {
             Attempt::DeviceUserCodeEntry => {
                 let capacity = self.config.device_user_code_capacity;
                 Self::charge(&mut state.device_user_code, capacity, ATTEMPT_COST)
             }
             Attempt::ClientAuthentication { client_id } => {
-                let capacity = self.config.client_authentication_capacity;
+                let shared = self.config.client_authentication_capacity;
+                // Read BEFORE the counter is borrowed, and read only for a tracked identifier: an
+                // untracked one is charged against the shared overflow counter, which several
+                // identifiers are spending at once and which therefore cannot be given any one of
+                // their exceptions.
+                let overridden = self.config.client_authentication_capacity_for(client_id);
                 let max_tracked = self.config.max_tracked_clients;
-                let budget = state.client_counter(client_id, max_tracked);
+                let (budget, tracked) = state.client_counter(client_id, max_tracked);
+                let capacity = if tracked { overridden } else { shared };
                 // The attempt is charged against what the FAILURE counter has not already taken,
                 // which is how the two budgets share one capacity without either being able to
                 // exhaust the other's half. See the module docs.
@@ -760,10 +943,16 @@ impl FixedWindowRateLimiter {
                 // lockout fix: past the ceiling a failure has already cost its `ATTEMPT_COST` at
                 // check time and costs nothing further, so no number of failures can take the
                 // reserved half of this client's budget away from the client itself.
-                let ceiling = self.config.client_authentication_failure_ceiling();
+                let shared = self.config.client_authentication_failure_ceiling();
+                // The reserve is derived from whichever capacity applies to this identifier, on
+                // the same terms as the charge above and with the same tracked-only rule.
+                let overridden = self
+                    .config
+                    .client_authentication_failure_ceiling_for(client_id);
                 let cost = self.config.client_authentication_failure_cost;
                 let max_tracked = self.config.max_tracked_clients;
-                let budget = state.client_counter(client_id, max_tracked);
+                let (budget, tracked) = state.client_counter(client_id, max_tracked);
+                let ceiling = if tracked { overridden } else { shared };
                 Self::penalise(&mut budget.failures, ceiling, cost);
             }
             Attempt::AuthorizationRequest { client_id } => {
@@ -840,9 +1029,14 @@ impl Window {
 
     /// The budget this `client_id` is charged against: its own if it has one or can have one, and
     /// the shared overflow budget otherwise.
-    fn client_counter(&mut self, client_id: &str, max_tracked: usize) -> &mut ClientBudget {
+    ///
+    /// The `bool` says whether the identifier got a counter OF ITS OWN. It is what decides which
+    /// capacity is charged: only a tracked identifier may be charged a
+    /// `client_authentication_capacity_overrides` entry, because the overflow counter is shared
+    /// with every other untracked identifier and cannot carry one identifier's exception.
+    fn client_counter(&mut self, client_id: &str, max_tracked: usize) -> (&mut ClientBudget, bool) {
         if client_id.len() > MAX_TRACKED_CLIENT_ID_LEN {
-            return &mut self.overflow;
+            return (&mut self.overflow, false);
         }
         // Two hash lookups on the hit path rather than one. A single `match self.clients.get_mut()`
         // with an insert in the `None` arm does not compile under this crate's MSRV borrow checker
@@ -852,7 +1046,7 @@ impl Window {
         // string is the cheaper of the two.
         if !self.clients.contains_key(client_id) {
             if self.clients.len() >= max_tracked {
-                return &mut self.overflow;
+                return (&mut self.overflow, false);
             }
             // The only allocation on this path, and only for a `client_id` seen for the first time
             // this window. `Box<str>` rather than `String`: the key is never grown, so the spare
@@ -860,9 +1054,12 @@ impl Window {
             self.clients
                 .insert(Box::from(client_id), ClientBudget::default());
         }
-        self.clients
-            .get_mut(client_id)
-            .expect("the entry was just confirmed or inserted")
+        (
+            self.clients
+                .get_mut(client_id)
+                .expect("the entry was just confirmed or inserted"),
+            true,
+        )
     }
 }
 

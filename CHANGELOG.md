@@ -10,7 +10,465 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
-## [0.9.1] - unreleased
+## [0.9.2] - 2026-08-14
+
+### Added: RFC 7662 introspection answers a RESOURCE SERVER
+
+0.9.1 made the documentation honest about this; 0.9.2 makes it unnecessary. Through 0.9.1 this
+server answered introspection only for the token's own client, and roughly twenty places in the
+source said so in writing and named this release. Those sentences are gone, because the thing they
+described is gone.
+
+A resource server authenticates as an ordinary confidential client, through the same client
+authentication every other endpoint uses: `client_secret_basic`, `client_secret_post`,
+`private_key_jwt`, `client_secret_jwt`, mTLS. There is no new principal and no new credential type,
+deliberately — a second credential path is a second place to get constant-time comparison, rotation
+and revocation right. What makes a client ALSO a resource server is a deployment statement, the new
+`ServerConfig::resource_servers`.
+
+**Which tokens an RS may read.** Only those whose RFC 8707 `resource` set names one of its
+registered identifiers. Anything else answers `{"active": false}` — never an error, because an
+error channel that distinguishes "not yours" from "not a token" is the same scanning oracle by
+another route. **A token whose grant named no resource at all is refused to every resource server**:
+an empty set means "restricted to nothing in particular", and reading that as "so anyone may ask"
+would expose every token that never used RFC 8707, which is most of them.
+
+**What differs from what the owning client sees: the two members that name OTHER SERVICES,**
+`aud` and `authorization_details`, each narrowed to the RS that asked. The rest of that set names
+the other services a user's token works at, and handing it to a third party describes the shape of
+someone's account (RFC 7662 section 5). Everything else, `sub` included, goes to both — a resource
+server that cannot identify the user cannot do per-user access control, which is what it is
+introspecting for. See the "Fixed" entry below for why the second member is on that list.
+
+`introspection_endpoint` stays `Option<String>` and is still advertised only where the host names
+it. 0.9.1 recorded an intent to make it unconditional again once this landed; that is deliberately
+NOT done. The capability is configuration-dependent in a way that sentence did not anticipate — a
+deployment that registers no resource server still answers only the token's own client, so
+advertising unconditionally would restore the original false claim for exactly the deployments the
+0.9.1 change was written to protect.
+
+### Added: a per-`client_id` client-authentication capacity, because a resource server is not a client
+
+`RateLimitConfig::with_client_authentication_capacity_for` and the
+`client_authentication_capacity_overrides` field behind it: one `client_id` gets its own
+`Attempt::ClientAuthentication` ceiling, everybody else stays on
+`client_authentication_capacity`. The failure reserve moves with it, derived from whichever
+capacity applies rather than from the global one.
+
+This exists because of the introspection entry above. **A resource server authenticates once per
+call at the protected resource it guards**, not once per grant, and that traffic is charged to the
+same per-`client_id` budget a client's token requests are. The 6000-a-minute default was derived
+from a client's token traffic — the module docs defended it as "above the rate at which a single
+client's token traffic on a single node is already an architecture discussion", which is true of a
+client and is not true of an API. Left at the default, registering a resource server caps that
+protected resource at 100 requests a second per node.
+
+**And it does not look like a throttle when it bites.** Introspection over the ceiling is refused
+with a bare `invalid_client`, the same answer a wrong secret gets, deliberately — a distinct code
+would tell an attacker they had found a live client id. A resource server failing closed then
+refuses every request it is handling, and its operator is reading what looks like a credential
+fault. The audit channel is where the two separate: `Event::ClientAuthenticationFailed` carries
+`ClientAuthFailure::RateLimited` for a throttle and `ClientAuthFailure::SecretMismatch` for a
+credential that did not verify. `ServerConfig::resource_servers`, the `rate_limit` module docs and
+`Attempt::ClientAuthentication` all now say this; before, none of them did.
+
+**Why an override and not a global raise.** The per-`client_id` ceiling is what bounds how many
+WRONG SECRETS one identifier can push through the host's secret verifier in a window — 3000 at the
+defaults, each of which can cost an argon2id. Advice to raise `client_authentication_capacity`
+twentyfold would raise that for every registration an attacker can name, to buy headroom one of
+them needed.
+
+**Why there is no `Attempt::Introspection`.** `Attempt` is `#[non_exhaustive]`, so adding a variant
+compiles everywhere — and lands in the wildcard arm of every host `RateLimiter` already written. A
+wildcard answering `Allow`, which is the ordinary shape for "budgets I have not configured", would
+silently stop throttling introspection altogether on upgrade: bounded to unbounded, with no
+compiler error and no log line. A ceiling that is too low and says so is the better failure.
+
+An override never applies to the shared overflow counter — an identifier that did not get a counter
+of its own, because the tracked map was full or because it is longer than
+`MAX_TRACKED_CLIENT_ID_LEN`, is charged the shared capacity whatever its override says. That
+counter is spent by several identifiers at once and cannot carry any one of their exceptions.
+
+### Added: `cimd`, a client identifier metadata document VALIDATOR
+
+draft-ietf-oauth-client-id-metadata-document-**01**, behind a new off-by-default `cimd` feature,
+the sixteenth. The revision matters: every section number the module cites is -01's, and -02
+(2026-07-06) reorganised the document without changing the rules, so the module header carries a
+table mapping each citation onto its -02 number. **This crate does not fetch.** The host fetches
+the document at the client-id URL and hands the bytes over; the crate validates them and turns them
+into a `Client`. That is the same
+posture as every other seam here — the host owns the listener, the signer, the clock — and it is a
+design position rather than a gap to close later: a library embedded in someone else's server does
+not get to open sockets on its own initiative.
+
+The security property is one comparison: the document's own `client_id` must equal the URL it was
+fetched from, byte for byte, normalising nothing. Without it, any document authorizes any client.
+`ValidatedClientIdDocument` and `ClientIdUrl` have private fields and no public constructor, so
+neither can exist except as the output of validation — which makes the specification's "never cache
+an invalid document" structural rather than a rule somebody has to remember.
+
+Redirect URIs, grant and response types, auth method and the scope ceiling are validated by the
+same function the RFC 7591 dynamic registration path uses, not a second copy of it.
+
+Two readings are worth stating because a future reader will otherwise assume the opposite. An
+absent `token_endpoint_auth_method` is taken as `none`, not RFC 7591 section 2's
+`client_secret_basic` default, which the draft forbids — read literally, the two together refuse
+every document that omits the member. And `client_id_metadata_document_supported` is derived from
+the host's configuration, not from whether the feature was compiled in: compiling a validator does
+not mean a deployment performs the fetch, and advertising on the strength of a `cfg` would claim a
+capability the build always refuses.
+
+### Changed: `ScopeSet` is a sorted `Vec`, not a `BTreeSet`
+
+No API change — the field is private and the invariant, sorted and deduplicated, is unchanged, so
+`Display`, `Serialize`, `PartialEq` and `is_subset` answer exactly as before.
+
+It is in the changelog because of what it costs a deployment. A `BTreeSet` allocates a whole leaf
+node the moment it holds anything, and that node is the same size for one scope token as for
+eleven, while a real scope set holds one to five short words. Measured, resident bytes per record:
+access token 688 to 432, refresh token 723 to 491, authorization code 1066 to 834, consent record
+573 to 341, device grant 1009 to 753. **A store holding 10,000 access tokens drops from 6,719 KiB
+to 4,218 KiB.** The linked binary drops 15,394 bytes on the default feature set, which is every
+`BTreeMap` instantiation the type dragged in.
+
+It is also faster from a hundred tokens up (81.09 to 48.68 microseconds at a thousand) and slightly
+slower below that — 32 to 39 nanoseconds at one token, which buys the single correctly-sized
+allocation the rest of the table rests on.
+
+### Changed: every client-authentication refusal now leaves through ONE exit that charges
+
+A structural fix for a defect class that four previous releases each fixed one site at a time. The
+costly property was never that the function branches; it is that the branches were also the EXITS,
+so every refusal had to remember to charge for verification work it had skipped, and each new
+refusal path was a new opportunity to forget. Four rounds of audit found four different sites.
+
+Refusals are now values rather than early returns, what was actually spent is tracked in a ledger,
+and one function charges for whatever the presented credential has not paid for — deciding from the
+PRESENTED credential and never from the registration, which is the property that makes a known
+client id cost what an unknown one costs. The refusal exits went from six, with eight scattered
+charge sites, to one. It is reviewable by counting exits, which is the point of doing it this way.
+
+**One residual is preserved rather than closed, and pinned by a test so it cannot be forgotten.**
+A client registered for RFC 7523 that presents an assertion malformed enough to be refused before
+any signature work pays less than an unknown client id sending the same bytes. Closing it needs the
+assertion verifier to report whether it reached the signature, which is a public API change; the
+alternative — inferring it from the failure variant — is exactly the kind of coupling kept in step
+by a comment that this restructure exists to remove.
+
+### Changed: four `Debug` impls stopped printing the credential they carry
+
+`ClientCredential`, `AuthorizationResponse`, `PushedAuthorizationResponse` (under `par`) and
+`CompactJws` (under `jwt`) had derived `Debug`, so `{:?}` on any of them wrote a live credential
+into whatever the host logs. Each now redacts, and a host feels this the moment it prints one of
+them: the value it used to see is `"[redacted]"`.
+
+Which is the point. The RECORD forms of two of these have been hand-redacted since they were
+written — `AuthorizationCodeRecord` because RFC 6749 section 4.1.2 makes a code a credential in its
+own right, the stored pushed request because RFC 9126 section 7.1 makes the `request_uri` a
+capability while it is live — and the RESPONSE forms, which carry the same string outward to the
+client, were left deriving. `ClientCredential` is the one a host builds by hand and passes in, so
+it is also the one most likely to appear in a host's own tracing on the path that refused it: it
+carries the shared secret and the RFC 7523 assertion. `CompactJws` is worse than it looks, because
+its `signing_input` and `signature` together rebuild the whole token: printing a refused DPoP proof
+or client assertion yielded a bearer credential still live until its `exp`, and `jti` single-use
+only bounds a proof that was ACCEPTED.
+
+**What still prints is what an operator debugging a refusal actually needs**, and that is the line
+each impl draws rather than blanket opacity. `ClientCredential` keeps the `Some`/`None` shape,
+because WHICH credential a request presented is a diagnostic and is not itself secret, and
+`client_assertion_type` prints in full because RFC 7521 section 4.2 makes it a fixed registered
+URN. `AuthorizationResponse` keeps `state` (the client's own opaque value) and `iss` (this server's
+public identifier). `PushedAuthorizationResponse` keeps `expires_in`. `CompactJws` keeps the
+decoded `header` and `payload` — which `alg`, which `iss`, which `aud` — because what makes a token
+spendable is the signature over the exact input bytes, and that is what is withheld.
+
+### Added: `ResourceServerRegistration` is `#[non_exhaustive]`, sealed in the release that introduces it
+
+A host writes `ResourceServerRegistration::new(client_id, resources)` rather than a struct literal.
+
+The attribute cannot be added after publication, because by then the literal is in somebody's
+production tree and adding it is the breaking change it exists to prevent. This is a DEPLOYMENT
+POLICY object for a channel that will grow — a per-RS claim filter, a per-RS introspection policy
+and a `token_endpoint_auth_method` constraint are all plausible next fields — and each of those
+would be a major-version event if a host could write the literal. Its sibling `CimdPolicy` is
+sealed for the same reason and says so in the same terms.
+
+Worth stating because the `tests/host_api_shape.rs` gate does not catch this one, and is not wrong
+to miss it: that scan flags types whose field set VARIES WITH A CARGO FEATURE, and this one's does
+not. The rule the crate follows is broader than the gate that enforces part of it.
+
+### Added: RFC 9470 step-up reaches a resource server by both routes
+
+`acr` and `auth_time` are now claims in the signed RFC 9068 access token, under the `consent`
+feature, alongside the RFC 7662 introspection members that already carried them.
+
+RFC 9470 section 6 has exactly two subsections because a token reaches a resource server in exactly
+two ways, and this crate answered one of them. Section 6.2 is introspection, which is all an OPAQUE
+token has; section 6.1 is the JWT, which is read OFFLINE by a resource server that never
+introspects at all. The party that needs this is the resource server that SENT the section 3
+`insufficient_user_authentication` challenge and now has to decide whether the token in front of it
+answers it — and on the JWT route that server had nothing in the token to decide with. It could
+only take the client's word for the step-up, which is the whole thing the challenge exists to
+avoid. Same shape as the RFC 8693 `act` claim in 0.9.1, and the same argument.
+
+What a host feels: nothing to change, and one member appears in tokens issued by a build with both
+`consent` and `jwt` when the host reported an authentication for the grant. `AccessTokenClaims` is
+`#[non_exhaustive]` with an `AccessTokenClaims::new` that takes the seven RFC 9068 section 2.2
+REQUIRED claims, so the two new fields are NOT a breaking change for a host that constructs one:
+a host outside this crate could never have used a struct literal, and `new` fills them with `None`.
+Both are omitted rather than sent as `null` when the host reported nothing, and both are answered
+from the same stored report, through the same conversion, that introspection answers from, so the
+two channels cannot state different things about one token. A refreshed token still states the
+ORIGINAL `auth_time`: a rotation is not a new login, and restamping it would let any client defeat
+any `max_age` by refreshing.
+
+### Fixed: two HTTP doors accepted `authorization_details` and dropped it
+
+RFC 9396 section 5 requires an authorization server to REFUSE an `authorization_details` it will
+not honour. The core refuses at every door where the parameter reaches it; two doors of the `http`
+service are the only place the request exists, and they were silently dropping it:
+
+- `POST /device_authorization`. RFC 9396 section 3 names the RFC 8628 device authorization request
+  explicitly as a place the parameter may be used, and this crate's `DeviceGrant` has no field for
+  one. The request was accepted and the client was handed a `user_code` for a permission that could
+  never appear on the token.
+- `POST /token` under `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`. That grant
+  answers from its own arm of the router and returns before the token endpoint's shared parameter
+  handling, so the SAME POST to the SAME URL refused for `authorization_code` and dropped for the
+  exchange.
+
+Both now answer `invalid_authorization_details`, before the credential and before the grant, so the
+client is told which parameter is wrong rather than being answered about whatever was checked
+first. The refusals are UNGATED, unlike the core's: there the answer turns on whether the build
+supports any detail TYPE, here it turns on the GRANT, which has nowhere to put a detail whether the
+type is supported or not — `AuthorizationServer::token` already refuses to mint detail for a device
+grant under `rar` for exactly this reason.
+
+What a host feels: a client that was sending this parameter to either endpoint and having it
+dropped now gets a 400 naming the parameter. That is the point; the token it was getting did not
+say what it believed it said.
+
+### Fixed: a client identifier metadata document offering a key was accepted with the key dropped
+
+`cimd` refused a document carrying `client_secret` — on the stated reasoning that dropping a member
+the client believes is being honoured registers a client on terms nobody agreed to — and then did
+the opposite with `jwks` and `jwks_uri`. Neither member is modelled by `ClientMetadata`, and the
+document type flattens into it without denying unknown fields, so `serde` dropped them silently and
+`to_client()` returned an unconditional `ClientAuth::Public`. A client that published a key and
+believed it authenticated with it was registered as a client that authenticates with nothing, and
+was told so nowhere.
+
+Both members are now REFUSED, with a new `CimdError::KeyMaterialPresent`. This is the one refusal
+in that enum that is a property of this BUILD rather than of the draft — the draft PERMITS public
+keys, and a public key is the only credential a world-readable document can carry — but this crate
+cannot register a client key at all (`registration` models neither member and refuses
+`private_key_jwt` outright), so accepting the document would produce a public client out of a
+document asking to be a confidential one. `CimdError` is `#[non_exhaustive]`, so when the
+`jwks`/`jwks_uri` gap closes, removing this refusal is a patch release.
+
+It also happens to be where the draft's MUST NOT on PRIVATE key material becomes reachable: a
+private JWK arrives inside `jwks`, and before this it was parsed away and never seen. Nothing else
+in the module inspected it, and nothing needs to — the whole member is the refusal either way.
+
+### Fixed: introspection told a caller which client ids are registered
+
+RFC 7662 introspection refused a PUBLIC client with an `invalid_client` carrying the description
+`"introspection requires a confidential client"`, while an unknown client id and a confidential
+client presenting the wrong secret both got a BARE `invalid_client` with no description at all. So
+the description was the one answer meaning "this client id is registered, and it is public" — the
+client-existence distinction the whole credential path collapses on purpose, rebuilt one endpoint
+downstream of it, one probe per candidate id.
+
+Pre-existing rather than introduced here, but 0.9.2 turns introspection into an advertised
+resource-server-facing surface, which is what makes it worth a release note: the probe is now one a
+deployment invites. All THREE sites of the shape now answer with a bare `invalid_client`,
+byte-identical to the unknown-id and wrong-secret answers — introspection, the RFC 6749 section 4.4
+client credentials grant (which the introspection comment cites as its authority for the refusal),
+and RFC 8693 token exchange under the `token-exchange` feature. Each was reachable by a caller
+presenting NO credential at all, because a public registration authenticates trivially. The
+neighbouring `unauthorized_client` refusals are NOT the same exposure and are unchanged: reaching
+one requires having already proved a confidential credential.
+
+The reason did not vanish, it moved to the channel where the reader is not the attacker: a new
+`ClientAuthFailure::NotConfidential` reaches the host's event sink as
+`Event::ClientAuthenticationFailed`. That matters because the usual cause here is a resource server
+registered with the wrong `token_endpoint_auth_method` rather than an attack, and a bare refusal
+with nothing in the log would be unactionable. `ClientAuthFailure` is `#[non_exhaustive]`, so the
+new variant is not a breaking change for a host that matches on it. The rate limiter is not charged
+a second time: client authentication has already recorded this attempt's outcome.
+
+### Fixed: RFC 7592 registration management was unthrottled
+
+`read_registration`, `update_registration` and `delete_registration` share one
+`authenticate_registration`, and it took no `Attempt` at all, so a host that had installed a
+`RateLimiter` still had this plane wide open. The crate's own note beside that function said the
+host "is expected to throttle anyway" — advice the host could not take through this crate, because
+nothing reached the seam. That is the doc-truth failure this project keeps finding, and the
+enumeration in `crates/oauth-as/src/rate_limit.rs` of what is unthrottled has been corrected with
+it rather than left to rot.
+
+The attempt is `Attempt::ClientAuthentication`, keyed on the `client_id` being managed — the SAME
+budget the token endpoint spends, not a new one. It is the same question (may this caller keep
+presenting credentials as this client), the registration access token is the more powerful of that
+client's two bearer credentials since it REWRITES and DELETES the registration, and one budget is
+the answer that cannot be walked around by moving from one endpoint to the other. It also adds no
+new denial of service: that budget is already keyed on a `client_id` RFC 6749 section 2.2 makes
+public, so anyone who could exhaust it here could already exhaust it by spraying wrong secrets at
+the token endpoint.
+
+The limiter is asked BEFORE the store is touched, so a throttled `DELETE` deletes nothing, and its
+refusal is the same `Unauthorized` a wrong token gets, so the throttle is not an oracle telling an
+attacker they found a live registration. Outcomes are reported, so a failure-weighted limiter
+charges a wrong registration access token what a guess costs and a correct one what a request
+costs.
+
+What a host feels: a host with no limiter installed is unaffected (the seam's default is Allow). A
+host with one now has RFC 7592 management counted against its per-client budget — including,
+deliberately, its own clients' legitimate management traffic, which is small.
+
+### Fixed: the introspection `aud` narrowing was undone by the member next to it
+
+The resource-server channel above narrows `aud` so that api.example is not told this token also
+works at payroll.example. It then handed the same resource server the whole
+`authorization_details` array — and an RFC 9396 section 2.2 element has `locations`, which NAMES
+RESOURCE SERVERS BY URI. The sentence the narrowing refused to say was said in full by the member
+beside it, with the actions and privileges granted at those other services attached. The policy
+was written in a comment and not implemented.
+
+`authorization_details` is now filtered for the asking resource server, which is what RFC 9396
+section 9.2 asks for in those words: "filtered and extended for the RS making the introspection
+request". An element whose `locations` names one of that RS's registered identifiers is kept, with
+its `locations` reduced to the intersection, so an element addressed to two resource servers no
+longer hands each of them the other's URI. An element with no `locations` is kept: section 2.2
+makes the member optional, so its absence is not a statement that the element belongs elsewhere,
+and dropping it would withhold an approved detail from the only party that can enforce it.
+Everything else is dropped.
+
+The other resolution — stop narrowing `aud`, and call a registered resource server a semi-trusted
+party that sees the grant as granted — was considered and rejected. A resource server is registered
+for the identifiers it answers for and nothing wider, so under that reading a deployment adding a
+second protected resource would be quietly telling the first one about it, and the person who pays
+is the user, who is not in the room.
+
+`scope` and `act` are deliberately NOT narrowed, and the reasoning is now in the method's
+documentation rather than implied by its silence. Nothing here maps a scope to a resource server,
+so filtering would be a guess, and a resource server that silently loses a scope refuses access the
+resource owner granted; `act` says who is acting in the call being made, not where else the grant
+reaches.
+
+What a host feels: nothing, unless it has set `ServerConfig::resource_servers` AND its grants carry
+`authorization_details` with `locations`. Those resource servers now receive a shorter array. The
+cost is real and worth naming — a filtered array cannot distinguish "not granted" from "not for
+you" — but both readings oblige the resource server to refuse, which is the harmless direction, and
+the disclosure direction has no such symmetry. The token's OWN client, and a host calling
+`AuthorizationServer::introspect`, still see the record whole.
+
+### Fixed: `AuthorizationResponse` lost its rustdoc, and `redirect` named the wrong open door
+
+Two documentation defects that a reader acts on. The doc comment explaining why
+`AuthorizationResponse` hand-writes `Debug` — the paragraph added earlier in 0.9.2 — was written
+above the `impl` rather than above the struct, which left the public type with NO rendered
+documentation at all and the crate's `#![warn(missing_docs)]` firing on it. The struct's half is
+back on the struct.
+
+And the note beside `crate::http`'s `redirect` explained the reachable `HeaderValue::from_str`
+failure by saying "only the RFC 7591 dynamic path validates [the redirect URI] — a host calling
+`register_client` directly supplies a bare `Vec<String>`". `register_client` validates, through the
+same predicate, and has since 0.9.1. The conclusion was right and the mechanism was wrong, which
+sends whoever meets the 500 to a door that is shut. The open one is below both registration APIs:
+`Storage::put_client` and `Storage::compare_and_swap_client` take a `Client` as given, so a host
+that provisions by writing rows puts a `redirect_uris` entry into circulation that no validator in
+this crate ever saw. `tests/authorization_code.rs` now pins that asymmetry, so the corrected
+sentence cannot drift back.
+
+### Fixed: RFC 7591 registration parsed a stranger's JSON before it asked the throttle
+
+`POST {registration_endpoint}` ran `serde_json::from_slice` over up to `MAX_BODY_BYTES` (64 KiB)
+and only then reached `register_dynamic_client`, where `Attempt::ClientRegistration` is consulted.
+An anonymous caller therefore set the rate at which this server parsed 64 KiB documents, which is
+the shape the comment beside `MAX_FORM_PARAMETERS` argues against: a refusal is work an attacker
+sets the rate of. This is the residual of the class the RFC 7592 `PUT` handler fixed one function
+down — that handler authenticates first, and RFC 7591 s3.1 registration may be ANONYMOUS, so there
+is no credential to check first here. There did not need to be: the throttle is keyed on nothing at
+all, and nothing stopped it being asked first.
+
+The HTTP handler now asks it before the parse. The refusal is byte-for-byte the one a throttled
+registration already got (`401` with `WWW-Authenticate: Bearer` and no body), so no caller can
+learn from the wire whether its document parsed, and a deployment with registration disabled still
+answers `Disabled` rather than spending budget on an endpoint it does not serve.
+
+The throttle is asked exactly ONCE per request, which is the difference from how the RFC 7592 `PUT`
+handler is arranged: that plane's budget is per-`client_id` at 6000 a window and can afford a
+second check, while this one is GLOBAL at 60, where a second charge would silently halve a host's
+configured ceiling. `register_dynamic_client` is internally two halves to make that possible.
+
+What a host feels: nothing, unless it had installed a `RateLimiter` that denies
+`Attempt::ClientRegistration`, in which case a throttled registration is now refused without its
+body being read. `AuthorizationServer::register_dynamic_client` is unchanged for a host calling it
+directly — same signature, same throttle, same order.
+
+### Documented: `Storage::get_client` is handed an ATTACKER-CHOSEN identifier
+
+`ClientId::new` validates nothing (RFC 6749 section 2.2 leaves the syntax to the server, and a host
+names its own clients), so the value arriving at a host-implemented `Storage::get_client` is a
+string an unauthenticated stranger picked. The trait never said so. It does now, on `get_client`,
+naming the routes it arrives from and — for the RFC 7592 management route, whose segment is
+percent-decoded — the exact shapes that decode produces: `%2F` becomes a real `/`, `%2E%2E` becomes
+`..`, `%00` becomes a NUL, and invalid UTF-8 becomes U+FFFD, because the decode is lossy.
+
+Nothing is refused, and that is the decision rather than an omission. Routing is settled on the RAW
+path before any decoding, so no request can reach an endpoint mounted under the registration
+endpoint. A host whose client ids are HTTPS URLs has a `/` in every one of them, so refusing the
+character would break a legitimate naming scheme. And it is not a shape unique to that route: the
+authorization and token endpoints hand the same seam an arbitrary unauthenticated string, so
+validating the RFC 7592 segment alone would close nothing while suggesting to a host that something
+had been closed. `crates/oauth-as/tests/storage_client_id_contract.rs` pins all of it, that last
+point included.
+
+A store using the id as an opaque key — a `HashMap`, a parameterised query, a key-value `GET`, so
+both `MemoryStorage` and `oauth-as-postgres` — is unaffected. A store that interpolates it into a
+filesystem path, an object key, an LDAP filter or SQL text must encode or reject it itself;
+answering `Ok(None)` for an id its own scheme could not have minted is always safe.
+
+### Documented: the RFC 7591/7592 plane is not cancellation safe either, and one drop is unrecoverable
+
+`AuthorizationServer::token` and `AuthorizationServer::revoke` carry a stated cancellation
+contract; `register_dynamic_client`, `update_registration` and `delete_registration` carried
+nothing, in the release that finally took this plane seriously enough to throttle it. They now
+carry one, and the cost is not the same as the token plane's.
+
+The sharp one is `update_registration`. When an update moves a client to an auth method that needs
+a secret it MINTS one, writes the hash through `compare_and_swap_client`, and returns the secret
+itself only at the end of the function. A future dropped after that swap resolves leaves the store
+holding a verifier for a string that exists nowhere — and the client's retry cannot repair it,
+because the stored registration is now confidential, so the second pass takes the arm that KEEPS
+the existing verifier rather than minting again. That arm is right for what it was written for (a
+metadata edit must not log a client out) and nothing on the wire tells the two cases apart. The
+only way out is RFC 7592 section 2.3: the registration access token is never rotated by an update,
+so the client can delete and register afresh. `register_dynamic_client` has the same shape at
+`put_client`, where a drop strands a permanent row whose registration access token — and, for a
+confidential registration, whose client secret — is gone with the frame, leaving a client nobody
+can authenticate as and section 2.3 cannot delete. `delete_registration` is the cheap one: nothing
+is left half-written, and what a drop costs is the audit event, plus a retry that reads to an
+operator like a guess at a registration access token.
+
+Reversing the order — returning a credential before the write — was considered and rejected: it
+hands a client a live-looking secret for a write that a concurrent section 2.3 delete is entitled
+to refuse, which is what the compare-and-swap exists to allow.
+
+What a host feels: nothing changes in the code. A host on the `axum` adapter was already covered,
+because that adapter spawns per request inside a single `fallback`. A host that mounts
+`AuthorizationService::handle` itself, or calls these methods directly, must drive them from a task
+the connection cannot cancel — spawn, and await the join handle.
+
+The `axum` adapter's own note on what detaching costs has been corrected in the same pass. It
+claimed a handler "does a bounded number of store calls with no unbounded waits of its own"; the
+number is bounded but the LATENCY is the host's — `Storage` has no timeout anywhere in this crate,
+the token path awaits an `Es256Signer` that may be a KMS round trip, and `SecretVerifier::verify`
+occupies an executor thread for its KDF. The remedy that paragraph already named (a concurrency
+limit in front of the service) is the one that holds.
+
+## [0.9.1] - 2026-08-13
 
 **0.9.1 is the BETA.** 0.9.0 was an alpha published so it could be built against; this is the
 release meant to be tested in earnest, and it exists because that alpha was audited hard the day it

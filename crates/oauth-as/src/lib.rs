@@ -60,10 +60,24 @@
 //! - `jwt` (RFC 9068 `at+jwt` access tokens and an RFC 7517 JWKS document), `dpop` (RFC 9449
 //!   sender-constrained tokens), `mtls` (RFC 8705 certificate-bound tokens and client
 //!   authentication), `client-assertion` (RFC 7523 `private_key_jwt` and `client_secret_jwt`).
+//! - `jwt-p256`, THE BUILT-IN ES256 BACKEND, and the one to reach for first: `jwt` compiles the
+//!   RFC 7515 machinery and the [`jwt::Es256Signer`] / [`jwt::Es256Verifier`] seams but SIGNS
+//!   NOTHING BY ITSELF, because where a private key lives is the host's decision (see the
+//!   [`jwt`] module docs). `jwt-p256` supplies [`jwt::EcdsaP256Key`] and installs
+//!   [`jwt::P256Verifier`] as the default, which is what a host with no opinion about its key
+//!   wants; a host with an HSM or a KMS installs its own signer instead and takes no `p256`.
+//!   The features are ADDITIVE rather than exclusive, so both at once compiles and the installed
+//!   signer wins. `jwt-pkcs8` adds PKCS#8 DER loading on top of `jwt-p256`, for a host whose key
+//!   arrives as the DER its KMS or `openssl` already emits rather than as a raw scalar.
 //! - `par` and `jar` (RFC 9126 pushed authorization requests, RFC 9101 signed request objects),
 //!   `rar` (RFC 9396 `authorization_details`), `token-exchange` (RFC 8693), `consent` (consent
 //!   records, withdrawal with a revocation cascade, and RFC 9470 step-up authentication),
 //!   `resource-metadata` (RFC 9728).
+//! - `cimd` (draft-ietf-oauth-client-id-metadata-document-01 client identifier metadata
+//!   documents),
+//!   which is VALIDATION ONLY: the HOST fetches the document at the client identifier URL and
+//!   hands this crate the bytes, because this crate makes no outbound HTTP request. See [`cimd`]
+//!   for the full list of what that leaves with the host.
 //! - `test-util`, a RUNNABLE conformance harness for the [`store::Storage`] contract that a host
 //!   runs from its own test suite against its OWN store.
 //!
@@ -208,6 +222,9 @@ let service = ServiceBuilder::new(server)
 // docs.rs reader which feature each one needs, and they say it on the module page too, which a
 // sentence written here never did.
 pub mod authorization;
+#[cfg(feature = "cimd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cimd")))]
+pub mod cimd;
 pub mod client;
 #[cfg(feature = "client-assertion")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-assertion")))]
@@ -284,6 +301,12 @@ pub use authorization::{
     AuthorizationCodeRecord, AuthorizationCodeState, AuthorizationError,
     AuthorizationErrorRedirect, AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod,
     ResponseType, ValidatedAuthorizationRequest,
+};
+#[cfg(feature = "cimd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cimd")))]
+pub use cimd::{
+    CimdError, CimdPolicy, ClientIdUrl, ValidatedClientIdDocument, MAX_CLIENT_ID_DOCUMENT_BYTES,
+    MAX_CLIENT_ID_URL_BYTES,
 };
 pub use client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash, SecretVerifier};
 #[cfg(feature = "client-assertion")]
@@ -386,8 +409,9 @@ pub use scope::{Scope, ScopeSet};
 // it to tell "unknown code" from "too many attempts", and having to reach into `server::` for the
 // error type of a re-exported method was an oversight rather than a decision.
 pub use server::{
-    AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ServerConfig, SystemClock,
-    TokenRequest, TokenRequestContext, UserApproval, MAX_RESOURCE_INDICATORS, MIN_USER_CODE_LENGTH,
+    AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ResourceServerRegistration,
+    ServerConfig, SystemClock, TokenRequest, TokenRequestContext, UserApproval,
+    MAX_RESOURCE_INDICATORS, MIN_USER_CODE_LENGTH,
 };
 // `RevocationBarrier` and `WriteOutcome` are here for the reason the comment above gives: a
 // re-export narrower than its item is an absence rather than an error. A host implementing

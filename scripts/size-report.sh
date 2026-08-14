@@ -6,8 +6,8 @@
 #
 # Run it:
 #   scripts/size-report.sh                 the whole table
-#   scripts/size-report.sh --check         the same, and FAIL if a row is over budget
-#   scripts/size-report.sh --selftest      prove --check can go RED, by forcing a budget to 1 byte
+#   scripts/size-report.sh --check         the same, and FAIL if a row is outside its band
+#   scripts/size-report.sh --selftest      prove --check can go RED, on both ends of the band
 #   scripts/size-report.sh --rows a,b,c    just those rows (names from the table below)
 #   scripts/size-report.sh --tsv           machine readable, one row per line
 #
@@ -52,11 +52,17 @@
 #     and it is exactly what the `(host has deps)` rows are for.
 #
 # AND THE ONE THING NO ROW SHOWS: `AuthorizationServer<S, C>` is monomorphized per (Storage,
-# Clock) pair. MEASURED, 2026-08-09, on the default surface: a SECOND instantiation costs 53,548
-# bytes, which is 27% of the whole default row again. One pair is the normal case and every row
-# here is one pair; a host that instantiates several pays roughly this per extra pair. That is
-# the price of the storage seam being allocation-free and devirtualized, and the root Cargo.toml
-# records the trade. It is written here because a trade with no number attached is not a trade.
+# Clock) pair. MEASURED, 2026-08-09, on the default surface: a SECOND instantiation cost 53,548
+# bytes. One pair is the normal case and every row here is one pair; a host that instantiates
+# several pays roughly this per extra pair. That is the price of the storage seam being
+# allocation-free and devirtualized, and the root Cargo.toml records the trade. It is written here
+# because a trade with no number attached is not a trade.
+#
+# THAT FIGURE IS THE ONE NUMBER IN THIS FILE NOT FROM THE 2026-08-13 RUN. It predates both
+# --remap-path-prefix and the `ScopeSet` change, and there is no row here that reproduces it: it
+# was taken by hand with a probe modified to instantiate a second pair. Since the change it
+# predates made the default surface SMALLER, treat 53,548 as an upper bound rather than a current
+# reading, and re-take it by hand before quoting it as anything tighter.
 #
 # The profile is scripts/size-probe/Cargo.toml's `[profile.release]` and its reasoning is written
 # down there. It is deliberately NOT this repository's root `[profile.release]`: cargo profiles are
@@ -65,7 +71,14 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `pwd -P`, the PHYSICAL path, and it is load bearing rather than tidy. rustc emits absolute paths
+# canonicalized through symlinks, so a repository reached through one -- which on macOS is every
+# checkout under /tmp, since /tmp is a symlink to /private/tmp -- yields a logical `$PWD` that does
+# NOT prefix-match what rustc embedded, and the --remap-path-prefix below silently matches nothing.
+# MEASURED 2026-08-13: the same tree built from `/tmp/x` linked `/private/tmp/x/crates/oauth-as/
+# src/store.rs` while the remap was written for `/tmp/x`, and the row came out 12 bytes off its
+# twin. A remap that quietly fails is worse than no remap, because the number still looks stable.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 PROBE_DIR="$REPO_ROOT/scripts/size-probe"
 # Per-configuration target directories, under one root, so that a second run is cached and so that
 # two configurations can never overwrite each other's binary (which they would in one directory,
@@ -75,7 +88,7 @@ TARGET_ROOT="${SIZE_REPORT_TARGET_ROOT:-$REPO_ROOT/target/size-report}"
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
 # Every oauth-as feature, mirrored in the probe as `f-<name>`. --all-features is this list.
-ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client-assertion,f-consent,f-token-exchange,f-resource-metadata,f-test-util"
+ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client-assertion,f-consent,f-token-exchange,f-resource-metadata,f-cimd,f-test-util"
 
 # ---------------------------------------------------------------------------------------------
 # THE ROWS.
@@ -109,6 +122,7 @@ ROWS=(
   "consent|f-consent||consent records, withdrawal cascade and RFC 9470 step-up"
   "token-exchange|f-token-exchange||RFC 8693 token exchange"
   "resource-metadata|f-resource-metadata||the RFC 9728 document type"
+  "cimd|f-cimd||the client identifier metadata document VALIDATOR; there is no fetch to measure"
   "test-util|f-test-util||the Storage conformance harness, RUN, not merely constructed"
   "http,jwt|f-http,f-jwt||the conformance server's own feature set"
   "axum,jwt|f-axum,f-jwt||a host that wants a mountable Router and signed tokens"
@@ -131,137 +145,217 @@ ROWS=(
 # measured on, and `--check` REFUSES on any other platform rather than passing vacuously against
 # numbers that do not describe it. The CI job runs on the platform these were taken on.
 #
-# Every number is the measured value at 0.9.0 plus a headroom allowance. The allowance is 5% or
-# 4 KB, whichever is larger, rounded up to the nearest KB: enough that an innocuous refactor or a
-# compiler upgrade does not go red for nothing, tight enough that a whole new subsystem cannot
-# arrive unnoticed. The measured figures the budgets were set from are in the table this script
-# prints, and are quoted in README.md's Cost section with the same caveats.
+# EVERY NUMBER BELOW WAS RE-DERIVED 2026-08-13 FOR 0.9.2, from one run of this script, and the
+# rule that produced them is uniform: the measured value plus 1.5%, rounded UP to the next whole
+# KiB. That lands every row between 1.51% and 1.92% of headroom. It replaces the old "5% or 4 KB,
+# whichever is larger" allowance, which produced margins that ranged from 4 KiB down to SEVEN BYTES
+# on the `default` row once that row had been raised by hand and then measured again. Seven bytes
+# is not headroom, it is a coincidence, and it is what put CI red at 0.9.1.
+#
+# The allowance is a band and not a per-row negotiation on purpose: a row with more slack than its
+# neighbours is a row that has quietly stopped gating. 1.5% of the smallest gated row is about
+# 3.9 KB, which absorbs an innocuous refactor or a compiler patch bump, and is far short of any new
+# subsystem -- the smallest optional feature in the table, `mtls`, is 5.6 KB all by itself.
+#
+# WHY THEY ALL MOVED AT ONCE, and why the previous numbers could not simply be kept:
+#
+#   1. `--remap-path-prefix` (see measure(), below) landed in this release. Before it, the byte
+#      count included the length of the directory the repository was checked out into -- MEASURED,
+#      240 bytes between two paths on this machine. Every budget recorded before it was taken in an
+#      unknown, unrecorded amount of path. Comparisons in the notes below to any pre-0.9.2 figure
+#      are therefore good to a couple of hundred bytes and no better, and are marked where it
+#      matters.
+#   2. `ScopeSet` became a sorted `Vec` instead of a `BTreeSet`, which took 13,463 bytes off the
+#      `default` row and more off others.
+#
+# Both of those make every row SMALLER, so every budget here comes DOWN. That direction is not
+# optional: a budget left at a number the code no longer approaches has stopped being a gate on
+# that row at all, and would silently permit back exactly the bytes that were just removed.
+#
+# The measured figures these were set from are in the table this script prints, and are quoted in
+# README.md's Cost section from the same run.
 budget_for() {
   case "$HOST_TRIPLE:$1" in
-    # ALL SIX MEASURED 2026-08-09 on aarch64-apple-darwin, rustc 1.97.0, by this script.
+    # ALL SEVEN MEASURED 2026-08-13 for 0.9.2, on aarch64-apple-darwin, rustc 1.97.0, by this
+    # script, in ONE run, with --remap-path-prefix in force. Each budget is that measurement plus
+    # 1.5% rounded up to the next KiB. The measured value is written beside every one of them, so a
+    # later reader can tell headroom from history without re-running anything.
     #
-    # the protocol core, every grant driven end to end. Measured 221,945 bytes at 0.9.1,
-    # RE-MEASURED from 199,953 at 0.9.0. The +21,992 is the RESURRECTION RULE and it is
-    # unconditional because revocation is: a `RevocationBarrier`, the predicate every write
-    # consults, four new `Storage` methods, `AuthorizationCodeState::Replayed` with its serde arms,
-    # and the undo path issuance needs when a revocation lands between its two writes.
+    # the protocol core, every grant driven end to end. MEASURED 221,026, against the 234,489 this
+    # row was set from at 0.9.1: it LOST 13,463 bytes.
     #
-    # RAISED DELIBERATELY, which this file's own rule permits only when the growth buys something
-    # and the reason is written next to the number. What it buys: in 0.9.0 a detected refresh-token
-    # reuse or authorization-code replay could be raced by an issuance already in flight across the
-    # ES256 signing await, so the AS revoked a family and the token it was containing stayed live.
-    # That was a HIGH severity known defect shipped in the published alpha, open under any remote
-    # signer, and closing it is the entire reason 0.9.1 exists. 21.5 KiB is what a revocation that
-    # cannot be undone costs.
+    # WHAT REMOVED THEM: `ScopeSet` stopped being a `BTreeSet<Scope>` and became a sorted `Vec`.
+    # The set holds one to five short words, which is a size at which a B-tree's leaf node and its
+    # descent code cost more than a linear scan over a slice, in both bytes and time. The invariant
+    # (sorted, deduplicated) is unchanged, so nothing about the type's contract moved. That commit
+    # measured 15,394 bytes off this row on its own; the net here is 13,463 because 0.9.2's own
+    # additions to the core spent some of it back. -13,463 is the figure to hold the release to.
     #
-    # THE CHANGE WAS FIXED FIRST, before the number moved: the barrier collection was a `HashMap`
-    # keyed by a compound enum while every read of it is a linear scan over three scopes at once,
-    # so the map bought nothing and cost a hashbrown instantiation. Making it a `Vec` took 2,204
-    # bytes off this row and put the `http` row back under its budget without touching that one.
+    # THE BUDGET COMES DOWN WITH IT, from 238,592 to 225,280. That is this file's own rule and it
+    # is the whole reason the rule exists: 238,592 against a 221,026 row would be 17 KB of licence
+    # to put the B-tree back, or anything else of that size, without a single gate going red.
     #
-    # RE-MEASURED 2026-08-13 at 0.9.1 FINAL: 234,489. The figures above (221,945 / 199,953) were
-    # taken mid-release and are superseded; the honest before-and-after is 209,376 at the rebuilt
-    # v0.9.0 tag against 234,489 now, so the resurrection rule cost this row 25,113 bytes.
+    # WHAT IS NO LONGER TRUE, since three sets of notes accumulated on this row across 0.9.1 and
+    # are superseded wholesale: the 221,945 / 199,953 / 209,376 / 234,496 figures, the "seven bytes
+    # of margin" that this row once passed by, and the stopgap ~4 KiB that was carried here while
+    # --remap-path-prefix was still 0.9.2 work. The remap is now in measure() and the path variance
+    # it was carrying is gone, so the margin is the ordinary 1.5% band and nothing special.
     #
-    # RAISED 2026-08-13, from 234,496, and NOT because the code grew.
-    #
-    # It was left at 234,496 earlier the same day on the argument that a passing row does not get
-    # its number moved. It passed by SEVEN BYTES. It then went RED on CI, on macos-26-arm64 — the
-    # same aarch64-apple-darwin triple — at 234,656, over by 161.
-    #
-    # THE MEASUREMENT IS NOT PATH INDEPENDENT, WHICH IS THE REAL DEFECT. The probe links panic
-    # `Location` strings, and they are ABSOLUTE, because oauth-as is an out-of-workspace path
-    # dependency of the probe. So the byte count includes the length of the checkout directory.
-    # Measured, same tree and same toolchain, only the directory differing: 218,989 from `/tmp/oa`
-    # against 219,229 from a 73-character worktree. 240 bytes of pure path length. A GitHub runner
-    # checks out at `/Users/runner/work/oauth-as/oauth-as`, which is longer than a typical local
-    # path, and that is the 161 bytes.
-    #
-    # A gate whose verdict depends on where the repository happens to sit is not a gate. Seven
-    # bytes of margin could never survive it, and leaving it there was the wrong call: the row was
-    # not passing on its merits, it was passing on this machine.
-    #
-    # THE NUMBER IS THE STOPGAP. THE FIX IS `--remap-path-prefix` in the probe profile, so the
-    # embedded paths are constant and the measurement is reproducible anywhere. That is 0.9.2 work
-    # because it changes every row at once and every budget has to be re-taken with it. Until then
-    # this row carries ~4 KiB, which is the same order as every other row here and enough to
-    # absorb the path-length variance rather than be decided by it.
-    aarch64-apple-darwin:default) echo 238592 ;;
-    # + the HTTP service with a request dispatched to every route. Measured 397,429. Roughly
-    # doubling the core is what a wire surface costs: a router, a form and query parser, a body
-    # reader, and one response serializer per endpoint.
-    # RAISED 2026-08-13 at 0.9.1 FINAL, from 417,792. Measured 438,009, over by 20,217.
-    #
-    # WHAT BOUGHT IT, attributed rather than asserted. The v0.9.0 tag was rebuilt in a worktree on
-    # this machine and toolchain and measured with its OWN probe: `http` was 404,943 there, so this
-    # row grew 33,066 bytes across the release. The `default` row grew 25,113 over the same span,
-    # which is the resurrection rule and is unconditional. So 25,113 of this row's growth is the
-    # core arriving, and roughly 8,000 is the HTTP surface's own: per-request `tokio::spawn`, the
-    # build-time route normalisation that made matching byte-exact on the raw wire path, the two
-    # new `ApprovalRequest` fields, and the RAR refusal sites.
-    #
-    # CAVEAT ON THE COMPARISON, because it changes what the number means: each tree was measured
-    # with its own `scripts/size-probe`, and 0.9.1's probe exercises more surface than 0.9.0's did.
-    # Some of the growth is therefore the probe reaching code that was always there. The bytes are
-    # real for a host that reaches the same code; they are not all NEW code.
-    aarch64-apple-darwin:http) echo 442368 ;;
+    # WHAT IS STILL TRUE and is the reason this row is as large as it is: the RESURRECTION RULE
+    # from 0.9.1. A `RevocationBarrier`, the predicate every write consults, four `Storage` methods
+    # and the undo path issuance needs when a revocation lands between its two writes. That was
+    # measured at 25,113 bytes when it landed and none of it has been given back; it is what stops
+    # a contained token staying live because an issuance was already in flight across a signing
+    # await.
+    aarch64-apple-darwin:default) echo 225280 ;;
+    # + the HTTP service with a request dispatched to every route. MEASURED 423,691, against the
+    # 438,009 this row was set from at 0.9.1: down 14,318. The `default` row underneath it accounts
+    # for 13,463 of that; the remaining 855 is this surface's own, and is small enough that it is
+    # not worth an attribution beyond "the same change, seen through more call sites". Roughly
+    # doubling the core is still what a wire surface costs: a router, a form and query parser, a
+    # body reader, and one response serializer per endpoint.
+    # Budget down from 442,368 to 430,080.
+    aarch64-apple-darwin:http) echo 430080 ;;
     # + the Router adapter AND a tokio multi-thread runtime with a bound listener, because that is
-    # what a host turns this feature on to do. Measured 614,661; the 212 KiB over the `http` row is
-    # almost entirely the runtime, which is the host's cost and not this crate's.
-    # RAISED 2026-08-13 at 0.9.1 FINAL, from 646,144. Measured 677,639, over by 31,495. Against the
-    # rebuilt v0.9.0 (623,963) this row grew 53,676: the 25,113 of core, the ~8,000 of HTTP surface
-    # accounted for on that row, and the balance is the axum adapter compiled against both.
-    aarch64-apple-darwin:axum) echo 681984 ;;
-    # + RFC 9068 signing over a HOST-SUPPLIED `Es256Signer`, the RFC 7517 JWKS, and the JWK
-    # parsing the verification seam rests on. NO curve implementation: this is what a host with
-    # its key in a KMS pays. Measured 244,013, RE-MEASURED 2026-08-09 when the seam split `jwt`
-    # from `jwt-p256`; the row was 274,254 when `jwt` implied p256, so the split took 29.5 KiB off
-    # a host that brings its own backend. The budget comes DOWN with the measurement, because a
-    # budget left at the old number would stop being a gate on this row at all.
-    # RE-MEASURED 2026-08-10 at 0.9.1: 256,491, up 12,478 from 244,013. The rise is the default
-    # row's rise minus what this row already carried, which is the same resurrection rule seen
-    # through a feature that adds signing on top of it.
-    aarch64-apple-darwin:"jwt (seam only)") echo 271360 ;;
+    # what a host turns this feature on to do. MEASURED 662,357, down 15,282 from the 677,639 this
+    # row was set from. The 233 KiB over the `http` row is almost entirely the runtime, which is
+    # the host's cost and not this crate's.
+    # Budget down from 681,984 to 672,768.
+    aarch64-apple-darwin:axum) echo 672768 ;;
+    # + RFC 9068 signing over a HOST-SUPPLIED `Es256Signer`, the RFC 7517 JWKS, and the JWK parsing
+    # the verification seam rests on. NO curve implementation: this is what a host with its key in
+    # a KMS pays. MEASURED 256,106, essentially where it was at 0.9.1 (256,491, down 385) -- and
+    # that near-standstill is the interesting part rather than a null result. This row took the
+    # same 13 KB of `ScopeSet` saving as every other, and gave it back to 0.9.2's own additions on
+    # the signing path. The row is flat; the code underneath it is not.
+    # Budget down from 271,360 to 260,096. The old number was 15 KB above the measurement, which is
+    # more slack than this row has ever needed.
+    aarch64-apple-darwin:"jwt (seam only)") echo 260096 ;;
     # + the built-in p256 backend, which is what every consumer of `jwt` had before the seam.
-    # Measured 274,725 against the pre-seam `jwt` row's 274,254: the seam costs a host that keeps
-    # the built-in backend 471 bytes, which is the `Arc<dyn Es256Signer>` vtable and the boxed
-    # future's shim. It does NOT include PKCS#8 key loading, which is a separate `jwt-pkcs8`
-    # feature and, measured, a separate 30,536 bytes paid only by a host that calls the two
-    # constructors behind it.
-    # RE-MEASURED 2026-08-10 at 0.9.1: 291,669, up 16,944 from 274,725. Same cause as the two rows
-    # above; the p256 backend itself did not move.
-    aarch64-apple-darwin:jwt-p256) echo 308224 ;;
-    # the conformance server's own feature set. Measured 440,476, down from 461,974 before the
-    # signing seam: `http,jwt` is now the HTTP surface plus the seam, with no curve.
-    # RAISED 2026-08-13 at 0.9.1 FINAL, from 462,848. Measured 472,520, over by 9,672. Against the
-    # rebuilt v0.9.0 (440,287) it grew 32,233, which is the core's 25,113 plus the HTTP surface's
-    # own. The signing seam did not move: the `jwt` and `jwt-p256` rows both still PASS, and were
-    # deliberately not raised.
-    aarch64-apple-darwin:"http,jwt") echo 476160 ;;
-    # every feature, every one exercised. Measured 1,170,306, RE-MEASURED 2026-08-09 for the
-    # signing seam. It was 1,165,636: the +4,670 is the seam itself (two traits, the object-safe
-    # bridge, the verifier indirection at three call sites) plus the `signer_conformance` harness,
-    # which `test-util` now carries alongside the `Storage` one. This is the ceiling on what this
-    # crate can cost anyone, and it is the row a new subsystem shows up in first.
-    # RAISED 2026-08-13 at 0.9.1 FINAL, from 1,229,824. Measured 1,372,273, over by 142,449 — by far
-    # the largest overrun in the table, and the one that had to be attributed before it was allowed.
+    # MEASURED 292,418, UP 749 from 291,669 at 0.9.1 -- the only gated row in the table that grew
+    # across this release. 749 bytes is the seam's own overhead moving slightly and not a subsystem
+    # arriving; the p256 backend itself did not change. The backend costs 36,312 bytes over the
+    # seam-only row, which is the number a host deciding whether to bring its own ES256 signer
+    # actually wants.
+    # Budget down from 308,224 to 296,960, because 308,224 was 5.4% above a row that moved by 749
+    # bytes all release.
+    aarch64-apple-darwin:jwt-p256) echo 296960 ;;
+    # the conformance server's own feature set: the HTTP surface plus the signing seam, with no
+    # curve. MEASURED 458,484, down 14,036 from the 472,520 this row was set from, for the same
+    # reason as `http`.
+    # Budget down from 476,160 to 465,920.
+    aarch64-apple-darwin:"http,jwt") echo 465920 ;;
+    # every feature, every one exercised. MEASURED 1,380,383, down 22,175 from the 1,402,558 this
+    # row was set from -- the largest absolute saving in the table, because this row links every
+    # feature's scope handling at once and `ScopeSet` is in all of them.
     #
-    # IT IS ALMOST ALL `test-util`. Against the rebuilt v0.9.0 this row grew 203,014 bytes, and the
-    # `test-util` row alone grew 121,819 of that (360,936 -> 482,755). Subtract the 25,113 of core
-    # every row took and `test-util` is 96,706 bytes bigger on its own account. That is the
-    # `Storage` conformance harness gaining twenty-seven checks, each with a planted fault: the
-    # checks a host runs against its own store to find out whether it honours the resurrection rule.
-    # The remaining ~81,000 is spread across the other thirteen features plus the cross-feature
-    # monomorphisation that only `all-features` links at all.
+    # Budget down from 1,406,976 to 1,401,856. Note what that means: the old budget was raised for
+    # `cimd` days ago and the row has since fallen 22 KB BELOW the number it was raised to. Leaving
+    # it would have left the whole `cimd` justification standing as unspent licence.
     #
-    # THIS IS THE ROW A HOST NEVER SHIPS. `test-util` is a dev-dependency feature and it is now the
-    # largest single feature in the crate, larger than the whole HTTP surface. No production binary
-    # enables it, and no other budgeted row includes it. Paying 96 KiB in a test binary to tell a
-    # stranger's store that it silently loses revocations is the trade this release exists to make.
+    # THE TWO THINGS THIS ROW IS FOR, both re-measured in the same run:
     #
-    # It is still the ceiling on what this crate can cost anyone, and still the row a new subsystem
-    # shows up in first — but read it knowing the harness dominates it.
-    aarch64-apple-darwin:all-features) echo 1378304 ;;
+    #   * IT IS DOMINATED BY `test-util`. That feature alone is 235,994 bytes over the core, larger
+    #     than the entire HTTP surface (202,665). It is a dev-dependency feature: it is the
+    #     `Storage` conformance harness a host RUNS against its own store to find out whether that
+    #     store honours the resurrection rule. No production binary enables it and no other budgeted
+    #     row includes it.
+    #   * IT IS WHERE A NEW SUBSYSTEM SHOWS UP FIRST. `cimd` is the most recent one. Standalone it
+    #     costs 90,132 bytes over the core, almost entirely serde_json's DESERIALIZER instantiated
+    #     for one more document shape -- the same shape of cost `rar` pays at 100,550. MEASURED
+    #     here by building this row with and without it: 1,644,742 against 1,614,113, so its
+    #     marginal cost in a binary that already parses JSON for something else is 30,629 bytes.
+    #     (The 24 KiB quoted for this before was taken pre-remap and pre-`ScopeSet`; 30,629 is the
+    #     figure from this run.)
+    aarch64-apple-darwin:all-features) echo 1401856 ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------
+# THE FLOORS, and why a size gate needs a MINIMUM at all.
+#
+# THE HOLE THEY CLOSE. Until these existed the only comparison in this script was
+# `[ "$delta" -gt "$budget" ]`. That makes a row that measures TOO LITTLE unconditionally green --
+# and measuring too little is not a hypothetical, it is the exact failure this whole probe was
+# built to prevent. Point 2 at the top of this file says it: under `lto = "fat"` the linker
+# deletes what nothing calls, so a row whose exerciser stops exercising collapses toward the
+# baseline and reports that the feature is nearly free. The budget then passes with room to
+# spare, `--check` prints "every gated feature set is within its recorded budget", and the number
+# it printed is a lie in the one direction the gate could not see.
+#
+# scripts/feature-mirrors.py cannot cover this. Its exerciser check is a STRING check: it looks
+# for a gated `pub fn <name>()` in exercise_features.rs and a call to it from exercise.rs. Replace
+# that function's BODY with `0` and the `#[cfg]`, the `pub fn` and the call site are all still
+# there, so it still reports "all mirrored". A byte count is the only thing that can notice, and
+# a byte count only notices if something compares it downward.
+#
+# THE RULE, and it is deliberately the budgets' own rule mirrored. A budget is the recorded
+# measurement plus 1.5% rounded UP to the next whole KiB; a floor is that same measurement minus
+# 1.5% rounded DOWN to the previous whole KiB. Same run, same date, same reasoning, one band per
+# row. That lands the floors between 1.50% and 1.78% below their measurements, which is the same
+# spread as the budgets' 1.51% to 1.92% above them, and for the same reason: a row with more slack
+# than its neighbours is a row that has quietly stopped gating, in either direction.
+#
+# A DROP IS A DECISION, exactly as a rise is. This file already insists that a budget only comes
+# down when someone writes down what removed the bytes -- the `ScopeSet` note on the `default` row
+# is that discipline in action. A floor makes the same discipline enforced instead of remembered:
+# take 13 KB off a row and the gate goes red and asks you to re-derive the band and say what did
+# it. That is a feature. The alternative is what 0.9.2 nearly shipped, where the budgets were
+# re-derived downward by hand only because somebody thought to.
+#
+# WHAT A FLOOR ON THESE ROWS DOES **NOT** CATCH, measured rather than assumed, because a gate
+# oversold is worse than no gate:
+#
+#   MEASURED 2026-08-13. `exercise_features::rar()` was replaced with a body of `0` -- the very
+#   sabotage feature-mirrors.py cannot see -- and the `all-features` row moved from 1,387,055 to
+#   1,385,187. ONE THOUSAND EIGHT HUNDRED AND SIXTY-EIGHT BYTES, 0.13% of the row. No floor can
+#   catch that, and one tight enough to try would go red on every innocuous refactor.
+#
+#   The reason is not that RAR is cheap: standalone it is 100,550 bytes over the core. It is that
+#   `all-features` links `cimd`, `consent`, `token-exchange` and the rest, which already
+#   instantiate serde_json's deserializer and the JSON machinery RAR shares -- the same effect the
+#   `cimd` note on the budget above records from the other direction (90,132 standalone, 30,629
+#   marginal). A feature's marginal cost inside the everything row is a small fraction of its
+#   standalone cost, so the everything row is the WORST place to look for one feature going quiet.
+#
+#   The floor therefore catches a ROW COLLAPSE -- an exerciser for a gated row's own surface
+#   stopping, the probe ceasing to link the crate, the instrument mis-parsing a section table --
+#   and not a single optional feature falling silent inside a row that carries fifteen others.
+#   Closing THAT hole means gating the feature's own row, where the collapse is 31% and not 0.13%.
+#   That is a decision about CI minutes (one fat-LTO link per row added, about 40 seconds each)
+#   and it is not taken here; it is written down so the next reader does not have to re-measure
+#   1,868 bytes to discover the limit for themselves.
+#
+# EVERY FLOOR BELOW COMES FROM THE SAME 2026-08-13 0.9.2 RUN AS THE BUDGET ABOVE IT, on
+# aarch64-apple-darwin, rustc 1.97.0, with --remap-path-prefix in force. The measurement is quoted
+# beside each so the band can be read without re-running anything. All seven were reproduced on a
+# second run of this script on the same machine; the reproduction cleared its floor by between
+# 3,862 bytes (`default`) and 28,207 (`all-features`), which is the margin these numbers actually
+# carry against run-to-run variation.
+floor_for() {
+  case "$HOST_TRIPLE:$1" in
+    # MEASURED 221,026, budget 225,280. 221,026 - 1.5% = 217,710, down to 212 KiB.
+    aarch64-apple-darwin:default) echo 217088 ;;
+    # MEASURED 423,691, budget 430,080. Down to 407 KiB. This row is the core plus the HTTP
+    # surface; if exercise_http::plane() stops dispatching, the row falls back to roughly the
+    # `default` row's 221 KB and this floor is 195 KB above that.
+    aarch64-apple-darwin:http) echo 416768 ;;
+    # MEASURED 662,357, budget 672,768. Down to 637 KiB.
+    aarch64-apple-darwin:axum) echo 652288 ;;
+    # MEASURED 256,106, budget 260,096. Down to 246 KiB. The tightest band in the table in
+    # absolute terms after `default`, and the row the 0.9.2 notes describe as flat: it moved 385
+    # bytes across a whole release, so 4 KB of downward slack is generous for it.
+    aarch64-apple-darwin:"jwt (seam only)") echo 251904 ;;
+    # MEASURED 292,418, budget 296,960. Down to 281 KiB. The gap to the seam-only floor is what
+    # stops the built-in p256 backend disappearing from the probe unnoticed.
+    aarch64-apple-darwin:jwt-p256) echo 287744 ;;
+    # MEASURED 458,484, budget 465,920. Down to 441 KiB.
+    aarch64-apple-darwin:"http,jwt") echo 451584 ;;
+    # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
+    # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
+    # before trusting this one to notice a single feature: it will not.
+    aarch64-apple-darwin:all-features) echo 1358848 ;;
     *) echo "" ;;
   esac
 }
@@ -279,8 +373,20 @@ budget_for_mode() {
   budget_for "$1"
 }
 
+# The same wrapper for the other end of the band. --force-floor sets a floor no real row can be
+# above, which is how the self-test proves the UNDER comparison exists -- the forced-budget proof
+# cannot say anything about it, because a row that fails a 1-byte budget passes its real floor on
+# the way past.
+floor_for_mode() {
+  if [ -n "$SELFTEST_FLOOR" ]; then
+    if [ -n "$(floor_for "$1")" ]; then printf '%s' "$SELFTEST_FLOOR"; fi
+    return
+  fi
+  floor_for "$1"
+}
+
 # The rows `--check` gates. Not every row: a gate over twenty numbers is a gate that goes red for
-# noise and gets ignored. These six are the feature sets a real consumer actually picks, and any
+# noise and gets ignored. These are the feature sets a real consumer actually picks, and any
 # regression big enough to matter shows up in at least one of them.
 # `jwt (seam only)` AND `jwt-p256` are both gated, because after the seam they are two different
 # consumers with two different costs, and a gate on only one of them would let the other drift.
@@ -328,7 +434,49 @@ measure() {
   else
     args+=(--features "$features")
   fi
-  if ! ( cd "$PROBE_DIR" && cargo "${args[@]}" >&2 ); then
+  # --remap-path-prefix, AND IT IS WHAT MAKES THIS GATE MEAN THE SAME THING TWICE.
+  #
+  # The probe links panic `Location` strings, and they are ABSOLUTE, because oauth-as is an
+  # out-of-workspace path dependency of the probe. So the byte count included the length of the
+  # directory the repository happened to be checked out into. MEASURED 2026-08-13, same tree, same
+  # toolchain, only the path differing: 218,989 bytes from `/tmp/oa` against 219,229 from a
+  # 73-character worktree. 240 bytes of pure path length.
+  #
+  # That is not an academic difference. The `default` row went RED on CI at 234,656 against a
+  # budget of 234,496 that passed locally at 234,489 -- on the SAME aarch64-apple-darwin triple.
+  # The runner checks out at /home/runner/work/oauth-as/oauth-as, which is longer than a typical
+  # local path, and the release was blocked by the name of a directory.
+  #
+  # Remapping both the repository root and CARGO_HOME collapses every such string to a constant, so
+  # the number this script prints depends on the code and the toolchain and nothing else. A gate
+  # whose verdict moves with where you cloned it is not a gate; it is a coincidence that has been
+  # passing.
+  #
+  # VERIFIED 2026-08-13 RATHER THAN ASSUMED, because a remap that silently misses looks exactly
+  # like a remap that works. The same tree (`diff -r` clean) was built from SIX directories: the
+  # 75-character worktree, `/private/tmp/x`, `/private/tmp/y` (same length, different name), a
+  # 74-character path of `q`s, and two under /Users. Five of the six gave a byte-identical
+  # `default` row of 485,377 linked. Comparing any two of the binaries, the __cstring section is
+  # now IDENTICAL: no absolute path survives anywhere in the image, which is the thing this flag
+  # was added to guarantee, and it is what took the 240-byte spread to zero.
+  #
+  # THE ONE RESIDUAL, stated because leaving it undocumented would invite the next person to
+  # rediscover it as a mystery. The sixth directory came out 8 bytes larger, and the difference is
+  # entirely in __unwind_info -- no code section, and no string, differs. The cause is that cargo
+  # derives a crate's `-C metadata` disambiguator from its absolute path, so the SYMBOL HASHES
+  # differ between checkouts, function layout follows them, and __unwind_info's page packing is
+  # quantized: it usually lands on the same size and occasionally lands 8 bytes off. It does not
+  # track path LENGTH (the 74-character path agreed with the 14-character one). 8 bytes against a
+  # smallest-row headroom of 3,990 is noise the budgets absorb without noticing; 240 bytes against
+  # the seven bytes of margin this gate once carried was not.
+  #
+  # Both prefixes are the PHYSICAL paths, for the reason written beside REPO_ROOT: rustc embeds
+  # symlink-resolved paths, so a logical prefix matches nothing and the remap fails without saying
+  # so. CARGO_HOME gets the same treatment because it is just as often a symlink into a volume.
+  local cargo_home
+  cargo_home="$(cd "${CARGO_HOME:-$HOME/.cargo}" && pwd -P)"
+  local remap="--remap-path-prefix=$REPO_ROOT=/oauth-as --remap-path-prefix=$cargo_home=/cargo"
+  if ! ( cd "$PROBE_DIR" && RUSTFLAGS="${RUSTFLAGS:-} $remap" cargo "${args[@]}" >&2 ); then
     echo "size-report: the probe failed to build for features '${features:-<none>}'." >&2
     echo "size-report: a size gate that skips a configuration it cannot build is a gate that" >&2
     echo "size-report: cannot fail, so this is fatal rather than a missing row." >&2
@@ -354,6 +502,7 @@ human() {
 MODE="table"
 ONLY=""
 SELFTEST_BUDGET=""
+SELFTEST_FLOOR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE="check" ;;
@@ -364,6 +513,8 @@ while [ $# -gt 0 ]; do
     # bytes so a green run has to go red. Not documented in --help because it is not a knob:
     # anybody who used it by hand would be turning the gate off.
     --force-budget) SELFTEST_BUDGET="$2"; shift ;;
+    # The same, for the floor: a value no real row can be above, so the UNDER arm has to fire.
+    --force-floor) SELFTEST_FLOOR="$2"; shift ;;
     -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "size-report: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -380,44 +531,106 @@ done
 # would leave `--check` printing "every gated feature set is within its recorded budget" over
 # nothing at all.
 #
-# WHAT IT PROVES, precisely: that a --check run whose budgets are impossible to meet exits 1 and
+# WHAT IT PROVES, precisely: that a --check run whose numbers are impossible to meet exits 1 and
 # names the row. That covers the whole chain -- the row set is non-empty, the probe built, the
 # instrument returned a positive byte count, the comparison happened, and the failure reaches the
 # exit status -- because a break anywhere in it produces a 0 instead.
 #
-# ONE ROW, not seven: this re-links the probe, and the proof is about the mechanism rather than
-# about any particular feature set. `default` is the cheapest and is gated in every run.
-if [ "$MODE" = "selftest" ]; then
-  echo "size-report: SELF-TEST. Re-running --check with every budget forced to 1 byte."
-  echo "size-report: the run below MUST fail. If it passes, this gate cannot go red and every"
-  echo "size-report: green it has ever produced means nothing."
+# THREE PROOFS, not one, and each answers a question the others cannot:
+#
+#   1. THE CEILING, on `default`. The original proof. Forces the budget to 1 byte.
+#   2. THE FLOOR, on `default`. Forces the floor above any real row. Proof 1 says NOTHING about
+#      this arm: a row that fails a 1-byte budget sails past its real floor on the way, so before
+#      the floors existed this self-test would have passed identically against a script with no
+#      downward comparison in it at all -- which is exactly what it did.
+#   3. THE CEILING ON A FEATURE ROW, `jwt (seam only)`. Proofs 1 and 2 both run `--rows default`,
+#      which is the `lib` row: no optional feature, no exercise_features.rs, no `--features` flag
+#      on the probe build. So they prove the shared mechanism and say nothing about whether a
+#      FEATURE row can go red -- whether the feature actually reaches the probe, whether the
+#      row's name survives the `--rows` filter with a space in it, whether budget_for()'s quoted
+#      case arms match. A feature row is where every one of those first goes wrong.
+#
+# ONE ROW PER PROOF, not seven: each re-links the probe, and the proof is about the mechanism
+# rather than about any particular feature set. `default` is the cheapest row, and
+# `jwt (seam only)` is the cheapest gated row that is a feature. The two share the `none`
+# baseline, which is measured once and cached on disk, so the third proof costs one extra link.
+#
+# A NON-ZERO EXIT IS NOT ENOUGH, and accepting one was the shape of the bug this whole release is
+# about. `--check` exits 1 for a missing budget table, an unparseable argument, a probe that will
+# not build and a row outside its band, and only the last of those proves anything about the
+# comparison. A self-test that asks only "did it fail?" is satisfied by a script that failed
+# before it measured a single byte -- it would report a healthy gate over an empty one, which is
+# precisely what it exists to rule out. So each proof asserts the SPECIFIC failure line, naming
+# the row and the end of the band it left, and treats any other red as a broken self-test.
+selftest_run() {
+  local what="$1" expect="$2" row="$3"; shift 3
+  local output rc=0
+  echo "size-report: SELF-TEST [$what]: the run below MUST fail with '$expect' on '$row'."
+  echo "size-report:   \$ ${BASH_SOURCE[0]} --check $*"
   echo
-  if "${BASH_SOURCE[0]}" --check --rows default --force-budget 1; then
-    echo >&2
-    echo "size-report: SELF-TEST FAILED: --check exited 0 against a 1 byte budget." >&2
-    echo "size-report: the gate is not comparing anything. Fix it before trusting a green." >&2
+  output="$("${BASH_SOURCE[0]}" --check "$@" 2>&1)" || rc=$?
+  printf '%s\n' "$output"
+  echo
+  if [ "$rc" = 0 ]; then
+    echo "size-report: SELF-TEST FAILED [$what]: --check exited 0 against numbers no row can" >&2
+    echo "size-report: satisfy. That arm of the gate is not comparing anything, and every green" >&2
+    echo "size-report: it has ever produced through it means nothing. Fix it before trusting one." >&2
     exit 1
   fi
+  case "$output" in
+    *"size-report: FAIL: '$row' is "*"$expect"*) ;;
+    *)
+      echo "size-report: SELF-TEST FAILED [$what]: --check exited $rc, but NOT with the" >&2
+      echo "size-report: comparison failure this proof is about ('$expect' on row '$row'). A red" >&2
+      echo "size-report: for some other reason -- a missing budget table, an argument it did not" >&2
+      echo "size-report: understand, a probe that would not build -- proves nothing about whether" >&2
+      echo "size-report: the comparison happened, and accepting one would make this self-test the" >&2
+      echo "size-report: same kind of gate it exists to rule out. Output is above." >&2
+      exit 1
+      ;;
+  esac
+  echo "size-report: [$what] went RED with the expected comparison failure, naming the row. OK."
   echo
-  echo "size-report: self-test passed: --check went RED against an impossible budget, naming the"
-  echo "size-report: row. The comparison, the measurement and the exit status all work."
+}
+
+if [ "$MODE" = "selftest" ]; then
+  echo "size-report: SELF-TEST. Three --check runs, each of which must fail."
+  echo
+  # The ceiling: 1 byte is a budget no linked row can be inside.
+  selftest_run "ceiling, lib row" "against a budget of" "default" \
+    --rows default --force-budget 1
+  # The floor: 1 GiB is a floor no row in this table is above. Deliberately not a number near a
+  # real row, so this cannot pass by coincidence if a budget is ever raised that far.
+  selftest_run "floor, lib row" "UNDER its floor of" "default" \
+    --rows default --force-floor 1073741824
+  # The ceiling again, on a row that is a FEATURE rather than the bare library.
+  selftest_run "ceiling, feature row" "against a budget of" "jwt (seam only)" \
+    --rows "jwt (seam only)" --force-budget 1
+  echo "size-report: self-test passed: --check went RED at BOTH ends of the band, and on a"
+  echo "size-report: feature row as well as the lib row. The comparisons, the measurement and"
+  echo "size-report: the exit status all work."
   exit 0
 fi
 
 if [ "$MODE" = "check" ]; then
   missing=0
+  # BOTH ENDS, because a row with a budget and no floor is a row that is gated in one direction
+  # only, which is the state this script shipped in and the state the floors exist to end. A
+  # half-recorded platform REFUSES rather than silently gating half of what it claims to.
   for row in "${GATED_ROWS[@]}"; do
-    if [ -z "$(budget_for "$row")" ]; then missing=1; fi
+    if [ -z "$(budget_for "$row")" ] || [ -z "$(floor_for "$row")" ]; then missing=1; fi
   done
   if [ "$missing" = 1 ]; then
     cat >&2 <<EOF
-size-report: no size budgets are recorded for $HOST_TRIPLE.
+size-report: no size band is recorded for $HOST_TRIPLE, for at least one gated row.
 
 Code size is a property of the target's instruction encoding, so budgets measured on one platform
 do not describe another. This gate REFUSES rather than passing against numbers that do not apply:
 a gate that cannot fail is worth nothing. Either run it on a platform with recorded budgets, or
 record a set for this one by running scripts/size-report.sh here and adding the measured figures
-to budget_for() in this file, with the date, toolchain and reasoning beside them.
+to budget_for() AND floor_for() in this file, with the date, toolchain and reasoning beside them.
+Both are required: a row with a budget and no floor is gated against growth only, and a row that
+collapses to nothing is comfortably inside any budget.
 EOF
     exit 1
   fi
@@ -465,6 +678,7 @@ for spec in "${ROWS[@]}"; do
   delta=$((total - base))
 
   budget="$(budget_for_mode "$name")"
+  floor="$(floor_for_mode "$name")"
   case "$MODE" in
     tsv)
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$features" "$base" "$total" "$delta" "$description"
@@ -481,6 +695,19 @@ for spec in "${ROWS[@]}"; do
           fi
         fi
       fi
+      # THE OTHER END OF THE BAND. Checked independently of the budget rather than as an `else`:
+      # the two are separate questions, and a --selftest that forces one must not be able to
+      # suppress the other.
+      if [ -n "$floor" ] && [ "$floor" != "0" ]; then
+        note="${note:+$note }(floor $(human "$floor") KiB)"
+        if [ "$delta" -lt "$floor" ]; then
+          note="$note UNDER"
+          if [ "$MODE" = "check" ]; then
+            echo "size-report: FAIL: '$name' is $(human "$delta") KiB, UNDER its floor of $(human "$floor") KiB ($((floor - delta)) bytes short)" >&2
+            status=1
+          fi
+        fi
+      fi
       if [ "$MODE" = "table" ]; then
         printf '%-28s %12s %12s %9s  %s\n' "$name" "$base" "$total" "$(human "$delta") KiB" "$note"
       fi
@@ -490,14 +717,24 @@ done
 
 if [ "$MODE" = "check" ]; then
   if [ "$status" = 0 ]; then
-    echo "size-report: every gated feature set is within its recorded budget."
+    echo "size-report: every gated feature set is inside its recorded band (floor and budget)."
   else
     cat >&2 <<'EOF'
 
-A budget is a DESIGN gate. The rule this project runs on, the same one tests/allocation.rs runs
-on: when a change blows a budget, the change gets fixed, not the number. If the growth is
-genuinely the cost of something worth having, raising the budget is allowed, but it is a decision
-that gets written down next to the number in scripts/size-report.sh, with what bought it.
+A band is a DESIGN gate at BOTH ends. The rule this project runs on, the same one
+tests/allocation.rs runs on: when a change leaves the band, the change gets fixed, not the number.
+
+OVER: if the growth is genuinely the cost of something worth having, raising the budget is
+allowed, but it is a decision that gets written down next to the number in scripts/size-report.sh,
+with what bought it.
+
+UNDER is not automatically good news, and it is the reason the floor exists. Ask first whether the
+row still MEASURES what it claims to: under `lto = "fat"` an exerciser that stopped exercising
+collapses the row toward its baseline, and the resulting "the feature is nearly free" is the one
+lie a budget alone cannot catch. Check scripts/size-probe/src/exercise*.rs before believing a
+saving. If the bytes really did go away, re-derive BOTH numbers for that row from a fresh run and
+write down what removed them -- a floor left under a row the code no longer approaches has stopped
+gating it just as surely as a budget left above one.
 EOF
   fi
 fi

@@ -210,22 +210,24 @@ fn a_document_omitting_the_optional_booleans_still_parses() {
 
 /// `introspection_endpoint` is advertised only where the host asked for it.
 ///
-/// RFC 7662's primary consumer is a RESOURCE SERVER, and this server has no resource-server
-/// channel: `AuthorizationServer::introspection_response_with_credential` answers
-/// `{"active":false}` to every authenticated caller that is not the token's own client. Publishing
-/// the member unconditionally therefore told every deployment's resource servers that a facility
-/// exists which cannot answer them, and this module's opening rule is that an advertised
-/// capability the server rejects is a lie the client cannot recover from.
+/// RFC 7662's primary consumer is a RESOURCE SERVER. 0.9.2 built that channel
+/// (`ServerConfig::resource_servers`), but it did NOT make this member unconditional again, and
+/// the reason is what this test pins: the channel is open only for a deployment that registered
+/// resource servers. One that registered none still answers the token's own client and nobody
+/// else, so publishing the member unconditionally would tell exactly those deployments' resource
+/// servers that a facility exists which cannot answer them. This module's opening rule is that an
+/// advertised capability the server rejects is a lie the client cannot recover from.
 ///
 /// The opt-in is `ServerConfig::introspection_endpoint`: a host that names the URL is a host that
-/// has decided to publish the endpoint. The bundled router still SERVES the path either way (a
-/// client introspecting its own token is the case that does work); it just stops promising it.
+/// has decided to publish the endpoint, and it is the only party that knows what its deployment
+/// configured. The bundled router still SERVES the path either way (a client introspecting its own
+/// token always works); it just stops promising it.
 #[test]
 fn introspection_is_advertised_only_when_the_host_named_the_endpoint() {
     assert!(
         document().get("introspection_endpoint").is_none(),
-        "RFC 7662 s2: this server answers only the token's own client, so the member is not \
-         published until a host opts in"
+        "RFC 7662 s2: a default config registers no resource servers, so this deployment answers \
+         only the token's own client and the member is not published until a host opts in"
     );
 
     let mut cfg = config();

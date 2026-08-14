@@ -945,3 +945,117 @@ fn a_poisoned_lock_is_recovered_from_rather_than_propagated() {
         "the limiter still answers after its mutex was poisoned"
     );
 }
+
+// ------------------------------------------------------- per-client_id capacity overrides
+
+/// THE RESOURCE-SERVER GATE. 0.9.2 opened RFC 7662 introspection to a resource server registered
+/// in `ServerConfig::resource_servers`, and an introspection is one client authentication charged
+/// to that resource server's `client_id`. A resource server introspects ONCE PER PROTECTED API
+/// CALL, so the 6000-a-minute default — sized for a client's own token traffic — is now the
+/// protected resource's request ceiling.
+///
+/// The guidance that follows from that is "raise the budget for the resource server", and it is
+/// only safe if it can be said about ONE registration: raising
+/// `client_authentication_capacity` globally multiplies every OTHER client's wrong-secret volume,
+/// and each wrong secret buys the host's argon2id. So the override must lift the named id and
+/// leave the rest exactly where they were.
+#[test]
+fn an_override_raises_one_client_ids_budget_and_nobody_elses() {
+    let l = limiter(
+        RateLimitConfig::default()
+            .with_client_authentication_budget(2, 0)
+            .with_client_authentication_capacity_for("resource-server", 5),
+    );
+    let now = at(&l, Duration::ZERO);
+    let rs = Attempt::ClientAuthentication {
+        client_id: "resource-server",
+    };
+    let app = Attempt::ClientAuthentication { client_id: "app" };
+
+    let mut admitted = 0;
+    while l.check_at(rs, now) == RateLimitDecision::Allow {
+        admitted += 1;
+    }
+    assert_eq!(
+        admitted, 5,
+        "the resource server gets the budget it was given"
+    );
+
+    let mut admitted = 0;
+    while l.check_at(app, now) == RateLimitDecision::Allow {
+        admitted += 1;
+    }
+    assert_eq!(
+        admitted, 2,
+        "every other client id is still on the configured capacity"
+    );
+}
+
+/// The reserve moves WITH the override. `client_authentication_failure_ceiling` is derived from
+/// the capacity at every use precisely so that a host lowering the capacity gets a reserve that
+/// moved with it; an override that raised the capacity but left the reserve frozen at the global
+/// half would hand the raised registration a failure penalty that saturates after a fraction of
+/// its budget, which is the "IT IS NOT A LOCKOUT" property read the other way round.
+#[test]
+fn an_override_moves_the_failure_reserve_with_the_capacity() {
+    let config = RateLimitConfig::default()
+        .with_client_authentication_budget(100, 9)
+        .with_client_authentication_capacity_for("resource-server", 1000);
+    assert_eq!(
+        config.client_authentication_failure_ceiling_for("resource-server"),
+        500
+    );
+    assert_eq!(config.client_authentication_failure_ceiling_for("app"), 50);
+
+    let l = limiter(config);
+    let now = at(&l, Duration::ZERO);
+    let rs = Attempt::ClientAuthentication {
+        client_id: "resource-server",
+    };
+    while client_failures(&l, "resource-server") < 500 {
+        assert_eq!(l.check_at(rs, now), RateLimitDecision::Allow);
+        l.record_at(rs, AttemptOutcome::Failed, now);
+    }
+    assert_eq!(
+        client_failures(&l, "resource-server"),
+        500,
+        "the penalty clamps at half the OVERRIDDEN capacity, not at half the global one"
+    );
+}
+
+/// An override is a statement about ONE registration, so it must not reach the SHARED overflow
+/// counter. An identifier that did not get a counter of its own — because the map is full, or
+/// because it is longer than `MAX_TRACKED_CLIENT_ID_LEN` — is charged against a budget every
+/// other untracked identifier shares, and applying a raised capacity there would raise it for the
+/// spray that filled the map. The overflow counter FAILS CLOSED and stays that way.
+#[test]
+fn an_override_never_raises_the_shared_overflow_budget() {
+    let l = limiter(
+        RateLimitConfig::default()
+            .with_max_tracked_clients(1)
+            .with_client_authentication_budget(2, 0)
+            .with_client_authentication_capacity_for("resource-server", 1000),
+    );
+    let now = at(&l, Duration::ZERO);
+    // The one tracked slot goes to the first identifier seen, so the resource server arrives to a
+    // full map and shares the overflow counter with everyone else.
+    assert_eq!(
+        l.check_at(Attempt::ClientAuthentication { client_id: "first" }, now),
+        RateLimitDecision::Allow
+    );
+    let rs = Attempt::ClientAuthentication {
+        client_id: "resource-server",
+    };
+    let mut admitted = 0;
+    while l.check_at(rs, now) == RateLimitDecision::Allow {
+        admitted += 1;
+        assert!(
+            admitted <= 8,
+            "the overflow budget is not the override's 1000"
+        );
+    }
+    assert_eq!(
+        admitted, 2,
+        "an untracked identifier is charged the SHARED capacity whatever its override says"
+    );
+}

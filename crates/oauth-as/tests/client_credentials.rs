@@ -82,6 +82,29 @@ async fn a_public_client_cannot_use_this_grant_even_if_registered_for_it() {
         .await
         .expect_err("a public client must never be able to use client_credentials");
     assert_eq!(err.error, ErrorCode::InvalidClient);
+    // AND IT SAYS NOTHING MORE. Through 0.9.1 this refusal carried the description
+    // "client_credentials requires a confidential client", while an unknown client id and a wrong
+    // secret both got a bare `invalid_client` — so the description was the one answer meaning
+    // "this id is registered, and it is public", which is the client-existence distinction the
+    // credential path collapses on purpose. The reason now goes to the audit channel; see
+    // `tests/introspection.rs` for the twin of this check and for the sink assertion.
+    assert_eq!(
+        err.error_description, None,
+        "a description here sorts registered ids from unregistered ones"
+    );
+
+    let unknown = srv
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("no-such-client"),
+            client_secret: None,
+            scope: None,
+        })
+        .await
+        .expect_err("an unregistered client_id has no grant either");
+    assert_eq!(
+        err, unknown,
+        "a registered public client and an unregistered id must be one indistinguishable answer"
+    );
 }
 
 /// A confidential client that IS authenticable but was not registered for this grant is refused

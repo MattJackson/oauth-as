@@ -62,6 +62,7 @@ mod exercise;
     feature = "f-consent",
     feature = "f-token-exchange",
     feature = "f-resource-metadata",
+    feature = "f-cimd",
     feature = "f-test-util",
 ))]
 mod exercise_features;

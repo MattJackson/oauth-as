@@ -156,13 +156,30 @@ impl ParConfig {
 
 /// The RFC 9126 section 2.2 success response body. The endpoint answers `201 Created`, which the
 /// RFC states rather than suggests; see [`PushedAuthorizationResponse::http_status`].
+/// `Debug` is HAND-WRITTEN (below) and does not print the `request_uri`. The stored RECORD has
+/// been hand-redacted since it was written, for the reason stated there -- the handle is a
+/// capability for as long as it is live (RFC 9126 section 7.1) -- and this type, which hands that
+/// same handle to the client, was left deriving until 0.9.2. The handle carries a fully validated
+/// authorization request including its redirect URI; a leaked live one is redeemable.
 #[cfg(feature = "par")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushedAuthorizationResponse {
     /// The single-use handle the client puts in its authorization request.
     pub request_uri: String,
     /// The handle's lifetime in seconds (a positive integer, per section 2.2).
     pub expires_in: u64,
+}
+
+/// Hand-written so the `request_uri` never prints. `expires_in` prints in full: a lifetime is not
+/// a credential and is the diagnostic an operator is usually after.
+#[cfg(feature = "par")]
+impl std::fmt::Debug for PushedAuthorizationResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushedAuthorizationResponse")
+            .field("request_uri", &"[redacted]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 #[cfg(feature = "par")]

@@ -2500,9 +2500,9 @@ where
         // constrains a token and which is dropped by exactly the same kind of missing column. It
         // went unchecked here for longer than `jkt` did, which is the argument for checking it: a
         // store certified clean by this harness while dropping `x5t_s256` silently unbinds every
-        // certificate-bound token it holds, and the caller that introspects (through 0.9.1, the
-        // token's own client) gets a token with no `cnf` at all, which reads as a plain bearer
-        // token rather than as an error.
+        // certificate-bound token it holds, and the caller that introspects (the token's own
+        // client, or since 0.9.2 the resource server it is addressed to) gets a token with no
+        // `cnf` at all, which reads as a plain bearer token rather than as an error.
         #[cfg(feature = "mtls")]
         report.same(c, "x5t_s256", &want.x5t_s256, &got.x5t_s256);
         // RFC 9396 section 5: what the resource owner actually approved, beyond the scope string.
@@ -3420,42 +3420,23 @@ where
         what: &str,
         results: TakeResults<T>,
     ) {
+        // COUNTING the results is the only part of this that depends on `T`. The three verdicts
+        // are arithmetic on those counts and three long strings, so they live in one non-generic
+        // function instead of being recompiled, strings and all, once per raced record type.
+        //
+        // WORTH IT HERE AND NOT EVERYWHERE, and the difference is worth stating because the
+        // opposite experiment was run and lost. This function and `race` are generic over a CLOSURE
+        // type as well as a record type, so every call site gets its own instantiation with nothing
+        // for the linker to fold, and each carries hundreds of bytes of prose. `Report::ok`,
+        // `Report::some` and `Report::same` look like the same opportunity at ~250 call sites and
+        // are NOT: outlining those cost 8,628 bytes rather than saving any. See the comment above
+        // `impl Report`.
+        //
+        // MEASURED 2026-08-13, `scripts/size-report.sh` `test-util` row, aarch64-apple-darwin,
+        // rustc 1.97.0: this and the `race` epilogue below are worth 2,940 bytes together.
         let winners = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
         let errors = results.iter().filter(|r| r.is_err()).count();
-        if winners > 1 {
-            report.fail(
-                check,
-                format!(
-                    "{winners} of {} concurrent takes each received the {what}: the operation is \
-                     not an atomic remove-and-return, so this store double-spends single-use \
-                     credentials under concurrency",
-                    results.len()
-                ),
-            );
-        } else if winners == 0 {
-            report.fail(
-                check,
-                format!(
-                    "none of {} concurrent takes received the {what}, though it was stored \
-                     beforehand: the value was lost rather than handed to exactly one caller",
-                    results.len()
-                ),
-            );
-        }
-        if errors > 0 {
-            report.fail(
-                check,
-                format!(
-                    "{errors} of {} concurrent takes failed with a StorageError. The server maps \
-                     that to server_error, so a legitimate redemption fails under ordinary \
-                     contention; a store using optimistic concurrency must retry internally \
-                     rather than surface the conflict. This is the `Storage` trait's rule that \
-                     contention is the store's to resolve, not the caller's: `Ok(None)` is how a \
-                     take says the record was not there to take, and a StorageError is not",
-                    results.len()
-                ),
-            );
-        }
+        judge_race_counts(report, check, what, winners, errors, results.len());
     }
 
     /// Build `racers` futures from `make`, all parked on one rendezvous gate, and run them
@@ -3507,31 +3488,15 @@ where
             None => JoinAll::new(futures).await,
         };
 
-        let abandoned = abandoned.load(Ordering::SeqCst);
-        if abandoned > 0 {
-            report.fail(
-                HARNESS_RACER_PANICKED,
-                format!(
-                    "{abandoned} of {n} racers never finished: the store's call panicked, or the \
-                     spawner dropped the task before it completed. Whatever the results of this \
-                     check say, a store that panics under concurrent access fails the request that \
-                     hit it, and on a host that aborts on panic it takes the process with it. The \
-                     panic message itself is on the spawner's own reporting path, not here"
-                ),
-            );
-        }
-
-        if gate.unsatisfied() {
-            report.fail(
-                HARNESS_RACE_SETUP,
-                format!(
-                    "the {n} racers never overlapped: each gave up waiting for the others, which \
-                     means they ran one after another and the atomicity results in this run prove \
-                     nothing. A `with_spawn` that runs its task to completion inline does this; \
-                     hand the futures to a real runtime instead",
-                ),
-            );
-        }
+        // Same reasoning as `judge_race`, and the same measurement: two verdicts that are functions
+        // of two numbers and a flag, reported from one place rather than from inside every
+        // `(T, M)` this is instantiated at.
+        race_setup_verdict(
+            report,
+            abandoned.load(Ordering::SeqCst),
+            n,
+            gate.unsatisfied(),
+        );
         results
     }
 
@@ -4812,6 +4777,37 @@ struct Report {
     violations: Vec<Violation>,
 }
 
+// `ok`, `some` and `same` ARE GENERIC AND ARE DELIBERATELY LEFT THAT WAY, and the repeated
+// `format!("... failed unexpectedly: {e}")` in this module's `match` arms is DELIBERATELY REPEATED.
+// Read this before "fixing" either, because both fixes were written and measured and both are
+// regressions.
+//
+// The reasoning that says to outline them sounds right. These three are called around 250 times at
+// a different `T` almost every time, and each instantiation carries its own copy of a `format!`
+// whose output does not vary with `T` in any way the reader of a violation could tell. So each was
+// rewritten to do only the `T`-dependent part (the comparison, or the match on the `Result`) and
+// hand the failure to a `#[cold] #[inline(never)]` non-generic body, with `same` taking
+// `&dyn fmt::Debug` so its formatting compiled once. Separately, the 40 identical "failed
+// unexpectedly" sites were collapsed into one shared function.
+//
+// MEASURED 2026-08-13, `scripts/size-report.sh` `test-util` row, aarch64-apple-darwin, rustc
+// 1.97.0, against a 455,289-byte baseline:
+//
+//   * outlining `ok`/`some`/`same`:                             463,917, or 8,628 bytes WORSE
+//   * one shared "failed unexpectedly", `#[inline(never)]`:     458,186, or 2,897 bytes WORSE
+//   * one shared "failed unexpectedly", left inlinable:         462,338, or 7,049 bytes WORSE
+//
+// Under this profile (`lto = "fat"`, `codegen-units = 1`, `opt-level = 3`) the formatting these
+// sites share is ALREADY being folded: the literal pieces dedupe in `__cstring`, and the failure
+// arm of a comparison that is almost never true is dead code the optimizer deletes outright.
+// Outlining replaces free dead code with ~250 live call sites that each marshal arguments across a
+// boundary the optimizer is then forbidden to erase, and, for `same`, materializes a `Debug` vtable
+// for every field type it is used on.
+//
+// `judge_race`/`race` ARE outlined, and are worth 2,940 bytes, because they are generic over a
+// CLOSURE type: a guaranteed fresh instantiation per call site with nothing for the linker to fold,
+// and hundreds of bytes of prose per copy rather than tens of bytes of argument setup. That is the
+// shape to look for. "It is generic and it formats" is not.
 impl Report {
     fn fail(&mut self, check: &'static str, detail: impl Into<String>) {
         self.violations.push(Violation {
@@ -4858,6 +4854,83 @@ impl Report {
                 format!("field {field} did not survive the round trip: stored {want:?}, read back {got:?}"),
             );
         }
+    }
+}
+
+/// The verdict on one raced `take_*`, over the COUNTS rather than over the records, so there is one
+/// copy of it however many record types get raced. See `StorageConformance::judge_race`, which is
+/// where the reasoning and the measurement are.
+///
+/// Exactly one racer may receive the value. More than one IS the double-spend; none means the value
+/// was lost, which is a different bug with the same root (a non-atomic pair of steps).
+fn judge_race_counts(
+    report: &mut Report,
+    check: &'static str,
+    what: &str,
+    winners: usize,
+    errors: usize,
+    total: usize,
+) {
+    if winners > 1 {
+        report.fail(
+            check,
+            format!(
+                "{winners} of {total} concurrent takes each received the {what}: the operation is \
+                 not an atomic remove-and-return, so this store double-spends single-use \
+                 credentials under concurrency"
+            ),
+        );
+    } else if winners == 0 {
+        report.fail(
+            check,
+            format!(
+                "none of {total} concurrent takes received the {what}, though it was stored \
+                 beforehand: the value was lost rather than handed to exactly one caller"
+            ),
+        );
+    }
+    if errors > 0 {
+        report.fail(
+            check,
+            format!(
+                "{errors} of {total} concurrent takes failed with a StorageError. The server maps \
+                 that to server_error, so a legitimate redemption fails under ordinary \
+                 contention; a store using optimistic concurrency must retry internally \
+                 rather than surface the conflict. This is the `Storage` trait's rule that \
+                 contention is the store's to resolve, not the caller's: `Ok(None)` is how a \
+                 take says the record was not there to take, and a StorageError is not"
+            ),
+        );
+    }
+}
+
+/// Whether the race was a race at all, and whether every racer came back. Both are properties of
+/// the HARNESS run rather than of any record type, so, like [`judge_race_counts`], this is compiled
+/// once instead of once per `(T, M)` that `StorageConformance::race` is instantiated at.
+fn race_setup_verdict(report: &mut Report, abandoned: usize, n: usize, gate_unsatisfied: bool) {
+    if abandoned > 0 {
+        report.fail(
+            HARNESS_RACER_PANICKED,
+            format!(
+                "{abandoned} of {n} racers never finished: the store's call panicked, or the \
+                 spawner dropped the task before it completed. Whatever the results of this \
+                 check say, a store that panics under concurrent access fails the request that \
+                 hit it, and on a host that aborts on panic it takes the process with it. The \
+                 panic message itself is on the spawner's own reporting path, not here"
+            ),
+        );
+    }
+
+    if gate_unsatisfied {
+        report.fail(
+            HARNESS_RACE_SETUP,
+            format!(
+                "the {n} racers never overlapped: each gave up waiting for the others, which \
+                 means they ran one after another and the atomicity results in this run prove \
+                 nothing. A `with_spawn` that runs its task to completion inline does this; \
+                 hand the futures to a real runtime instead"
+            ),
+        );
     }
 }
 

@@ -19,25 +19,33 @@ oauth-as = "0.9"
 
 ## Beta
 
-**0.9.1 is a beta.** 0.9.0 was an alpha, published so it could be built against and reported on;
-this is the release meant to be tested in earnest, and it exists because auditing that alpha found
-things worth fixing. It is still pre-1.0 and the API is not frozen.
+**0.9.2 is a beta.** 0.9.0 was an alpha, published so it could be built against and reported on;
+this line of releases is meant to be tested in earnest, and each of them exists because auditing
+the one before it found things worth fixing. It is still pre-1.0 and the API is not frozen.
 
-**It contains a BREAKING CHANGE to `Storage`, and one to a feature name.** A host implementing
-`Storage` itself has work to do; a host on `MemoryStorage` or `oauth-as-postgres` does not. See
-`CHANGELOG.md` for the migration, and run `oauth_as::storage_conformance` against your store,
-which now checks the new rule.
+**Nothing here breaks a 0.9.1 host.** There is no breaking section in this release: no `Storage`
+change, no renamed feature, no changed signature. A host that compiles against 0.9.1 compiles
+against this, and a store that passes `oauth_as::storage_conformance` still passes it. (Coming from
+0.9.0 is a different matter: 0.9.1's breaking `Storage` change is still in front of you, and
+`CHANGELOG.md` has that migration.)
 
-What 0.9.0 listed here as a known defect is FIXED:
+**What is new is the RFC 7662 introspection channel for a RESOURCE SERVER**, which is the caller
+that specification is written for and the one this server had no answer for through 0.9.1: a
+resource server that did what the RFC told it to do was told `{"active": false}` about every live
+token it held.
 
-- **Reuse detection can no longer be raced during token signing.** In 0.9.0, detecting a stolen
-  refresh token revoked the family, but an issuance already in flight across the `await` inside
-  ES256 signing could complete behind the revocation and leave a live access token, which was
-  effectively closed for the built-in `jwt-p256` backend and OPEN for an `Es256Signer` fronting a
-  remote KMS or HSM. The fix needed the breaking `Storage` change this release makes: a revocation
-  now records a durable barrier, and the writes that would resurrect what it removed are refused.
-  The same held for authorization code replay, and that half needed a second mechanism. The two
-  reproductions that shipped `#[ignore]`d in 0.9.0 are green and no longer ignored.
+Two things a host should know before adopting it:
+
+- **It is OFF until you configure it.** The channel opens only for clients named in the new
+  `ServerConfig::resource_servers`, which is empty by default. A deployment that sets nothing
+  answers exactly as 0.9.1 did — the token's own client and nobody else — and a resource server may
+  only read tokens whose RFC 8707 `resource` set names one of its own registered identifiers.
+- **It changes what your rate limiter sees.** A resource server authenticates once per call at the
+  protected resource it guards, not once per grant, and that traffic is charged to the same
+  per-`client_id` `Attempt::ClientAuthentication` budget a client's token requests are. Hence
+  `RateLimitConfig::with_client_authentication_capacity_for`, which gives one `client_id` its own
+  ceiling without raising anybody else's. Setting `resource_servers` without deciding this is how
+  a busy resource server throttles itself.
 
 What is still true and worth knowing before you adopt it:
 
@@ -57,7 +65,7 @@ The known-defects section of `CHANGELOG.md` has the detail, including the test n
 | Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, reuse detection revokes the family, and the revocation cannot be undone by an issuance already in flight |
 | Client credentials | RFC 6749 s4.4 | Confidential clients only, no refresh token |
 | Server metadata | RFC 8414 | Derived from config, so an advertised endpoint is one that exists |
-| Token introspection | RFC 7662 | Unknown, expired and other clients' tokens all read `{"active": false}` |
+| Token introspection | RFC 7662 | Answers the token's own client always, and the resource server it is addressed to once that server is declared in `ServerConfig::resource_servers` (empty by default, so the resource-server channel is off until configured); unknown, expired, other clients' and other resource servers' tokens all read `{"active": false}` |
 | Token revocation | RFC 7009 | Idempotent, ownership verified, no existence oracle, cascades to the grant |
 | Mix-up defence | RFC 9207 | `iss` on every authorization response, success and error |
 | Resource indicators | RFC 8707 | Narrowable audience, wired into the JWT `aud` claim |
@@ -77,6 +85,7 @@ Behind off-by-default features:
 | Rich authorization requests | RFC 9396 | `rar` |
 | Protected resource metadata | RFC 9728 | `resource-metadata` |
 | Consent records and step-up auth | RFC 9470 | `consent` |
+| Client identifier metadata documents (validation; **the host fetches**) | `draft-ietf-oauth-client-id-metadata-document-01` | `cimd` |
 | An HTTP service over all of it | | `http` |
 | An axum adapter for that service | | `axum` |
 | A `Storage` conformance harness for hosts | | `test-util` |
@@ -91,7 +100,7 @@ discovered.
 
 ## Features
 
-Fifteen features. The default set is **empty**, and stays that way.
+Sixteen features. The default set is **empty**, and stays that way.
 
 | Feature | Adds | Implies | Cost in dependencies |
 | ------- | ---- | ------- | -------------------- |
@@ -110,13 +119,14 @@ Fifteen features. The default set is **empty**, and stays that way.
 | `token-exchange` | RFC 8693 token exchange | | none |
 | `consent` | Consent records, withdrawal with a revocation cascade, RFC 9470 step-up | | none |
 | `resource-metadata` | The RFC 9728 document type, for a host that also runs a resource server | | none |
+| `cimd` | draft-ietf-oauth-client-id-metadata-document-01 client identifier metadata documents (the module docs carry a table mapping every section number it cites onto -02's renumbering). **Validation only: this crate makes no outbound HTTP request, so the host fetches the document and hands in the bytes.** See the module docs for the duties that leaves with the host | | `serde_json` |
 | `test-util` | A runnable `Storage` conformance harness for hosts to run against their own store | | none |
 
-Five of the fifteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
+Five of the sixteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
 `token-exchange`, `resource-metadata` and `test-util` are serde shapes and comparisons over what is
 already there. Three more (`client-assertion`, `dpop`, `jar`) add no crate of their own; they turn
-on `jwt`, which brings `serde_json`. The other seven each bring at least one crate: `serde_json`
-for `jwt`, `mtls` and `rar` (it is optional as of 0.9.0, so a default build no longer carries it),
+on `jwt`, which brings `serde_json`. The other eight each bring at least one crate: `serde_json`
+for `jwt`, `mtls`, `rar` and `cimd` (it is optional as of 0.9.0, so a default build no longer carries it),
 `http`/`http-body`/`bytes` for `http`, `axum` and `tokio` for `axum`, `p256` for `jwt-p256`, and
 `pkcs8` for `jwt-pkcs8`. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
 whose major has never moved, so they can appear in this crate's public signatures without making a
@@ -140,36 +150,43 @@ difference between two linked binaries, one with the crate and one without, buil
 
 | You enable | It costs | Into a host that already has serde_json, http, bytes and sha2 |
 | ---------- | -------- | ------------------------------------------------------------ |
-| *(default)* the protocol core | **229 KiB** | 216 KiB |
-| `jwt` | 263 KiB | 244 KiB |
-| `http` | 428 KiB | not measured |
-| `http` + `jwt` | 461 KiB | 389 KiB |
-| `axum` (with a tokio runtime and a bound listener) | 662 KiB | not measured |
-| everything, all fifteen features | 1340 KiB | 1259 KiB |
+| *(default)* the protocol core | **216 KiB** | 204 KiB |
+| `jwt` | 250 KiB | 233 KiB |
+| `http` | 414 KiB | not measured |
+| `http` + `jwt` | 448 KiB | 375 KiB |
+| `axum` (with a tokio runtime and a bound listener) | 647 KiB | not measured |
+| everything, all sixteen features | 1348 KiB | 1267 KiB |
 
 What each optional feature adds on top of the core:
 
 | Feature | Adds | Feature | Adds |
 | ------- | ---- | ------- | ---- |
-| `mtls` | 7 KiB | `jwt` | 34 KiB (the seam and the JWS surface: NO curve implementation) |
-| `resource-metadata` | 7 KiB | `jwt-p256` | 69 KiB (`jwt` plus the built-in backend, so 35 KiB over `jwt`) |
-| `token-exchange` | 11 KiB | `rar` | 96 KiB |
-| `par` | 19 KiB | `test-util` | 242 KiB |
-| `consent` | 33 KiB | `http` | 199 KiB |
-|  |  | `axum` | 433 KiB (234 of it over `http`, and nearly all of that is tokio) |
+| `mtls` | 6 KiB | `jwt` | 34 KiB (the seam and the JWS surface: NO curve implementation) |
+| `resource-metadata` | 6 KiB | `jwt-p256` | 70 KiB (`jwt` plus the built-in backend, so 35 KiB over `jwt`) |
+| `token-exchange` | 12 KiB | `rar` | 98 KiB |
+| `par` | 18 KiB | `test-util` | 230 KiB |
+| `consent` | 32 KiB | `http` | 198 KiB |
+| `cimd` | 88 KiB |  |  |
+|  |  | `axum` | 431 KiB (233 of it over `http`, and nearly all of that is tokio) |
 
-and on top of `jwt-p256`: `dpop` 46 KiB, `jar` 46 KiB, `client-assertion` 53 KiB, `jwt-pkcs8`
+and on top of `jwt-p256`: `dpop` 45 KiB, `jar` 46 KiB, `client-assertion` 52 KiB, `jwt-pkcs8`
 30 KiB.
 
-`test-util` is the largest single feature, and it is larger than the whole HTTP surface. That is
-the conformance harness a host runs against its own `Storage` implementation, and it grew by 94 KiB
-in 0.9.1 because it gained twenty-seven checks. It is a dev-dependency feature: nothing that ships
-to production should enable it, and no other row in this table includes it.
+`cimd`'s 88 KiB is almost entirely `serde_json`'s deserializer instantiated for one more
+document shape, which is the same cost `rar` pays at 98 KiB. In a build that already has
+another JSON-carrying feature the marginal figure is smaller: building `--all-features` with and
+without it moved that row by 30 KiB, because the parser core is already there.
 
-The `jwt` row is the one that moved: it was 64 KiB when the feature implied `p256`. A host that
-brings its own ES256 backend (a cloud KMS, an HSM, or the `ring` it already links through `rustls`)
-now pays 34 KiB and takes no second elliptic curve implementation. A host with no opinion enables
-`jwt-p256` and pays 68 KiB, which is 471 bytes more than the same host paid before the seam.
+`test-util` is the largest single feature, and it is larger than the whole HTTP surface. That is
+the conformance harness a host runs against its own `Storage` implementation, and it is that size
+because it gained twenty-seven planted-fault checks in 0.9.1. It is a dev-dependency feature:
+nothing that ships to production should enable it, and no other row in this table includes it.
+
+A host that brings its own ES256 backend (a cloud KMS, an HSM, or the `ring` it already links
+through `rustls`) pays 34 KiB for `jwt` and takes no second elliptic curve implementation. A host
+with no opinion enables `jwt-p256` and pays 70 KiB, of which 35 KiB is the built-in backend. That
+split is what the signing seam bought, and it is why both rows are gated separately in CI: they are
+two different consumers with two different costs.
 
 **Read the caveats, because they change what the numbers mean.**
 
@@ -178,32 +195,46 @@ now pays 34 KiB and takes no second elliptic curve implementation. A host with n
   instruction encoding, so an x86-64 figure is a different figure. **Nothing in this repository's
   `[profile.release]` reaches you**: cargo honors profiles only for the workspace being built, so
   you compile this crate with YOUR profile and get YOUR numbers. A build without LTO will be
-  larger, in some rows considerably.
+  larger, in some rows considerably. Every figure above is from one run on 2026-08-13 under
+  `rustc 1.97.0`.
+- **The measurement does not depend on where you cloned it.** The probe used to link absolute panic
+  `Location` strings, so the byte count included the length of the checkout directory — 240 bytes
+  of spread between two paths, which was enough to put this gate red on CI and green locally on the
+  same target. The report now builds with `--remap-path-prefix`. Verified by building the same tree
+  from six different directories: no absolute path survives in the linked image at all, and five of
+  the six agreed to the byte. The sixth was 8 bytes larger, entirely in the unwind tables, because
+  cargo derives a crate's symbol-hash disambiguator from its path and the table's packing is
+  quantized. 8 bytes is inside every budget's headroom; 240 was not.
 - **"Uses" is doing real work in that sentence.** With LTO the linker deletes whatever nothing
   calls, so a feature you switch on and never touch costs close to nothing. Every row above was
   measured with the surface actually driven: all four grants end to end, the authorization
   endpoint, introspection, revocation, dynamic registration, and for `http` a request dispatched to
   every route. `scripts/size-probe/src/` is the definition of what was exercised, per row.
 - **The rows include a host's own calling code**, because something has to call the library and
-  under fat LTO the two are inlined together and cannot be separated. About 48 KiB of the default
-  row is attributed to the probe's driver by `cargo bloat`, much of which is inlined library code.
-  Treat every row as an upper bound.
-- **`AuthorizationServer<S, C>` is monomorphized per (`Storage`, `Clock`) pair.** Measured: a
-  second instantiation of the default surface costs **53 KiB**, about 27% of the row again. One
+  under fat LTO the two are inlined together and cannot be separated. At 0.9.1 `cargo bloat`
+  attributed about 48 KiB of the default row to the probe's driver, much of which is inlined
+  library code; that attribution has not been re-taken since. Treat every row as an upper bound.
+- **`AuthorizationServer<S, C>` is monomorphized per (`Storage`, `Clock`) pair.** Measured at
+  0.9.1: a second instantiation of the default surface cost **53 KiB**. That figure predates the
+  0.9.2 change that made the default surface smaller, so treat it as an upper bound; it is the one
+  number on this page not taken from the run above, because no row in the report reproduces it. One
   pair is the normal case and every row above is one pair. That is the price of a storage seam that
   is allocation-free and devirtualized rather than a `dyn Storage` with an indirect call on every
   storage operation, and it is the trade this crate chose deliberately.
 - **Sharing helps less than the dependency list suggests.** Adding this crate to a host that
-  already links and uses serde_json, http, bytes and sha2 recovers only about 7% of the default
+  already links and uses serde_json, http, bytes and sha2 recovers only about 5% of the default
   row. serde and serde_json are generic: their machinery instantiated for your types is different
   machine code from the same machinery instantiated for ours, and only the non-generic core is
   actually shared.
 - The `.rlib` is megabytes and is **not** a cost. It is crate metadata plus generic bodies nobody
   instantiates. Do not use it to judge this or any other crate.
 
-**CI fails the build when any of `default`, `jwt`, `http`, `http,jwt`, `axum` or `--all-features`
-grows past a recorded budget**, and the budgets carry their reasoning next to them in
-`scripts/size-report.sh`. When one is blown, the design gets fixed, not the number.
+**CI fails the build when any of `default`, `jwt`, `jwt-p256`, `http`, `http,jwt`, `axum` or
+`--all-features` grows past a recorded budget**, and the budgets carry their reasoning next to them
+in `scripts/size-report.sh`. When one is blown, the design gets fixed, not the number. Every budget
+was re-derived from the run these figures come from, and each is its measurement plus 1.5% rounded
+up to the next KiB — so a budget also comes DOWN when a row does, which is the only way it stays a
+gate on that row.
 
 ### Allocations
 
@@ -258,9 +289,11 @@ row instead.
 
 The `http` row is the one to read carefully. `cargo +1.75 build -p oauth-as --locked --features
 http` does succeed, and that was re-measured for this release, but it was measured on a
-workstation: no job in `.github/workflows/qa.yml` builds `http` on 1.75. The `MSRV (1.75) build`
-job builds default, `jwt` and `jwt-p256` only, and `http` is built by the separate
-`MSRV (1.80) http feature` job. So 1.80 is the number for `http` that a stranger can verify from
+workstation: no job in `.github/workflows/qa.yml` builds `http` on 1.75. The
+`MSRV build (toolchain from rust-version)` job — named that because it reads the floor out of
+`crates/oauth-as/Cargo.toml` rather than hardcoding it, so the number in the manifest is the number
+CI installs — builds default, `jwt`, `jwt-p256` and `jwt-pkcs8` only, and `http` is built by the
+separate `MSRV (1.80) http feature` job. So 1.80 is the number for `http` that a stranger can verify from
 CI logs alone, and 1.75 is a local measurement that nothing re-checks on every push.
 
 Every MSRV job BUILDS and none of them TEST, and that is deliberate rather than an omission. An
@@ -274,11 +307,11 @@ checked at the floor, and cannot be without dragging every dev-dependency back, 
 tests".
 
 `axum` is the only feature that raises the floor, and it raises it because a dependency it pulls
-in says so, not because of anything in this crate. Of the other fourteen, five add no crate at all
+in says so, not because of anything in this crate. Of the other fifteen, five add no crate at all
 (`par`, `consent`, `token-exchange`, `resource-metadata`, `test-util`) and so add no floor, and the
 rest add only crates whose own declared floor is below this one: `serde_json` 1.71 for `jwt` (and
-so for `client-assertion`, `dpop` and `jar`, which turn it on), for `mtls` and for `rar`,
-`http` 1.57 / `http-body` 1.61 / `bytes` 1.57 for `http`, `p256` 1.65 for `jwt-p256`, and
+so for `client-assertion`, `dpop` and `jar`, which turn it on), for `mtls`, for `rar` and for
+`cimd`, `http` 1.57 / `http-body` 1.61 / `bytes` 1.57 for `http`, `p256` 1.65 for `jwt-p256`, and
 `pkcs8` 1.65 for `jwt-pkcs8`.
 
 1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower

@@ -242,6 +242,163 @@ async fn an_authenticated_management_put_still_reports_a_body_that_is_not_metada
     );
 }
 
+// ------------------------------------ RFC 7591: the throttle before the parse, on an ANONYMOUS
+// endpoint
+
+/// A limiter that refuses RFC 7591 registration and allows everything else, counting how many
+/// times it was asked so a second charge for one request cannot hide.
+struct RegistrationThrottle {
+    deny: bool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl oauth_as::RateLimiter for RegistrationThrottle {
+    fn check(&self, attempt: oauth_as::Attempt<'_>) -> oauth_as::RateLimitDecision {
+        match attempt {
+            oauth_as::Attempt::ClientRegistration => {
+                self.asked
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.deny {
+                    oauth_as::RateLimitDecision::Deny
+                } else {
+                    oauth_as::RateLimitDecision::Allow
+                }
+            }
+            _ => oauth_as::RateLimitDecision::Allow,
+        }
+    }
+
+    fn record(&self, _attempt: oauth_as::Attempt<'_>, _outcome: oauth_as::AttemptOutcome) {}
+}
+
+struct ThrottleHandle(Arc<RegistrationThrottle>);
+
+impl oauth_as::RateLimiter for ThrottleHandle {
+    fn check(&self, attempt: oauth_as::Attempt<'_>) -> oauth_as::RateLimitDecision {
+        self.0.check(attempt)
+    }
+
+    fn record(&self, attempt: oauth_as::Attempt<'_>, outcome: oauth_as::AttemptOutcome) {
+        self.0.record(attempt, outcome)
+    }
+}
+
+async fn registration_service(throttle: Arc<RegistrationThrottle>) -> Service {
+    let srv = AuthorizationServer::new(management_config(), MemoryStorage::new())
+        .with_rate_limiter(Box::new(ThrottleHandle(throttle)));
+    ServiceBuilder::new(Arc::new(srv)).build().expect("service")
+}
+
+fn register_request(body: &str) -> http::Request<Body> {
+    http::Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("a well-formed request")
+}
+
+/// RFC 7591 s3.1 registration is ANONYMOUS, so there is no credential to check before the body —
+/// but `Attempt::ClientRegistration` is not a credential, it is keyed on nothing, and it is the
+/// one gate this endpoint has. Asking it AFTER `serde_json::from_slice` lets a stranger set the
+/// rate at which this server parses up to `MAX_BODY_BYTES`.
+#[tokio::test]
+async fn a_throttled_registration_is_refused_before_its_body_is_parsed() {
+    let throttle = Arc::new(RegistrationThrottle {
+        deny: true,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = registration_service(Arc::clone(&throttle)).await;
+
+    // Not JSON, and deliberately: a parse-first handler answers about THIS, which proves it read
+    // it.
+    let response = service.handle(register_request("{ this is not json")).await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::UNAUTHORIZED,
+        "the throttle is the refusal; the body is a stranger's bytes and must not be parsed to \
+         reach it"
+    );
+}
+
+/// THE SAME REFUSAL, for a body that IS metadata, so the reordering introduces no oracle: a
+/// throttled caller cannot learn from the wire whether its document parsed.
+#[tokio::test]
+async fn a_throttled_registration_answers_the_same_for_a_body_that_is_metadata() {
+    let throttle = Arc::new(RegistrationThrottle {
+        deny: true,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = registration_service(Arc::clone(&throttle)).await;
+
+    let response = service
+        .handle(register_request(
+            r#"{"redirect_uris":["https://app.example/cb"]}"#,
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::UNAUTHORIZED,
+        "a throttled registration says the same thing whatever the body was"
+    );
+    assert!(
+        response.headers().get("www-authenticate").is_some(),
+        "and carries the same header the other refusal does"
+    );
+}
+
+/// The other side of the order, so it is a REORDERING and not a new refusal: with the throttle
+/// allowing, a body that is not metadata still earns its metadata error.
+#[tokio::test]
+async fn an_unthrottled_registration_still_reports_a_body_that_is_not_metadata() {
+    let throttle = Arc::new(RegistrationThrottle {
+        deny: false,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = registration_service(Arc::clone(&throttle)).await;
+
+    let response = service.handle(register_request("{ this is not json")).await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::BAD_REQUEST,
+        "a caller the throttle admitted is entitled to be told its document could not be read"
+    );
+    assert_eq!(
+        body_of(response)
+            .await
+            .get("error")
+            .and_then(|v| v.as_str()),
+        Some("invalid_client_metadata"),
+    );
+}
+
+/// ONE CHARGE PER REQUEST. Moving the check into the handler must not leave the one inside
+/// `register_dynamic_client` in place as well, or every HTTP registration would spend two units of
+/// a budget whose shipped default is 60 per window — halving a host's configured ceiling without
+/// saying so.
+#[tokio::test]
+async fn an_http_registration_asks_the_throttle_exactly_once() {
+    let throttle = Arc::new(RegistrationThrottle {
+        deny: false,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = registration_service(Arc::clone(&throttle)).await;
+
+    let response = service
+        .handle(register_request(
+            r#"{"redirect_uris":["https://app.example/cb"]}"#,
+        ))
+        .await;
+    // No `RegistrationPolicy` is installed, so the registration is refused on policy — after the
+    // throttle, which is the only thing being counted here.
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        throttle.asked.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one registration request is one attempt"
+    );
+}
+
 // ------------------------------------------- RFC 7592 s3: the URL this server hands the client
 
 /// `registration_client_uri` is `{registration_endpoint}/{client_id}` (RFC 7592 s3), minted here

@@ -78,7 +78,8 @@ fn main() {
 
     // --- ScopeSet::parse. RFC 6749 s3.3 puts no bound on how many scope tokens a request may
     // name, so this is unauthenticated attacker-controlled length on the authorization and token
-    // endpoints both. `ScopeSet` is a `BTreeSet`, so the expectation is n log n, which shows up
+    // endpoints both. `ScopeSet` is a SORTED `Vec` (it was a `BTreeSet` through 0.9.1), so parsing
+    // one still sorts and the expectation is n log n either way, which shows up
     // here as a slowly rising ns/element rather than a flat one; anything steeper is a finding.
     const SCOPE_SIZES: &[usize] = &[1, 10, 100, 1000];
     for &n in SCOPE_SIZES {

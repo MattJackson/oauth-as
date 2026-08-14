@@ -718,12 +718,20 @@ fn a_host_that_never_registers_anything_pays_one_pointer() {
         std::mem::size_of::<usize>(),
         "the registration record must be one pointer on Client, which every request clones"
     );
-    // Unchanged from the budget `tests/allocation.rs` pins, which is the point. The `rar` term
-    // matches the one there, for the same reason and with the same shape: RFC 9396 s10's
-    // `authorization_details_types_supported` is an `Option<Vec<String>>`, three words, and a
-    // deployment that does not enable rich authorization requests must not be made to pay for it.
+    // The same budget `tests/allocation.rs` pins, which is the point: the two must move together
+    // or one of them is not a gate. The `rar` term matches the one there, for the same reason and
+    // with the same shape: RFC 9396 s10's `authorization_details_types_supported` is an
+    // `Option<Vec<String>>`, three words, and a deployment that does not enable rich authorization
+    // requests must not be made to pay for it.
+    //
+    // `RESOURCE_SERVERS` is 0.9.2's `ServerConfig::resource_servers`, an `Option<Box<[_]>>` that
+    // bought the RFC 7662 resource-server introspection channel. Named rather than folded into the
+    // base for the same reason every other term here is named: a bare `+ 16` is a number nobody
+    // can audit. `tests/allocation.rs` carries the measurements and the argument for the shape.
+    const RESOURCE_SERVERS: usize = 16;
     assert!(
-        std::mem::size_of::<ServerConfig>() <= 448 + if cfg!(feature = "rar") { 24 } else { 0 },
+        std::mem::size_of::<ServerConfig>()
+            <= 448 + RESOURCE_SERVERS + if cfg!(feature = "rar") { 24 } else { 0 },
         "ServerConfig grew past its size budget: {}",
         std::mem::size_of::<ServerConfig>()
     );

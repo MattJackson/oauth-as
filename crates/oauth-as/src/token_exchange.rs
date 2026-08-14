@@ -128,9 +128,10 @@
 //!   OPAQUE, so introspection is the ONLY channel a resource server has. A delegation it cannot
 //!   see is a delegation the resource server has to take the host's word for, which collapses RFC
 //!   8693 section 1.1 delegation back into impersonation from the one viewpoint the distinction
-//!   exists for. Through 0.9.1 introspection answers only the token's own client, so on the opaque
-//!   route that viewpoint is not yet served; the resource-server channel is 0.9.2 work, and the
-//!   claim is persisted now because the record is the half that cannot be added later.
+//!   exists for. The claim was persisted before there was anybody to read it, because the record
+//!   is the half that cannot be added later; since 0.9.2 a resource server registered in
+//!   `ServerConfig::resource_servers` is served on the opaque route too, so that viewpoint is now
+//!   a real one rather than a promised one.
 
 use std::fmt;
 use std::str::FromStr;
@@ -688,9 +689,19 @@ async fn exchange<S: Storage, C: Clock>(
     let client = server
         .authenticate_client(request.client_id, &bound.cred)
         .await?;
+    // BARE, and the reason goes to the audit channel. The third site of one shape: see the
+    // introspection and client-credentials twins in `crate::server`. A description here was
+    // reachable by a caller presenting NO credential at all (a public registration authenticates
+    // trivially), so it was the one answer on this endpoint meaning "this client id is registered,
+    // and it is public", while `authenticate_client` returns a bare `invalid_client` for both an
+    // unknown id and a wrong secret. The `unauthorized_client` below is NOT the same exposure: it
+    // is only reachable by a caller that has already proved a confidential credential.
     if !client.auth.is_confidential() {
-        return Err(ErrorResponse::new(ErrorCode::InvalidClient)
-            .with_description("token exchange requires a confidential client"));
+        server.hooks().emit(|| Event::ClientAuthenticationFailed {
+            client_id: request.client_id.as_str(),
+            failure: crate::events::ClientAuthFailure::NotConfidential,
+        });
+        return Err(ErrorResponse::new(ErrorCode::InvalidClient));
     }
     if !client.allows_grant(GrantType::TokenExchange) {
         return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient)

@@ -625,8 +625,8 @@ impl Confirmation {
     /// token was presented over is the one the token is bound to.
     ///
     /// A resource server that has introspected a token (section 3.2 — a channel this server opens
-    /// to resource servers in 0.9.2; through 0.9.1 introspection answers only the token's own
-    /// client) or verified a JWT (section
+    /// to registered resource servers since 0.9.2; see [`crate::ServerConfig::resource_servers`])
+    /// or verified a JWT (section
     /// 3.1) calls this with the DER of the client certificate ITS OWN TLS layer verified. The two
     /// halves are equally load bearing, and this method can only do the second one: a certificate
     /// the resource server did not verify proves nothing, exactly as set out in this module's docs.

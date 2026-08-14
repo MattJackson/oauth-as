@@ -156,6 +156,21 @@ pub struct ServerConfig {
     /// parameter is answered with `request_not_supported` rather than parsed.
     #[cfg(feature = "jar")]
     pub jar: Option<Box<crate::par::JarConfig>>,
+    /// draft-ietf-oauth-client-id-metadata-document-01 client identifier metadata documents. `None`
+    /// is the DEFAULT and means the mechanism is OFF: the RFC 8414 document says
+    /// `client_id_metadata_document_supported: false`.
+    ///
+    /// SETTING IT IS A CLAIM ABOUT THE HOST, not about this crate, and that is why it is a config
+    /// field rather than a constant derived from the cargo feature. This crate performs no fetch
+    /// (see [`crate::cimd`]), so compiling the feature in proves only that the VALIDATOR is
+    /// available; whether this deployment actually dereferences a client identifier URL is
+    /// something only the host knows. Deriving the advertised member from the feature would
+    /// publish a capability the build might always refuse, which is a defect shape this crate has
+    /// already shipped twice.
+    ///
+    /// BOXED for the same reason as [`ServerConfig::registration`].
+    #[cfg(feature = "cimd")]
+    pub cimd: Option<Box<crate::cimd::CimdPolicy>>,
     /// RFC 8414 `scopes_supported`. `None` omits the member rather than claiming an empty
     /// catalogue.
     pub scopes_supported: Option<Vec<String>>,
@@ -180,6 +195,84 @@ pub struct ServerConfig {
     ///
     /// A deployment serving more than one resource server should set this.
     pub allowed_resources: Option<Box<[Box<str>]>>,
+    /// Which registered clients are RESOURCE SERVERS, and which RFC 8707 resource identifiers each
+    /// one answers for. This is what opens the channel RFC 7662 section 1 describes, in which the
+    /// specification "allows authorized protected resources to query the authorization server";
+    /// empty (the default) means this server introspects for
+    /// the token's own client and nobody else, which is what it did through 0.9.1.
+    ///
+    /// A resource server is NOT a new kind of principal. It registers as an ordinary confidential
+    /// [`crate::Client`] and authenticates to the introspection endpoint with whatever this build
+    /// accepts from any client -- `client_secret_basic`, `client_secret_post`, RFC 7523
+    /// `private_key_jwt` or `client_secret_jwt`, RFC 8705 mutual TLS -- through the same
+    /// `authenticate_client` every other endpoint uses. Section 2.1 requires the endpoint be
+    /// protected; reusing the client credential machinery is how it is protected, and inventing a
+    /// second credential type would have meant a second thing to get constant-time comparison,
+    /// rotation and revocation right on.
+    ///
+    /// What this adds on top of authentication is AUTHORIZATION, and that is the part that is not
+    /// optional. Authenticating as a resource server must not mean reading every token in the
+    /// store: an introspection endpoint that answers any authenticated resource server about any
+    /// token is a token-scanning oracle, which is section 4's warning with a credential stapled to
+    /// it. So a resource server is answered about a token ONLY when the token's own
+    /// [`crate::IssuedToken::resource`] set names one of the identifiers registered here.
+    ///
+    /// AN EMPTY `resource` ON THE TOKEN NAMES NOBODY, AND IS REFUSED TO EVERY RESOURCE SERVER.
+    /// That is the same fail-open reading [`crate::jwt::Audience::names_a_resource_server`] exists
+    /// to refuse, arriving through the other door: a grant that requested no resource indicator is
+    /// restricted to nothing in particular, and reading "restricted to nothing in particular" as
+    /// "so anyone may ask about it" would hand every resource server in the deployment every token
+    /// that did not happen to use RFC 8707. The token's own client can still introspect it, which
+    /// is the pre-0.9.2 behaviour and is unchanged.
+    ///
+    /// # WHAT THIS COSTS YOUR RATE LIMITER, and what to set
+    ///
+    /// SETTING THIS CHANGES THE TRAFFIC SHAPE AT THE CLIENT-AUTHENTICATION BUDGET, and it is the
+    /// one consequence of registering a resource server that is not visible from anything else on
+    /// this page. An introspection is a client authentication like any other -- that is the whole
+    /// point of the paragraph above -- so it is charged
+    /// [`crate::rate_limit::ATTEMPT_COST`] against
+    /// [`crate::events::Attempt::ClientAuthentication`] keyed on the RESOURCE SERVER's
+    /// `client_id`. Through 0.9.1 that budget only ever carried a client asking about tokens it
+    /// had itself been issued, so its volume tracked issuance. A resource server introspects ONCE
+    /// PER CALL AT THE PROTECTED RESOURCE, at a rate set by that API's own clients.
+    ///
+    /// [`crate::rate_limit::DEFAULT_CLIENT_AUTHENTICATION_CAPACITY`] is 6000 a minute, which is
+    /// 100 a second, and it was derived from a client's token traffic. Left alone it becomes the
+    /// protected resource's request ceiling, per node.
+    ///
+    /// AND IT DOES NOT READ AS A THROTTLE WHEN IT BITES. RFC 7662 introspection over the ceiling
+    /// is refused with a bare `invalid_client`, the same answer a wrong secret gets, because a
+    /// distinct code would tell an attacker they had found a live client id. A resource server
+    /// that fails closed then refuses EVERY request it is handling, and its operator is looking at
+    /// what appears to be a credential problem. The [`crate::events::EventSink`] channel is where
+    /// the two are distinguishable:
+    /// [`crate::events::Event::ClientAuthenticationFailed`] carries
+    /// [`crate::events::ClientAuthFailure::RateLimited`] for a throttle and
+    /// [`crate::events::ClientAuthFailure::SecretMismatch`] for a credential that did not verify.
+    /// A deployment that registers resource servers should install one.
+    ///
+    /// So, two things:
+    ///
+    /// - Size the budget for the API, not for a client:
+    ///   [`crate::rate_limit::RateLimitConfig::with_client_authentication_capacity_for`] raises
+    ///   ONE registration and leaves every other `client_id` where it was. Raising
+    ///   `client_authentication_capacity` globally would also raise how many wrong secrets every
+    ///   other registration admits per window, each of which can cost the host an argon2id.
+    /// - CACHE THE INTROSPECTION RESPONSE at the resource server, which RFC 7662 section 4
+    ///   recommends and which is the only measure that changes the traffic shape rather than the
+    ///   ceiling. It costs a bounded delay before a revocation is observed.
+    ///
+    /// A host that implements [`crate::events::RateLimiter`] itself makes the same decision in its
+    /// own terms; there is no introspection-specific [`crate::events::Attempt`] variant to key on,
+    /// deliberately, and the module docs on [`crate::rate_limit`] say why.
+    ///
+    /// `Option<Box<[_]>>` rather than `Vec<_>` for the reason [`ServerConfig::allowed_resources`]
+    /// gives next door and with the same measurement behind it: the list is written once at
+    /// construction and only ever iterated, so the growable shape buys nothing, and a boxed slice
+    /// is 16 bytes against a vector header's 24 on every `ServerConfig` in every deployment.
+    /// MEASURED: `ServerConfig` 464 before this field, 488 as a `Vec`, 480 as this.
+    pub resource_servers: Option<Box<[ResourceServerRegistration]>>,
     /// RFC 8414 `service_documentation`.
     pub service_documentation: Option<String>,
     /// RFC 9396 section 10 `authorization_details_types_supported`: the authorization
@@ -384,6 +477,134 @@ pub const MIN_USER_CODE_LENGTH: usize = 8;
 /// the client asked for, with nothing told to anybody: the exact failure `crate::rar` refuses for
 /// unknown members. `invalid_target` (section 2) is the honest answer.
 pub const MAX_RESOURCE_INDICATORS: usize = 16;
+
+/// Which of RFC 7662's two legitimate callers an introspection request is being answered as.
+///
+/// Not public: it is the shape of one decision inside
+/// [`AuthorizationServer::introspection_response_with_credential`], and a host that could name it
+/// would be able to depend on a split that exists to serve the response document rather than to
+/// describe the deployment.
+enum IntrospectionView {
+    /// The client the token was issued to. Sees the whole record, including every resource
+    /// identifier the grant was restricted to.
+    OwningClient,
+    /// A registered resource server, carrying the identifiers of ITS OWN that this token names.
+    /// Never empty: an empty intersection is not a resource-server view, it is `active: false`.
+    ResourceServer(Vec<String>),
+}
+
+/// The RFC 9396 details a RESOURCE SERVER may be told about, given the identifiers `mine` it is
+/// registered for and answers for.
+///
+/// Section 9.2: the details are "filtered and extended for the RS making the introspection
+/// request". This is the filtering half; this crate does no extending, because an extension would
+/// be an assertion about an API vocabulary it does not know (see [`crate::rar`] on `other`).
+///
+/// The rule, and why each arm is the safe one:
+///
+/// - an element with NO `locations` is KEPT. Section 2.2 makes the member optional, so its absence
+///   says nothing about where the element belongs; dropping it would withhold a detail the resource
+///   owner did approve from the only party in a position to enforce it, which is a fail-open move
+///   dressed as a privacy one.
+/// - an element whose `locations` names one of `mine` is kept, with its `locations` REDUCED to the
+///   intersection. Keeping the element whole would let a detail addressed to two resource servers
+///   hand each of them the other's URI, which is the disclosure this function exists to stop
+///   arriving one level down.
+/// - anything else is DROPPED: its `locations` names other services only, and a resource server
+///   that is not named in an element has no business acting on it or knowing it exists.
+///
+/// The reduction cannot produce an element with an EMPTY `locations`, because an empty intersection
+/// is the dropped arm. That matters beyond tidiness: empty is how this crate spells "the member was
+/// absent", so an element narrowed to nothing would read on the wire as one that was never located
+/// at all -- a widening performed by a filter.
+///
+/// Filtering everything away yields an EMPTY set, and
+/// [`crate::token::IntrospectionResponse::authorization_details`] omits the member rather than
+/// serializing `[]`, so the resource server sees exactly what it sees for a grant that carried no
+/// details at all. That is the "not granted" / "not for you" indistinguishability at its widest,
+/// and it is the intended shape: see this method's caller for why that direction is the harmless
+/// one.
+#[cfg(feature = "rar")]
+fn details_for_resource_server(
+    details: &crate::rar::AuthorizationDetails,
+    mine: &[String],
+) -> crate::rar::AuthorizationDetails {
+    crate::rar::AuthorizationDetails::from_elements(
+        details
+            .iter()
+            .filter_map(|detail| {
+                if detail.locations.is_empty() {
+                    return Some(detail.clone());
+                }
+                let locations: Vec<Box<str>> = detail
+                    .locations
+                    .iter()
+                    .filter(|at| mine.iter().any(|id| id.as_str() == &***at))
+                    .cloned()
+                    .collect();
+                (!locations.is_empty()).then(|| crate::rar::AuthorizationDetail {
+                    locations: locations.into_boxed_slice(),
+                    ..detail.clone()
+                })
+            })
+            .collect(),
+    )
+}
+
+/// One resource server, as [`ServerConfig::resource_servers`] declares it: the registered client
+/// identity it authenticates as, and the RFC 8707 resource identifiers it is the protected
+/// resource FOR.
+///
+/// The two halves answer two different questions and neither substitutes for the other.
+/// `client_id` answers "who is calling", and it is checked by the ordinary client authentication
+/// every endpoint uses, so a resource server needs a real credential and gets constant-time
+/// verification, rotation and revocation for free. `resources` answers "what may it ask about",
+/// and it is checked against the token's own [`crate::IssuedToken::resource`] set, so a resource
+/// server is told about tokens addressed to it and is told `{"active": false}` about every other
+/// token in the store.
+///
+/// Registering the same `client_id` twice is not an error and not special: the identifier sets are
+/// considered in order and a match in any of them is a match. It is simply a longer way of writing
+/// one entry with both lists concatenated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// `#[non_exhaustive]`: this is a DEPLOYMENT POLICY object for a channel that will grow. A per-RS
+/// claim filter, a per-RS introspection policy and a `token_endpoint_auth_method` constraint are
+/// all plausible next fields, and each one would be a major-version event if a host could write a
+/// struct literal here. Its sibling [`crate::cimd::CimdPolicy`] is sealed for the same reason and
+/// states it plainly: "A host writes a full struct literal today and has a build that breaks on a
+/// patch release; `new()` plus assignment does not. The attribute cannot be added after
+/// publication, because by then the literal is in somebody's production tree."
+///
+/// It is sealed HERE rather than later because 0.9.2 is the release that introduces it. The
+/// `tests/host_api_shape.rs` gate does not catch this one and is not wrong to miss it -- that scan
+/// flags types whose field set VARIES WITH A CARGO FEATURE, and this one's does not. The rule the
+/// crate actually follows is broader than the gate that enforces part of it.
+#[non_exhaustive]
+pub struct ResourceServerRegistration {
+    /// The registered client this resource server authenticates as. It must be a CONFIDENTIAL
+    /// client: introspection refuses public clients (see
+    /// [`AuthorizationServer::introspection_response_with_credential`]), and naming a public client
+    /// here therefore registers a resource server that can never successfully call.
+    pub client_id: ClientId,
+    /// The RFC 8707 resource identifiers this server is the protected resource for. An entry with
+    /// an EMPTY list can never match any token, because matching requires naming an identifier the
+    /// token carries; it registers a resource server with no authority rather than one with
+    /// universal authority, which is the fail-closed direction.
+    pub resources: Vec<String>,
+}
+
+impl ResourceServerRegistration {
+    /// Declare `client_id` to be the resource server for `resources`.
+    pub fn new(
+        client_id: ClientId,
+        resources: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            client_id,
+            resources: resources.into_iter().map(Into::into).collect(),
+        }
+    }
+}
 
 /// The RFC 8693 section 4.1 actor an issuance carries, in a wrapper that is ZERO SIZED without the
 /// `token-exchange` feature.
@@ -592,8 +813,13 @@ impl ServerConfig {
             par: None,
             #[cfg(feature = "jar")]
             jar: None,
+            // OFF, and off means the RFC 8414 document says so: a host that has not wired the
+            // fetch must not advertise that it did. See the field's own docs.
+            #[cfg(feature = "cimd")]
+            cimd: None,
             scopes_supported: None,
             allowed_resources: None,
+            resource_servers: None,
             service_documentation: None,
             // OFF. An undeclared catalogue supports no types: see the field's own docs and
             // RFC 9396 section 5.
@@ -761,7 +987,15 @@ impl fmt::Debug for TokenRequest {
 /// again.
 ///
 /// [`Default`] is a PUBLIC client: no secret, no assertion.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `Debug` is HAND-WRITTEN (below) and does not print the secret or the assertion. It derived one
+/// until 0.9.2, which made the guarantee on `crate::http`'s private `Credentials` -- "DELIBERATELY NOT
+/// `Debug` ... a derived `Debug` would put all of it verbatim into a host's logs the first time
+/// somebody wrote `tracing::debug!(?creds)`" -- last exactly as long as the one function call that
+/// converts the one into the other. And this is the worse of the two to leave open: it is PUBLIC
+/// API, so it is the value a host builds by hand for [`AuthorizationServer::token`], and a host
+/// that never touches `http::Credentials` reaches it anyway.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 /// `#[non_exhaustive]`: `client-assertion` adds two fields and `mtls` adds a third, so this is four
 /// different structs depending on the flag set. Three named constructors already cover the three
 /// ways a client can authenticate ([`ClientCredential::secret`], [`ClientCredential::assertion`],
@@ -805,6 +1039,29 @@ pub struct ClientCredential<'a> {
     ///   binding does not present a certificate.
     #[cfg(feature = "mtls")]
     pub certificate: Option<&'a crate::mtls::ClientCertificate<'a>>,
+}
+
+/// Hand-written so neither the shared secret nor the assertion ever prints, in the same shape
+/// [`crate::token::TokenResponse`] uses: the `Some`/`None` distinction is KEPT, because WHICH
+/// credential a request presented is the diagnostic an operator actually needs and is not itself
+/// secret, while the value is. `client_assertion_type` prints in full: RFC 7521 section 4.2 makes
+/// it a fixed registered URN, so it identifies the mechanism rather than the holder. The
+/// certificate prints through its own `Debug`, which is a public document by construction.
+impl fmt::Debug for ClientCredential<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn redact_opt<T>(value: &Option<T>) -> Option<&'static str> {
+            value.as_ref().map(|_| "[redacted]")
+        }
+        let mut out = f.debug_struct("ClientCredential");
+        out.field("client_secret", &redact_opt(&self.client_secret));
+        #[cfg(feature = "client-assertion")]
+        out.field("client_assertion_type", &self.client_assertion_type);
+        #[cfg(feature = "client-assertion")]
+        out.field("client_assertion", &redact_opt(&self.client_assertion));
+        #[cfg(feature = "mtls")]
+        out.field("certificate", &self.certificate);
+        out.finish()
+    }
 }
 
 impl<'a> ClientCredential<'a> {
@@ -1111,6 +1368,54 @@ fn dummy_assertion_key() -> crate::jwt::PublicJwk {
 
 fn randomness_error() -> ErrorResponse {
     ErrorResponse::new(ErrorCode::ServerError)
+}
+
+/// WHAT THIS REQUEST'S PRESENTED CREDENTIAL HAS ALREADY BEEN CHARGED FOR, carried from wherever the
+/// work happened to the ONE exit that refuses a client authentication.
+///
+/// This exists because the previous shape had no such carrier: every branch of
+/// [`AuthorizationServer::authenticate_client`] was also an EXIT, so every branch had to remember to
+/// charge the dummy verification the unknown-id path charges, and four consecutive audit rounds
+/// found a branch that had forgotten. A flag that records what WAS spent, plus a single exit that
+/// spends the remainder, cannot forget: adding a refusal adds a `return Ok(Refused(..))` that
+/// carries this ledger unchanged, and the charge happens whether or not the author thought about it.
+///
+/// Both fields mean "a REAL verification of this kind has already been performed on this request",
+/// so the exit owes the dummy for whichever kind the request PRESENTED and did not get. Nothing here
+/// is a fact about the registration, which is the point: what a refusal costs must be a function of
+/// what arrived on the wire, never of what the store holds.
+#[derive(Default)]
+struct CredentialCost {
+    /// A secret verification ran through [`crate::client::ClientAuth::verify_with`].
+    secret: bool,
+    /// An RFC 7523 assertion verification was ATTEMPTED against a registration's keys.
+    ///
+    /// "Attempted" rather than "performed", and that is the residual documented as FOURTH on
+    /// [`AuthorizationServer::authenticate_client`]: `verify_assertion` refuses a malformed
+    /// assertion, and one whose `alg` is not the registration's, before it reaches any signature
+    /// work. Setting the flag at the call preserves EXACTLY what this crate charged before this
+    /// restructure, which is what makes the restructure reviewable as a mechanical change; closing
+    /// that last gap needs `verify_assertion` to report whether it reached the signature, which is
+    /// a change to a public function and is not this one.
+    #[cfg(feature = "client-assertion")]
+    assertion: bool,
+}
+
+/// The outcome of examining a presented credential, BEFORE anything is charged, recorded or
+/// emitted for it.
+///
+/// A value rather than a return: this is what lets the five refusal decisions in
+/// [`AuthorizationServer::classify_client_credential`] be decisions instead of exits. Every one of
+/// them hands back `Refused(failure)` and the single exit does the identical three things to all of
+/// them — settle the credential's cost, record the failed attempt, tell the audit channel which
+/// failure it was — before returning the one bare `invalid_client` RFC 6749 section 5.2 collapses
+/// them into.
+enum ClientAuthVerdict {
+    /// The credential verified. The `Arc` is the registration the caller asked for.
+    Authenticated(std::sync::Arc<Client>),
+    /// The credential did not verify, for the reason the HOST's audit channel is told. The wire is
+    /// told nothing beyond `invalid_client`.
+    Refused(ClientAuthFailure),
 }
 
 /// The rejection-sampling bound: the largest multiple of [`USER_CODE_ALPHABET`]'s length that fits
@@ -1706,6 +2011,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         jti: String,
         bound: &Bound<'_>,
         actor: &GrantedActor,
+        // What the HOST reported about the resource owner's login, for RFC 9470 s6.1. Handed in
+        // rather than read off the record being written next door, for the reason `expires_at` is:
+        // the signed claim and the persisted record must be the one value stated twice, and the
+        // record is written after this returns.
+        authentication: &GrantedAuthentication,
     ) -> Result<Result<(&crate::jwt::JwtConfig, String), String>, ErrorResponse> {
         // Only the RFC 8705 binding is read out of it here; without that feature the
         // signed claim set does not depend on how the client authenticated.
@@ -1728,6 +2038,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // is without `dpop`; see the note at the top of `issue`.
         #[cfg(not(feature = "token-exchange"))]
         let _ = actor;
+        // Same for the RFC 9470 report: without `consent` there is no field on the claim set to
+        // fill and no field on the wrapper to fill it from.
+        #[cfg(not(feature = "consent"))]
+        let _ = authentication;
         let claims = AccessTokenClaims {
             // The SAME spelling the RFC 8414 document publishes, the RFC 9207 `iss` parameter
             // carries and introspection reports. `issuer_identifier` trims a trailing slash, and
@@ -1772,6 +2086,27 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // so, in a form the resource server can check for itself.
             #[cfg(feature = "rar")]
             authorization_details: details.clone().into_details(),
+            // RFC 9470 s6.1, in the token itself. s6.2 (introspection) was the only channel this
+            // crate answered on through 0.9.1, and it is the channel a JWT deployment does not
+            // use: a resource server that verifies the signature locally never asks this server
+            // anything, so a step-up it could not see in the claims was one it had to take the
+            // client's word for. That is the failure the s3 challenge exists to prevent.
+            //
+            // The SAME conversion the introspection response uses, deliberately: `unix_seconds`
+            // answers `None` for an instant before the epoch, so a host-reported `auth_time` this
+            // server cannot state is stated by NEITHER channel rather than by one of them. Two
+            // channels disagreeing about one token is worse than both being silent, and silence
+            // here re-challenges (s3) rather than admitting anything.
+            #[cfg(feature = "consent")]
+            auth_time: authentication
+                .authentication
+                .as_ref()
+                .and_then(|a| unix_seconds(a.auth_time)),
+            #[cfg(feature = "consent")]
+            acr: authentication
+                .authentication
+                .as_ref()
+                .and_then(|a| a.acr.as_deref().map(str::to_string)),
             // EVERY binding the AS-side record carries, in the form a resource server can check
             // for itself without calling introspection at all. RFC 9449 s6.1 for `jkt`, RFC 8705
             // s3.1 for `x5t#S256`, built the same way introspection builds it so the two can never
@@ -2308,47 +2643,51 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ///   `Public` or `ConfidentialAssertion` registration handed a posted secret; a mutual-TLS
     ///   registration refuses on a thumbprint comparison. Each of those was FASTER than the
     ///   unknown-id path, which pays `dummy_verify` through the host's scheme, so "fast" positively
-    ///   identified a registered id. Each now charges the dummy before refusing.
+    ///   identified a registered id. Each is charged the dummy by the one exit below.
     ///
     /// - THE REFUSALS THAT PRECEDE THE ASSERTION VERIFICATION, which the fix for the case above
     ///   introduced. `authenticate_by_assertion` refuses three requests before it decodes a byte,
-    ///   and it now charges `dummy_verify` for all three through the SAME
-    ///   `assertion_could_be_verified` predicate this function uses, rather than through a comment
-    ///   asking the two to be kept in step. They were not kept in step: a request carrying an
+    ///   and all three are charged `dummy_verify` by the same exit, rather than through a comment
+    ///   asking two functions to be kept in step. They were not kept in step: a request carrying an
     ///   assertion AND a `client_secret` was refused by a known id for free while an unknown id
     ///   paid the host's secret scheme, so the fix for the previous bullet reopened the bullet
     ///   before it. See the comment at the top of that function.
     ///
+    /// # ONE EXIT, and why the list above is a history rather than a checklist
+    ///
+    /// Every bullet above was fixed at its own SITE, and each fix was found incomplete by the next
+    /// audit round: round 7 added a dummy, round 8 found the dummy made an unknown id cost MORE
+    /// than a known one, round 9 found three known-id paths costing nothing, and round 10 found
+    /// that round 9's own guard had two refusal sites it did not reach. The diagnosis recorded here
+    /// after round 10 was that the costly half is not the branching — it is that THE BRANCHES WERE
+    /// ALSO THE EXITS. Every refusal returned from where it was decided, so every refusal had to
+    /// remember to charge, and that is the obligation that was forgotten four times.
+    ///
+    /// So this function no longer refuses anywhere. It asks
+    /// [`AuthorizationServer::classify_client_credential`] for a [`ClientAuthVerdict`], a VALUE, and
+    /// there is exactly one place that turns a `Refused` into a wire answer. That place charges
+    /// [`AuthorizationServer::settle_credential_cost`] unconditionally, records the failed attempt
+    /// and emits the failure, in that order, for every refusal there is or ever will be. What a
+    /// refusal costs is therefore a function of what the request PRESENTED (through
+    /// [`CredentialCost`], which records only what was really spent) and of nothing the store holds,
+    /// which is the property the four rounds above were each trying to reach one site at a time.
+    ///
+    /// A reviewer checks this by COUNTING: one `ClientAuthVerdict::Refused` arm, one
+    /// `settle_credential_cost` call on it, and no `ErrorCode::InvalidClient` built anywhere in the
+    /// credential path except there. Adding a refusal means adding a `return Ok(Refused(..))`, which
+    /// cannot skip the charge because it does not do the charging.
+    ///
+    /// THE RATE-LIMIT GATE IS NOT ONE OF THOSE REFUSALS and is deliberately kept out of the count.
+    /// It is answered before the store is touched, from a public `client_id` and nothing else, so it
+    /// cannot vary with any fact about a registration — and charging a dummy verification there is
+    /// exactly the amplification [`crate::rate_limit::CLIENT_AUTHENTICATION_FAILURE_CEILING_DIVISOR`]
+    /// exists to bound: past the failure ceiling a denial is what an attacker can buy at
+    /// [`crate::rate_limit::ATTEMPT_COST`] apiece, thousands per window per client id, and each one
+    /// would then buy the host's argon2id as well. The gate refuses free, on purpose, and it is
+    /// separated into [`AuthorizationServer::admit_client_authentication`] so that the credential
+    /// decision below has one exit rather than nearly one.
+    ///
     /// # What it does NOT cover, stated rather than left to be discovered
-    ///
-    /// THE STRUCTURE IS STILL WRONG, and this list is the evidence rather than a footnote to it.
-    /// This function decides how much work to do by branching on the very facts an attacker is
-    /// trying to learn: whether the id exists, what KIND of registration it is, and whether its
-    /// secret has expired. Every such branch is a potential oracle. FOUR variants of this one bug
-    /// have now been found in four consecutive audit rounds, and each was a consequence of the fix
-    /// before it: round 7 added a dummy, round 8 found the dummy made an unknown id cost MORE than
-    /// a known one, round 9 found three known-id paths costing nothing, and round 10 found that
-    /// round 9's own guard had two refusal sites it did not reach. The failures are getting harder
-    /// to see rather than easier, which is the argument for the structure and not for another
-    /// site. Any change to this function or to `authenticate_by_assertion` must therefore ask what
-    /// a request costs on BOTH paths, not only whether it is refused correctly. The
-    /// structural answer is for the cost to be uniform by CONSTRUCTION: perform exactly one
-    /// verification of the kind the request PRESENTED, never of the kind the registration holds,
-    /// and let every branch below compute a boolean that falls through to a single refusal. That
-    /// is a redesign of the most security-sensitive function in this crate, it changes the order of
-    /// rate-limit accounting and of which failure the audit channel hears, and it needs the
-    /// unknown-id path to simulate an assertion verification WITHOUT spending a `jti`. It is
-    /// deferred past 0.9.1 deliberately, and the residuals below are what that costs meanwhile.
-    ///
-    /// THE SHAPE THAT REDESIGN SHOULD TAKE, recorded now so the next attempt does not start from
-    /// nothing. The costly half is not the branching: it is that the branches are also the EXITS.
-    /// Every refusal returns from where it was decided, so each one has to remember to charge, and
-    /// that is the obligation that has been forgotten four times. Keeping every branch, every
-    /// `ClientAuthFailure` and every wire answer exactly as they are, and routing them through ONE
-    /// exit that charges whatever the request's presented credential has not yet been charged for,
-    /// gets the property by construction without redesigning the semantics. It is a mechanical
-    /// change that a reviewer can check by counting exits, which is the part that makes it worth
-    /// doing after a release rather than during one.
     ///
     /// FIRST, a host scheme whose verifier returns `None` from `dummy_hash`. This crate cannot
     /// invent a well-formed argon2id or bcrypt encoding to hand such a verifier, and one in the
@@ -2375,6 +2714,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// charging a second dummy on top of the real comparison would only make the same registration
     /// distinguishable in the other direction.
     ///
+    /// FOURTH, and FOUND BY THIS RESTRUCTURE rather than closed by it, because closing it is not a
+    /// mechanical change. A registration that DOES authenticate by assertion, handed an assertion
+    /// that `verify_assertion` refuses before any signature work — one over
+    /// [`crate::client_assertion::MAX_ASSERTION_BYTES`], one that is not a compact JWS, or one whose
+    /// `alg` is not the registration's — pays nothing, while an unknown id sending the same bytes
+    /// pays [`AuthorizationServer::dummy_assertion_verify`]. That separates "registered for RFC 7523
+    /// with these keys" from "not registered", which is a narrower fact than the ones above (it is
+    /// only readable for the assertion-registered subset) but it is the same shape. Closing it needs
+    /// `verify_assertion` to say whether it reached the signature; deciding it from the returned
+    /// [`crate::client_assertion::AssertionFailure`] variant would be exactly the "kept in step by a
+    /// comment" coupling this restructure exists to remove. `CredentialCost::assertion` records
+    /// where that boundary currently is.
+    ///
     /// RFC 8705 mutual TLS is not on this list because there is nothing to price: the HOST
     /// verified the certificate before this crate saw it, and what happens here is a thumbprint
     /// comparison.
@@ -2386,6 +2738,56 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let attempt = Attempt::ClientAuthentication {
             client_id: client_id.as_str(),
         };
+        self.admit_client_authentication(attempt, client_id)?;
+
+        // WHAT WAS SPENT, carried to the exit. Nothing reads it except `settle_credential_cost`,
+        // and nothing writes it except the two places that perform a real verification.
+        let mut paid = CredentialCost::default();
+        // THE DECISION, as a value. Its `?` is a STORAGE failure and not a refusal: it is
+        // `server_error`, it says nothing about whether the id exists (the store answered nothing at
+        // all), and it is the same propagation every other endpoint in this crate makes.
+        let verdict = self
+            .classify_client_credential(client_id, cred, &mut paid)
+            .await?;
+        match verdict {
+            ClientAuthVerdict::Authenticated(client) => {
+                self.hooks.record(attempt, AttemptOutcome::Succeeded);
+                Ok(client)
+            }
+            // THE ONE EXIT. Every refusal in the credential path arrives here, and this is the only
+            // place any of them costs, records or reports anything.
+            ClientAuthVerdict::Refused(failure) => {
+                // UNCONDITIONAL, and the order is the one every site used before: charge, record,
+                // emit. What is charged depends on what the request PRESENTED and on what has
+                // already been spent for it — never on which branch decided the refusal.
+                self.settle_credential_cost(cred, &paid);
+                self.hooks.record(attempt, AttemptOutcome::Failed);
+                self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                    client_id: client_id.as_str(),
+                    failure,
+                });
+                // The one bare `invalid_client` (RFC 6749 section 5.2). The host's audit channel was
+                // told which refusal it was one line up; the wire is told nothing, because the
+                // difference between "no such client", "expired", "wrong secret" and "wrong kind of
+                // credential" is exactly what tells a caller that an id is real.
+                Err(ErrorResponse::new(ErrorCode::InvalidClient))
+            }
+        }
+    }
+
+    /// The host's [`RateLimiter`] gate, asked FIRST, before the store is touched.
+    ///
+    /// SEPARATE FROM THE CREDENTIAL DECISION on purpose; see "ONE EXIT" on
+    /// [`AuthorizationServer::authenticate_client`]. It refuses on a public `client_id` and nothing
+    /// else, so it cannot vary with a fact about a registration, and it must stay FREE: a denial is
+    /// what an attacker can buy in bulk once the failure ceiling is reached, so charging a dummy
+    /// verification here would sell them the host's password hashing at
+    /// [`crate::rate_limit::ATTEMPT_COST`] apiece.
+    fn admit_client_authentication(
+        &self,
+        attempt: Attempt<'_>,
+        client_id: &ClientId,
+    ) -> Result<(), ErrorResponse> {
         if self.hooks.check(attempt) == RateLimitDecision::Deny {
             self.hooks.emit(|| Event::ClientAuthenticationFailed {
                 client_id: client_id.as_str(),
@@ -2395,7 +2797,54 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // attacker that they had found a live client id and merely hit the throttle.
             return Err(ErrorResponse::new(ErrorCode::InvalidClient));
         }
+        Ok(())
+    }
 
+    /// PAY FOR WHAT THIS REQUEST PRESENTED AND DID NOT GET, at the one exit that refuses.
+    ///
+    /// The unknown-id path is naturally the cheapest one — there is no secret to verify and no key
+    /// to verify against — so the collapse of "no such client" and "wrong credential" into one
+    /// `invalid_client` is worth nothing unless the two take the same wall time. Every refusal
+    /// therefore ends here, and here spends whatever a request of this shape would have spent had it
+    /// got as far as a verification:
+    ///
+    /// - [`AuthorizationServer::dummy_verify`] unless a real secret verification already ran. It
+    ///   does nothing when no secret was presented, which is what MATCHES the known-id path:
+    ///   `verify_with` refuses a confidential registration with no secret without verifying anything
+    ///   either.
+    /// - [`AuthorizationServer::dummy_assertion_verify`] unless a real assertion verification
+    ///   already ran, and only when this request COULD have reached one
+    ///   ([`AuthorizationServer::assertion_could_be_verified`]) — a request every registration would
+    ///   have refused before decoding a byte must not pay for a verification on either path.
+    ///
+    /// Both conditions are facts about `cred` and about work already done. NEITHER is a fact about
+    /// the registration, and that is the whole property: no caller of this can make a refusal cheap
+    /// by knowing something about the client.
+    fn settle_credential_cost(&self, cred: &ClientCredential<'_>, paid: &CredentialCost) {
+        if !paid.secret {
+            self.dummy_verify(cred.client_secret);
+        }
+        #[cfg(feature = "client-assertion")]
+        if !paid.assertion && Self::assertion_could_be_verified(cred) {
+            self.dummy_assertion_verify();
+        }
+    }
+
+    /// EXAMINE the presented credential and say what it amounts to. Charge nothing, record nothing,
+    /// emit nothing: those belong to the single exit in
+    /// [`AuthorizationServer::authenticate_client`], which is what keeps them from being forgotten.
+    ///
+    /// Every branch here is the one it was before this became a function of its own — the RFC 7591
+    /// section 3.2.1 expiry gate, the RFC 7523 assertion path, the RFC 8705 mutual-TLS path and the
+    /// shared-secret comparison, in that order — and each answers with a value instead of a wire
+    /// refusal. `paid` is written by the two places that perform real verification work, so the exit
+    /// can charge the remainder.
+    async fn classify_client_credential(
+        &self,
+        client_id: &ClientId,
+        cred: &ClientCredential<'_>,
+        paid: &mut CredentialCost,
+    ) -> Result<ClientAuthVerdict, ErrorResponse> {
         let found = self
             .store
             .get_client(client_id)
@@ -2403,35 +2852,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .map_err(storage_error)?;
         let client = match found {
             Some(client) => client,
-            None => {
-                // THE COLLAPSE IS ALSO A TIMING PROPERTY, and it was one this function did not
-                // keep. Returning here without verifying anything makes an unknown id answer in
-                // the time of one store read, while a real id additionally pays a full secret
-                // verification. Under the shape `with_secret_verifier` exists to serve — a
-                // `ConfidentialSecretHash` in a host scheme such as argon2id — that is roughly two
-                // milliseconds against two hundred, so one request per candidate id enumerates the
-                // whole client registry. Per-id throttling cannot see it: the attacker sends
-                // exactly one request per id and never repeats one.
-                //
-                // So the same work happens on this path, through the SAME `verify_with` seam, and
-                // the result is discarded. See `SecretVerifier::dummy_hash` for the half only the
-                // host can supply, and the doc on this function for what remains uncovered.
-                self.dummy_verify(cred.client_secret);
-                // The RFC 7523 half of the same rule. Charged only when this request could have
-                // reached a verification had the id existed, so a request a KNOWN id would have
-                // had refused before any verification does not pay for one here either; see
-                // `assertion_could_be_verified`.
-                #[cfg(feature = "client-assertion")]
-                if Self::assertion_could_be_verified(cred) {
-                    self.dummy_assertion_verify();
-                }
-                self.hooks.record(attempt, AttemptOutcome::Failed);
-                self.hooks.emit(|| Event::ClientAuthenticationFailed {
-                    client_id: client_id.as_str(),
-                    failure: ClientAuthFailure::UnknownClient,
-                });
-                return Err(ErrorResponse::new(ErrorCode::InvalidClient));
-            }
+            // THE COLLAPSE IS ALSO A TIMING PROPERTY. Answering here in the time of one store read,
+            // while a real id additionally pays a full secret verification, enumerates the whole
+            // registry at one request per candidate: under the shape `with_secret_verifier` exists
+            // to serve — a `ConfidentialSecretHash` in a host scheme such as argon2id — that is
+            // roughly two milliseconds against two hundred, and per-id throttling cannot see it
+            // because the attacker never repeats an id. Nothing is charged HERE any more; the exit
+            // charges it, for this refusal and for every other one, through the same `verify_with`
+            // seam a real authentication uses. See `SecretVerifier::dummy_hash` for the half only
+            // the host can supply.
+            None => return Ok(ClientAuthVerdict::Refused(ClientAuthFailure::UnknownClient)),
         };
         // RFC 7591 section 3.2.1 `client_secret_expires_at`. THIS SERVER MINTS THAT VALUE AND
         // PUBLISHES IT TO THE REGISTRANT, and until this check existed it never looked at it again:
@@ -2461,26 +2891,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         // host's problem rather than a reason to refuse a live credential.
                         .unwrap_or(false);
                 if expired {
-                    // AND IT PAYS FOR THE VERIFICATION IT SKIPPED. This return is BEFORE every
-                    // credential branch below, so an expired registration answered in the time of
-                    // one store read while an unknown id paid a full `dummy_verify` through the
-                    // host's scheme, which `SecretVerifier::dummy_hash` prices at argon2id
-                    // milliseconds. Fast therefore meant "this id is registered", which is the one
-                    // fact the bare `invalid_client` two lines down exists to withhold.
-                    self.dummy_verify(cred.client_secret);
-                    #[cfg(feature = "client-assertion")]
-                    if Self::assertion_could_be_verified(cred) {
-                        self.dummy_assertion_verify();
-                    }
-                    self.hooks.record(attempt, AttemptOutcome::Failed);
-                    self.hooks.emit(|| Event::ClientAuthenticationFailed {
-                        client_id: client_id.as_str(),
-                        failure: ClientAuthFailure::SecretExpired,
-                    });
-                    // The same bare `invalid_client` as every other refusal here. The host's audit
-                    // channel is told which it was; the wire is not, because the difference between
-                    // "expired" and "wrong" tells a caller that the id is real.
-                    return Err(ErrorResponse::new(ErrorCode::InvalidClient));
+                    // NOTHING IS VERIFIED ON THIS PATH, and that is why it was once the fastest
+                    // refusal in the function: an expired registration answered in the time of one
+                    // store read while an unknown id paid a full `dummy_verify` through the host's
+                    // scheme, so "fast" meant "this id is registered", the one fact the bare
+                    // `invalid_client` exists to withhold. `paid` is untouched, so the exit charges
+                    // exactly what the unknown-id refusal above charges for the same request.
+                    return Ok(ClientAuthVerdict::Refused(ClientAuthFailure::SecretExpired));
                 }
             }
         }
@@ -2507,23 +2924,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // request it makes: precisely the deployments RFC 7523 exists for, and the ones FAPI
             // 2.0 requires it of. `client_assertion_verification_bound` in
             // `tests/allocation_paths.rs` pins the result.
-            return match self.authenticate_by_assertion(&client, cred).await {
-                Ok(()) => {
-                    self.hooks.record(attempt, AttemptOutcome::Succeeded);
-                    Ok(client)
-                }
+            let outcome = self.authenticate_by_assertion(&client, cred, paid).await;
+            return Ok(match outcome {
+                Ok(()) => ClientAuthVerdict::Authenticated(client),
+                // The reason is carried to the audit channel by the single exit. The wire answer is
+                // one bare `invalid_client` for every one of them, which is why there is nothing
+                // here to choose between.
                 Err(reason) => {
-                    self.hooks.record(attempt, AttemptOutcome::Failed);
-                    self.hooks.emit(|| Event::ClientAuthenticationFailed {
-                        client_id: client_id.as_str(),
-                        failure: ClientAuthFailure::AssertionInvalid { reason },
-                    });
-                    // The one bare `invalid_client`, built HERE, because it is the same one for
-                    // every reason above: the wire's collapse is the point, and the reason went to
-                    // the audit channel one line up.
-                    Err(ErrorResponse::new(ErrorCode::InvalidClient))
+                    ClientAuthVerdict::Refused(ClientAuthFailure::AssertionInvalid { reason })
                 }
-            };
+            });
         }
 
         // RFC 8705 s2 mutual-TLS client authentication, handled apart from the secret
@@ -2538,31 +2948,29 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // below.
         #[cfg(feature = "mtls")]
         if matches!(client.auth, crate::client::ClientAuth::Mtls { .. }) {
-            return match crate::mtls::verify_certificate(&client, cred) {
-                Ok(()) => {
-                    self.hooks.record(attempt, AttemptOutcome::Succeeded);
-                    Ok(client)
-                }
-                Err(failure) => {
-                    // A thumbprint comparison is microseconds, so an mTLS registration handed a
-                    // posted `client_secret` refused far faster than an unknown id paying
-                    // `dummy_verify`. `dummy_verify` does nothing at all for the `None` a real
-                    // mutual-TLS request carries, so the ordinary path is unchanged and only the
-                    // probe pays; see the residuals section on this function.
-                    self.dummy_verify(cred.client_secret);
-                    self.hooks.record(attempt, AttemptOutcome::Failed);
-                    self.hooks.emit(|| Event::ClientAuthenticationFailed {
-                        client_id: client_id.as_str(),
-                        failure,
-                    });
-                    // The same bare `invalid_client` every other refusal here returns: RFC
-                    // 6749 s5.2 collapses them on purpose, so a caller cannot probe a
-                    // registration. The host's audit channel was told which it was.
-                    Err(ErrorResponse::new(ErrorCode::InvalidClient))
-                }
-            };
+            return Ok(match crate::mtls::verify_certificate(&client, cred) {
+                Ok(()) => ClientAuthVerdict::Authenticated(client),
+                // A thumbprint comparison is microseconds, so an mTLS registration handed a
+                // posted `client_secret` refuses far faster than an unknown id pays
+                // `dummy_verify`. `paid` is untouched — no secret was verified — so the exit
+                // charges the dummy, and it does nothing at all for the `None` a real mutual-TLS
+                // request carries, which leaves the legitimate path unchanged.
+                Err(failure) => ClientAuthVerdict::Refused(failure),
+            });
         }
 
+        // WHICH REGISTRATIONS ACTUALLY VERIFY A SECRET, recorded BEFORE the call so the exit knows
+        // what it still owes. `verify_with` answers `false` in nanoseconds for `Public` and for
+        // `ConfidentialAssertion` (see the arms in `crate::client`: there is no presented string
+        // that could be right for either), so a request posting junk as `client_secret` separated
+        // those registrations from an unknown id by wall time alone — and the unknown id was the
+        // SLOW one, argon2id milliseconds against nanoseconds under a host scheme. The two kinds
+        // that DO verify are marked paid, so they are never charged twice.
+        paid.secret = matches!(
+            client.auth,
+            crate::client::ClientAuth::ConfidentialSecret { .. }
+                | crate::client::ClientAuth::ConfidentialSecretHash { .. }
+        );
         // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this
         // crate does not implement is decided by the host's verifier (see
         // `crate::client::SecretVerifier`), and by nobody at all when none is installed.
@@ -2570,30 +2978,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .auth
             .verify_with(cred.client_secret, self.hooks.secret_verifier())
         {
-            // A REGISTRATION THAT CANNOT VERIFY A SECRET STILL PAYS FOR ONE. `verify_with` answers
-            // `false` in nanoseconds for `Public` and for `ConfidentialAssertion` (see the arms in
-            // `crate::client`: there is no presented string that could be right), so a request
-            // posting junk as `client_secret` separated those registrations from an unknown id by
-            // wall time alone, and the unknown id was the SLOW one. Under a host scheme that is
-            // argon2id milliseconds against nanoseconds, which sorts a whole registry in one
-            // request per candidate. `matches!` on the two kinds that DID verify, so a
-            // `ConfidentialSecret` or `ConfidentialSecretHash` is never charged twice.
-            if !matches!(
-                client.auth,
-                crate::client::ClientAuth::ConfidentialSecret { .. }
-                    | crate::client::ClientAuth::ConfidentialSecretHash { .. }
-            ) {
-                self.dummy_verify(cred.client_secret);
-            }
-            self.hooks.record(attempt, AttemptOutcome::Failed);
-            self.hooks.emit(|| Event::ClientAuthenticationFailed {
-                client_id: client_id.as_str(),
-                failure: ClientAuthFailure::SecretMismatch,
-            });
-            return Err(ErrorResponse::new(ErrorCode::InvalidClient));
+            return Ok(ClientAuthVerdict::Refused(
+                ClientAuthFailure::SecretMismatch,
+            ));
         }
-        self.hooks.record(attempt, AttemptOutcome::Succeeded);
-        Ok(client)
+        Ok(ClientAuthVerdict::Authenticated(client))
     }
 
     /// RFC 7523 section 3, plus the single-use claim that makes it worth anything.
@@ -2616,26 +3005,33 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         client: &Client,
         cred: &ClientCredential<'_>,
+        paid: &mut CredentialCost,
     ) -> Result<(), crate::client_assertion::AssertionFailure> {
         use crate::client_assertion::AssertionFailure;
         // THE THREE REFUSALS THAT PRECEDE ANY DECODING ARE ONE EXPRESSION, and it is the SAME
         // expression `authenticate_client` uses to decide whether to charge the assertion dummy on
         // the unknown-id path. They were three separate `if`s here and a predicate there, kept in
-        // step by a comment, and a comment cannot hold an invariant across two functions: the
-        // predicate reached all three conditions and this function reached none of them with a
-        // charge, so two of the three were free.
+        // step by a comment, and a comment cannot hold an invariant across two functions.
         //
-        // WHAT THAT COST, because it is the fourth variant of one bug in four audit rounds and the
-        // pattern is the point. `authenticate_client` enters this function on
-        // `cred.client_assertion.is_some()` ALONE, so a request carrying an assertion AND a
-        // `client_secret` arrives here and is refused by the RFC 6749 section 2.3 check below in
-        // nanoseconds. The UNKNOWN id sending identical bytes takes the not-found arm, which
-        // charges `dummy_verify(cred.client_secret)` unconditionally, and with a secret present
-        // that runs the host's `SecretVerifier` scheme: argon2id milliseconds against nanoseconds.
-        // The assertion dummy is skipped on both sides (the predicate is false when a secret is
-        // present), so nothing balanced it. One request per candidate id, never repeated, sorts
-        // registered ids from unregistered ones, which is the enumeration the whole mechanism
-        // exists to close, reopened by the round that closed its previous variant.
+        // WHAT THAT COSTS WHEN IT DRIFTS — and the history matters, because 0.9.2 changed WHERE
+        // this is paid and an auditor should not read the danger below as a hole 0.9.1 shipped.
+        // `authenticate_client` enters this function on `cred.client_assertion.is_some()` ALONE,
+        // so a request carrying an assertion AND a `client_secret` arrives here and is refused by
+        // the RFC 6749 section 2.3 check below in nanoseconds. The UNKNOWN id sending identical
+        // bytes takes the not-found arm, which charges `dummy_verify(cred.client_secret)`
+        // unconditionally, and with a secret present that runs the host's `SecretVerifier` scheme:
+        // argon2id milliseconds against nanoseconds. The assertion dummy balances nothing there,
+        // because `assertion_could_be_verified` is false when a secret is present. One request per
+        // candidate id, never repeated, sorts registered ids from unregistered ones, which is the
+        // enumeration the whole mechanism exists to close.
+        //
+        // THAT STATE EXISTED DURING 0.9.1'S AUDIT ROUNDS AND WAS NOT RELEASED IN ONE. Released
+        // 0.9.1 closed it HERE, with a `self.dummy_verify(cred.client_secret)` immediately before
+        // the `Malformed` return below, so the known and unknown ids paid the same call for the
+        // same request. (0.9.0 is a different shape again: it had no dummy verification anywhere,
+        // so there was no asymmetry of this kind to have — the whole balancing mechanism arrived
+        // in 0.9.1.) What 0.9.2 changed is that the charge is no longer made at this site, or at
+        // the second site further down: see below.
         //
         // The three conditions, and why each refuses before anything is read:
         //
@@ -2655,12 +3051,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // So collapsing them changes what is SPENT and nothing else, on the wire or in the audit
         // channel.
         //
-        // The dummy charged is `dummy_verify`, not the assertion one, and that is deliberate: it is
-        // the same call the unknown-id path makes for the same request, which is the only thing
-        // that makes the two cost the same. When no secret was presented it does nothing, on both
-        // paths, and there is nothing to balance.
+        // NOTHING IS CHARGED HERE ANY MORE, by either half of this function: `paid` is untouched on
+        // every refusal below that did no verification, and the single exit in
+        // `authenticate_client` spends what such a request would have spent. That is the 0.9.2
+        // change, and it is a change of PLACE rather than of amount: 0.9.1 made two charges from
+        // inside this function — a `dummy_verify` at the `Malformed` return just below, and a
+        // `dummy_assertion_verify` in the `WrongPrincipal` arm after it — and each got its own
+        // case right while neither could see what the other, or `authenticate_client`, had already
+        // spent. `CredentialCost` is what a single exit needs in order to know.
         if !Self::assertion_could_be_verified(cred) {
-            self.dummy_verify(cred.client_secret);
             return Err(AssertionFailure::Malformed);
         }
         let assertion = cred.client_assertion.ok_or(AssertionFailure::Malformed)?;
@@ -2673,18 +3072,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // The registration does not authenticate this way at all, so there is no key any
             // assertion could have been signed with. `WrongPrincipal` is the closest true
             // statement: the party this credential claims to be is not the party it names.
-            _ => {
-                // AND IT PAYS THE DUMMY FIRST, which is the half of the timing collapse that is
-                // only fixable here. `authenticate_client` charges an unknown id one verification
-                // so that "this id exists" cannot be read off the clock; returning from here for
-                // free undid that, because a registered id that does not use assertions answered
-                // in nanoseconds while an unknown id sending identical bytes paid the full
-                // verification. The registration KIND is exactly what such a probe is after, so
-                // this cannot be fixed by choosing when to charge on the other path: the known
-                // path has to pay too. See `dummy_assertion_verify`.
-                self.dummy_assertion_verify();
-                return Err(AssertionFailure::WrongPrincipal);
-            }
+            // NOTHING WAS VERIFIED, so `paid.assertion` stays false and the exit charges
+            // `dummy_assertion_verify` for it. A registered id that does not use assertions
+            // answering in nanoseconds, while an unknown id sending identical bytes paid a full
+            // verification, is the registration KIND readable off the clock — and the kind is
+            // exactly what such a probe is after, so the known path has to pay too.
+            _ => return Err(AssertionFailure::WrongPrincipal),
         };
 
         // RFC 7523 section 3 (3) admits either the token endpoint URL or, by long-established
@@ -2696,6 +3089,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // an HS256 HMAC over the registered secret and touches no curve at all, so requiring a
         // backend on that path refused a valid credential for a reason no RFC gives. Which one
         // this registration is, is `client.auth`'s to say, and `AssertionKeys` is what says it.
+        // CHARGED AS PAID AT THE CALL, not at its result. Every outcome from here on is one the
+        // unknown-id path prices with a single `dummy_assertion_verify`, so charging a second one on
+        // top would make a KNOWN id the slower of the two — which is how round 8 broke round 7. The
+        // one gap this leaves is the refusals `verify_assertion` makes before it reaches a
+        // signature; see the FOURTH residual on `authenticate_client`, and `CredentialCost`.
+        paid.assertion = true;
         let verified = verify_assertion(
             self.es256_verifier(),
             keys,
@@ -2859,8 +3258,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// registration says may ever be granted.
     ///
     /// Written as a guarded clone so the OVERWHELMINGLY common case is byte for byte what this
-    /// always did. `register_client` refuses the disagreement outright, so a host that registers
-    /// through this crate never reaches the second arm at all.
+    /// always did. THE SECOND ARM IS REACHABLE AND IS NOT DEAD CODE: `register_client` does NOT
+    /// refuse a registration whose `default_scopes` exceed its `allowed_scopes`, deliberately, and
+    /// says why in its own body -- narrowing `allowed_scopes` alone is exactly how an operator
+    /// corrects an over-broad registration, and refusing that would turn a security control into
+    /// an error message. This trim is what makes that safe, so deleting it as unreachable
+    /// reintroduces the defect the paragraph above describes.
     ///
     /// Called from BOTH places the RFC 6749 section 3.3 default is applied, which is the other
     /// half of the fix: the authorization endpoint had its own copy of "absent means the registered
@@ -2899,8 +3302,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // identical fresh authorization request naming no scope mints the same grant again.
             // Intersecting is the only reading that makes the two halves agree, and it is the
             // fail-closed one: what is granted is exactly what the registration says may ever be
-            // granted. `register_client` refuses the disagreement outright, so a host that goes
-            // through it never reaches this arm with anything to trim.
+            // granted. `register_client` does NOT refuse the disagreement -- see its body for why
+            // not, and `granted_default_scope` for why this trim is therefore load bearing rather
+            // than defensive.
             None => Ok(Self::granted_default_scope(client)),
             Some(s) if s.is_subset(&client.allowed_scopes) => Ok(s.clone()),
             // NB: descriptions must stay inside the RFC 6749 section 5.2 charset (no double
@@ -4503,9 +4907,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let client = self.authenticate_client(client_id, &bound.cred).await?;
         // RFC 6749 section 4.4: this grant is for confidential clients. A public client has no
         // secret, so "the client itself" is not an identity anyone has proven.
+        //
+        // BARE, for the reason spelled out at the introspection twin of this check: a description
+        // here would be the only response on the endpoint that distinguishes a registered public
+        // client from an unknown id, and the credential path just above collapses exactly that
+        // distinction. Both sites were changed together because the introspection comment cites
+        // this one as "the same refusal, for the same reason", and a fix applied to one of a pair
+        // that call each other authority is how a rule ends up living in two places with two
+        // answers. The operator's sentence is `ClientAuthFailure::NotConfidential`.
         if matches!(client.auth, crate::client::ClientAuth::Public) {
-            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
-                .with_description("client_credentials requires a confidential client"));
+            self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                client_id: client_id.as_str(),
+                failure: ClientAuthFailure::NotConfidential,
+            });
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient));
         }
         if !client.allows_grant(GrantType::ClientCredentials) {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
@@ -5202,6 +5617,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             access_token,
             bound,
             &actor,
+            &authentication,
         )?;
         #[cfg(feature = "jwt")]
         let access_token = match prepared {
@@ -5223,9 +5639,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // without having to parse a token this server may have issued as opaque.
                 #[cfg(feature = "dpop")]
                 jkt: bound.jkt.map(Box::from),
-                // Through 0.9.1 introspection answers only the token's own client; the
-                // resource-server channel is 0.9.2. The record is written now regardless,
-                // because the record is the half that cannot be added later.
+                // The record was written this way before there was anybody to read it, because the
+                // record is the half that cannot be added later; a registered resource server
+                // reads it now (`ServerConfig::resource_servers`).
                 //
                 // RFC 8705 s3, and the same argument as `jkt` immediately above: an opaque
                 // token carries its binding nowhere else, so s3.2 introspection could not
@@ -5386,10 +5802,78 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
 
     /// RFC 7662 token introspection, as the protected endpoint the RFC describes.
     ///
-    /// The caller must authenticate (section 2.1), and a token belonging to a DIFFERENT client
+    /// The caller must authenticate (section 2.1), and a token the caller has no relationship to
     /// reads as inactive rather than as a description of somebody else's grant: section 2.2 says
     /// the response for an invalid token is simply `active: false`, and section 4 warns that this
     /// endpoint otherwise becomes an oracle for probing tokens a caller does not hold.
+    ///
+    /// # The two callers
+    ///
+    /// Section 1 names a protected resource as the primary consumer, and section 2.1 permits a
+    /// client to introspect its own token. Both are served:
+    ///
+    /// - the token's OWN CLIENT, which sees the whole record; and
+    /// - a RESOURCE SERVER declared in [`ServerConfig::resource_servers`], which sees a token only
+    ///   when the token's RFC 8707 [`IssuedToken::resource`] set names one of the identifiers that
+    ///   resource server is registered for.
+    ///
+    /// Everything else is `{"active": false}`, including a live token belonging to another client
+    /// and addressed to another resource server. A deployment that registers no resource servers
+    /// answers the token's own client and nobody else, which is what this server did through
+    /// 0.9.1.
+    ///
+    /// The resource server is not a new kind of principal and gets no new credential: it registers
+    /// as an ordinary confidential client and authenticates here exactly as any client does. See
+    /// [`ServerConfig::resource_servers`] for why the authorization half is not optional -- and
+    /// for what a resource server's traffic costs the client-authentication rate limit, which is
+    /// the one thing about this endpoint that a host has to size rather than accept. A resource
+    /// server calls it once per request at the protected resource, and the default budget was
+    /// derived from a client's token traffic.
+    ///
+    /// # What a resource server is not told
+    ///
+    /// RFC 7662 section 5: "omitting privacy-sensitive information from an introspection response
+    /// is the simplest way of minimizing privacy issues". The sensitive thing here is not only the
+    /// user's identity, which the resource server needs and gets. It is the SHAPE OF THE GRANT:
+    /// which OTHER services this user's token is good at. Two members carry that fact and both are
+    /// narrowed to the asking resource server:
+    ///
+    /// - `aud`, to the RFC 8707 identifiers that resource server is registered for; and
+    /// - `authorization_details`, to the RFC 9396 section 2.2 elements whose `locations` name one
+    ///   of those identifiers, or that carry no `locations` at all. A kept element has its own
+    ///   `locations` narrowed too, so an element addressed to two resource servers does not smuggle
+    ///   the second one's URI past the filter. Section 9.2 asks for precisely this ("filtered and
+    ///   extended for the RS making the introspection request"), and section 9.1 says the same of
+    ///   the JWT form.
+    ///
+    /// An earlier 0.9.2 draft narrowed `aud` and shipped `authorization_details` whole, which meant
+    /// the disclosure
+    /// the first refused was re-made verbatim by the second, with the actions and privileges
+    /// granted elsewhere attached. That is fixed rather than accepted, and the alternative
+    /// resolution -- STOP NARROWING `aud`, and treat a registered resource server as a semi-trusted
+    /// party that sees the grant as granted -- was rejected. A resource server is registered for
+    /// the identifiers it answers for and nothing wider; a deployment adding a second protected
+    /// resource would otherwise be silently telling the first one about it, and the party who pays
+    /// for that is the user, who is not present and cannot be asked. Consistency in the other
+    /// direction is cheaper to buy and costs somebody else.
+    ///
+    /// Two members are NOT narrowed, and the omission is a decision rather than an oversight:
+    ///
+    /// - `scope` is the whole grant's scope set. Nothing in this crate maps a scope to a resource
+    ///   server -- there is no per-resource catalogue to filter against -- so any narrowing would
+    ///   be a guess at which strings "belong" to the asker, and a resource server that silently
+    ///   loses a scope refuses access the resource owner granted. A scope is also a token in the
+    ///   deployment's own vocabulary; unlike a `locations` URI it does not NAME another service.
+    /// - `act` (RFC 8693 section 4.1) describes who is acting in the call this resource server is
+    ///   handling, not where else the grant reaches.
+    ///
+    /// The cost of the narrowing, stated plainly: a resource server given a filtered
+    /// `authorization_details` cannot distinguish "not granted" from "not for you". That is the
+    /// same indistinguishability the `aud` narrowing already imposes, and it is the harmless
+    /// direction -- both readings oblige the resource server to refuse, because an element it is
+    /// not named in is one it must not act on either way. The disclosure direction has no such
+    /// symmetry. A caller that needs the unfiltered record is the token's OWN CLIENT, and it still
+    /// gets it; so does a host, through [`AuthorizationServer::introspect`].
     pub async fn introspection_response(
         &self,
         client_id: &ClientId,
@@ -5422,14 +5906,47 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // is not authentication, and an ownership check made against an identity anyone may claim
         // is not an access control. Same refusal as `client_credentials_token`, for the same
         // reason.
+        //
+        // BARE, AND THE REASON GOES TO THE AUDIT CHANNEL. It used to carry the description
+        // "introspection requires a confidential client", which was a client-existence oracle:
+        // an unknown client id and a confidential client with the wrong secret both leave
+        // `authenticate_client` as a BARE `invalid_client` (see "THE ONE EXIT"), so a description
+        // here was the one answer that meant "this id is registered, and it is public". That is
+        // precisely the distinction the whole credential path collapses, rebuilt one endpoint
+        // downstream of it. 0.9.2 also turns this endpoint into an advertised resource-server-
+        // facing surface, so it is now a probe an attacker is invited to make.
+        //
+        // The operator still gets the sentence — `ClientAuthFailure::NotConfidential` — because
+        // the usual cause is a misregistered resource server rather than an attack, and a bare
+        // refusal with nothing in the log would be unactionable. The rate limiter is NOT charged
+        // again: `authenticate_client` already recorded this attempt's outcome, and recording a
+        // second one for a single request would make this endpoint count double.
         if matches!(client.auth, crate::client::ClientAuth::Public) {
-            return Err(ErrorResponse::new(ErrorCode::InvalidClient)
-                .with_description("introspection requires a confidential client"));
+            self.hooks.emit(|| Event::ClientAuthenticationFailed {
+                client_id: client_id.as_str(),
+                failure: ClientAuthFailure::NotConfidential,
+            });
+            return Err(ErrorResponse::new(ErrorCode::InvalidClient));
         }
         let record = self.introspect(token).await.map_err(storage_error)?;
-        Ok(match record {
-            Some(t) if t.client_id == client.client_id => IntrospectionResponse {
+        // WHOSE QUESTION IS THIS. RFC 7662 has two legitimate callers and they are answered from
+        // the same arm but not with the same document, so the viewpoint is decided once, here,
+        // before anything is copied out of the record.
+        //
+        // `None` covers unknown, expired, somebody else's, and addressed-to-some-other-resource-
+        // server. All four are `{"active": false}` on purpose: section 2.2 gives exactly one answer
+        // for a token the caller has not proven a relationship to, and distinguishing "no such
+        // token" from "a live token that is not yours" would rebuild the oracle section 4 warns
+        // about out of the error channel instead of the response body.
+        let view = record
+            .as_ref()
+            .and_then(|t| self.introspection_view(&client, t));
+        Ok(match (record, view) {
+            (Some(t), Some(view)) => IntrospectionResponse {
                 active: true,
+                // RFC 7662 s2.2, THE WHOLE GRANT'S SCOPE SET, to both viewpoints, and deliberately
+                // so: see "What a resource server is not told" on this method for why this member
+                // is not narrowed the way `aud` and `authorization_details` are.
                 scope: (!t.scope.is_empty()).then(|| t.scope.to_string()),
                 client_id: Some(t.client_id.as_str().to_string()),
                 sub: t.subject.clone(),
@@ -5446,7 +5963,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // RFC 7662 s2.2: `aud` is OPTIONAL, and this server has one to report exactly when
                 // the grant carried RFC 8707 resource indicators. Omitted rather than empty when it
                 // does not: see `IntrospectionResponse::aud`.
-                aud: (!t.resource.is_empty()).then(|| t.resource.clone()),
+                //
+                // THIS IS THE ONE MEMBER THE TWO VIEWPOINTS DO NOT SHARE. The token's own client
+                // sees the whole set, because it asked for it and already holds it. A RESOURCE
+                // SERVER sees only the identifiers it is itself registered for, because the rest of
+                // the set is a list of the OTHER resource servers this user's token is good at, and
+                // section 5's privacy considerations do not stop at the user's identity: telling
+                // api.example that this token also works at payroll.example discloses the shape of
+                // somebody's account to a third party that has no part in it. Narrowing here rather
+                // than at the record keeps `aud` a true statement in both documents; it is the same
+                // claim, answered to the extent the asker is entitled to it.
+                aud: match &view {
+                    IntrospectionView::OwningClient => {
+                        (!t.resource.is_empty()).then(|| t.resource.clone())
+                    }
+                    IntrospectionView::ResourceServer(mine) => Some(mine.clone()),
+                },
                 // RFC 9470 s6.2. A resource server that sent a step-up challenge has to be able to
                 // see whether the token it now holds satisfies it; without these two it would have
                 // to take the client's word for that, which is the whole thing the challenge exists
@@ -5464,10 +5996,23 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // RFC 9396 s9.2: the details as a top-level member of the introspection
                 // response. For an OPAQUE token this is the ONLY way a resource server can
                 // learn what the token actually authorizes, which is the whole point of the
-                // parameter. Through 0.9.1 introspection answers only the token's own client;
-                // the resource-server channel is 0.9.2.
+                // parameter, and a resource server registered under
+                // `ServerConfig::resource_servers` is now the caller that receives it.
+                //
+                // FILTERED FOR THE ASKER, for the reason `aud` above is. An earlier 0.9.2 draft
+                // left it unfiltered until the audit noticed the two members carry the same fact. A
+                // section 2.2 element has `locations`, which NAMES RESOURCE SERVERS BY URI, so
+                // handing api.example the whole array says "this token also works at
+                // payroll.example" in the very breath `aud` refuses to say it, and adds the
+                // actions and privileges granted there. Section 9.2 asks for exactly this:
+                // "filtered and extended for the RS making the introspection request".
                 #[cfg(feature = "rar")]
-                authorization_details: t.authorization_details.clone(),
+                authorization_details: match &view {
+                    IntrospectionView::OwningClient => t.authorization_details.clone(),
+                    IntrospectionView::ResourceServer(mine) => {
+                        details_for_resource_server(&t.authorization_details, mine)
+                    }
+                },
                 // RFC 9449 s6.1 and RFC 8705 s3.2, in ONE RFC 7800 s3.1 object. Both mechanisms
                 // register a member of `cnf` and a token can carry both, so this is built from
                 // every binding the record has rather than from whichever one happens to be
@@ -5475,8 +6020,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 //
                 // A caller that introspects must be able to confirm the binding, or the binding
                 // stops at this server and the caller is back to trusting a bearer string.
-                // Through 0.9.1 that caller is the token's own client; the resource-server
-                // channel is 0.9.2.
+                // That caller is the token's own client or, since 0.9.2, the resource server the
+                // token is addressed to; both need to confirm the binding for the same reason.
                 #[cfg(any(feature = "dpop", feature = "mtls"))]
                 cnf: {
                     let cnf = crate::token::Confirmation {
@@ -5490,12 +6035,61 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 // RFC 8693 s4.1, and the reason it is on the record at all: for an OPAQUE token
                 // this is the only channel a resource server has for learning that what it holds
                 // is a DELEGATION rather than the subject acting directly.
+                //
+                // Not narrowed, and unlike `scope` there is nothing here that could be: `act`
+                // describes WHO IS ACTING in the call this resource server is being made, not
+                // where else the grant reaches. It names no other resource server, so it does not
+                // carry the fact `aud` withholds, and withholding it would leave the RS unable to
+                // tell a delegated call from a direct one -- which is the one thing section 4.1
+                // exists to tell it.
                 #[cfg(feature = "token-exchange")]
                 act: t.act.as_deref().cloned(),
             },
-            // Unknown, expired, or somebody else's. All three are one answer on purpose.
+            // Unknown, expired, somebody else's, or addressed to a different resource server.
+            // All four are one answer on purpose; see `view` above.
             _ => IntrospectionResponse::inactive(),
         })
+    }
+
+    /// Which RFC 7662 viewpoint `client` holds on `token`, or `None` for the callers section 2.2
+    /// answers `{"active": false}`.
+    ///
+    /// Ownership is checked FIRST and wins outright. A client that is both the token's own client
+    /// and a registered resource server is answered as the owner, which is the wider of the two
+    /// documents; being told about your own token is not a privilege that a second, narrower role
+    /// should be able to take away.
+    fn introspection_view(
+        &self,
+        client: &Client,
+        token: &IssuedToken,
+    ) -> Option<IntrospectionView> {
+        if token.client_id == client.client_id {
+            return Some(IntrospectionView::OwningClient);
+        }
+        // The resource-server channel. A registration matches only by NAMING an identifier the
+        // token actually carries, so a token whose grant requested no resource indicator at all
+        // (`token.resource` empty) matches nothing here and is refused to every resource server.
+        // That is deliberate and it is the whole defence: see `ServerConfig::resource_servers`.
+        let mine: Vec<String> = self
+            .config
+            .resource_servers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|rs| rs.client_id == client.client_id)
+            .flat_map(|rs| rs.resources.iter())
+            .filter(|id| token.resource.iter().any(|r| r == *id))
+            .map(|id| id.to_string())
+            .fold(Vec::new(), |mut acc, id| {
+                // Deduped because the same identifier may legitimately appear in two registrations
+                // for one client (see `ResourceServerRegistration`), and `aud` repeating it would
+                // be a malformed-looking document produced by a configuration that is not wrong.
+                if !acc.contains(&id) {
+                    acc.push(id);
+                }
+                acc
+            });
+        (!mine.is_empty()).then_some(IntrospectionView::ResourceServer(mine))
     }
 
     /// Record that a resource owner has consented to a client acting for them.

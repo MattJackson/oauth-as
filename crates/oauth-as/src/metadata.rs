@@ -93,24 +93,39 @@ pub struct AuthorizationServerMetadata {
     ///
     /// # Why this one is opt-in and the others are not
     ///
-    /// RFC 7662's primary consumer is a PROTECTED RESOURCE (section 1: "a protected resource to
-    /// query an authorization server"), and through 0.9.1 this server has no channel for one.
-    /// [`crate::AuthorizationServer::introspection_response_with_credential`] authenticates the
-    /// caller as a registered CLIENT and then answers from a single arm,
-    /// `Some(t) if t.client_id == client.client_id`; every other authenticated caller falls to
-    /// `{"active": false}`, which section 2.2 defines as "the token is not active". So a resource
-    /// server that did what the document told it to do is told, indistinguishably from the truth,
-    /// that every live token it holds is dead.
+    /// RFC 7662's primary consumer is a PROTECTED RESOURCE — the abstract defines the whole
+    /// document as "a method for a protected resource to query an OAuth 2.0 authorization server",
+    /// and section 1 as a protocol that "allows authorized protected resources to query the
+    /// authorization server". Through 0.9.1 this server had no channel for one: it
+    /// answered from a single arm, `Some(t) if t.client_id == client.client_id`, so a resource
+    /// server that did what the document told it to do was told, indistinguishably from the truth,
+    /// that every live token it held was dead. Advertising the endpoint unconditionally was
+    /// therefore the exact thing this module's opening rule forbids: an advertised capability the
+    /// server rejects.
     ///
-    /// Advertising it unconditionally was therefore the exact thing this module's opening rule
-    /// forbids: an advertised capability the server rejects. The client-facing half is real (a
-    /// client may introspect its OWN token, and RFC 7662 section 2.1 permits that), and the
-    /// bundled `http` router still ROUTES the endpoint in every build, so nothing that worked
-    /// stops working. What changes is the PROMISE: it is now made only by a host that named the
-    /// URL, which is a host that has read this and decided what its deployment means by it.
+    /// 0.9.2 BUILT THE CHANNEL. A resource server declared in
+    /// [`crate::ServerConfig::resource_servers`] now authenticates as an ordinary confidential
+    /// client and is answered about the tokens addressed to it.
     ///
-    /// The resource-server channel is 0.9.2 work. When it lands this member becomes unconditional
-    /// again, and that is an addition to the document rather than a withdrawal.
+    /// # Why this member stayed conditional anyway
+    ///
+    /// 0.9.1 recorded the intent that "when it lands this member becomes unconditional again", and
+    /// THAT INTENT IS DELIBERATELY NOT CARRIED OUT. Two reasons, and the second is the real one.
+    ///
+    /// The cheap reason is that going back to `String` is itself a breaking change, so the API
+    /// would take two breaking changes in consecutive releases to arrive where it started, and the
+    /// second one would be paid by every host that had already adapted to the first.
+    ///
+    /// The reason that actually decides it is that the capability is CONFIGURATION-DEPENDENT in a
+    /// way 0.9.1 did not anticipate when it wrote that sentence. The resource-server channel is
+    /// open only for a deployment that registered resource servers; one that registers none still
+    /// answers the token's own client and nobody else. Making the member unconditional would
+    /// therefore restore the original defect precisely for the deployments the 0.9.1 change was
+    /// made to protect -- the endpoint would be advertised to resource servers that this
+    /// particular deployment will never answer. The honest form of "advertise what you serve" is
+    /// for the host, which is the only party that knows whether it configured any, to say so.
+    ///
+    /// So: `Option`, and the host names the URL when it means the promise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub introspection_endpoint: Option<String>,
     /// RFC 7009 section 2. Present when this server serves revocation.
@@ -221,6 +236,19 @@ pub struct AuthorizationServerMetadata {
     #[cfg(feature = "rar")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_details_types_supported: Option<Vec<String>>,
+    /// draft-ietf-oauth-client-id-metadata-document-01 section 5 (section 6 in -02; see
+    /// [`crate::cimd`] for the renumbering). Whether this server dereferences an HTTPS URL used as
+    /// a `client_id`.
+    ///
+    /// DERIVED FROM [`ServerConfig::cimd`], never from the cargo feature. The feature compiles the
+    /// VALIDATOR in; it does not perform the fetch, because this crate performs no fetch at all
+    /// (see [`crate::cimd`]). So the only party who can answer this honestly is the host that
+    /// either wired the fetch or did not, and a member derived from `#[cfg]` would advertise a
+    /// capability a build might always refuse. Section 5's default when the member is absent is
+    /// `false`, and this publishes `false` explicitly rather than omitting it, because the member
+    /// is what a client checks before trying at all.
+    #[cfg(feature = "cimd")]
+    pub client_id_metadata_document_supported: bool,
     /// RFC 9207 section 3. Always `true` from this server, and NOT an `Option`.
     ///
     /// The member exists so a client can decide whether it is allowed to REQUIRE the `iss`
@@ -473,6 +501,9 @@ impl AuthorizationServerMetadata {
             authorization_details_types_supported: config
                 .authorization_details_types_supported
                 .clone(),
+            // The HOST's claim, not the build's: see the field's docs.
+            #[cfg(feature = "cimd")]
+            client_id_metadata_document_supported: config.cimd.is_some(),
             authorization_response_iss_parameter_supported: true,
             #[cfg(feature = "mtls")]
             tls_client_certificate_bound_access_tokens: true,

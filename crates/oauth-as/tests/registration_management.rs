@@ -593,3 +593,193 @@ async fn an_update_cannot_smuggle_past_the_registration_policy() {
     );
     assert_eq!(still.metadata.client_name.as_deref(), Some("Partner App"));
 }
+
+// --------------------------------------------------------------------------------- throttle
+
+/// A limiter that refuses client authentication for one `client_id` and allows everything else,
+/// recording what it was asked and told.
+///
+/// The RFC 7592 management plane authenticates a client with a bearer credential, so it takes the
+/// SAME [`oauth_as::Attempt::ClientAuthentication`] the token endpoint takes, keyed on the same
+/// public identifier. Two budgets for one client's two credentials would let an attacker stuffing
+/// the registration access token stay under a limiter watching the token endpoint, which is the
+/// wrong way round: the registration access token is the more powerful of the two, since it
+/// REWRITES and DELETES the registration the other one merely authenticates as.
+#[derive(Default)]
+struct ManagementThrottle {
+    deny: Option<String>,
+    seen: Mutex<Vec<String>>,
+}
+
+impl oauth_as::RateLimiter for ManagementThrottle {
+    fn check(&self, attempt: oauth_as::Attempt<'_>) -> oauth_as::RateLimitDecision {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("check {attempt:?}"));
+        match attempt {
+            oauth_as::Attempt::ClientAuthentication { client_id }
+                if self.deny.as_deref() == Some(client_id) =>
+            {
+                oauth_as::RateLimitDecision::Deny
+            }
+            _ => oauth_as::RateLimitDecision::Allow,
+        }
+    }
+
+    fn record(&self, attempt: oauth_as::Attempt<'_>, outcome: oauth_as::AttemptOutcome) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("record {attempt:?} {outcome:?}"));
+    }
+}
+
+struct ThrottleHandle(std::sync::Arc<ManagementThrottle>);
+
+impl oauth_as::RateLimiter for ThrottleHandle {
+    fn check(&self, attempt: oauth_as::Attempt<'_>) -> oauth_as::RateLimitDecision {
+        self.0.check(attempt)
+    }
+
+    fn record(&self, attempt: oauth_as::Attempt<'_>, outcome: oauth_as::AttemptOutcome) {
+        self.0.record(attempt, outcome)
+    }
+}
+
+/// A registration, and the server it lives in, with `throttle` installed. The registration itself
+/// is made while the limiter still allows everything, because what is under test is the MANAGEMENT
+/// plane and not RFC 7591.
+async fn registered_with(
+    throttle: std::sync::Arc<ManagementThrottle>,
+) -> (AuthorizationServer<MemoryStorage>, ClientId, String) {
+    let srv = server(registration_config()).with_rate_limiter(Box::new(ThrottleHandle(throttle)));
+    let info = srv
+        .register_dynamic_client(&code_client_metadata(), None)
+        .await
+        .expect("registered");
+    let client_id = ClientId::new(info.client_id.clone());
+    let token = info.registration_access_token.clone().unwrap();
+    (srv, client_id, token)
+}
+
+/// THE DESTRUCTIVE ONE. RFC 7592 section 2.3 deletes the registration and, in this crate, cascades
+/// through every token, refresh chain and code it held. Through 0.9.1 the whole management plane
+/// took no [`oauth_as::Attempt`] at all, so a host that installed a limiter still had this
+/// endpoint wide open, and the crate's own note beside it said the host "is expected to throttle
+/// anyway" while handing the host nothing to throttle it with.
+///
+/// The assertion is that the registration SURVIVES, because the refusal has to land before the
+/// store is touched: a throttled delete that still deleted would be the worst of both.
+#[tokio::test]
+async fn a_throttled_delete_deletes_nothing() {
+    // Registered under an allowing limiter, then the SAME throttle switched to refusing: the
+    // deny list is per `client_id`, which is only known once the registration exists.
+    let throttle = std::sync::Arc::new(ManagementThrottle::default());
+    let (srv, client_id, token) = registered_with(throttle).await;
+    let throttle = std::sync::Arc::new(ManagementThrottle {
+        deny: Some(client_id.as_str().to_string()),
+        seen: Mutex::default(),
+    });
+    let srv = srv.with_rate_limiter(Box::new(ThrottleHandle(throttle.clone())));
+
+    let refused = srv
+        .delete_registration(&client_id, &token)
+        .await
+        .expect_err("a throttled management call must be refused, RIGHT token or not");
+    assert!(
+        matches!(refused, RegistrationFailure::Unauthorized),
+        "the throttle must be indistinguishable from a wrong token, or it is an oracle telling an \
+         attacker they found a live registration: got {refused:?}"
+    );
+
+    // The store is the witness. A refusal that happened after the delete would be a client that no
+    // longer exists reporting an error.
+    assert!(
+        srv.store()
+            .get_client(&client_id)
+            .await
+            .expect("store")
+            .is_some(),
+        "RFC 7592 s2.3 is irreversible: a throttled delete must never have reached the store"
+    );
+
+    let seen = throttle
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        seen,
+        vec![format!(
+            "check ClientAuthentication {{ client_id: \"{}\" }}",
+            client_id.as_str()
+        )],
+        "the limiter must be asked BEFORE the store read, and a refused attempt reports no \
+         outcome for work that never happened: {seen:?}"
+    );
+}
+
+/// The other two verbs of section 2 go through the same authentication, so they inherit the same
+/// throttle. Throttling only the delete would leave the guessing oracle open on the two endpoints
+/// an attacker would use to CONFIRM a token before spending it.
+#[tokio::test]
+async fn a_throttled_read_and_update_are_refused_too() {
+    let throttle = std::sync::Arc::new(ManagementThrottle::default());
+    let (srv, client_id, token) = registered_with(throttle).await;
+    let throttle = std::sync::Arc::new(ManagementThrottle {
+        deny: Some(client_id.as_str().to_string()),
+        seen: Mutex::default(),
+    });
+    let srv = srv.with_rate_limiter(Box::new(ThrottleHandle(throttle)));
+
+    assert!(
+        matches!(
+            srv.read_registration(&client_id, &token).await,
+            Err(RegistrationFailure::Unauthorized)
+        ),
+        "a throttled read must be refused"
+    );
+    assert!(
+        matches!(
+            srv.update_registration(&client_id, &token, &code_client_metadata())
+                .await,
+            Err(RegistrationFailure::Unauthorized)
+        ),
+        "a throttled update must be refused"
+    );
+}
+
+/// The outcome reaches the limiter, so a host counting FAILURES rather than traffic has something
+/// to count: a wrong registration access token is the shape a guessing attack makes, and a right
+/// one must not be charged as though it were one.
+#[tokio::test]
+async fn management_outcomes_are_reported_to_the_limiter() {
+    let throttle = std::sync::Arc::new(ManagementThrottle::default());
+    let (srv, client_id, token) = registered_with(throttle.clone()).await;
+
+    let _ = srv.read_registration(&client_id, "not-the-token").await;
+    srv.read_registration(&client_id, &token)
+        .await
+        .expect("the right token still reads");
+
+    let client = client_id.as_str();
+    let seen: Vec<String> = throttle
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|line| line.contains("ClientAuthentication"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            format!("check ClientAuthentication {{ client_id: \"{client}\" }}"),
+            format!("record ClientAuthentication {{ client_id: \"{client}\" }} Failed"),
+            format!("check ClientAuthentication {{ client_id: \"{client}\" }}"),
+            format!("record ClientAuthentication {{ client_id: \"{client}\" }} Succeeded"),
+        ],
+        "a wrong token must count as a failure and a right one as a success: {seen:?}"
+    );
+}

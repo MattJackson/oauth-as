@@ -20,12 +20,14 @@
 //! alone for the host that serves its own routes.
 //!
 //! TWO, RFC 7662. `introspection_endpoint` was advertised unconditionally while
-//! `AuthorizationServer::introspection_response_with_credential` answers `{"active":false}` to
-//! every authenticated caller that is not the token's own client, which is to say to every
-//! RESOURCE SERVER, RFC 7662's primary consumer. The advertisement is now the host's opt-in
-//! (`ServerConfig::introspection_endpoint`). The ROUTE is unconditional either way, because a
-//! client introspecting its own token is the case that does work and withdrawing it would be a
-//! functional regression rather than an honesty fix.
+//! `AuthorizationServer::introspection_response_with_credential` answered `{"active":false}` to
+//! every authenticated caller that was not the token's own client, which was to say to every
+//! RESOURCE SERVER, RFC 7662's primary consumer. 0.9.2 built that channel
+//! (`ServerConfig::resource_servers`) and the advertisement REMAINS the host's opt-in
+//! (`ServerConfig::introspection_endpoint`), because the channel only exists for a deployment that
+//! registered resource servers and this crate cannot know whether one did. The ROUTE is
+//! unconditional either way, because a client introspecting its own token always works and
+//! withdrawing it would be a functional regression rather than an honesty fix.
 
 #![cfg(feature = "http")]
 

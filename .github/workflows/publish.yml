@@ -286,7 +286,7 @@ jobs:
       - name: tests (every feature EXCEPT the ES256 backend)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,test-util
+            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,cimd,test-util
 
       # See dev.yml's copy for the argument. RFC 9396 section 5's refusals are proven by two files
       # gated `not(feature = "rar")`, and no feature set anywhere ran them; one was never compiled.
@@ -294,7 +294,33 @@ jobs:
       - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,test-util
+            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,cimd,test-util
+      # THE MUTUALLY-EXCLUSIVE PAIRS, which no other step in any workflow REACHES.
+      #
+      # Four tests were gated on feature combinations that every running configuration
+      # contradicted: `all(dpop, not(mtls))` and `all(mtls, not(dpop))` in
+      # introspection_feature_bounds.rs, and `not(jwt)` under `#![cfg(http)]` in
+      # http_advertised_reachability.rs. Default, --all-features, no-backend and no-rar all have
+      # dpop and mtls together or neither, and every set with http also has jwt. The clippy
+      # combination loop COMPILES them, which is why they type-checked forever; clippy does not RUN
+      # tests, so nothing ever executed them. Proven by making each panic and watching all four
+      # configurations stay green.
+      #
+      # They are not decoration. They are the cases the top-level guards CANNOT reach: a
+      # certificate-bound token read as a plain bearer by a dpop-only build, the mirror image for
+      # mtls, and a jwks_uri advertised by a build that cannot serve one. Each is a silent
+      # downgrade, which is the failure those files exist to prevent.
+      #
+      # Scoped to the two files rather than a fourth full matrix: what is missing is REACH, not
+      # coverage, and a full run of each would cost minutes to execute tests the other steps
+      # already ran.
+      - name: the changelog must date the version being built
+        run: python3 scripts/changelog-dated.py
+      - name: tests (the feature pairs no other step reaches)
+        run: |
+          cargo test -p oauth-as --locked --features dpop --test introspection_feature_bounds
+          cargo test -p oauth-as --locked --features mtls --test introspection_feature_bounds
+          cargo test -p oauth-as --locked --features http --test http_advertised_reachability
 
       - name: docs must build clean, since docs.rs is the published surface
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p oauth-as --locked --all-features --no-deps

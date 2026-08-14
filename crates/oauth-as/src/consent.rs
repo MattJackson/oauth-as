@@ -30,7 +30,13 @@
 //! so with an `insufficient_user_authentication` challenge (section 3). The client then repeats its
 //! authorization request carrying `acr_values` and `max_age` (section 4, the parameters OpenID
 //! Connect Core section 3.1.2.1 defines), and the authorization server is expected to act on them
-//! and to report what it did as `acr` and `auth_time` (section 5).
+//! (section 5) and to report what it did as `acr` and `auth_time` (section 6).
+//!
+//! SECTION 6 HAS TWO SUBSECTIONS AND THIS CRATE ANSWERS BOTH, because a token reaches a resource
+//! server two ways: 6.1 is the RFC 9068 JWT access token, read offline by a server that never
+//! introspects, and 6.2 is RFC 7662 introspection, which is all an OPAQUE token has. Through 0.9.1
+//! only 6.2 was answered, which left the step-up invisible to exactly the deployment that verifies
+//! signatures locally.
 //!
 //! This crate has no login page, no session store, no password, no second factor, and no way to
 //! challenge a user, and it will not grow any of them: that is the same boundary the crate docs
@@ -133,8 +139,10 @@ pub const MAX_ACR_VALUES: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authentication {
     /// When the user actually authenticated. OpenID Connect Core section 2 defines `auth_time` as
-    /// the "time when the End-User authentication occurred", and RFC 9470 section 6.2 is what makes
-    /// it worth carrying: `max_age` is meaningless without an instant to measure from.
+    /// the "time when the End-User authentication occurred", and RFC 9470 section 6 is what makes
+    /// it worth carrying: `max_age` is meaningless without an instant to measure from. It is
+    /// reported through both of that section's channels, the JWT claim of 6.1 and the introspection
+    /// member of 6.2.
     ///
     /// NOT "when this request arrived". A host that conflates the two makes every request look
     /// freshly authenticated, which is the one mistake that turns this whole mechanism into

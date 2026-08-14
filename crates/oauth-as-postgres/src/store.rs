@@ -75,8 +75,9 @@
 //! client. Those live out their expiry unless something revokes them, which is what
 //! [`Storage::revoke_token_family`] and the cascade are for. A deployment that needs "revoked NOW"
 //! at the resource server still needs introspection or short token lifetimes; that was never a
-//! statement about this race and it has not changed. The resource-server introspection channel is
-//! 0.9.2 work, so short lifetimes are the 0.9.1 answer.
+//! statement about this race and it has not changed. Since 0.9.2 introspection is available to a
+//! resource server registered in `ServerConfig::resource_servers`, so it is a real answer here and
+//! not only short lifetimes.
 
 use oauth_as::authorization::AuthorizationCodeRecord;
 use oauth_as::client::{Client, ClientId};
@@ -170,6 +171,55 @@ fn scope_key(scope: &str, parts: [&str; 2]) -> String {
     format!("{scope}:{}:{first}:{}:{second}", first.len(), second.len())
 }
 
+/// The barrier keys one write has to hold, IN THE ORDER THEY MUST BE ACQUIRED.
+///
+/// A separate function from [`lock_barrier_scopes`] for one reason: the order is a deadlock
+/// invariant of the whole crate, and a `vec!` built inline inside the locking call is something a
+/// later edit reorders for readability without anything going red. Here it has a name, a stated
+/// invariant, and unit tests that fail on a reorder.
+///
+/// THE INVARIANT: `client` is index 0. Every other key comes after it.
+///
+/// WHY. `unnest` acquires these one at a time, so a writer part-way through the array HOLDS the
+/// keys it has taken and WAITS for the next one. That is enough to be one edge of a cycle, and the
+/// other two edges exist:
+///
+/// - `revoke_consent` takes a ROW lock (its `DELETE ... RETURNING` claim) BEFORE its advisory
+///   lock, so it can hold a consent row while waiting for `consent:(C, S)`.
+/// - `delete_client` takes `client:C` FIRST and then cascades into `oauth_as_consents`, so it can
+///   hold `client:C` while waiting for that same consent row.
+///
+/// With `consent` before `client` in this array, a `put_token` for (C, S) holding `consent:(C, S)`
+/// and waiting for `client:C` closes the triangle, and PostgreSQL breaks it with `40P01` — whose
+/// loser can be the REVOCATION, which then reaches the caller as `server_error` with the grant
+/// still live. That is the same defect class the 0.9.1 audit found in `delete_client`'s cascade
+/// order, one level down. `client` first makes the third edge unconstructible: no writer ever
+/// holds a `consent` or `family` key while waiting for `client`, so nothing waits on a revocation
+/// that is waiting on a writer.
+///
+/// The same argument covers `family` against `revoke_token_family`, which also takes `family:F`
+/// before its cascade: a writer holding `family:F` and waiting for `client:C` would close the
+/// identical triangle through the token rows.
+///
+/// Order among the keys AFTER `client` is free. Both belong to writers only in the shared mode,
+/// and each revocation takes exactly ONE exclusive key, so no two of the non-client keys can be
+/// held by two waiters in opposite orders.
+fn barrier_scope_keys(
+    client_id: &str,
+    family_id: Option<&str>,
+    subject: Option<&str>,
+) -> Vec<String> {
+    // FIRST, unconditionally, and `tests::the_client_key_is_acquired_first` is what keeps it here.
+    let mut keys = vec![scope_key("client", [client_id, ""])];
+    if let Some(family_id) = family_id {
+        keys.push(scope_key("family", [family_id, ""]));
+    }
+    if let Some(subject) = subject {
+        keys.push(scope_key("consent", [client_id, subject]));
+    }
+    keys
+}
+
 /// Take the SHARED half of the barrier lock, for a write a revocation could refuse.
 ///
 /// Called first thing inside the transaction that checks the barrier and then writes, and held
@@ -184,11 +234,13 @@ fn scope_key(scope: &str, parts: [&str; 2]) -> String {
 /// through one queue, at one transaction each. A shared lock lets them all through together and
 /// makes only a revocation of that exact identity wait.
 ///
-/// ONE STATEMENT over an array, rather than one statement per key. Lock ORDER does not matter
-/// here and cannot deadlock: a shared lock waits only on an exclusive holder, the exclusive side
-/// below takes exactly ONE of these locks per revocation, and nothing that holds one ever waits on
-/// a lock a writer holds — a writer holds no row locks at the point it takes these, because it has
-/// not written anything yet. So there is no cycle to form in either direction.
+/// ONE STATEMENT over an array, rather than one statement per key — but the ORDER WITHIN THAT
+/// ARRAY IS LOAD BEARING, and through 0.9.1 this comment said the opposite. It argued that
+/// "nothing that holds one of these ever waits on a lock a writer holds", which is false the
+/// moment there is more than one key: `unnest` acquires them one at a time, so a writer that has
+/// taken key N and is blocked on key N+1 is holding one and waiting. What actually keeps a cycle
+/// from closing is [`barrier_scope_keys`] putting `client` FIRST; that function owns the argument,
+/// and its unit tests pin it.
 async fn lock_barrier_scopes(
     op: &'static str,
     tx: &mut sqlx::PgConnection,
@@ -196,13 +248,7 @@ async fn lock_barrier_scopes(
     family_id: Option<&str>,
     subject: Option<&str>,
 ) -> Result<(), StorageError> {
-    let mut keys = vec![scope_key("client", [client_id, ""])];
-    if let Some(family_id) = family_id {
-        keys.push(scope_key("family", [family_id, ""]));
-    }
-    if let Some(subject) = subject {
-        keys.push(scope_key("consent", [client_id, subject]));
-    }
+    let keys = barrier_scope_keys(client_id, family_id, subject);
     sqlx::query(
         "SELECT pg_advisory_xact_lock_shared(hashtextextended(k, 0)) \
          FROM unnest($1::text[]) AS t(k)",
@@ -1252,6 +1298,13 @@ impl Storage for PostgresStorage {
         // `oauth_as_consents` (the claim above) before `oauth_as_access_tokens` (the cascade
         // below), and `delete_client` was reordered to do the same. Anything added to either
         // cascade has to keep that order.
+        //
+        // AND THERE IS A THIRD ARGUMENT, WHICH IS NEITHER OF THOSE TWO. Holding a row lock while
+        // asking for an advisory one — which this method does here and no other revocation does —
+        // is one edge of a cycle a WRITER can complete: see `barrier_scope_keys`, which acquires
+        // `client` before `consent` for exactly this reason. Moving the claim above to after this
+        // lock would close the hazard from this end, but it cannot be moved: the pair this key
+        // names is what the claim returns.
         lock_barrier_scope_exclusive(OP, &mut tx, &scope_key("consent", [&client_id, &subject]))
             .await?;
         // Recorded from the pair the DELETE ... RETURNING just claimed, so the barrier names
@@ -1449,5 +1502,64 @@ impl Storage for PostgresStorage {
             }
         }
         Ok(removed)
+    }
+}
+
+/// THE DEADLOCK INVARIANT, CHECKED WITHOUT A DATABASE.
+///
+/// `tests/revocation_races.rs` drives the real three-transaction cycle against a real PostgreSQL,
+/// which is the evidence that the invariant below is about something. This module is the GATE: it
+/// needs no `pg-integration` feature and no server, so it runs on `cargo test --workspace` on a
+/// machine that has neither, and a reorder of [`barrier_scope_keys`] cannot reach a commit through
+/// a suite nobody on that machine could run.
+#[cfg(test)]
+mod tests {
+    use super::{barrier_scope_keys, scope_key};
+
+    /// `client` is index 0 in EVERY shape of key list the function can produce.
+    ///
+    /// Written as "index 0 equals the client key" rather than "the client key is present": the
+    /// defect being pinned is a REORDER, and a set-membership assertion survives one.
+    #[test]
+    fn the_client_key_is_acquired_first() {
+        let client = scope_key("client", ["c", ""]);
+        for (family, subject) in [
+            (None, None),
+            (Some("f"), None),
+            (None, Some("s")),
+            (Some("f"), Some("s")),
+        ] {
+            let keys = barrier_scope_keys("c", family, subject);
+            assert_eq!(
+                keys.first(),
+                Some(&client),
+                "the client barrier key is no longer acquired first (family={family:?}, \
+                 subject={subject:?}, keys={keys:?}). A writer that holds `consent` or `family` \
+                 while waiting for `client` closes a three-transaction cycle with `revoke_consent` \
+                 and `delete_client`, and PostgreSQL breaks it with 40P01 — whose loser can be the \
+                 REVOCATION, which reaches the caller as `server_error` with the grant still live. \
+                 See `barrier_scope_keys`, and `tests/revocation_races.rs`'s \
+                 `a_writer_waiting_for_the_client_barrier_cannot_hold_the_consent_one`."
+            );
+        }
+    }
+
+    /// Every key a shape names is still THERE, so the assertion above cannot be satisfied by
+    /// dropping the others: a lost key would let a revocation and a write miss each other
+    /// entirely, which is the defect the barrier lock exists to close.
+    #[test]
+    fn every_named_identity_is_still_locked() {
+        assert_eq!(
+            barrier_scope_keys("c", Some("f"), Some("s")),
+            vec![
+                scope_key("client", ["c", ""]),
+                scope_key("family", ["f", ""]),
+                scope_key("consent", ["c", "s"]),
+            ]
+        );
+        assert_eq!(
+            barrier_scope_keys("c", None, None),
+            vec![scope_key("client", ["c", ""])]
+        );
     }
 }

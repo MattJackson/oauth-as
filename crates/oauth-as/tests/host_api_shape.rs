@@ -362,6 +362,40 @@ fn must_use_on_consuming_builders_is_all_or_nothing() {
 /// A source scan, and it has to be: a re-export that is MISSING is not an error anywhere inside this
 /// crate, because `crate::store::RevocationWindow` resolves perfectly well from here. It is only an
 /// absence, and only from outside. Same idiom and same reason as the scans above.
+/// The re-export surface: every `pub use` statement in lib.rs, joined, so that a name inside a
+/// braced multi-line list counts. Matching the whole file would let a doc comment mentioning an
+/// item stand in for actually exporting it, which is the failure both callers are about.
+///
+/// Deliberately blind to `#[cfg]`: a feature-gated item and its feature-gated re-export are both
+/// text here, so the comparison holds under every feature combination rather than only the one the
+/// test binary happens to be built with. A cap that is re-exported under the WRONG cfg is caught by
+/// the compiler in every build that enables its feature, which is where that belongs.
+fn reexport_surface(lib_src: &str) -> String {
+    let mut reexports = String::new();
+    let mut in_use = false;
+    for line in lib_src.lines() {
+        if line.starts_with("pub use ") {
+            in_use = true;
+        }
+        if in_use {
+            reexports.push_str(line);
+            reexports.push('\n');
+            if line.trim_end().ends_with(';') {
+                in_use = false;
+            }
+        }
+    }
+    reexports
+}
+
+/// Whether `name` appears in `haystack` as a whole word. `Client` must not be satisfied by
+/// `ClientId`, and `MAX_PROOF_BYTES` must not be satisfied by a longer constant that contains it.
+fn names_word(haystack: &str, name: &str) -> bool {
+    haystack
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|t| t == name)
+}
+
 #[test]
 fn every_type_in_a_storage_signature_is_reexported_at_the_crate_root() {
     /// Names that appear in `Storage` signatures and belong to `std`/`core` rather than to this
@@ -400,23 +434,7 @@ fn every_type_in_a_storage_signature_is_reexported_at_the_crate_root() {
         + trait_at;
     let body = &store_src[trait_at..trait_end];
 
-    // The re-export surface: every `pub use` line in lib.rs, joined, so that a name inside a braced
-    // multi-line list counts. Matching the whole file would let a doc comment mentioning a type
-    // stand in for actually exporting it, which is the failure this test is about.
-    let mut reexports = String::new();
-    let mut in_use = false;
-    for line in lib_src.lines() {
-        if line.starts_with("pub use ") {
-            in_use = true;
-        }
-        if in_use {
-            reexports.push_str(line);
-            reexports.push('\n');
-            if line.trim_end().ends_with(';') {
-                in_use = false;
-            }
-        }
-    }
+    let reexports = reexport_surface(lib_src);
 
     let mut named = Vec::new();
     let mut missing = Vec::new();
@@ -446,9 +464,7 @@ fn every_type_in_a_storage_signature_is_reexported_at_the_crate_root() {
             }
             // Word boundaries matter: `Client` must not be satisfied by `ClientId`, and this crate
             // publishes both.
-            let exported = reexports
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .any(|t| t == word);
+            let exported = names_word(&reexports, word);
             if !exported && !missing.iter().any(|m| m == word) {
                 missing.push(word.to_string());
             }
@@ -476,69 +492,166 @@ fn every_type_in_a_storage_signature_is_reexported_at_the_crate_root() {
 /// parameters than [`oauth_as::MAX_FORM_PARAMETERS`], has moved the refusal somewhere this crate
 /// cannot describe. They are of no use one at a time, so they are published in one place.
 ///
-/// This test is a COMPILE-time assertion first: naming a constant that is not re-exported fails to
-/// build, which is the whole of the property.
+/// THE LIST IS DERIVED, NOT MAINTAINED, and that is the whole point of this version. Through 0.9.1
+/// this test held a hand-written `Vec` of caps and asserted `value > 0` over it -- true by
+/// construction for every cap in the crate, so the runtime half tested nothing, and the compile
+/// half only proved that the caps somebody had REMEMBERED to list were re-exported. Nothing watched
+/// the list, and it had already fallen behind: `MIN_CLIENT_SECRET_JWT_KEY_LENGTH` and
+/// `MAX_TRACKED_CLIENT_ID_LEN` were both missing from it. That is the same defect class as the
+/// unchecked feature mirror this crate fixed earlier in the release: a hand-maintained mirror of a
+/// thing that changes, with no test on the mirroring.
+///
+/// So the caps are read out of `src/` instead, in the idiom of `tests/hex_single_definition.rs` and
+/// the statics scan in `tests/allocation.rs`. A new `pub const CAP: usize` added to a public module
+/// without a crate-root re-export now fails HERE, at the point the cap is added, rather than going
+/// unnoticed until a host cannot find it.
+///
+/// A re-export that is missing is an absence rather than an error: `crate::http::MAX_BODY_BYTES`
+/// resolves perfectly well from inside this crate, so nothing in a normal build can see the gap.
+/// Only a scan from outside can.
 #[test]
 fn every_public_request_cap_is_reexported_at_the_crate_root() {
-    // Collected rather than asserted one at a time, so the runtime check is about a value the
-    // compiler has not folded away, and so a failure names WHICH cap. Naming a constant that is
-    // not re-exported is a compile error, which is the property that actually matters here.
-    // `mut` is cfg-dependent: the feature-gated `caps.extend(..)` calls below are the only writers,
-    // so a build with none of those features enabled sees a `mut` nothing uses. Allowed rather than
-    // removed, because removing it would break every build that DOES enable one.
-    #[allow(unused_mut)]
-    let mut caps: Vec<(&str, usize)> = vec![
-        ("MIN_USER_CODE_LENGTH", oauth_as::MIN_USER_CODE_LENGTH),
-        ("MAX_RESOURCE_INDICATORS", oauth_as::MAX_RESOURCE_INDICATORS),
-        (
-            "MAX_REGISTERED_REDIRECT_URIS",
-            oauth_as::MAX_REGISTERED_REDIRECT_URIS,
-        ),
+    /// Caps that are public on their module and deliberately NOT at the crate root, each with the
+    /// reason it stays there. This is an exception list rather than the old inventory: it does not
+    /// have to grow when a cap is added, only when a cap is added and deliberately kept off the
+    /// root, which is a decision worth writing down. Every entry is checked in both directions
+    /// below, so a stale one fails rather than silently excusing nothing.
+    ///
+    /// None of these were argued for at the time; they are pinned as the state 0.9.2 ships so
+    /// that the next change to any of them is a decision rather than a drift. Promoting one to the
+    /// root is a semver-additive change and only requires deleting its line here.
+    const MODULE_ONLY: &[(&str, &str)] = &[
+        // An internal structural bound on delegation chains, not a request size a gateway sizes
+        // itself against.
+        ("MAX_ACT_CHAIN_DEPTH", "token_exchange"),
+        // The assertion arrives inside a form body already bounded by `MAX_BODY_BYTES`, which is
+        // the cap a host's proxy actually needs.
+        ("MAX_ASSERTION_BYTES", "client_assertion"),
+        // Reached through `consent::` by every host that uses the consent surface at all.
+        ("MAX_ACR_VALUES", "consent"),
+        // A bound on a nested member of `authorization_details`, not on the request.
+        ("MAX_DETAIL_LIST_ENTRIES", "rar"),
+        // A bound on a member of a DPoP proof, which is itself bounded by `MAX_PROOF_BYTES`.
+        ("MAX_JTI_BYTES", "dpop"),
     ];
-    #[cfg(feature = "rar")]
-    caps.extend([
-        (
-            "MAX_AUTHORIZATION_DETAILS_BYTES",
-            oauth_as::MAX_AUTHORIZATION_DETAILS_BYTES,
-        ),
-        (
-            "MAX_AUTHORIZATION_DETAILS_ELEMENTS",
-            oauth_as::MAX_AUTHORIZATION_DETAILS_ELEMENTS,
-        ),
-        (
-            "MAX_AUTHORIZATION_DETAILS_DEPTH",
-            oauth_as::MAX_AUTHORIZATION_DETAILS_DEPTH,
-        ),
-    ]);
-    #[cfg(feature = "token-exchange")]
-    caps.push(("MAX_AUDIENCE_VALUES", oauth_as::MAX_AUDIENCE_VALUES));
-    #[cfg(feature = "consent")]
-    caps.push(("MAX_CONSENT_RESOURCES", oauth_as::MAX_CONSENT_RESOURCES));
-    #[cfg(feature = "dpop")]
-    caps.push(("MAX_PROOF_BYTES", oauth_as::MAX_PROOF_BYTES));
-    #[cfg(feature = "http")]
-    caps.extend([
-        ("MAX_FORM_PARAMETERS", oauth_as::MAX_FORM_PARAMETERS),
-        ("MAX_BODY_BYTES", oauth_as::MAX_BODY_BYTES),
-    ]);
 
-    for (name, value) in &caps {
-        assert!(*value > 0, "{name} must be a positive cap");
+    let lib_src = include_str!("../src/lib.rs");
+    let reexports = reexport_surface(lib_src);
+    let src_dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+
+    // Every `.rs` under `src/`, except the `src/tests/` tree: that tree is `#[cfg(test)]`-only and
+    // never ships, so a constant there is not part of anybody's public surface. Same scope, and the
+    // same reason, as `tests/hex_single_definition.rs`.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![src_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the crate's src/ must be readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
+                    stack.push(path);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
     }
-    #[cfg(feature = "token-exchange")]
-    {
-        let audience = caps
-            .iter()
-            .find(|(n, _)| *n == "MAX_AUDIENCE_VALUES")
-            .expect("it was just pushed");
-        let resource = caps
-            .iter()
-            .find(|(n, _)| *n == "MAX_RESOURCE_INDICATORS")
-            .expect("it is unconditional");
-        assert_eq!(
-            audience.1, resource.1,
-            "RFC 8693 s2.1.1 makes audience and resource two spellings of one thing, and this \
-             crate holds them to one number"
+    files.sort();
+
+    let mut caps: Vec<(String, String)> = Vec::new();
+    let mut scanned_modules = 0_usize;
+    for path in &files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("a source file has a name");
+        // A `pub const` inside a PRIVATE module is not public, so demanding a re-export for it
+        // would be wrong rather than strict. `mod hex;` and `mod skew;` are the live examples.
+        // Publicity is read from lib.rs, which is where every module in this crate is declared.
+        if !lib_src.contains(&format!("pub mod {stem};")) {
+            continue;
+        }
+        scanned_modules += 1;
+        let text = std::fs::read_to_string(path).expect("a readable source file");
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            // `pub const NAME: usize` / `: u32`, which is what a cap is in this crate. Durations
+            // (`MAX_PROOF_AGE`, `MAX_ASSERTION_LIFETIME`) are policy defaults a host overrides
+            // through `ServerConfig`, not numbers it has to mirror in a proxy, and they are left
+            // out by the type rather than by a name anybody has to keep updating.
+            let Some(rest) = trimmed.strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            let ty = ty.trim_start();
+            if !(ty.starts_with("usize") || ty.starts_with("u32")) {
+                continue;
+            }
+            if !(name.starts_with("MAX_") || name.starts_with("MIN_")) {
+                continue;
+            }
+            caps.push((name.to_string(), stem.to_string()));
+        }
+    }
+
+    // A scan that has stopped finding anything passes everything, so the reach of the scan is
+    // asserted before its result. At 0.9.2 it finds 20 caps, spread over 10 of the crate's public
+    // modules, while reading every public module there is. The floors are set well below both, so
+    // that deleting a cap is not a failure but switching the scan off is.
+    assert!(
+        caps.len() >= 15 && scanned_modules >= 8,
+        "the scan found only {} caps across {scanned_modules} public modules, so it has stopped \
+         finding them and is no longer testing anything: {caps:?}",
+        caps.len()
+    );
+
+    let mut missing: Vec<String> = Vec::new();
+    for (name, module) in &caps {
+        if names_word(&reexports, name) {
+            continue;
+        }
+        if MODULE_ONLY.iter().any(|(excused, _)| excused == name) {
+            continue;
+        }
+        missing.push(format!("{name} (src/{module}.rs)"));
+    }
+    assert!(
+        missing.is_empty(),
+        "these caps are public on their module and NOT re-exported at the crate root, so a host \
+         sizing its own gateway cannot reach them from `oauth_as::` alone: {missing:?}\n\
+         Add each to the `pub use` list in lib.rs under the SAME `#[cfg]` its item carries, or, if \
+         it genuinely belongs to its module only, add it to MODULE_ONLY in this test with the \
+         reason."
+    );
+
+    // The exception list, checked in both directions. An entry naming a cap that no longer exists
+    // excuses nothing and hides the next one that lands under that name; an entry naming a cap that
+    // HAS since been re-exported makes the list a lie about the crate's surface.
+    for (excused, module) in MODULE_ONLY {
+        assert!(
+            caps.iter()
+                .any(|(name, found_in)| name == excused && found_in == module),
+            "MODULE_ONLY names {excused} in src/{module}.rs, and the scan does not find it there. \
+             It was renamed, moved or deleted: fix the entry rather than leaving a dead excuse in \
+             the list."
+        );
+        assert!(
+            !names_word(&reexports, excused),
+            "MODULE_ONLY says {excused} is reachable only through `oauth_as::{module}::`, but \
+             lib.rs now re-exports it at the root. Delete the entry: the exception is spent."
         );
     }
+
+    // Not an inventory property but a cross-cap one, and the only claim here the compiler has to
+    // check rather than the text: RFC 8693 s2.1.1 makes audience and resource two spellings of one
+    // thing, and this crate holds them to one number.
+    #[cfg(feature = "token-exchange")]
+    assert_eq!(
+        oauth_as::MAX_AUDIENCE_VALUES,
+        oauth_as::MAX_RESOURCE_INDICATORS,
+        "RFC 8693 s2.1.1 makes audience and resource two spellings of one thing, and this crate \
+         holds them to one number"
+    );
 }
