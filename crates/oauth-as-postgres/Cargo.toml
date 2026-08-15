@@ -75,7 +75,7 @@ oauth-as = { version = "0.9", path = "../oauth-as" }
 # connection pool and transaction types are in the box. `default-features = false` drops the
 # macros, the CLI-facing migrator, and every TLS backend: this crate opens no socket the host did
 # not configure, and a TLS stack it does not use would be attack surface plus a C toolchain.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "postgres",       # the wire protocol, nothing else
     "runtime-tokio",  # the async runtime the trait's Send futures are driven on
     "json",           # so a record payload can be bound as jsonb without hand-rolling its wire form
