@@ -352,10 +352,25 @@ async fn barrier_covers(
     // schema forbids an empty `family_id` on a 'family' row and an empty `subject` on a 'consent'
     // row, because this crate never mints an empty one. So the `''` sentinel does the work an
     // `IS NOT NULL` guard would have, without a nullable bind.
+    // The client clause refuses on EITHER of two conditions, and the second closes a race the
+    // window alone could not. The window (`recorded_at_ns >= $4`) exists so a `client_id` the host
+    // RE-PROVISIONS after a deletion is served: its new grants are established after the old
+    // barrier, the window admits them, and refusing on identity alone would lock a re-registered
+    // client out for the barrier's whole life. But `delete_client` records the barrier and deletes
+    // the client row in ONE transaction, so a client barrier standing next to a MISSING client row
+    // is a deletion no re-provisioning followed, and a grant for it must be refused however its
+    // `grant_established_at` compares. Without the `NOT EXISTS` disjunct a write that raced the
+    // deletion and lost the advisory-lock race -- so its own refusal check runs after the barrier
+    // commits -- is admitted anyway, because its `pushed_at`/`grant_established_at` was stamped a
+    // few microseconds after the revocation's `recorded_at`. `tests/revocation_races.rs`'s
+    // `a_pushed_request_cannot_land_behind_a_client_deletion` is the site that surfaced it, and a
+    // re-provisioned client (the `oauth_as_clients` row is back) still takes the window path.
     let row = sqlx::query(
         "SELECT EXISTS ( \
              SELECT 1 FROM oauth_as_revocation_barriers WHERE \
-                 (scope = 'client'  AND client_id = $1 AND recorded_at_ns >= $4) \
+                 (scope = 'client'  AND client_id = $1 \
+                     AND (recorded_at_ns >= $4 \
+                          OR NOT EXISTS (SELECT 1 FROM oauth_as_clients WHERE client_id = $1))) \
               OR (scope = 'family'  AND family_id = $2) \
               OR (scope = 'consent' AND client_id = $1 AND subject = $3 \
                                     AND recorded_at_ns >= $4) \

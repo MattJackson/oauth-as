@@ -541,7 +541,20 @@ impl ClientIdUrl {
         // address the fetcher will connect to. Anything else is refused rather than normalised,
         // because normalising an address the caller wrote ambiguously is guessing at intent on the
         // one input where guessing wrong reaches inside the network.
-        if ends_in_a_number(host) && host.parse::<std::net::Ipv4Addr>().is_err() {
+        // NOT for an IPv6 literal. `host_of` has stripped the brackets by here, so a host that
+        // still contains a colon is v6, and WHATWG's "ends in a number" rule is part of the
+        // IPv4/opaque-host path -- a v6 literal has its own parser and never reaches it. Applying
+        // it here refused `::ffff:93.184.216.34`, a PUBLIC address, because its last dot-label is
+        // `34` and `Ipv4Addr::from_str` then fails on the colons. The same address spelled
+        // `::ffff:5db8:d822` was accepted, so the verdict depended on the spelling rather than on
+        // the address. Worse, it short-circuited the v4-mapped branch of `is_special_use_literal`
+        // for every dotted form, which is why the 0.9.2 sweep left seventeen survivors in there
+        // and why the test asserting `[::ffff:169.254.169.254]` is refused was passing on this
+        // rule rather than on the one it names.
+        if !host.contains(':')
+            && ends_in_a_number(host)
+            && host.parse::<std::net::Ipv4Addr>().is_err()
+        {
             return Err(CimdError::SpecialUseAddress);
         }
         // A BACKSLASH IS A SLASH TO THE FETCHER AND NOT TO US, which makes it the same class of

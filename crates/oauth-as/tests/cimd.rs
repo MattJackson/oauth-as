@@ -923,3 +923,207 @@ fn a_percent_escaped_authority_is_refused() {
     // decides where the request goes.
     assert!(ClientIdUrl::parse("https://client.example/a%20b", &policy).is_ok());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Section 6.5, the other direction: what the SSRF refusal must NOT refuse.
+// ---------------------------------------------------------------------------------------------
+
+/// The whole of section 6.5's coverage above asserts REFUSALS, and a refusal-only suite cannot
+/// tell a working defence from one that refuses everything. This is the half that was missing:
+/// the mutation sweep at 0.9.2 left seventeen survivors inside `is_special_use_literal`, all of
+/// them mutations that change WHICH address the function computes while leaving the verdict
+/// "special-use, refuse" intact -- so every assertion above still passed.
+///
+/// The v4-mapped case is the sharpest of them. `::ffff:93.184.216.34` extracts its embedded
+/// address with `s[6] >> 8`; mutate that to `<<` and the extraction truncates to `0.x.x.x`,
+/// which `[0, ..] => true` refuses as "this host on this network". Every refusal test still
+/// passes, because the mutant refuses MORE. Only an acceptance can see the difference.
+///
+/// The boundaries matter for the same reason and for a second one: a range guard that is one
+/// address too wide silently refuses a legitimate client, and the failure mode of an SSRF
+/// defence that is too broad is an authorization server that will not talk to real clients.
+#[test]
+fn addresses_outside_every_special_use_range_are_accepted() {
+    for host in [
+        // An ordinary public v4 literal, and the same address written v4-mapped. The second is
+        // the one that pins the embedded-address arithmetic.
+        "93.184.216.34",
+        "[::ffff:93.184.216.34]",
+        // One address on each side of every bounded v4 range, chosen to sit exactly one step
+        // outside it, so a guard widened by one is caught rather than merely a guard deleted.
+        "172.15.255.255",  // just below 172.16.0.0/12
+        "172.32.0.1",      // just above 172.31.255.255
+        "100.63.255.255",  // just below 100.64.0.0/10
+        "100.128.0.1",     // just above 100.127.255.255
+        "198.17.255.255",  // just below 198.18.0.0/15
+        "198.20.0.1",      // just above 198.19.255.255
+        "223.255.255.255", // just below the 224/4 multicast floor
+        // And the v6 boundaries, which the suite reached not at all.
+        "[2001:200::1]", // outside 2001::/23, which ends at 2001:01ff
+        "[2003::1]",     // outside 2002::/16
+        "[fb00::1]",     // just below fc00::/7
+        "[fec0::1]",     // outside fe80::/10, above its ceiling
+        "[2606:2800:220:1:248:1893:25c8:1946]", // a real public v6 address
+    ] {
+        let raw = format!("https://{host}/app");
+        assert!(
+            ClientIdUrl::parse(&raw, &strict()).is_ok(),
+            "{host} is outside every RFC 6890 special-use range, so refusing it would make this \
+             server decline a legitimate client identifier"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mutation-kill coverage: boundaries and bit-ops the tests above did not pin.
+// ---------------------------------------------------------------------------------------------
+
+/// The URL length cap is `>`, not `>=`: a URL EXACTLY at the cap is within it. Without a case at
+/// the boundary, the length check could be off by one (refusing the last legal byte) and every
+/// test still pass, because the only length assertions above are one-over.
+#[test]
+fn a_client_id_url_exactly_at_the_cap_is_accepted() {
+    let prefix = "https://client.example/";
+    let at_cap = format!(
+        "{prefix}{}",
+        "a".repeat(oauth_as::MAX_CLIENT_ID_URL_BYTES - prefix.len())
+    );
+    assert_eq!(at_cap.len(), oauth_as::MAX_CLIENT_ID_URL_BYTES);
+    assert!(
+        ClientIdUrl::parse(&at_cap, &strict()).is_ok(),
+        "a URL exactly at the cap is not over it; the check is strictly greater-than"
+    );
+}
+
+/// `Display` writes the identifier VERBATIM. A host that logs or renders the client identifier
+/// gets the string it parsed, so an impl that wrote nothing (or a default) would silently blank
+/// every audit line that formats a `ClientIdUrl`.
+#[test]
+fn a_client_id_url_displays_as_the_string_it_parsed() {
+    let parsed = url(URL);
+    assert_eq!(format!("{parsed}"), URL);
+    assert_eq!(parsed.to_string(), URL);
+    // A non-empty rendering is the point: an `Ok(Default::default())` impl would print "".
+    assert!(!parsed.to_string().is_empty());
+}
+
+/// The three IPv4 ranges whose membership turns on the SECOND octet, pinned on BOTH sides of each
+/// boundary. A test that only supplies in-range addresses cannot tell a real range guard from one
+/// that always fires; each accepted address below is the octet just outside the range, and would be
+/// wrongly refused if the guard were widened to `true` or its bound moved.
+#[test]
+fn the_second_octet_ranges_are_pinned_on_both_sides() {
+    let policy = strict();
+    // RFC 1918 private: 172.16.0.0/12, i.e. second octet 16..=31.
+    // RFC 6598 shared: 100.64.0.0/10, i.e. second octet 64..=127.
+    // RFC 2544 benchmarking: 198.18.0.0/15, i.e. second octet 18 or 19.
+    let refused = [
+        "172.16.0.1",
+        "172.31.255.255",
+        "100.64.0.1",
+        "100.127.255.255",
+        "198.18.0.1",
+        "198.19.0.1",
+    ];
+    for host in refused {
+        let raw = format!("https://{host}/app");
+        assert_eq!(
+            ClientIdUrl::parse(&raw, &policy).err(),
+            Some(CimdError::SpecialUseAddress),
+            "{host} is inside its special-use range and must be refused"
+        );
+    }
+    let accepted = [
+        "172.15.0.1",  // one below the 172.16 range
+        "172.32.0.1",  // one above the 172.31 range
+        "100.63.0.1",  // one below the 100.64 range
+        "100.128.0.1", // one above the 100.127 range
+        "198.17.0.1",  // one below the benchmarking pair
+        "198.20.0.1",  // one above the benchmarking pair
+    ];
+    for host in accepted {
+        let raw = format!("https://{host}/app");
+        assert!(
+            ClientIdUrl::parse(&raw, &policy).is_ok(),
+            "{host} is OUTSIDE every special-use range and must be accepted; refusing it would be a \
+             range guard that fires too widely"
+        );
+    }
+}
+
+/// A v4-mapped (`::ffff:a.b.c.d`) or v4-compatible (`::a.b.c.d`) IPv6 literal is classified by its
+/// EMBEDDED v4 address, and it reaches this crate spelled in hex/colon form (the dotted form is
+/// refused one step earlier by the "ends in a number" rule). This pins the octet extraction and the
+/// guard that selects the mapped/compatible block: each accepted address embeds a PUBLIC v4 address,
+/// and each refused address embeds a SPECIAL-USE one whose classification turns on an octet the
+/// extraction must read correctly.
+#[test]
+fn a_v4_mapped_or_compatible_literal_is_classified_by_its_embedded_address() {
+    let policy = strict();
+
+    // Embedded 8.8.8.8, public. `::ffff:808:808` has s[5]==0xffff; `::808:808` has s[5]==0. Both
+    // must be ACCEPTED, which pins the mapped/compatible guard (any mutation that skips the block
+    // falls through to `match s[0]`, where s[0]==0 => true => wrongly refused) and the first-octet
+    // extraction (a `<<` in place of `>>` zeroes the first octet, making it 0.8.8.8, special).
+    for host in ["[::ffff:808:808]", "[::808:808]"] {
+        let raw = format!("https://{host}/app");
+        assert!(
+            ClientIdUrl::parse(&raw, &policy).is_ok(),
+            "{host} embeds the public address 8.8.8.8 and must be accepted"
+        );
+    }
+
+    // Embedded special-use addresses whose membership turns on the SECOND octet (`s[6] & 0xff`) and
+    // the THIRD octet (`s[7] >> 8`), so a bit-op that mangles those octets would wrongly ACCEPT them.
+    // `::ffff:ac10:505` = ::ffff:172.16.5.5 (RFC 1918, second octet); the second octet OR-ed or
+    // XOR-ed with 0xff leaves the 16..=31 range and would be accepted.
+    // `::ffff:cb00:7105` = ::ffff:203.0.113.5 (RFC 5737 doc, third octet); zeroing the third octet
+    // gives 203.0.0.5, which is not special and would be accepted.
+    // `2002::808:808` is 6to4 (special by s[0]) with a public embedded tail: a mapped/compatible
+    // guard that fired on s[5]==0 alone would classify it by 8.8.8.8 and wrongly accept it.
+    let refused = ["[::ffff:ac10:505]", "[::ffff:cb00:7105]", "[2002::808:808]"];
+    for host in refused {
+        let raw = format!("https://{host}/app");
+        assert_eq!(
+            ClientIdUrl::parse(&raw, &policy).err(),
+            Some(CimdError::SpecialUseAddress),
+            "{host} is special-use and must be refused; accepting it is the SSRF the check exists \
+             to stop"
+        );
+    }
+}
+
+/// The IPv6 range guards that turn on segments after the first, pinned at their boundaries.
+///
+/// `100::/64` (RFC 6666 discard) is special only when segments 1..=3 are all zero; an address that
+/// zeroes only SOME of them (`100:1::`, `100:0:1::`) is a different, non-special address and must be
+/// accepted, which pins both `&&`s in that guard. `2001::/23` (RFC 2928) is `s[1] < 0x0200`;
+/// `2001:200::1` is the first address just OUTSIDE it and must be accepted, which pins the `<`
+/// against a `<=`.
+#[test]
+fn the_v6_range_guards_are_pinned_at_their_boundaries() {
+    let policy = strict();
+
+    // Inside 100::/64: refused.
+    for host in ["[100::1]", "[2001::1]"] {
+        let raw = format!("https://{host}/app");
+        assert_eq!(
+            ClientIdUrl::parse(&raw, &policy).err(),
+            Some(CimdError::SpecialUseAddress),
+            "{host} is inside its special-use range and must be refused"
+        );
+    }
+
+    // Just outside each guard: accepted.
+    for host in [
+        "[100:1::]",     // segment 1 non-zero => not the /64 discard prefix
+        "[100:0:1::]",   // segment 2 non-zero => not the /64 discard prefix
+        "[2001:200::1]", // s[1] == 0x0200 is the first value outside 2001::/23
+    ] {
+        let raw = format!("https://{host}/app");
+        assert!(
+            ClientIdUrl::parse(&raw, &policy).is_ok(),
+            "{host} is OUTSIDE its special-use range and must be accepted"
+        );
+    }
+}

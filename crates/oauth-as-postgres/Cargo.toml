@@ -3,7 +3,7 @@
 
 [package]
 name = "oauth-as-postgres"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 # NOT the core crate's 1.75 floor, and that is a deliberate consequence of this being a SEPARATE
 # crate rather than a feature of `oauth-as`. sqlx and its tree declare their own, higher, floor.

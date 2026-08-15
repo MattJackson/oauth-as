@@ -685,6 +685,32 @@ async fn an_empty_submission_asks_for_the_code() {
     );
 }
 
+/// A freshly-fetched verification page with NO code entered must not accuse the user of typing a
+/// code that was not recognised. That sentence belongs ONLY to a code that was actually typed and
+/// matched nothing (see `an_unrecognised_code_says_it_was_not_recognised`); showing it on the empty
+/// form -- the `Ok(None)` a lookup of no code returns -- would tell every first-time visitor their
+/// blank field was rejected.
+#[tokio::test]
+async fn an_empty_verification_page_does_not_claim_a_code_was_unrecognised() {
+    let (addr, _server) = serve(
+        MemoryStorage::new(),
+        Wiring {
+            subject: true,
+            consent: true,
+            csrf: true,
+        },
+        None,
+    )
+    .await;
+    let (page, _csrf) = get_form(addr, "").await;
+    assert_eq!(page.status, 200, "body: {}", page.body);
+    assert!(
+        !page.body.contains("That code was not recognised."),
+        "a page with no code entered must not report one as unrecognised: {}",
+        page.body
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Which status the failures carry
 // ---------------------------------------------------------------------------------------------
@@ -779,6 +805,14 @@ async fn a_throttled_code_entry_is_a_429_that_reveals_nothing() {
     assert!(
         !resp.body.contains("not recognised"),
         "a throttled attempt must not report whether the code existed: {}",
+        resp.body
+    );
+    // The code entered here is a REAL, live one, so a re-render that looked it up would name the
+    // client. A refused entry must be re-rendered as `CodeEntry::Refused`, which does NOT look up:
+    // rendering "Test Device" is exactly the oracle the throttle exists to remove.
+    assert!(
+        !resp.body.contains("Test Device"),
+        "a throttled POST re-rendered the client, handing back the oracle the refusal took away: {}",
         resp.body
     );
 }

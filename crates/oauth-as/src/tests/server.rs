@@ -503,3 +503,91 @@ fn the_dummy_assertion_material_costs_a_complete_es256_verification() {
         "the dummy signature must verify under the dummy key, or the verification short-circuits"
     );
 }
+
+/// The largest `SystemTime` this platform can represent: the point beyond which `checked_add`
+/// returns `None`. Found rather than hardcoded, because the ceiling differs by platform (a 64-bit
+/// `timespec` on one host, a 128-bit intermediate on another), and the whole subject of the test
+/// below is what [`saturating_deadline`] does when it reaches that ceiling.
+#[cfg(test)]
+fn system_time_ceiling() -> SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // Largest whole second still representable as an offset from the epoch.
+    let mut lo: u64 = 0;
+    let mut hi: u64 = u64::MAX;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2 + 1;
+        if UNIX_EPOCH.checked_add(Duration::from_secs(mid)).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let secs = lo;
+    // Then the largest sub-second remainder that still fits on top of it.
+    let mut nlo: u32 = 0;
+    let mut nhi: u32 = 999_999_999;
+    while nlo < nhi {
+        let mid = nlo + (nhi - nlo) / 2 + 1;
+        if UNIX_EPOCH.checked_add(Duration::new(secs, mid)).is_some() {
+            nlo = mid;
+        } else {
+            nhi = mid - 1;
+        }
+    }
+    UNIX_EPOCH
+        .checked_add(Duration::new(secs, nlo))
+        .expect("the searched value is representable by construction")
+}
+
+/// KILLS the three `saturating_deadline` mutants on the halving loop's guard (`server.rs`
+/// `while span > Duration::from_secs(1)`): `>` replaced by `==`, by `<`, and by `>=`.
+///
+/// The loop only runs when `base.checked_add(span)` has ALREADY overflowed the platform ceiling,
+/// so nothing on any ordinary request path exercises it — every caller adds a sane TTL to `now`,
+/// which fits, and the function returns on its first line. The existing coverage
+/// (`tests/mutation_gaps_091.rs`) drives the fits-exactly path and so never enters the loop at all.
+///
+/// To reach it we place `base` a hair below the ceiling and add a span that cannot fit, so the
+/// function must fall back to halving. With `base = ceiling - 7.75s` and `span = 8s`:
+///
+/// - `ceiling` is unreachable, so `checked_add(8s)` overflows and the loop is entered.
+/// - The real guard `span > 1s` halves `8s -> 4s -> 2s -> 1s`, accumulating `+4s +2s +1s` onto
+///   `base` and stopping the instant `span` reaches `1s`. The result is `base + 7s`.
+/// - `==` and `<` are both false for the initial `8s`, so the loop body never runs and the result
+///   is `base` unchanged — a deadline in the PAST relative to the real one, which for an expiry
+///   means a token that is born already expired.
+/// - `>=` runs one extra iteration at `span == 1s`, adding another `+0.5s`, giving `base + 7.5s`:
+///   a deadline half a second later than the real one, observable through `unix_seconds` whenever
+///   it crosses a second boundary.
+///
+/// The exact `base + 7s` is asserted, which distinguishes the real result from all three mutants at
+/// once.
+#[test]
+fn saturating_deadline_halves_toward_the_ceiling_when_the_sum_overflows() {
+    use std::time::Duration;
+
+    let ceiling = system_time_ceiling();
+    // A hair below the ceiling: close enough that `+ 8s` cannot fit (forcing the halving fallback),
+    // but with enough headroom that every partial add the real loop makes DOES fit, and so does the
+    // extra half-second the `>=` mutant would add — otherwise that add would overflow and be
+    // silently skipped, hiding the mutant.
+    let base = ceiling
+        .checked_sub(Duration::from_millis(7_750))
+        .expect("7.75s below the ceiling is representable");
+
+    assert!(
+        base.checked_add(Duration::from_secs(8)).is_none(),
+        "the fixture is only meaningful if the 8s span genuinely overflows and forces the halving \
+         path"
+    );
+
+    let deadline = saturating_deadline(base, Duration::from_secs(8));
+    assert_eq!(
+        deadline,
+        base + Duration::from_secs(7),
+        "the halving loop must accumulate 4s + 2s + 1s and stop the instant the remaining span \
+         reaches one second: a loop that never runs leaves the deadline in the past, and one that \
+         runs a step too far pushes it half a second beyond where the real code lands"
+    );
+}

@@ -239,3 +239,34 @@ fn introspection_is_advertised_only_when_the_host_named_the_endpoint() {
         "a host that named the endpoint gets it advertised verbatim"
     );
 }
+
+/// Without the `jwt` feature this crate signs nothing, so `jwks_uri` is exactly the host's own
+/// declaration -- advertised verbatim when set, omitted when not.
+///
+/// Kills all three `metadata.rs:345 advertised_jwks_uri -> Option<String>` mutants in the
+/// `not(feature = "jwt")` build (`Some("xyzzy")`, `None`, `Some(String::new())`). Each replaces
+/// the host's declared value with a fixed one, and until now nothing in this build read the member
+/// back. The `jwt` build routes through a different `advertised_jwks_uri` (the signing-format one),
+/// which its own tests cover, so this is gated to the build the mutant lives in.
+#[cfg(not(feature = "jwt"))]
+#[test]
+fn without_jwt_the_jwks_uri_is_the_hosts_own_declaration() {
+    // Declared: advertised verbatim. Kills the `None` and `Some(String::new())` mutants, and the
+    // `Some("xyzzy")` mutant since the value is neither empty nor "xyzzy".
+    let mut cfg = config();
+    cfg.jwks_uri = Some("https://as.example.com/host-held-keys.json".to_string());
+    let doc = serde_json::to_value(AuthorizationServerMetadata::from_config(&cfg)).unwrap();
+    assert_eq!(
+        doc["jwks_uri"],
+        json!("https://as.example.com/host-held-keys.json"),
+        "a host that declares a jwks_uri gets exactly that value advertised"
+    );
+
+    // Not declared: omitted. Kills the `Some(..)` mutants, which would advertise an endpoint the
+    // host never named.
+    let doc = document();
+    assert!(
+        doc.get("jwks_uri").is_none(),
+        "a host that declares no jwks_uri must not have one invented for it: {doc}"
+    );
+}

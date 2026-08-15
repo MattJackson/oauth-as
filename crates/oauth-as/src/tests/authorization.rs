@@ -186,3 +186,81 @@ fn rfc8707_resource_is_the_one_repeatable_authorization_parameter() {
         "every OTHER parameter still keeps the first occurrence (RFC 6749 s3.1)"
     );
 }
+
+/// The success-redirect response Debug prints its shape and redacts the one-time `code`.
+///
+/// Kills `396 <impl Debug for AuthorizationResponse>::fmt -> Ok(Default::default())`. RFC 6749
+/// section 4.1.2 makes the code a credential in its own right; a host that logs the response it is
+/// about to redirect with would write a live, unredeemed code to disk. Emptied, the hand-written
+/// redaction prints nothing at all, so the derived form this type shipped with until 0.9.2 is
+/// effectively back.
+#[test]
+fn authorization_response_debug_format_redacts_the_code() {
+    let response = AuthorizationResponse {
+        code: "the-secret-authorization-code".to_string(),
+        state: Some("client-state-xyz".to_string()),
+        iss: "https://as.example".to_string(),
+    };
+    let printed = format!("{response:?}");
+    assert!(
+        printed.contains("AuthorizationResponse"),
+        "an emptied Debug names nothing: {printed}"
+    );
+    assert!(printed.contains("[redacted]"), "{printed}");
+    assert!(
+        !printed.contains("the-secret-authorization-code"),
+        "the code is a bearer credential and must not print: {printed}"
+    );
+    // state is the client's own echoed value and iss is this server's public identifier.
+    assert!(printed.contains("client-state-xyz"), "{printed}");
+    assert!(printed.contains("as.example"), "{printed}");
+}
+
+/// A persisted code record with no `redirect_uri_was_explicit` member deserializes to the
+/// fail-closed `true`.
+///
+/// Kills `653 redirect_uri_was_explicit_default -> false`. The member arrived after 0.9.0, and
+/// `#[serde(default = "redirect_uri_was_explicit_default")]` is what lets a record minted before
+/// it still deserialize. TRUE is the fail-closed reading: it keeps RFC 6749 section 4.1.3's
+/// required-parameter check for a code with no stated decision, rather than silently waiving it for
+/// every grant that survived the upgrade. Under the mutant that default is `false`, which waives it.
+#[test]
+fn a_code_record_missing_redirect_uri_was_explicit_defaults_to_fail_closed_true() {
+    let record = AuthorizationCodeRecord {
+        issued_at: std::time::UNIX_EPOCH,
+        code: "code-value".to_string(),
+        client_id: crate::client::ClientId::new("some-client"),
+        redirect_uri: "https://registered.example/callback".to_string(),
+        redirect_uri_was_explicit: true,
+        scope: crate::scope::ScopeSet::parse("read").unwrap(),
+        subject: "user-1".to_string(),
+        code_challenge: "some-challenge".to_string(),
+        code_challenge_method: CodeChallengeMethod::S256,
+        resource: vec!["https://rs.example/api".to_string()],
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
+        expires_at: std::time::SystemTime::UNIX_EPOCH,
+        state: AuthorizationCodeState::Consumed {
+            access_token: Some("at".to_string()),
+            refresh_token: None,
+        },
+        #[cfg(feature = "consent")]
+        authentication: None,
+    };
+    let mut value = serde_json::to_value(&record).expect("the record serializes");
+    let removed = value
+        .as_object_mut()
+        .expect("a record serializes to a JSON object")
+        .remove("redirect_uri_was_explicit");
+    assert!(
+        removed.is_some(),
+        "the field must be present to model a record written before it existed"
+    );
+    let restored: AuthorizationCodeRecord =
+        serde_json::from_value(value).expect("a pre-field record still deserializes");
+    assert!(
+        restored.redirect_uri_was_explicit,
+        "a record with no stated decision must default to the fail-closed TRUE that keeps \
+         RFC 6749 s4.1.3's required-parameter check"
+    );
+}

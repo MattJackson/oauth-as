@@ -1531,10 +1531,21 @@ impl MemoryInner {
         grant_established_at: std::time::SystemTime,
     ) -> bool {
         if let Some(scopes) = self.barriers.get(client_id.as_str()) {
-            if scopes
-                .client
-                .is_some_and(|t| t.covers(grant_established_at))
-            {
+            // A client barrier refuses on EITHER of two conditions. The window
+            // (`t.covers(grant_established_at)`) refuses a grant established at or before the
+            // revocation, and admits a later one so a re-provisioned `client_id` is served. The
+            // second, `!self.clients.contains_key`, refuses whenever the client the barrier names
+            // is GONE: `delete_client` records the barrier and removes the client row as one act,
+            // so a client barrier standing over an ABSENT client is a deletion no re-provisioning
+            // followed, and every grant for it is dead however its instant compares. A client the
+            // host put back is present, so only the window applies -- re-provisioning is still
+            // served, which is the property `admits_a_later_grant` holds. Without the absence arm a
+            // write that raced the deletion, its `grant_established_at` a few microseconds after
+            // `recorded_at`, is waved through as if it were a re-provisioned grant; the cross-store
+            // race `a_pushed_request_cannot_land_behind_a_client_deletion` is where that surfaced.
+            if scopes.client.is_some_and(|t| {
+                t.covers(grant_established_at) || !self.clients.contains_key(client_id.as_str())
+            }) {
                 return true;
             }
             if let Some(subject) = subject {

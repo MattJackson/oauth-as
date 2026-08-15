@@ -839,6 +839,22 @@ fn as_written_by_0_9_0<T: serde::Serialize + serde::de::DeserializeOwned>(
 /// standing revocation, with a same-shaped record whose instant POSTDATES the revocation admitted
 /// alongside it — so neither a far-future default nor a barrier that refuses everything
 /// unconditionally could satisfy this test.
+/// A public client under the id a barrier stands over, for putting BACK after a deletion so the
+/// barrier's instant comparison -- not the "client no longer exists" arm -- is what a later test
+/// line turns on.
+fn reprovisioned_public_app(client_id: &ClientId) -> oauth_as::Client {
+    oauth_as::Client {
+        client_id: client_id.clone(),
+        auth: oauth_as::ClientAuth::Public,
+        grant_types: vec![oauth_as::GrantType::AuthorizationCode],
+        redirect_uris: vec!["https://app.example/cb".to_string()],
+        allowed_scopes: oauth_as::ScopeSet::parse("read").unwrap(),
+        default_scopes: oauth_as::ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    }
+}
+
 #[tokio::test]
 async fn a_token_record_from_0_9_0_dates_from_the_epoch_and_stays_revoked() {
     use oauth_as::store::{RevocationWindow, Storage};
@@ -863,6 +879,15 @@ async fn a_token_record_from_0_9_0_dates_from_the_epoch_and_stays_revoked() {
     // revocation, which is exactly the comparison on trial here.
     let store = MemoryStorage::new();
     store.delete_client(&client_id, window).await.unwrap();
+    // Re-provisioned, so what is on trial below is the INSTANT comparison and not client absence:
+    // a client barrier also refuses every grant for a client that no longer exists, and this store
+    // deleted one that was never registered. The host legitimately re-registers a deleted id, and
+    // the 0.9.0 epoch-dated record must still be refused (its instant predates the barrier) while
+    // the after-dated control is served -- the property this test is named for.
+    store
+        .put_client(reprovisioned_public_app(&client_id))
+        .await
+        .unwrap();
 
     let mut token = IssuedToken::new(
         "at-1",
@@ -894,6 +919,10 @@ async fn a_token_record_from_0_9_0_dates_from_the_epoch_and_stays_revoked() {
 
     let store = MemoryStorage::new();
     store.delete_client(&client_id, window).await.unwrap();
+    store
+        .put_client(reprovisioned_public_app(&client_id))
+        .await
+        .unwrap();
 
     let mut chain = RefreshTokenRecord::new(
         "rt-1",

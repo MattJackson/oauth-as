@@ -656,3 +656,64 @@ mod empty_audience {
         );
     }
 }
+
+// --------------------------------------------------------------------------------------------
+// Mutation survivors closed at 0.9.3: the ES256 verify guard and the CompactJws Debug redaction.
+
+/// `verify_es256` FAILS CLOSED on a JWK whose coordinates are not 32 bytes, rather than panicking.
+///
+/// Kills `jwt.rs:1660 replace || with && in verify_es256`. A `PublicJwk` obtained through
+/// `from_json`/`from_coordinates` is guaranteed 32-byte coordinates, but `Jwk::to_public_jwk`
+/// revalidates NOTHING (see its doc), so a host that hand-builds a `Jwk` with a coordinate whose
+/// leading zero a big-integer library trimmed reaches this guard with a 31-byte value. Under the
+/// real `||` the guard returns `false` and the key fails closed; under `&&` a 31-byte coordinate
+/// slips past into a `copy_from_slice` into a 32-byte slot, which PANICS -- and this is on the
+/// verify path RFC 9449 DPoP proofs, RFC 9101 request objects and RFC 7523 assertions all reach.
+#[test]
+fn verify_es256_fails_closed_on_a_short_coordinate_rather_than_panicking() {
+    let key = EcdsaP256Key::generate("short-coordinate");
+    let mut jwk = key.public_jwk();
+    // Trim one byte off `y`, the way a library that strips a leading zero emits it: now 31 bytes.
+    let mut y = URL_SAFE_NO_PAD
+        .decode(&jwk.y)
+        .expect("this crate emits base64url");
+    y.remove(0);
+    jwk.y = URL_SAFE_NO_PAD.encode(&y);
+    let public = jwk.to_public_jwk();
+    assert!(
+        !oauth_as::jwt::verify_es256(&public, b"any signing input", &[0u8; 64]),
+        "a JWK whose coordinate is not 32 bytes must fail closed at verification, not panic"
+    );
+}
+
+/// The parsed-but-unverified `CompactJws` Debug prints its shape and redacts what rebuilds a token.
+///
+/// Kills `jwt.rs:1536 <impl fmt::Debug for CompactJws>::fmt -> Ok(Default::default())`. Emptied,
+/// the hand-written redaction prints nothing at all, so its whole reason for existing -- never
+/// letting `signing_input` (which is `header.payload` verbatim) or the signature reach a log --
+/// is silently discarded and a derived-looking blank is all a host sees.
+#[test]
+fn compact_jws_debug_redacts_the_signing_input_and_signature() {
+    let mut header = serde_json::Map::new();
+    header.insert("alg".into(), Value::String("ES256".into()));
+    let mut payload = serde_json::Map::new();
+    payload.insert("iss".into(), Value::String("issuer-is-visible".into()));
+    let jws = oauth_as::jwt::CompactJws {
+        signing_input: "SECRET-SIGNING-INPUT-THAT-REBUILDS-THE-TOKEN",
+        header,
+        payload,
+        signature: vec![0xAB; 64],
+    };
+    let printed = format!("{jws:?}");
+    assert!(
+        printed.contains("CompactJws"),
+        "an emptied Debug names nothing: {printed:?}"
+    );
+    assert!(printed.contains("[redacted]"), "{printed:?}");
+    assert!(
+        !printed.contains("SECRET-SIGNING-INPUT-THAT-REBUILDS-THE-TOKEN"),
+        "the signing input is the token minus its signature and must not print: {printed:?}"
+    );
+    // The decoded header and payload DO print: they are what a host debugging a refusal needs.
+    assert!(printed.contains("issuer-is-visible"), "{printed:?}");
+}

@@ -299,6 +299,46 @@ struct Faults {
     drops_the_client_secret: bool,
     /// `find_device_grant_by_user_code` normalizes the query on the caller's behalf.
     normalizes_user_codes: bool,
+    /// `put_client` is INSERT-only: a second registration under an id that already exists is
+    /// dropped rather than replacing the first. The shape an `INSERT ... ON CONFLICT DO NOTHING`
+    /// hands a host, one clause away from the upsert `put_client` is documented to be. Every
+    /// round-trip check that writes a key once passed it; only `round_trip/client`, which writes a
+    /// DIFFERENT registration first and requires the second to win, can see it, and it names the
+    /// field that did not survive.
+    put_client_insert_only: bool,
+    /// `put_pushed_authorization_request` is INSERT-only in the same way: the authorization
+    /// endpoint is answered from whichever push happened to land first under a handle.
+    #[cfg(feature = "par")]
+    put_pushed_insert_only: bool,
+    /// `put_consent` is INSERT-only: a widen in place keeps the narrower approval the user gave
+    /// first, and every later authorization request is answered from it.
+    #[cfg(feature = "consent")]
+    put_consent_insert_only: bool,
+    /// `put_device_grant` cannot UPDATE an existing `device_code`: a second put under a code that
+    /// is already stored fails, the shape an `INSERT` with no `ON CONFLICT` gives a host. The put
+    /// that RE-CODES a grant in place is refused, so the user-code index it was supposed to move
+    /// never moves, and the harness must not mistake the failed put for an index defect.
+    put_device_grant_refuses_to_update: bool,
+    /// `put_token` surfaces a `StorageError` when it collides with a concurrent sweep, rather than
+    /// letting the issuance through. The server maps that to `server_error`, so the host's
+    /// maintenance schedule becomes a source of failed token requests: exactly the
+    /// `sweep_expired/safe_under_concurrent_writes` contract, in the direction of a spurious error
+    /// rather than a lost write. Keyed on the racer's own token names so only the writes made
+    /// DURING the sweep race fail, not the live records planted before it.
+    issuance_fails_beside_a_sweep: bool,
+    /// Every `compare_and_swap_*` that LOSES its comparison answers `Err(StorageError)` instead of
+    /// `Ok(false)`. The `Storage` trait makes contention the store's to resolve: `Ok(false)`
+    /// already says "somebody else got there first", so a store that surfaces the conflict as an
+    /// error fails a legitimate overlapping request. Invisible to every sequential check, because
+    /// nothing loses a comparison without a concurrent writer; only the raced swap checks see it.
+    swap_surfaces_contention_as_error: bool,
+    /// `compare_and_swap_consent` reports `Ok(true)` for a WIDEN and writes nothing: the UPDATE
+    /// branch of an upsert whose `WHERE` clause matched no rows, with the driver's "statement ran"
+    /// mistaken for "a row changed". The create still writes, so the pair holds a consent and the
+    /// swap's `applies_when_it_matches` read-back — the one check that reads the record back after
+    /// a widen rather than trusting the boolean — is the only thing that can see the widen was lost.
+    #[cfg(feature = "consent")]
+    consent_swap_widen_is_lost: bool,
     /// `put_token` persists every column except the RFC 9449 `jkt` binding.
     #[cfg(feature = "dpop")]
     drops_jkt: bool,
@@ -516,7 +556,14 @@ impl Inner {
             RevocationBarrier::Client(c) => {
                 c == client_id
                     && (self.refuses_on_identity_alone
-                        || grant_established_at <= window.recorded_at)
+                        || grant_established_at <= window.recorded_at
+                        // A client barrier over a client that no longer exists refuses every grant:
+                        // the deletion recorded the barrier and removed the registration as one act,
+                        // so an ABSENT client is a deletion no re-provisioning followed, and a grant
+                        // stamped a hair after `recorded_at` by a concurrent write must not slip
+                        // through. A client the host put back is present, so only the window governs
+                        // it -- which is what keeps `refuses_on_identity_alone` a distinct fault.
+                        || !self.clients.contains_key(client_id.as_str()))
             }
             RevocationBarrier::TokenFamily(f) => family_id == Some(&**f),
             RevocationBarrier::Consent {
@@ -796,7 +843,12 @@ impl Storage for NaiveStore {
         } else {
             client
         };
-        self.lock().clients.insert(
+        let mut g = self.lock();
+        // INSERT-only: a registration already under this id is kept, and the replacement dropped.
+        if self.faults.put_client_insert_only && g.clients.contains_key(client.client_id.as_str()) {
+            return Ok(());
+        }
+        g.clients.insert(
             client.client_id.as_str().to_string(),
             std::sync::Arc::new(client),
         );
@@ -840,6 +892,12 @@ impl Storage for NaiveStore {
             None => self.faults.client_swap_upserts,
         };
         if !matches {
+            // A loser that surfaces the conflict as an error rather than answering `Ok(false)`.
+            if self.faults.swap_surfaces_contention_as_error {
+                return Err(StorageError::new(
+                    "write conflict: another writer got there first",
+                ));
+            }
             return Ok(false);
         }
         g.clients.insert(
@@ -897,6 +955,15 @@ impl Storage for NaiveStore {
         let grant = self.maybe_drop_device_grant_fields(grant);
         let mut g = self.lock();
         let normalized = normalize_user_code(&grant.user_code);
+        // INSERT with no ON CONFLICT: a device_code already stored cannot be re-put, so the put
+        // that re-codes a grant in place fails outright rather than moving its user-code index.
+        if self.faults.put_device_grant_refuses_to_update
+            && g.device_by_code.contains_key(&grant.device_code)
+        {
+            return Err(StorageError::new(
+                "device_code already exists and this store cannot update it",
+            ));
+        }
         if self.faults.index_overwrites {
             g.user_code_index.insert(normalized, grant.clone());
             g.device_by_code.insert(grant.device_code.clone(), grant);
@@ -1105,6 +1172,11 @@ impl Storage for NaiveStore {
         if !self.faults.put_ignores_barriers && revoked {
             return Ok(oauth_as::store::WriteOutcome::RefusedRevoked);
         }
+        // INSERT-only: a second push under a handle already stored is dropped, so the
+        // authorization endpoint reads whichever push landed first.
+        if self.faults.put_pushed_insert_only && g.pushed.contains_key(&record.request_uri) {
+            return Ok(oauth_as::store::WriteOutcome::Applied);
+        }
         g.pushed.insert(record.request_uri.clone(), record);
         Ok(oauth_as::store::WriteOutcome::Applied)
     }
@@ -1148,6 +1220,16 @@ impl Storage for NaiveStore {
         token: IssuedToken,
     ) -> Result<oauth_as::store::WriteOutcome, StorageError> {
         let token = self.maybe_drop_token_fields(token);
+        // A write made DURING the sweep race collides with the maintenance job and is surfaced as
+        // an error. Keyed on the racer's own token names so the live records planted before the
+        // race still write: only issuance overlapping the sweep fails.
+        if self.faults.issuance_fails_beside_a_sweep
+            && token.access_token.contains("sweep-race-written")
+        {
+            return Err(StorageError::new(
+                "a maintenance sweep is running and this store surfaces the overlap as an error",
+            ));
+        }
         if self.faults.put_refuses_everything {
             return Ok(oauth_as::store::WriteOutcome::RefusedRevoked);
         }
@@ -1285,6 +1367,13 @@ impl Storage for NaiveStore {
         }
         let record = std::sync::Arc::new(record);
         let mut g = self.lock();
+        // INSERT-only: a widen under a consent_id already stored is dropped, so the pair keeps the
+        // first, narrower approval and every later authorization request is answered from it.
+        if self.faults.put_consent_insert_only
+            && g.consents.contains_key(record.consent_id.as_ref())
+        {
+            return Ok(());
+        }
         g.consents.insert(
             record.consent_id.to_string(),
             std::sync::Arc::clone(&record),
@@ -1416,6 +1505,11 @@ impl Storage for NaiveStore {
             // this one was not.
             (None, _) if self.faults.consent_swap_upserts => {}
             _ => return Ok(false),
+        }
+        // The comparison said apply, and the store reports that it did — and writes nothing. A
+        // widen (`expected` names a live record) whose UPDATE matched no rows, counted as success.
+        if self.faults.consent_swap_widen_is_lost && expected.is_some() {
+            return Ok(true);
         }
         g.consents.insert(
             updated.consent_id.to_string(),
@@ -1913,6 +2007,214 @@ async fn a_swap_that_repoints_another_grants_user_code_is_caught() {
         detail.contains("did not fail") && detail.contains("StorageError"),
         "the violation must say a refusal was owed and what shape it takes, got: {detail}"
     );
+    // The refusal was owed AND the damage the repoint did has to be named, or a store that only
+    // ever answered `is_ok()` would satisfy the line above while the index it corrupted goes
+    // unreported. The repointed code now resolves to the wrong device_code...
+    assert!(
+        detail.contains("not to the grant that owned it"),
+        "the violation must say the clashing code was repointed away from its owner, got: {detail}"
+    );
+    // ...the swapping grant was rewritten with a user code that belonged to another device...
+    assert!(
+        detail.contains("was rewritten even though its new user code belonged"),
+        "the violation must say the swapping grant took a code that was not free, got: {detail}"
+    );
+    // ...and "a refusal must leave the store exactly as it was" reaches the state the swap named,
+    // which the repoint carried where a refusal must still read the stored `Pending`.
+    assert!(
+        detail.contains("state of the grant a refused swap targeted"),
+        "the violation must say a refused swap left the grant's state unchanged, got: {detail}"
+    );
+}
+
+/// An INSERT-only `put_client`. Every round-trip check that writes a key once passed it; only the
+/// one that writes a DIFFERENT registration under the same id first and requires the second to win
+/// can see it. The violation has to NAME the field the store kept from the first write, or a store
+/// that dropped every replacement would be reported as one that dropped a specific column.
+#[tokio::test]
+async fn an_insert_only_put_client_is_caught() {
+    let violations = run_against(Faults {
+        put_client_insert_only: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/client"],
+        "an insert-only put_client must fail only the client round trip: {violations:#?}"
+    );
+    let detail = detail_of(&violations, "round_trip/client");
+    // The two fields `round_trip/client` deliberately differs between the superseded record and
+    // the one that must replace it. Both must be named, or a mutation that stopped the harness
+    // varying one of them would go unseen.
+    assert!(
+        detail.contains("field name did not survive"),
+        "the kept `name` must be named: {detail}"
+    );
+    assert!(
+        detail.contains("field allowed_scopes did not survive"),
+        "the kept `allowed_scopes` must be named: {detail}"
+    );
+}
+
+/// The same INSERT-only defect on `put_pushed_authorization_request`: the authorization endpoint
+/// is answered from whichever push landed first. Only the PAR round trip, which pushes a different
+/// record under the handle first, can see it, and it names the field that did not survive.
+#[cfg(feature = "par")]
+#[tokio::test]
+async fn an_insert_only_put_pushed_request_is_caught() {
+    let violations = run_against(Faults {
+        put_pushed_insert_only: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/pushed_authorization_request"],
+        "an insert-only put_pushed_authorization_request must fail only the PAR round trip: \
+         {violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "round_trip/pushed_authorization_request")
+            .contains("field state did not survive"),
+        "the kept `state` must be named: {:#?}",
+        violations
+    );
+}
+
+/// The same INSERT-only defect on `put_consent`: a widen in place keeps the narrower approval the
+/// user gave first. The consent round trip writes a different record under the id first, and the
+/// two fields it varies — `scope`, the thing an authorization request is answered against, and
+/// `resource`, the RFC 8707 audience — must each be named when the replacement is lost.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn an_insert_only_put_consent_is_caught() {
+    let violations = run_against(Faults {
+        put_consent_insert_only: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["round_trip/consent"],
+        "an insert-only put_consent must fail only the consent round trip: {violations:#?}"
+    );
+    let detail = detail_of(&violations, "round_trip/consent");
+    assert!(
+        detail.contains("field scope did not survive"),
+        "the kept `scope` must be named: {detail}"
+    );
+    assert!(
+        detail.contains("field resource did not survive"),
+        "the kept `resource` must be named: {detail}"
+    );
+}
+
+/// A `put_device_grant` that cannot UPDATE an existing `device_code`: the re-coding put fails. The
+/// user-code index check must NOT then mistake the failed write for an index defect. Its guard
+/// runs the index assertions only when BOTH puts landed, so with the second put failing the check
+/// reports the failed write and nothing else — a store that ran the index assertions anyway would
+/// blame the index for a code that was never rewritten.
+#[tokio::test]
+async fn a_put_device_grant_that_cannot_update_is_caught() {
+    let violations = run_against(Faults {
+        put_device_grant_refuses_to_update: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["user_code_index/retires_old_entry"],
+        "a put that cannot update must be reported as a failed put, not an index defect: \
+         {violations:#?}"
+    );
+    let detail = detail_of(&violations, "user_code_index/retires_old_entry");
+    assert!(
+        detail.contains("failed unexpectedly"),
+        "the failed re-put must be reported as such: {detail}"
+    );
+    // The index assertions must NOT have run against a store whose re-coding put never landed: a
+    // code that was never rewritten cannot have failed to be retired or to resolve.
+    assert!(
+        !detail.contains("does not resolve") && !detail.contains("still resolves"),
+        "the index must not be judged when the put that would have moved it failed: {detail}"
+    );
+}
+
+/// A `compare_and_swap_consent` that reports a widen applied and writes nothing. The boolean says
+/// yes and the record never grew, so the ONE swap check that reads the record back after a widen
+/// rather than trusting the return value is the only thing that can see it.
+#[cfg(feature = "consent")]
+#[tokio::test]
+async fn a_consent_widen_that_reports_success_but_writes_nothing_is_caught() {
+    let violations = run_against(Faults {
+        consent_swap_widen_is_lost: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert!(
+        checks_that_fired(&violations)
+            .contains(&"compare_and_swap_consent/applies_when_it_matches"),
+        "a widen that reports success and writes nothing must be caught by the read-back: \
+         {violations:#?}"
+    );
+    assert!(
+        detail_of(
+            &violations,
+            "compare_and_swap_consent/applies_when_it_matches"
+        )
+        .contains("did not change the stored record"),
+        "the violation must say the widen the store reported did not land: {violations:#?}"
+    );
+}
+
+/// A store whose `compare_and_swap_*` answers `Err` instead of `Ok(false)` when it loses its
+/// comparison. `Ok(false)` already tells a caller "somebody got there first", so surfacing the
+/// overlap as a `StorageError` fails a legitimate request; the trait makes contention the store's
+/// to resolve. Only the RACED swap check produces a loser at all, so only it can see this.
+#[tokio::test]
+async fn a_swap_that_surfaces_contention_as_an_error_is_caught() {
+    let violations = run_against(Faults {
+        swap_surfaces_contention_as_error: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert!(
+        detail_of(&violations, "compare_and_swap_client/atomic_under_a_race")
+            .contains("failed with a StorageError"),
+        "the raced swap must report the losers that errored rather than answering Ok(false): \
+         {violations:#?}"
+    );
+}
+
+/// A store whose `put_token` surfaces a `StorageError` when it overlaps a sweep. An issuance may
+/// not fail because a maintenance job is running beside it. Only the concurrent-writes check makes
+/// a write during a sweep at all, so only it can see it — and it counts the errored racers.
+#[tokio::test]
+async fn an_issuance_that_fails_beside_a_sweep_is_caught() {
+    let violations = run_against(Faults {
+        issuance_fails_beside_a_sweep: true,
+        ..Faults::default()
+    })
+    .await;
+
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["sweep_expired/safe_under_concurrent_writes"],
+        "an issuance that errors beside a sweep must fail only the concurrent-writes check: \
+         {violations:#?}"
+    );
+    assert!(
+        detail_of(&violations, "sweep_expired/safe_under_concurrent_writes")
+            .contains("failed with a StorageError"),
+        "the violation must count the issuances the sweep made fail: {violations:#?}"
+    );
 }
 
 /// A store whose READS are takes. `Storage::get_refresh_token` exists precisely so that a check
@@ -1989,9 +2291,15 @@ async fn a_par_barrier_that_ignores_the_client_it_names_is_caught() {
     })
     .await;
 
+    // It trips `admits_a_later_grant` as well: dropping the `client_id` conjunct also drops the
+    // "client no longer exists" arm the correct predicate refuses a deleted-and-gone push on, so
+    // the same broken check that spares nothing also admits the request pushed after a deletion.
     assert_eq!(
         checks_that_fired(&violations),
-        vec!["revocation_barrier/spares_unrelated_records"],
+        vec![
+            "revocation_barrier/admits_a_later_grant",
+            "revocation_barrier/spares_unrelated_records",
+        ],
         "{violations:#?}"
     );
     assert!(
@@ -2452,6 +2760,20 @@ async fn every_violation_names_a_published_check() {
         // Unreachable behind `withdrawal_leaves_credentials`, which returns first.
         #[cfg(feature = "consent")]
         withdrawal_counts_the_consent_row: false,
+        // The insert-only and contention faults are omitted from this omnibus: each needs a store
+        // that WRITES the record it is asked about (so it can drop the SECOND write, or surface a
+        // losing comparison as an error), which the drop-everything faults above have already
+        // suppressed. Their own single-fault tests below own the vocabulary they produce.
+        put_client_insert_only: false,
+        #[cfg(feature = "par")]
+        put_pushed_insert_only: false,
+        #[cfg(feature = "consent")]
+        put_consent_insert_only: false,
+        put_device_grant_refuses_to_update: false,
+        issuance_fails_beside_a_sweep: false,
+        swap_surfaces_contention_as_error: false,
+        #[cfg(feature = "consent")]
+        consent_swap_widen_is_lost: false,
     })
     .await;
 

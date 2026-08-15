@@ -805,3 +805,30 @@ async fn a_sub_second_ttl_still_reports_a_usable_lifetime() {
         "the handle died before the lifetime its own response promised"
     );
 }
+
+/// The PAR response Debug prints its shape and redacts the single-use `request_uri`.
+///
+/// Kills `par.rs:178 <impl Debug for PushedAuthorizationResponse>::fmt -> Ok(Default::default())`.
+/// The handle is a capability for as long as it is live (RFC 9126 section 7.1) and carries a fully
+/// validated authorization request; a host that logs the response it is about to hand the client
+/// would write a live, redeemable handle to disk. Emptied, the hand-written redaction prints
+/// nothing, so nothing stops that.
+#[test]
+fn pushed_authorization_response_debug_redacts_the_request_uri() {
+    let response = oauth_as::PushedAuthorizationResponse {
+        request_uri: "urn:ietf:params:oauth:request_uri:SECRET-LIVE-HANDLE".to_string(),
+        expires_in: 90,
+    };
+    let printed = format!("{response:?}");
+    assert!(
+        printed.contains("PushedAuthorizationResponse"),
+        "an emptied Debug names nothing: {printed:?}"
+    );
+    assert!(printed.contains("[redacted]"), "{printed:?}");
+    assert!(
+        !printed.contains("SECRET-LIVE-HANDLE"),
+        "the request_uri is a live capability and must not print: {printed:?}"
+    );
+    // A lifetime is not a credential and is the diagnostic an operator is usually after.
+    assert!(printed.contains("90"), "{printed:?}");
+}

@@ -252,6 +252,10 @@ fn the_issuer_origin_drops_the_path() {
         issuer_origin("https://as.example/a/b"),
         "https://as.example"
     );
+    // The `+ 3` that steps past `://` is exactly three. A `* 3` would land ten bytes further into
+    // the issuer and, with more than one path segment, cut the origin at a LATER slash: this input
+    // has its authority end at index 13 but `5 * 3 == 15` sits past it, inside `/tenant`.
+    assert_eq!(issuer_origin("https://as.ex/tenant/x"), "https://as.ex");
 }
 
 /// The origin is derived by SEARCHING for the path separator rather than by subtracting a trimmed
@@ -275,6 +279,23 @@ fn the_issuer_origin_does_not_slice_inside_a_character() {
     );
     // A trailing slash with no path at all, which is the case that already worked.
     assert_eq!(issuer_origin("https://as.example//"), "https://as.example");
+}
+
+/// RFC 9110 s5.6.4: a quoted-string escapes exactly two characters, `"` and `\`, each by prefixing
+/// one backslash, and leaves everything else alone. A value with neither is BORROWED, so the
+/// ordinary 401 whose `WWW-Authenticate` names a well-formed issuer URL costs no allocation.
+#[test]
+fn escape_quoted_string_escapes_only_quote_and_backslash_and_borrows_otherwise() {
+    // Nothing to escape: borrowed, byte for byte, not rebuilt or replaced by a constant.
+    assert!(matches!(
+        escape_quoted_string("https://as.example"),
+        Cow::Borrowed("https://as.example")
+    ));
+    assert_eq!(escape_quoted_string("plain"), "plain");
+    // A quote and a backslash each gain exactly one backslash, and ONLY those two do.
+    assert_eq!(escape_quoted_string("a\"b"), "a\\\"b");
+    assert_eq!(escape_quoted_string("a\\b"), "a\\\\b");
+    assert_eq!(escape_quoted_string("x\"y\\z"), "x\\\"y\\\\z");
 }
 
 #[test]
@@ -782,6 +803,45 @@ fn the_route_table_is_normalised_to_what_a_client_sends() {
     assert_ne!(encode_route_path("/token"), "/%74oken");
     // An issuer that already carries escapes passes through once, not twice.
     assert_eq!(encode_route_path("/tenant%20a/token"), "/tenant%20a/token");
+    // BOTH nibbles must be hex for a `%` to be an escape. `%2g` is a literal `%` followed by two
+    // pchars, so it is copied verbatim, letters and all -- treating it as an escape (either nibble
+    // hex) would uppercase the `g` and rewrite the configured path.
+    assert_eq!(encode_route_path("/%2g"), "/%2g");
+    assert_eq!(encode_route_path("/%g2"), "/%g2");
+}
+
+/// The WIRE half of the same normalisation, [`uppercase_escapes`], which nothing else pins. It
+/// BORROWS unless the path carries a lowercase escape, uppercases the hex digits of a real escape,
+/// and copies everything else -- including a `%` that is not an escape -- byte for byte.
+#[test]
+fn uppercase_escapes_borrows_unless_a_lowercase_escape_is_present() {
+    // No `%` at all: borrowed, even when two hex-looking letters follow another byte (the `needs`
+    // scan must key on `%`, and only on the pattern that starts with one).
+    assert!(matches!(uppercase_escapes("/ab"), Cow::Borrowed("/ab")));
+    assert!(matches!(
+        uppercase_escapes("/token"),
+        Cow::Borrowed("/token")
+    ));
+    // An UPPERCASE escape is already canonical: there is nothing to change, so it stays borrowed
+    // rather than being copied because a `%` was seen.
+    assert!(matches!(uppercase_escapes("/%20"), Cow::Borrowed("/%20")));
+    // A lowercase escape is the one case that allocates.
+    assert!(matches!(uppercase_escapes("/%2f"), Cow::Owned(_)));
+}
+
+#[test]
+fn uppercase_escapes_uppercases_real_escapes_and_copies_everything_else_verbatim() {
+    // A real lowercase escape becomes uppercase.
+    assert_eq!(uppercase_escapes("/%2fpath"), "/%2Fpath");
+    // A `%` where the second nibble is not hex is NOT an escape: copied as-is, letters unchanged.
+    assert_eq!(uppercase_escapes("/%2f%zz"), "/%2F%zz");
+    // Nor is one where only the FIRST nibble is hex.
+    assert_eq!(uppercase_escapes("/%2f%az"), "/%2F%az");
+    // A stray `%` at the very end is passed through, and the run loop must still TERMINATE and copy
+    // the whole preceding run: a decrement-that-never-advances hangs here.
+    assert_eq!(uppercase_escapes("/%2f%"), "/%2F%");
+    // Runs between escapes are copied whole and byte for byte.
+    assert_eq!(uppercase_escapes("/a%2fb%2fc"), "/a%2Fb%2Fc");
 }
 
 /// RFC 9110 s15.5.6 makes `Allow` mandatory on a 405, and HEAD is listed wherever GET is because

@@ -133,6 +133,7 @@ tests/mutation_gaps_redacted_text.rs
 tests/mutation_gaps_registration.rs
 tests/mutation_gaps_request_object.rs
 tests/mutation_gaps_signer_harness.rs
+tests/mutation_gaps_step_up_capacity.rs
 tests/mutation_gaps_storage_swap.rs
 tests/mutation_gaps_store.rs
 tests/mutation_gaps_verifier_seam.rs

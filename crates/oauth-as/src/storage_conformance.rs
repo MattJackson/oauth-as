@@ -635,19 +635,23 @@ where
             ),
         }
 
-        // Established AFTER it: a new decision, which must be served.
-        let mut fresh = sample_token("at-grant-after-deletion", client.as_str(), None);
-        fresh.grant_established_at = at(60);
-        match store.put_token(fresh).await {
-            Ok(WriteOutcome::Applied) => {}
-            Ok(WriteOutcome::RefusedRevoked) => report.fail(
+        // Established AFTER it, WHILE THE CLIENT IS STILL DELETED: refused. A grant instant later
+        // than the revocation is only a "new decision" if the identity came back; a client the host
+        // removed and did not put back is gone, and every grant for it is dead however its instant
+        // compares. A concurrent write can stamp a `grant_established_at` a hair after the
+        // revocation's `recorded_at` -- `a_pushed_request_cannot_land_behind_a_client_deletion` in
+        // oauth-as-postgres shows exactly that -- so a store that admits a later grant on the
+        // timestamp ALONE lets a deleted client's credentials return.
+        let mut orphan = sample_token("at-grant-after-deletion-still-gone", client.as_str(), None);
+        orphan.grant_established_at = at(60);
+        match store.put_token(orphan).await {
+            Ok(WriteOutcome::RefusedRevoked) => {}
+            Ok(WriteOutcome::Applied) => report.fail(
                 BARRIER_ADMITS_A_LATER_GRANT,
-                "put_token refused a token whose grant was established AFTER the revocation. A \
-                 barrier that refuses on identity alone never lets the identity come back: a \
-                 re-provisioned client, or a user who withdrew an application and approved it \
-                 again, is locked out until the barrier is swept — as long as the longest token \
-                 this server mints. Compare the grant instant against \
-                 RevocationWindow::recorded_at for the client and consent scopes",
+                "put_token wrote a token for a client that was DELETED and not re-provisioned, on \
+                 the strength of a grant instant later than the revocation. A concurrent write can \
+                 stamp exactly that instant, so a deleted client's credentials come back: refuse a \
+                 client-scope grant whenever the client no longer exists",
             ),
             Err(e) => report.fail(
                 BARRIER_ADMITS_A_LATER_GRANT,
@@ -655,12 +659,11 @@ where
             ),
         }
 
-        // AND IT MUST NAME ONE CLIENT. Everything above uses a single `client_id`, so a store
-        // whose client-scope predicate ignores `client_id` altogether — a barrier table queried
-        // without its scope column, a predicate that matched on the barrier KIND — passes every
-        // line of it. The grant here predates the deletion, exactly as the refused one above does,
-        // so identity is the only thing that can tell them apart. RFC 7592 section 2.3 deletes one
-        // registration; a store that got this wrong stops every client in the deployment
+        // AND IT MUST NAME ONE CLIENT. A store whose client-scope predicate ignores `client_id` --
+        // a barrier table queried without its scope column, a predicate matched on the barrier KIND
+        // -- refuses this too. The grant predates the deletion, exactly as the windowed refusal
+        // above does, so identity is the only thing that tells them apart. RFC 7592 s2.3 deletes
+        // ONE registration; a store that got this wrong stops every client in the deployment
         // refreshing for the barrier's whole life, on a path an administrator drives by hand.
         let mut bystander = sample_token(
             "at-another-clients-grant-before-the-deletion",
@@ -682,14 +685,83 @@ where
             ),
         }
 
-        // The pushed request is judged on `pushed_at`, and it is judged the same way round. This
-        // is the ADMIT half for the seventh site: a client re-provisioned under an id the host
-        // deleted must be able to push again, or the RFC 9126 endpoint answers `server_error` for
-        // it until the barrier is swept, which is a fail-closed PAR outage nothing reports.
+        // RE-PROVISIONED: the host registers the id again, and NOW a later grant must be served.
+        // This is the property that keeps a client barrier from locking an id out for its whole
+        // life -- a re-registered client, or a user who withdrew an application and approved it
+        // again, must be admitted -- and it is the OTHER half of the concurrent-write fix: the
+        // window still governs a client that exists, so a genuine re-provisioning is not refused.
+        if report
+            .ok(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                "put_client (re-provision)",
+                store.put_client(sample_client(client.as_str())).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let mut fresh = sample_token("at-grant-after-reprovisioning", client.as_str(), None);
+        fresh.grant_established_at = at(60);
+        match store.put_token(fresh).await {
+            Ok(WriteOutcome::Applied) => {}
+            Ok(WriteOutcome::RefusedRevoked) => report.fail(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                "put_token refused a token whose grant was established AFTER the client was \
+                 re-provisioned: a re-registered client is locked out until the barrier is swept, \
+                 as long as the longest token this server mints. A client that EXISTS is judged by \
+                 RevocationWindow::recorded_at alone",
+            ),
+            Err(e) => report.fail(
+                BARRIER_ADMITS_A_LATER_GRANT,
+                format!("put_token failed unexpectedly: {e}"),
+            ),
+        }
+
+        // The pushed request is judged the same way, both halves. Deleted-and-gone refuses a push
+        // authored after the revocation (the RFC 9126 s2.2 resurrection); re-provisioned admits it,
+        // or the endpoint answers `server_error` for a live registration until the barrier sweeps.
         #[cfg(feature = "par")]
         {
+            let store2 = self.store().await;
+            let deleted = ClientId::new("client-par-deleted-and-gone");
+            if store2
+                .put_client(sample_client(deleted.as_str()))
+                .await
+                .is_ok()
+                && store2
+                    .delete_client(
+                        &deleted,
+                        crate::store::RevocationWindow {
+                            recorded_at: at_before(0),
+                            until: barrier_until(),
+                        },
+                    )
+                    .await
+                    .is_ok()
+            {
+                let mut pushed_orphan = sample_pushed_request(
+                    "urn:ietf:params:oauth:request_uri:pushed-while-client-gone",
+                );
+                pushed_orphan.client_id = deleted.clone();
+                pushed_orphan.pushed_at = at(60);
+                match store2.put_pushed_authorization_request(pushed_orphan).await {
+                    Ok(WriteOutcome::RefusedRevoked) => {}
+                    Ok(WriteOutcome::Applied) => report.fail(
+                        BARRIER_ADMITS_A_LATER_GRANT,
+                        "put_pushed_authorization_request wrote a request for a client that was \
+                         deleted and not re-provisioned, on a `pushed_at` later than the \
+                         revocation. A concurrent push stamps exactly that, so a deleted client's \
+                         request_uri survives (RFC 9126 s2.2)",
+                    ),
+                    Err(e) => report.fail(
+                        BARRIER_ADMITS_A_LATER_GRANT,
+                        format!("put_pushed_authorization_request failed unexpectedly: {e}"),
+                    ),
+                }
+            }
+
             let mut pushed_after = sample_pushed_request(
-                "urn:ietf:params:oauth:request_uri:pushed-after-the-deletion",
+                "urn:ietf:params:oauth:request_uri:pushed-after-reprovisioning",
             );
             pushed_after.client_id = client.clone();
             pushed_after.pushed_at = at(60);
@@ -697,11 +769,9 @@ where
                 Ok(WriteOutcome::Applied) => {}
                 Ok(WriteOutcome::RefusedRevoked) => report.fail(
                     BARRIER_ADMITS_A_LATER_GRANT,
-                    "put_pushed_authorization_request refused a request pushed AFTER the client \
-                     was deleted. The barrier compares `pushed_at`, so a handle authored after the \
-                     revocation belongs to whatever registration holds the id now; refusing on \
-                     identity alone makes every push fail for the barrier's life, silently and in \
-                     the fail-closed direction",
+                    "put_pushed_authorization_request refused a request pushed for a client the \
+                     host RE-PROVISIONED: the RFC 9126 endpoint answers server_error for a live \
+                     registration until the barrier is swept",
                 ),
                 Err(e) => report.fail(
                     BARRIER_ADMITS_A_LATER_GRANT,
@@ -986,6 +1056,23 @@ where
                 c,
                 "delete_client (a second revocation, with an EARLIER window)",
                 store.delete_client(&client, earlier).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // RE-PROVISION the client, so the halves below turn on `recorded_at` and nothing else. A
+        // client barrier also refuses a grant whose client no longer exists, and both deletions
+        // above removed this one; without putting it back, every `between`/`predating` grant is
+        // refused on ABSENCE and neither the rewound `recorded_at` nor a shortened deadline could
+        // be seen. The host legitimately re-registers a deleted id, and it is the `recorded_at`
+        // merge this check is named for that must still govern the re-registered client's grants.
+        if report
+            .ok(
+                c,
+                "put_client (re-provision, so the merge is what is tested)",
+                store.put_client(sample_client(client.as_str())).await,
             )
             .is_none()
         {
@@ -2166,6 +2253,21 @@ where
         // time under a second name, and a host would chase two. Same reasoning as
         // `index_already_dirty` in the resurrection check above.
         if applied {
+            // The swap carried a NEW state as well as a new user code, and a store that moved the
+            // index but did not persist the state has recorded a decision the caller never made.
+            // Read it back: a swap that reports success has to have written what it was handed.
+            if let Some(Some(got)) = report.ok(
+                SWAP_RETIRES_OLD_USER_CODE,
+                "get_device_grant after the re-coding swap",
+                store.get_device_grant(&pending.device_code).await,
+            ) {
+                report.same(
+                    SWAP_RETIRES_OLD_USER_CODE,
+                    "state",
+                    &DeviceGrantState::Denied,
+                    &got.state,
+                );
+            }
             if let Some(found) = report.ok(
                 SWAP_RETIRES_OLD_USER_CODE,
                 "find_device_grant_by_user_code(new)",
@@ -2288,6 +2390,22 @@ where
                      store exactly as it was",
                 ),
             }
+        }
+        // "Exactly as it was" reaches the STATE too, not the user code alone: a swap that rewrote
+        // the grant and then reported a refusal has moved a decision the caller was told it left
+        // untouched. The clashing swap named `Denied`, so a store that let it through carries that
+        // where a refusal must still read the `Pending` the grant was stored with.
+        if let Some(Some(g)) = report.ok(
+            SWAP_REFUSES_DUPLICATE_USER_CODE,
+            "get_device_grant (state) after the refused swap",
+            store.get_device_grant(&second.device_code).await,
+        ) {
+            report.same(
+                SWAP_REFUSES_DUPLICATE_USER_CODE,
+                "state of the grant a refused swap targeted",
+                &second.state,
+                &g.state,
+            );
         }
     }
 
@@ -3012,6 +3130,17 @@ where
                     "get_consent returned a record that differs from the one stored",
                 );
             }
+            // Field by field as well, so the violation NAMES the column an INSERT-only store kept
+            // from the superseded record rather than leaving a host to diff two consents. `scope`
+            // is what an authorization request is answered against and `resource` is the RFC 8707
+            // audience it was approved for; a widen that did not land loses one or the other.
+            report.same(ROUND_TRIP_CONSENT, "scope", &mine.scope, &back.scope);
+            report.same(
+                ROUND_TRIP_CONSENT,
+                "resource",
+                &mine.resource,
+                &back.resource,
+            );
         } else {
             report.fail(ROUND_TRIP_CONSENT, "get_consent did not return the record");
         }

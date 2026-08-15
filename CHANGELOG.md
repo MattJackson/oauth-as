@@ -10,6 +10,62 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
+## [0.9.3] - 2026-08-14
+
+This release adds no features. It closes Gate 4: a full mutation sweep of the crate, with every
+surviving mutant either killed by a test or argued equivalent in writing. Earlier releases shipped
+with that gate open and said so; this one closes it.
+
+### The sweep
+
+`cargo mutants -p oauth-as --all-features` over the whole crate: 2154 mutants, run across eight
+machines and merged (verified 2154 unique, none double-counted). 1748 were already caught by the
+existing suite; 104 survived; the rest were unviable or non-terminating timeouts (which count as
+caught). All 104 survivors are now closed: 83 killed by new tests, 21 argued equivalent. No changed
+signature and no schema change: a 0.9.2 host recompiles unchanged. It DOES change one `Storage`
+BEHAVIOUR, below -- a revocation-barrier fix, which a store built on `oauth_as::storage_conformance`
+gets held to automatically.
+
+### A revocation-barrier resurrection, closed
+
+Chasing a Postgres race the sweep's test surfaced
+(`a_pushed_request_cannot_land_behind_a_client_deletion`) turned up a real one. A client-scope
+revocation barrier decided whether a grant predated the revocation by comparing WALL-CLOCK instants
+(`grant_established_at` vs `RevocationWindow::recorded_at`). Two operations racing on separate
+connections are ordered by the database, not by their clocks, and the two can disagree by
+microseconds: a request pushed, or a token minted, in the instant a client is being deleted can be
+stamped just after the revocation's `recorded_at`, and the window then reads it as a "later grant"
+and admits it -- a handle for a client that no longer exists, redeemable if the `client_id` is
+re-provisioned (RFC 9126 s2.2 / RFC 7592 s2.3).
+
+The window exists for a real reason: a `client_id` a host RE-PROVISIONS after deleting it must be
+served, and refusing on identity alone would lock it out for the barrier's whole life. So the fix
+keeps the window and adds the signal the window was a proxy for: `delete_client` records the barrier
+and removes the client row as one act, so a client barrier standing over an ABSENT client is a
+deletion no re-provisioning followed, and a grant for it is refused however its instant compares. A
+client the host put back is present, so it still takes the window. Both `MemoryStorage` and the
+Postgres store implement it, and `revocation_barrier/admits_a_later_grant` in the conformance
+harness now holds every store to both halves.
+
+### One real defect the sweep exposed
+
+Chasing the first survivor turned up a genuine bug in the CIMD SSRF filter, not just a missing test.
+`is_special_use_literal` classifies an address literal as private/special-use so a client identifier
+URL cannot point the host's fetcher at its own network. A WHATWG rule (`ends_in_a_number`, for
+telling an IPv4 literal from a name) was being applied to bracket-stripped IPv6 hosts too, and
+short-circuited the v4-mapped branch: `https://[::ffff:93.184.216.34]` (a PUBLIC address) was
+refused, while `https://[::ffff:5db8:d822]` -- the identical address, spelled in hex -- was accepted.
+The verdict tracked the spelling rather than the address. Scoped the rule to non-v6 hosts, and added
+the acceptance coverage the suite lacked: it had only ever asserted refusals, so a filter that
+refused too much was invisible to it.
+
+### Correctness of the record itself
+
+The sweep also falsified one equivalence the previous release had ARGUED: consent step-up challenge
+sizing (`+ 3` vs `* 3`) is not equivalent -- the mutant under-reserves for short `acr` class names
+and forces a second allocation a counting-allocator test can see. It is now killed rather than
+excused. Re-measuring, rather than trusting the prior record, is the reason it was caught.
+
 ## [0.9.2] - 2026-08-14
 
 ### Added: RFC 7662 introspection answers a RESOURCE SERVER

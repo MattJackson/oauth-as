@@ -19,26 +19,34 @@ oauth-as = "0.9"
 
 ## Beta
 
-**0.9.2 is a beta.** 0.9.0 was an alpha, published so it could be built against and reported on;
+**0.9.3 is a beta.** 0.9.0 was an alpha, published so it could be built against and reported on;
 this line of releases is meant to be tested in earnest, and each of them exists because auditing
 the one before it found things worth fixing. It is still pre-1.0 and the API is not frozen.
 
-**Nothing here breaks a 0.9.1 host.** There is no breaking section in this release: no `Storage`
-change, no renamed feature, no changed signature. A host that compiles against 0.9.1 compiles
-against this, and a store that passes `oauth_as::storage_conformance` still passes it. (Coming from
-0.9.0 is a different matter: 0.9.1's breaking `Storage` change is still in front of you, and
-`CHANGELOG.md` has that migration.)
+**Nothing here breaks a 0.9.2 host.** There is no breaking section in this release: no `Storage`
+change, no renamed feature, no changed signature, and no new capability. A host that compiles
+against 0.9.2 compiles against this, and a store that passes `oauth_as::storage_conformance` still
+passes it. (Coming from 0.9.0 is a different matter: 0.9.1's breaking `Storage` change is still in
+front of you, and `CHANGELOG.md` has that migration.)
 
-**What is new is the RFC 7662 introspection channel for a RESOURCE SERVER**, which is the caller
-that specification is written for and the one this server had no answer for through 0.9.1: a
-resource server that did what the RFC told it to do was told `{"active": false}` about every live
-token it held.
+**0.9.3 adds no feature. It closes the mutation gate.** A full `cargo mutants` sweep of the crate
+ran to completion, and every surviving mutant is now either killed by a test or argued equivalent
+in writing beside the code it mutates. Earlier releases said in this spot that mutation coverage was
+incomplete; that is no longer true, and the sentence that said so is gone because the thing it
+described is gone.
 
-Two things a host should know before adopting it:
+The sweep was not just bookkeeping. Chasing its first survivor uncovered a real defect: the
+client-identifier-metadata SSRF filter accepted or refused the same address depending on how it was
+spelled, so a public address written one way was refused while the identical address written another
+was let through. That is fixed, with the acceptance coverage the test suite had never had. The full
+account, including the sweep numbers and every equivalence argument, is in `CHANGELOG.md`.
 
-- **It is OFF until you configure it.** The channel opens only for clients named in the new
+If you are adopting the RFC 7662 introspection channel for a RESOURCE SERVER (added in 0.9.2), two
+things are still worth knowing:
+
+- **It is OFF until you configure it.** The channel opens only for clients named in
   `ServerConfig::resource_servers`, which is empty by default. A deployment that sets nothing
-  answers exactly as 0.9.1 did — the token's own client and nobody else — and a resource server may
+  answers as it always did — the token's own client and nobody else — and a resource server may
   only read tokens whose RFC 8707 `resource` set names one of its own registered identifiers.
 - **It changes what your rate limiter sees.** A resource server authenticates once per call at the
   protected resource it guards, not once per grant, and that traffic is charged to the same
@@ -46,14 +54,6 @@ Two things a host should know before adopting it:
   `RateLimitConfig::with_client_authentication_capacity_for`, which gives one `client_id` its own
   ceiling without raising anybody else's. Setting `resource_servers` without deciding this is how
   a busy resource server throttles itself.
-
-What is still true and worth knowing before you adopt it:
-
-- **Mutation coverage is incomplete.** Surviving mutants are tracked individually rather than as a
-  percentage, and the ones that are not killed by a test are argued in writing beside the code they
-  mutate. A green test run does not yet mean the tests would have caught any given change.
-
-The known-defects section of `CHANGELOG.md` has the detail, including the test names.
 
 ## What it does
 

@@ -888,3 +888,26 @@ fn der(fixed_width: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&body);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::der;
+
+    /// `der` encodes an all-zero 32-byte integer as the single zero octet: `02 01 00`.
+    ///
+    /// Kills `signer_conformance.rs:872 replace - with +` and `replace - with /` in `der::integer`.
+    /// `position(|b| *b != 0)` returns `None` only for an all-zero coordinate, and
+    /// `unwrap_or(value.len() - 1)` is what keeps the single trailing zero as the integer's body.
+    /// `value.len() + 1` indexes one past the end (`&value[33..]` on a 32-byte half panics), and
+    /// `value.len() / 1` is `value.len()`, an empty slice whose `body[0]` panics; either way the
+    /// exact-bytes assertion below is never reached. The harness's own A.3 signature has non-zero r
+    /// and s, so its live path never selects this default -- which is exactly why the sweep saw
+    /// these two survive with no test exercising a zero integer.
+    #[test]
+    fn der_encodes_an_all_zero_integer_as_a_single_zero_octet() {
+        assert_eq!(
+            der(&[0u8; 64]),
+            vec![0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00],
+        );
+    }
+}

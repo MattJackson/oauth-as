@@ -337,3 +337,51 @@ async fn the_authentication_a_grant_rests_on_reaches_the_tokens_it_mints() {
     assert_eq!(carried.auth_time, at(NOW));
     assert_eq!(carried.acr.as_deref(), Some("urn:acr:phr"));
 }
+
+/// SURVIVOR: `server.rs replace UserApproval<'a>::decided_at ->
+/// Option<std::time::SystemTime> with None`.
+///
+/// [`UserApproval::granted_at`] exists for the STANDING-consent case: a host acting on a remembered
+/// approval must date it at the instant the decision was actually made, not at `now`, or a
+/// months-old approval outranks a withdrawal recorded in between and the revocation barrier lets a
+/// code through that it should refuse. `decided_at` is how that instant leaves the approval; the
+/// module's own documentation on `granted_at` spells out the exact failure a dropped instant
+/// causes.
+///
+/// Constant `None` erases the distinction: `granted_at(req, sub, t)` becomes indistinguishable from
+/// `granted(req, sub)`, i.e. "the decision was made now". The accessor is the seam the issuance path
+/// reads to learn the grant instant, so a `None` here silently re-dates every standing approval to
+/// the moment it is redeemed.
+#[tokio::test]
+async fn a_dated_approval_reports_the_instant_it_was_dated_with() {
+    let srv = support::server_with(ManualClock::at_epoch(), vec![confidential_client()]).await;
+    let challenge = oauth_as::pkce::code_challenge_s256(RFC7636_VERIFIER);
+    let validated = srv
+        .validate_authorization_request(&query(&challenge, &[]))
+        .await
+        .expect("the request is well formed");
+
+    let decided = at(NOW - 3600);
+    let dated = UserApproval::granted_at(&validated, "user-1", decided);
+    assert_eq!(
+        dated.decided_at(),
+        Some(decided),
+        "a host dating a standing approval must have that instant reported back verbatim: a \
+         constant None re-dates it to redemption time and lets a code outrank a withdrawal made \
+         after the decision but before the redemption"
+    );
+
+    // A second instant, so the accessor cannot be passing by returning one hard-coded time, and
+    // the undated form still reports None (which is what means 'now').
+    let other = at(NOW - 60);
+    assert_eq!(
+        UserApproval::granted_at(&validated, "user-1", other).decided_at(),
+        Some(other)
+    );
+    assert_eq!(
+        UserApproval::granted(&validated, "user-1").decided_at(),
+        None,
+        "an undated approval carries no instant: that is the 'decided now' case granted_at exists \
+         to distinguish itself from"
+    );
+}

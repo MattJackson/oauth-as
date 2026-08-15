@@ -450,3 +450,102 @@ fn the_rfc_7515_a3_vector_restated_here_is_self_consistent() {
         "the appendix A.3 vector must verify under the appendix A.3 key"
     );
 }
+
+// ------------------------------------------------------------------ the two tamperings the harness makes
+//
+// `check_verifier` builds a signature that MUST be rejected by flipping the low bit of the first
+// signature byte (`bad_signature[0] ^= 0x01`) and a signing input that MUST be rejected by flipping
+// the low bit of the last input byte (`tampered[last] ^= 0x01`). The `^= 0x01` matters: it is what
+// guarantees the byte actually CHANGES. A mutant that masks the byte (`&= 0x01`) instead produces a
+// DIFFERENT wrong value, so a correct verifier still rejects it and the baseline stays green -- but
+// a verifier that is malleable at exactly the bit the harness flips is no longer caught, because the
+// harness is now flipping a different bit than the one the verifier tolerates.
+
+/// The A.3 signing input, restated (see `INPUT_A`/`INPUT_B` above on why this file duplicates rather
+/// than imports the harness's private constants). Pinned by
+/// `the_rfc_7515_a3_vector_restated_here_is_self_consistent`, which verifies the A.3 signature over
+/// exactly these bytes.
+const A3_SIGNING_INPUT: &str = concat!(
+    "eyJhbGciOiJFUzI1NiJ9",
+    ".",
+    "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+);
+
+const VERIFIER_REJECTS_A_TAMPERED_SIGNATURE: &str = "verifier/rejects_a_tampered_signature";
+const VERIFIER_REJECTS_A_TAMPERED_INPUT: &str = "verifier/rejects_a_tampered_signing_input";
+
+/// Accepts ONE exact signature and otherwise verifies for real: a verifier malleable at precisely
+/// the byte value the harness's `^= 0x01` produces.
+struct AcceptsExactSignature {
+    accept: Vec<u8>,
+}
+
+impl Es256Verifier for AcceptsExactSignature {
+    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+        signature == self.accept.as_slice() || verify_es256(key, signing_input, signature)
+    }
+}
+
+/// Accepts ONE exact signing input and otherwise verifies for real: malleable at precisely the input
+/// byte the harness's `^= 0x01` produces.
+struct AcceptsExactInput {
+    accept_input: Vec<u8>,
+}
+
+impl Es256Verifier for AcceptsExactInput {
+    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+        signing_input == self.accept_input.as_slice() || verify_es256(key, signing_input, signature)
+    }
+}
+
+/// The tampered-signature check XOR-flips the byte rather than masking it.
+///
+/// Kills `signer_conformance.rs:402 replace ^= with &= in check_verifier`. The harness presents the
+/// A.3 signature with its first byte `^= 0x01`; this verifier accepts exactly that value. Under the
+/// real `^=` the presented signature IS that value, so the malleable verifier is caught. Under `&=`
+/// the harness zeroes the byte instead (`0x0e & 0x01 == 0x00`), presents a signature this verifier
+/// does not recognise and that does not verify, and the check never fires. (The `|= 0x01` mutant is
+/// equivalent here: the real byte `0x0e` is even, so `^` and `|` with `0x01` both yield `0x0f`.)
+#[test]
+fn the_tampered_signature_check_flips_the_bit_rather_than_masking_the_byte() {
+    assert!(CHECKS.contains(&VERIFIER_REJECTS_A_TAMPERED_SIGNATURE));
+    let mut accept = decode(A3_SIGNATURE);
+    accept[0] ^= 0x01;
+    let violations = run(
+        EcdsaP256Key::generate("tamper-signature"),
+        AcceptsExactSignature { accept },
+    );
+    assert!(
+        reports(&violations, VERIFIER_REJECTS_A_TAMPERED_SIGNATURE),
+        "a verifier that accepts the exact bit-flipped signature the harness presents must be \
+         caught; a harness that masked the byte instead would present something else and miss it: \
+         {violations:#?}"
+    );
+}
+
+/// The tampered-input check XOR-flips the byte rather than masking it.
+///
+/// Kills `signer_conformance.rs:390 replace ^= with &= in check_verifier`. The harness presents the
+/// A.3 signing input with its LAST byte `^= 0x01`; this verifier accepts exactly that input. Under
+/// the real `^=` the presented input IS that value and the malleable verifier is caught. Under `&=`
+/// the harness produces `0x51 & 0x01 == 0x01` instead, a different input this verifier does not
+/// recognise, and the check never fires. (The `|= 0x01` mutant is not a survivor: the real byte
+/// `0x51` is odd, so `| 0x01` leaves it unchanged, the "tampered" input equals the real one, and a
+/// correct verifier accepting it makes the baseline green run go red.)
+#[test]
+fn the_tampered_input_check_flips_the_bit_rather_than_masking_the_byte() {
+    assert!(CHECKS.contains(&VERIFIER_REJECTS_A_TAMPERED_INPUT));
+    let mut accept_input = A3_SIGNING_INPUT.as_bytes().to_vec();
+    let last = accept_input.len() - 1;
+    accept_input[last] ^= 0x01;
+    let violations = run(
+        EcdsaP256Key::generate("tamper-input"),
+        AcceptsExactInput { accept_input },
+    );
+    assert!(
+        reports(&violations, VERIFIER_REJECTS_A_TAMPERED_INPUT),
+        "a verifier that accepts the exact bit-flipped input the harness presents must be caught; \
+         a harness that masked the byte instead would present something else and miss it: \
+         {violations:#?}"
+    );
+}

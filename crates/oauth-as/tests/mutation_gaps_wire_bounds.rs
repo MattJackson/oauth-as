@@ -324,9 +324,14 @@ mod challenge {
     /// them), so a host with a short class name is a panic out of a library, on the path that
     /// builds a resource server's challenge.
     ///
-    /// The sibling mutant `+` to `*` is NOT killed here, deliberately: it changes the capacity the
-    /// buffer is reserved with and nothing else, so no reachable value can tell the two spellings
-    /// apart. An allocation-size mutant with no observable behaviour is argued rather than killed.
+    /// The sibling mutant `+` to `*` is killed separately, in
+    /// `mutation_gaps_step_up_capacity.rs`. An earlier version of this comment argued it was
+    /// equivalent -- an allocation-size change with nothing observable -- and that was WRONG: `+ 3`
+    /// reserves enough that a challenge naming several short `acr` classes lands in ONE allocation,
+    /// while `* 3` under-reserves for short names and forces a buffer grow, a second allocation the
+    /// counting allocator sees even though the emitted string is byte-identical. The 0.9.2 sweep
+    /// left it surviving because nothing counted allocations on this path; the 0.9.3 sweep's kill
+    /// does.
     #[test]
     fn a_short_acr_value_does_not_underflow_the_challenge_buffer() {
         let acr: Vec<Box<str>> = vec!["a".into(), "bb".into()];

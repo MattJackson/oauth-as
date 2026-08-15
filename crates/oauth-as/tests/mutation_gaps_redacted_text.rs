@@ -108,3 +108,70 @@ mod service {
         );
     }
 }
+
+/// The credential a token request presents, whose `Debug` is hand written so the shared secret and
+/// the assertion never print while the `Some`/`None` distinction an operator needs stays visible.
+mod client_credential {
+    use oauth_as::ClientCredential;
+
+    /// KILLS four survivors on `ClientCredential`'s hand-written `Debug`, all at once:
+    ///
+    /// ```text
+    /// server.rs replace <impl fmt::Debug for ClientCredential<'_>>::fmt -> fmt::Result with Ok(Default::default())
+    /// server.rs replace ...::fmt::redact_opt -> Option<&'static str> with None
+    /// server.rs replace ...::fmt::redact_opt -> Option<&'static str> with Some("")
+    /// server.rs replace ...::fmt::redact_opt -> Option<&'static str> with Some("xyzzy")
+    /// ```
+    ///
+    /// The impl exists to keep a client's shared secret out of whatever caught a `{:?}` while
+    /// preserving WHICH credential was presented, because that is the diagnostic an operator needs
+    /// and is not itself secret. Nothing read it, so a mutation sweep found four ways to hollow it
+    /// out with no test noticing:
+    ///
+    /// - Emptying the whole body (`Ok(Default::default())`) renders the credential as the empty
+    ///   string: the redaction is gone, but so is every trace that there was a credential at all.
+    /// - `redact_opt -> None` drops the field entirely, so a presented secret reads as absent — the
+    ///   `Some`/`None` distinction the doc calls the whole point of the hand-written impl is
+    ///   inverted for the case that matters.
+    /// - `redact_opt -> Some("")` and `-> Some("xyzzy")` keep a field but replace the redaction
+    ///   marker with something a reader cannot recognise as a redaction (or, worse, mistakes for a
+    ///   real value).
+    ///
+    /// Asserting the exact `client_secret: Some("[redacted]")` rendering pins all four: the marker
+    /// is present (kills the empty body and both wrong-marker mutants) AND it sits inside a `Some`
+    /// (kills the dropped-field mutant), while the literal secret never appears.
+    #[test]
+    fn a_presented_client_secret_is_redacted_but_still_shown_to_be_present() {
+        let secret = "confidential-app-shared-secret-value";
+        let printed = format!("{:?}", ClientCredential::secret(Some(secret)));
+
+        assert!(
+            !printed.contains(secret),
+            "the shared secret must never reach a debug format: {printed:?}"
+        );
+        assert!(
+            printed.contains("ClientCredential"),
+            "an emptied body prints nothing at all, losing even the fact that a credential exists: \
+             {printed:?}"
+        );
+        assert!(
+            printed.contains(r#"client_secret: Some("[redacted]")"#),
+            "the secret is redacted rather than dropped or renamed: a reader has to see that a \
+             secret WAS presented (Some, not None) and that it was deliberately hidden (the \
+             redaction marker, not an empty or arbitrary string): {printed:?}"
+        );
+    }
+
+    /// A public client presents no secret, and the debug must say so rather than inventing one.
+    /// This pins the `None` arm of `redact_opt` from the other side: a credential built with no
+    /// secret renders `client_secret: None`, which the `-> Some(...)` mutants would turn into a
+    /// phantom credential.
+    #[test]
+    fn an_absent_client_secret_reads_as_none() {
+        let printed = format!("{:?}", ClientCredential::secret(None));
+        assert!(
+            printed.contains("client_secret: None"),
+            "a public client presented no secret, and the debug must not fabricate one: {printed:?}"
+        );
+    }
+}

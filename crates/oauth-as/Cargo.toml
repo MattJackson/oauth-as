@@ -1,6 +1,6 @@
 [package]
 name = "oauth-as"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 # MEASURED, not declared. 1.74 fails on return-position impl Trait in the Storage trait (RPITIT,
 # stabilised in 1.75); 1.75 compiles and tests clean. Going lower would mean Box<dyn Future> in
