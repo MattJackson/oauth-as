@@ -280,7 +280,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # for the measurement, and in particular for what it does NOT buy: a host that never calls the two
 # PKCS#8 constructors pays zero bytes for them either way, because LTO deletes them. The split is
 # for the dependency tree.
-p256 = { version = "0.13", default-features = false, features = [
+p256 = { version = "0.14", default-features = false, features = [
     "ecdsa",  # ECDSA/P-256/SHA-256 signing, which is ES256 (RFC 7518 s3.4)
     "std",    # this crate is std anyway; adds no crate to the tree, only alloc/error impls
 ], optional = true }
