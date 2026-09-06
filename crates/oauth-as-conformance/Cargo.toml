@@ -37,5 +37,5 @@ url = "2"
 # silent upgrade can never loosen what it accepts. 5.0.0 is the latest 5.x line release
 # verified against crates.io on 2026-08-07 (MIT OR Apache-2.0).
 oauth2 = { version = "=5.0.0", default-features = false, features = ["reqwest"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
