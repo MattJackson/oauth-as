@@ -10,6 +10,38 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
+## [0.9.4] - 2026-09-06
+
+This release adds no protocol features and changes no API. It is a repository-hygiene and
+toolchain-drift release: the crate source, tests and public surface are byte-identical in behaviour
+to 0.9.3, and a host recompiles unchanged.
+
+### Changed: README standardized for open-source publication
+
+The README was brought into line with the standard open-source layout — badges, install, feature
+matrix, links to the RFC-by-RFC documentation and the licence statement — without changing any of
+the technical claims it makes. The crate's substance is unchanged; only its front door is.
+
+### Changed: the CI status badge tracks `main`
+
+The build-status badge now reports the state of the `main` branch — the branch that publishes —
+rather than a fixed or stale ref, so the badge a reader sees on crates.io and GitHub reflects the
+released line.
+
+### Fixed: scoped `#[allow(clippy::result_large_err)]` for the Rust 1.98 clippy toolchain drift
+
+Rust 1.98's clippy began firing `result_large_err` on this crate's `Result` types, which the
+1.86 CI toolchain does not. The lint is allowed at the narrowest scope it fires on, with the
+existing measured justification kept beside it: the error variant is the size it is for a reason
+already argued in the source, and boxing it to satisfy a newer lint would move a cost onto every
+caller to quiet a warning the pinned toolchain never raises. The allow is scoped, not
+crate-wide, so any new site the lint flags is still surfaced.
+
+### Changed: Dependabot GitHub Actions bumps
+
+`actions/upload-artifact` 4 → 7 and `actions/setup-go` 5 → 7, both from Dependabot, in the CI
+workflows. No effect on the crate or its consumers.
+
 ## [0.9.3] - 2026-08-14
 
 This release adds no features. It closes Gate 4: a full mutation sweep of the crate, with every
@@ -2300,4 +2332,5 @@ protocol implementation, and says so in its own docs and README. Superseded by t
 No comparison links for 0.1.0 or Unreleased: neither has a git tag yet, since 0.1.0 has not been
 promoted through `main` or published. Links will be added once tags exist.
 
+[0.9.4]: https://github.com/MattJackson/oauth-as/compare/v0.9.3...v0.9.4
 [0.0.1]: https://crates.io/crates/oauth-as/0.0.1
