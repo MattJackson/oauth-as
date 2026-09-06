@@ -1100,7 +1100,7 @@ jobs:
       # The version the job actually runs is pinned in
       # crates/oauth-as-conformance/interop/go/go.mod, with go.sum locking the module hashes.
       # This only supplies a toolchain new enough to build it.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
       - name: Prove the interop gate can go RED
@@ -1404,7 +1404,7 @@ jobs:
       # here: without it the failure is a log line, and with it it is a test case.
       - name: upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
