@@ -74,6 +74,9 @@ fn requirement(acr_values: Option<&str>, max_age: Option<&str>) -> Authenticatio
 
 /// Run one authorization request through validation and code issuance, with whatever the host says
 /// it did about authenticating the user.
+// `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+// worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+#[allow(clippy::result_large_err)]
 async fn authorize<S: oauth_as::Storage>(
     srv: &oauth_as::AuthorizationServer<S, ManualClock>,
     requirement: &AuthenticationRequirement,

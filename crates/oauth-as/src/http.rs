@@ -3036,6 +3036,9 @@ async fn delete_registration_handler<S: Storage, C: Clock>(
 ///
 /// With neither feature compiled in this is the plain query path and nothing else, which is what
 /// the crate did before either feature existed.
+// `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+// worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+#[allow(clippy::result_large_err)]
 async fn resolve_authorization_request<S: Storage, C: Clock>(
     state: &Inner<S, C>,
     pairs: &[Pair<'_>],
