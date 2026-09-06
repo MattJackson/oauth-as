@@ -1031,6 +1031,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The handle is consumed atomically, so a second use of it fails however many requests are in
     /// flight (RFC 9126 section 4 and section 7.3).
     #[cfg(feature = "par")]
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     pub async fn validate_pushed_authorization_request(
         &self,
         client_id: &str,
@@ -1126,6 +1129,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// all: RFC 9101 section 6.3 requires the server to use only the object's own parameters, and
     /// the surest way to honour that is to have no other parameters in hand.
     #[cfg(feature = "jar")]
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     pub async fn validate_signed_authorization_request(
         &self,
         client_id: &str,

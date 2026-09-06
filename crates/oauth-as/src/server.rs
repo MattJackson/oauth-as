@@ -3942,6 +3942,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// On success the host shows its consent UI and then calls
     /// [`AuthorizationServer::issue_authorization_code`], or reports
     /// [`ValidatedAuthorizationRequest::denied`] if the user refuses.
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     pub async fn validate_authorization_request(
         &self,
         request: &AuthorizationRequest<'_>,
@@ -3982,6 +3985,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// it needs this and not the wrapper. Everything else about it is unchanged, which is the
     /// point: the PAR endpoint validates a pushed request by calling exactly the function the
     /// authorization endpoint calls, so the two cannot drift.
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn validate_direct_authorization_request(
         &self,
         request: &AuthorizationRequest<'_>,
@@ -4031,6 +4037,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Split out so that every `?` below reports its refusal to the limiter through ONE place. The
     /// alternative, threading `hooks.record` through a dozen early returns, is the shape that ends
     /// with one path that forgot to.
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     async fn validate_direct_authorization_request_inner(
         &self,
         request: &AuthorizationRequest<'_>,
@@ -4308,6 +4317,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Taking a [`ValidatedAuthorizationRequest`] (through the approval) rather than a raw request
     /// is deliberate for the same reason one level down: an unvalidated request cannot reach code
     /// issuance, because it cannot be spelled.
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     pub async fn issue_authorization_code(
         &self,
         approval: UserApproval<'_>,
@@ -4362,6 +4374,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// section 10.12 reason: a satisfied `acr_values` says the user authenticated STRONGLY, never
     /// that they agreed.
     #[cfg(feature = "consent")]
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     pub async fn issue_authorization_code_with_authentication(
         &self,
         approval: UserApproval<'_>,
@@ -4387,6 +4402,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     }
 
     /// The issuance itself, shared by both entry points above so that they cannot drift.
+    // `clippy::result_large_err` here is a measured false positive: boxing the error is strictly
+    // worse because the `Ok` arm dominates the `Result`'s size. See `tests/allocation_paths.rs`.
+    #[allow(clippy::result_large_err)]
     async fn issue_authorization_code_inner(
         &self,
         approval: UserApproval<'_>,
