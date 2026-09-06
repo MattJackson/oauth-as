@@ -381,6 +381,22 @@ that.
   house rules, which are unusual. [CHANGELOG.md](CHANGELOG.md) carries a migration for every
   breaking change and a section for what each release knowingly left open.
 
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the house rules and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the standards expected of participants. CI runs on the
+dev → qa → main flow, so a change is validated on `dev` and `qa` before it reaches `main`.
+
+## Security
+
+To report a vulnerability, follow the private disclosure process in [SECURITY.md](SECURITY.md).
+Please do not open a public issue for security reports.
+
+## Changelog
+
+Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md), which follows
+[Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
+
 ## License
 
 Dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
