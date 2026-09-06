@@ -241,7 +241,7 @@ serde = { version = "1", features = ["derive"] }
 # memchr.
 serde_json = { version = "1", optional = true }
 getrandom = "0.3"
-sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
+sha2 = "0.11"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
 base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
 
 # OPTIONAL, feature `http` only. The HTTP vocabulary, and nothing above it.
