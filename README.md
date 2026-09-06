@@ -1,5 +1,7 @@
 # oauth-as
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/MattJackson)
+
 [![CI](https://github.com/MattJackson/oauth-as/actions/workflows/publish.yml/badge.svg?branch=main)](https://github.com/MattJackson/oauth-as/actions/workflows/publish.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/oauth-as?display_name=tag&sort=semver)](https://github.com/MattJackson/oauth-as/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
