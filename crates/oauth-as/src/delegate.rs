@@ -384,6 +384,17 @@ macro_rules! delegate_storage {
             $crate::store::Storage::get_refresh_token(&self.$f, refresh_token).await
         }
     };
+    (@one $f:tt, rotate_refresh_token) => {
+        async fn rotate_refresh_token(
+            &self,
+            expected: &$crate::RefreshTokenRecord,
+            spent: &$crate::RefreshTokenRecord,
+            access: &$crate::IssuedToken,
+            next: Option<&$crate::RefreshTokenRecord>,
+        ) -> ::core::result::Result<bool, $crate::store::StorageError> {
+            $crate::store::Storage::rotate_refresh_token(&self.$f, expected, spent, access, next).await
+        }
+    };
     (@one $f:tt, take_refresh_token) => {
         async fn take_refresh_token(
             &self,

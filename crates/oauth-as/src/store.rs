@@ -957,6 +957,31 @@ pub trait Storage: Send + Sync {
         refresh_token: &str,
     ) -> impl Future<Output = Result<Option<Arc<RefreshTokenRecord>>, StorageError>> + Send;
 
+    /// Atomically complete an opt-in retryable refresh rotation. Compare the entire
+    /// current predecessor with `expected`, check the existing client/family/consent
+    /// revocation barriers, then persist `spent`, `access` and `next` together.
+    /// Return false without writing if the predecessor changed, disappeared or was
+    /// revoked. A failure must commit either all records or none; no credential may
+    /// be released before this succeeds. All records belong to the same grant.
+    ///
+    /// Only used when `ServerConfig::refresh_retry_window` is nonzero. The default
+    /// fails closed so existing stores cannot silently emulate a transaction with
+    /// separate writes. MemoryStorage and the PostgreSQL backend implement it.
+    fn rotate_refresh_token(
+        &self,
+        expected: &RefreshTokenRecord,
+        spent: &RefreshTokenRecord,
+        access: &IssuedToken,
+        next: Option<&RefreshTokenRecord>,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        let _ = (expected, spent, access, next);
+        async {
+            Err(StorageError::new(
+                "atomic refresh rotation is not supported",
+            ))
+        }
+    }
+
     /// Atomically remove and return a refresh token record. This is what makes rotation single
     /// use: under concurrent refresh exactly one caller wins and every other presentation of the
     /// same token is `invalid_grant`.
@@ -1939,6 +1964,35 @@ impl Storage for MemoryStorage {
         refresh_token: &str,
     ) -> Result<Option<Arc<RefreshTokenRecord>>, StorageError> {
         Ok(self.lock().refresh.get(refresh_token).cloned())
+    }
+
+    async fn rotate_refresh_token(
+        &self,
+        expected: &RefreshTokenRecord,
+        spent: &RefreshTokenRecord,
+        access: &IssuedToken,
+        next: Option<&RefreshTokenRecord>,
+    ) -> Result<bool, StorageError> {
+        let mut g = self.lock();
+        if g.refresh.get(&expected.refresh_token).map(AsRef::as_ref) != Some(expected)
+            || g.is_revoked(
+                &expected.client_id,
+                Some(&expected.family_id),
+                expected.subject.as_deref(),
+                expected.grant_established_at,
+            )
+        {
+            return Ok(false);
+        }
+        g.refresh
+            .insert(spent.refresh_token.clone(), Arc::new(spent.clone()));
+        g.tokens
+            .insert(access.access_token.clone(), Arc::new(access.clone()));
+        if let Some(next) = next {
+            g.refresh
+                .insert(next.refresh_token.clone(), Arc::new(next.clone()));
+        }
+        Ok(true)
     }
 
     async fn take_refresh_token(

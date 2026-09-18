@@ -262,6 +262,22 @@ now **yours to do**. None of these is optional, and the first one is the one peo
 - **Show a real consent screen.** Naming the user is not the same as asking them.
 - **Wire the CSRF seam** on the device verification form, and give the subject resolver a session
   your server established rather than a header a caller chose.
+- **Refresh retry tolerance is opt-in.** Set `ServerConfig::refresh_retry_window`
+  to a short duration (for example 30 seconds) to recover a lost response or
+  overlapping refresh without revoking the grant. Both bundled stores atomically
+  record one rotation in the existing credential rows. Equivalent retries and early
+  refreshes of its successor return the same credentials with the remaining access
+  lifetime; the deadline and absolute refresh expiry never slide. Different scope,
+  resource or authorization-detail selections are refused during this window.
+  Revocation and sender constraints still apply. After the window, presenting a
+  spent predecessor again revokes its family. This intentionally delays theft
+  detection: a holder of the same bearer credential can recover its successor
+  during the window. The default is zero (strict rotation). Custom stores must
+  implement `Storage::rotate_refresh_token` atomically or requests fail closed;
+  separate writes are not a substitute. Enable the same policy on all nodes.
+  The optional serde field is backwards readable, but older nodes enforce strict
+  reuse and must be drained before enabling retries. No new table is required.
+
 - **Implement `take_*` and `claim_replay_id` atomically.** Read-then-delete double-spends refresh
   tokens across nodes and destroys reuse detection. Check yours with the `test-util` conformance
   harness rather than by reading it.

@@ -5612,6 +5612,7 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
         expires_at: Some(at(86_400)),
         family_id: family_id.to_string(),
         state: RefreshTokenState::Spent,
+        retry: None,
         // RFC 9449 s5. Dropped here, a stolen refresh token can be re-bound to the thief's key on
         // the next rotation, which leaves the attacker holding a provable token and the victim
         // holding the key that gets refused.

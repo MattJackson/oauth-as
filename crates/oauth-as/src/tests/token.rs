@@ -69,6 +69,7 @@ fn c13_refresh_token_record_debug_redacts_the_refresh_token() {
         expires_at: Some(UNIX_EPOCH + Duration::from_secs(9_000)),
         family_id: "fam-1".into(),
         state: RefreshTokenState::Spent,
+        retry: None,
         #[cfg(feature = "consent")]
         authentication: None,
     };

@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod alloc;
+pub mod refresh_retry;
 
 use oauth_as::server::UserApproval;
 use std::sync::atomic::{AtomicBool, Ordering};

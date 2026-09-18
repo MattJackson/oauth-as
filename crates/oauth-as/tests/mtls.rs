@@ -615,3 +615,65 @@ async fn a_signed_access_token_carries_the_cnf_claim() {
         "RFC 8705 s3.1 puts the thumbprint in the cnf claim of the access token"
     );
 }
+
+#[tokio::test]
+async fn refresh_retry_requires_the_original_client_certificate() {
+    let mut config = support::refresh_retry::config();
+    config.refresh_token_ttl = None;
+    let srv = oauth_as::AuthorizationServer::with_clock(
+        config,
+        oauth_as::MemoryStorage::new(),
+        ManualClock::at_epoch(),
+    );
+    srv.register_client(support::public_client()).await.unwrap();
+    let certificate = ClientCertificate::from_der(CLIENT_DER);
+    let thief = ClientCertificate::from_der(ATTACKER_DER);
+    let code = issue_code(&srv, "public-app", support::PUBLIC_REDIRECT, "read").await;
+    let initial = srv
+        .token_with_context(
+            TokenRequest::AuthorizationCode {
+                client_id: ClientId::new("public-app"),
+                client_secret: None,
+                code,
+                redirect_uri: Some(support::PUBLIC_REDIRECT.into()),
+                code_verifier: Some(support::RFC7636_VERIFIER.into()),
+            },
+            with_certificate(&certificate),
+        )
+        .await
+        .unwrap();
+    let token = initial.refresh_token.as_deref().unwrap();
+    let rotated = srv
+        .token_with_context(
+            support::refresh_retry::request(token),
+            with_certificate(&certificate),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.token_with_context(
+            support::refresh_retry::request(token),
+            with_certificate(&thief)
+        )
+        .await
+        .unwrap_err()
+        .error,
+        ErrorCode::InvalidGrant
+    );
+    assert_eq!(
+        srv.token(support::refresh_retry::request(token))
+            .await
+            .unwrap_err()
+            .error,
+        ErrorCode::InvalidGrant
+    );
+    assert_eq!(
+        srv.token_with_context(
+            support::refresh_retry::request(token),
+            with_certificate(&certificate)
+        )
+        .await
+        .unwrap(),
+        rotated
+    );
+}

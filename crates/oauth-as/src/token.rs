@@ -869,8 +869,17 @@ pub enum RefreshTokenState {
     Spent,
 }
 
+/// A completed rotation retained on the existing refresh rows for bounded retries.
+/// Credentials have the same redacted `Debug` representation as `TokenResponse`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshTokenRetry {
+    pub(crate) response: TokenResponse,
+    pub(crate) until: SystemTime,
+}
+
 /// A persisted refresh token. Single use: redemption goes through
-/// [`crate::store::Storage::take_refresh_token`], and rotation issues a replacement carrying the
+/// [`crate::store::Storage::take_refresh_token`] by default, or the atomic retryable
+/// rotation when explicitly enabled. Rotation issues a replacement carrying the
 /// SAME `expires_at`, so a chain has an absolute lifetime rather than a sliding one.
 ///
 /// `Debug` is hand-written (see below) rather than derived: `refresh_token` is a bearer credential
@@ -957,6 +966,10 @@ pub struct RefreshTokenRecord {
     pub family_id: String,
     /// Whether this link is still redeemable, or is a retained rotated one.
     pub state: RefreshTokenState,
+    /// Completed rotation, shared by its spent predecessor and active successor.
+    /// Older rows default to strict single-use behavior. Hosts should not modify this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<Box<RefreshTokenRetry>>,
     /// The authentication the host reported when the grant this chain came from was approved,
     /// carried across rotation UNCHANGED.
     ///
@@ -1006,6 +1019,7 @@ impl RefreshTokenRecord {
             x5t_s256: None,
             family_id: family_id.into(),
             state: RefreshTokenState::Active,
+            retry: None,
             #[cfg(feature = "consent")]
             authentication: None,
         }
@@ -1034,7 +1048,8 @@ impl fmt::Debug for RefreshTokenRecord {
         #[cfg(feature = "mtls")]
         out.field("x5t_s256", &self.x5t_s256);
         out.field("family_id", &self.family_id)
-            .field("state", &self.state);
+            .field("state", &self.state)
+            .field("retry", &self.retry);
         #[cfg(feature = "consent")]
         out.field("authentication", &self.authentication);
         out.finish()

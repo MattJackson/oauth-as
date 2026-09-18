@@ -386,6 +386,66 @@ async fn barrier_covers(
     row.try_get("covered").map_err(|e| error::db(op, e))
 }
 
+async fn write_token(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    token: &IssuedToken,
+) -> Result<(), StorageError> {
+    const OP: &str = "write_token";
+    let payload = encode(OP, token)?;
+    sqlx::query(
+        "INSERT INTO oauth_as_access_tokens \
+         (access_token, client_id, subject, family_id, expires_at_ns, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (access_token) DO UPDATE SET \
+         client_id     = EXCLUDED.client_id, \
+         subject       = EXCLUDED.subject, \
+         family_id     = EXCLUDED.family_id, \
+         expires_at_ns = EXCLUDED.expires_at_ns, \
+         payload       = EXCLUDED.payload",
+    )
+    .bind(&token.access_token)
+    .bind(token.client_id.as_str())
+    .bind(token.subject.as_deref())
+    .bind(token.family_id.as_deref())
+    .bind(to_nanos(token.expires_at))
+    .bind(payload)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| error::db(OP, e))?;
+    Ok(())
+}
+
+async fn write_record(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &RefreshTokenRecord,
+) -> Result<(), StorageError> {
+    const OP: &str = "write_record";
+    let payload = encode(OP, record)?;
+    sqlx::query(
+        "INSERT INTO oauth_as_refresh_tokens \
+         (refresh_token, client_id, subject, family_id, expires_at_ns, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (refresh_token) DO UPDATE SET \
+         client_id     = EXCLUDED.client_id, \
+         subject       = EXCLUDED.subject, \
+         family_id     = EXCLUDED.family_id, \
+         expires_at_ns = EXCLUDED.expires_at_ns, \
+         payload       = EXCLUDED.payload",
+    )
+    .bind(&record.refresh_token)
+    .bind(record.client_id.as_str())
+    .bind(record.subject.as_deref())
+    .bind(&record.family_id)
+    // `None` is a chain with no ABSOLUTE lifetime and stays NULL. The sweep must not treat
+    // that as "expired at the epoch": doing so logs every such client out.
+    .bind(record.expires_at.map(to_nanos))
+    .bind(payload)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| error::db(OP, e))?;
+    Ok(())
+}
+
 impl Storage for PostgresStorage {
     async fn get_client(
         &self,
@@ -856,7 +916,6 @@ impl Storage for PostgresStorage {
     /// insert.
     async fn put_token(&self, token: IssuedToken) -> Result<WriteOutcome, StorageError> {
         const OP: &str = "put_token";
-        let payload = encode(OP, &token)?;
         let mut tx = self.begin(OP).await?;
         // BEFORE the check, so that no revocation of this token's client, family or consent can
         // commit between the check and the insert below. See `lock_barrier_scopes`.
@@ -883,26 +942,7 @@ impl Storage for PostgresStorage {
             tx.rollback().await.map_err(|e| error::db(OP, e))?;
             return Ok(WriteOutcome::RefusedRevoked);
         }
-        sqlx::query(
-            "INSERT INTO oauth_as_access_tokens \
-                 (access_token, client_id, subject, family_id, expires_at_ns, payload) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (access_token) DO UPDATE SET \
-                 client_id     = EXCLUDED.client_id, \
-                 subject       = EXCLUDED.subject, \
-                 family_id     = EXCLUDED.family_id, \
-                 expires_at_ns = EXCLUDED.expires_at_ns, \
-                 payload       = EXCLUDED.payload",
-        )
-        .bind(&token.access_token)
-        .bind(token.client_id.as_str())
-        .bind(token.subject.as_deref())
-        .bind(token.family_id.as_deref())
-        .bind(to_nanos(token.expires_at))
-        .bind(payload)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| error::db(OP, e))?;
+        write_token(&mut tx, &token).await?;
         tx.commit().await.map_err(|e| error::db(OP, e))?;
         Ok(WriteOutcome::Applied)
     }
@@ -940,7 +980,6 @@ impl Storage for PostgresStorage {
         record: RefreshTokenRecord,
     ) -> Result<WriteOutcome, StorageError> {
         const OP: &str = "put_refresh_token";
-        let payload = encode(OP, &record)?;
         let mut tx = self.begin(OP).await?;
         lock_barrier_scopes(
             OP,
@@ -963,28 +1002,7 @@ impl Storage for PostgresStorage {
             tx.rollback().await.map_err(|e| error::db(OP, e))?;
             return Ok(WriteOutcome::RefusedRevoked);
         }
-        sqlx::query(
-            "INSERT INTO oauth_as_refresh_tokens \
-                 (refresh_token, client_id, subject, family_id, expires_at_ns, payload) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (refresh_token) DO UPDATE SET \
-                 client_id     = EXCLUDED.client_id, \
-                 subject       = EXCLUDED.subject, \
-                 family_id     = EXCLUDED.family_id, \
-                 expires_at_ns = EXCLUDED.expires_at_ns, \
-                 payload       = EXCLUDED.payload",
-        )
-        .bind(&record.refresh_token)
-        .bind(record.client_id.as_str())
-        .bind(record.subject.as_deref())
-        .bind(&record.family_id)
-        // `None` is a chain with no ABSOLUTE lifetime and stays NULL. The sweep must not treat
-        // that as "expired at the epoch": doing so logs every such client out.
-        .bind(record.expires_at.map(to_nanos))
-        .bind(payload)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| error::db(OP, e))?;
+        write_record(&mut tx, &record).await?;
         tx.commit().await.map_err(|e| error::db(OP, e))?;
         Ok(WriteOutcome::Applied)
     }
@@ -1005,6 +1023,57 @@ impl Storage for PostgresStorage {
                 .await
                 .map_err(|e| error::db(OP, e))?;
         payload_arc_of(OP, row)
+    }
+
+    async fn rotate_refresh_token(
+        &self,
+        expected: &RefreshTokenRecord,
+        spent: &RefreshTokenRecord,
+        access: &IssuedToken,
+        next: Option<&RefreshTokenRecord>,
+    ) -> Result<bool, StorageError> {
+        const OP: &str = "rotate_refresh_token";
+        let mut tx = self.begin(OP).await?;
+        lock_barrier_scopes(
+            OP,
+            &mut tx,
+            expected.client_id.as_str(),
+            Some(&expected.family_id),
+            expected.subject.as_deref(),
+        )
+        .await?;
+        if barrier_covers(
+            OP,
+            &mut tx,
+            expected.client_id.as_str(),
+            Some(&expected.family_id),
+            expected.subject.as_deref(),
+            expected.grant_established_at,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        // The row stays present throughout rotation. Other nodes wait for this
+        // transaction and then observe its completed retry response or rollback.
+        let row = sqlx::query(
+            "SELECT payload FROM oauth_as_refresh_tokens WHERE refresh_token = $1 FOR UPDATE",
+        )
+        .bind(&expected.refresh_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| error::db(OP, e))?;
+        let current: Option<RefreshTokenRecord> = payload_of(OP, row)?;
+        if current.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        write_record(&mut tx, spent).await?;
+        write_token(&mut tx, access).await?;
+        if let Some(next) = next {
+            write_record(&mut tx, next).await?;
+        }
+        tx.commit().await.map_err(|e| error::db(OP, e))?;
+        Ok(true)
     }
 
     /// ATOMIC remove-and-return, and THE one that matters most. This is what makes rotation

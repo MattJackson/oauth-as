@@ -49,7 +49,7 @@ impl Storage for CountingStore {
         take_authorization_code,
         put_pushed_authorization_request, take_pushed_authorization_request,
         get_token, delete_token,
-        put_refresh_token, get_refresh_token, take_refresh_token, revoke_token_family,
+        put_refresh_token, get_refresh_token, take_refresh_token, rotate_refresh_token, revoke_token_family,
         put_consent, compare_and_swap_consent, get_consent, find_consent,
         consents_for_subject, revoke_consent,
         claim_replay_id,

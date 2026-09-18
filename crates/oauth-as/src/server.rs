@@ -415,6 +415,12 @@ pub struct ServerConfig {
     /// presentation reads as an unknown token. When the chain HAS an absolute expiry, that expiry
     /// is used instead: there is nothing left to protect once the chain itself is dead.
     pub refresh_reuse_window: Duration,
+    /// Opt-in window for equivalent refresh retries to receive the same credentials.
+    /// Zero (the default) preserves strict single-use rotation. Nonzero requires
+    /// `Storage::rotate_refresh_token` and delays reuse detection by this duration:
+    /// a thief with the same bearer token can also recover its successor during it.
+    /// The deadline never slides and cannot exceed the chain or access-token expiry.
+    pub refresh_retry_window: Duration,
     /// RFC 9449: whether EVERY token request must carry a DPoP proof.
     ///
     /// `false` by default, which means "DPoP is available, and a client that wants a
@@ -845,6 +851,7 @@ impl ServerConfig {
             // 30 days: long enough that a chain abandoned by a client that later comes back with
             // a stale token is still recognised as reuse rather than as noise.
             refresh_reuse_window: Duration::from_secs(30 * 24 * 60 * 60),
+            refresh_retry_window: Duration::ZERO,
             #[cfg(feature = "dpop")]
             require_dpop: false,
             user_code_length: MIN_USER_CODE_LENGTH,
@@ -1723,6 +1730,7 @@ impl GrantedDetails {
 pub(crate) struct RefreshChain {
     family_id: String,
     expires_at: Option<SystemTime>,
+    retry: Option<Box<RefreshTokenRecord>>,
 }
 
 /// The authorization server. Generic over the host's [`Storage`] and (for tests) the [`Clock`].
@@ -1929,6 +1937,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         record: crate::token::RefreshTokenRecord,
     ) -> Result<(), ErrorResponse> {
+        // Retryable rotation reads without taking. A refusal must not overwrite
+        // a concurrent rotation with the snapshot that was just rejected.
+        if !self.config.refresh_retry_window.is_zero() {
+            return Ok(());
+        }
         let _outcome = self
             .store
             .put_refresh_token(record)
@@ -5146,15 +5159,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
         }
 
-        // Consume first (atomic): that is what makes redemption single use under concurrency.
-        // Judging comes after, and every judgement below either puts the record back or has a
-        // stated reason not to.
-        let record = self
-            .store
-            .take_refresh_token(refresh_token)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
+        // Retryable rotations keep the predecessor present and atomically replace
+        // it with the completed response. Strict stores retain their take contract.
+        let record = if self.config.refresh_retry_window.is_zero() {
+            self.store
+                .take_refresh_token(refresh_token)
+                .await
+                .map_err(storage_error)?
+        } else {
+            self.store
+                .get_refresh_token(refresh_token)
+                .await
+                .map_err(storage_error)?
+                .map(|record| (*record).clone())
+        }
+        .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
 
         // Presented by a client it was not issued to. The record goes BACK: the presenter proved
         // only that they hold a string, and destroying a live credential on that basis locks out
@@ -5163,6 +5182,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         if record.client_id != client.client_id {
             self.restore_refresh_token(record).await?;
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+
+        if !self.config.refresh_retry_window.is_zero() {
+            if let Some(response) = self
+                .refresh_retry_response(
+                    &record,
+                    &client,
+                    bound,
+                    requested_scope,
+                    requested_resources,
+                    &requested_details,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
         }
 
         // REUSE. This token was already rotated away, so two parties hold it, and the AS has just
@@ -5325,69 +5360,41 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         };
 
-        // Retain the rotated token, marked spent, exactly as the authorization code path retains a
-        // consumed code and for the same reason: a deleted token makes a later presentation
-        // indistinguishable from an unknown string, and reuse detection is then impossible. A
-        // chain with no absolute expiry gets a retention deadline here, so the record is
-        // reclaimable by `Storage::sweep_expired` rather than immortal.
-        //
-        // THIS WRITE HAPPENS BEFORE ISSUANCE, AND THE ORDER IS A SECURITY PROPERTY RATHER THAN A
-        // STYLE CHOICE. `Storage` deliberately has no transaction (see the trait's own docs: a host
-        // may be backing this with anything from a HashMap to a sharded KV store, and requiring
-        // cross-key atomicity would exclude most of them), so the atomic take above and this write
-        // CANNOT be made one operation. All that can be chosen is which way the pair fails.
-        //
-        // Issuing first and marking spent afterwards fails OPEN. The take has already removed this
-        // token; if anything in issuance or in this write then fails, the token is gone with NO
-        // spent record, so a later presentation of it reads as an unknown string rather than as
-        // reuse. RFC 9700 section 4.14.2 detection is then off for this family, permanently and
-        // silently, at exactly the moment the deployment's storage is misbehaving, which is when a
-        // compromise is most likely to go unnoticed. The freshly minted tokens meanwhile stay live
-        // and orphaned, because the caller is answered with an error and never sees them.
-        //
-        // Marking spent first fails CLOSED, and that is the right trade. If this write fails,
-        // nothing has been minted and the client re-authenticates. If it succeeds and issuance then
-        // fails, the client is locked out of this chain and re-authenticates, and the alarm is
-        // ARMED: the next presentation of this token is recognised as reuse and revokes the family.
-        // Locking a client out is an inconvenience it can recover from without help; a
-        // compromise-detection capability going offline is not.
         let chain_expires_at = record.expires_at;
-        // Read off the record BEFORE it is moved into the spent value below. These are the same
-        // three clones the issuance took when it ran first, so the ordering change costs nothing.
         let subject = record.subject.clone();
         let family_id = record.family_id.clone();
         let authentication = GrantedAuthentication::from_refresh(&record);
-        // Read BEFORE `record` is consumed into `spent` below.
         let grant_established_at = record.grant_established_at;
-        let spent = RefreshTokenRecord {
-            state: RefreshTokenState::Spent,
-            // `saturating_deadline` rather than `+`: `refresh_reuse_window` is a plain public
-            // field with no validating constructor, and this branch is the DEFAULT
-            // configuration's (`refresh_token_ttl: None` means the chain has no absolute expiry),
-            // so every rotation in such a deployment performs this addition on a request path.
-            expires_at: chain_expires_at.or_else(|| {
-                Some(saturating_deadline(
-                    self.clock.now(),
-                    self.config.refresh_reuse_window,
-                ))
-            }),
-            ..record
+        let retry = if self.config.refresh_retry_window.is_zero() {
+            // Strict rotation arms reuse detection before issuance. A failed mint
+            // remains fail-closed, as it did before retry support was enabled.
+            let spent = RefreshTokenRecord {
+                state: RefreshTokenState::Spent,
+                expires_at: chain_expires_at.or_else(|| {
+                    Some(saturating_deadline(
+                        self.clock.now(),
+                        self.config.refresh_reuse_window,
+                    ))
+                }),
+                ..record
+            };
+            if self
+                .store
+                .put_refresh_token(spent)
+                .await
+                .map_err(storage_error)?
+                .is_refused()
+            {
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidGrant).with_description(
+                        "the grant was revoked while this token was being refreshed",
+                    ),
+                );
+            }
+            None
+        } else {
+            Some(Box::new(record))
         };
-        // NOT `restore_refresh_token`: this write is not a restoration and a refusal here is not
-        // benign. The spent marker is what arms reuse detection for the token about to be minted,
-        // so if a revocation has reached this family the rotation must STOP rather than continue
-        // to issuance. Continuing would mint a chain from a grant that was revoked a moment ago,
-        // and would do it with the alarm disarmed.
-        if self
-            .store
-            .put_refresh_token(spent)
-            .await
-            .map_err(storage_error)?
-            .is_refused()
-        {
-            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
-                .with_description("the grant was revoked while this token was being refreshed"));
-        }
 
         self.issue_boxed(
             &client,
@@ -5403,6 +5410,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             Some(RefreshChain {
                 family_id,
                 expires_at: chain_expires_at,
+                retry,
             }),
             true,
             authentication,
@@ -5414,6 +5422,83 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             None,
         )
         .await
+    }
+
+    async fn refresh_retry_response(
+        &self,
+        record: &RefreshTokenRecord,
+        client: &Client,
+        bound: &Bound<'_>,
+        requested_scope: Option<&ScopeSet>,
+        requested_resources: &[String],
+        requested_details: &GrantedDetails,
+    ) -> Result<Option<TokenResponse>, ErrorResponse> {
+        let Some(retry) = &record.retry else {
+            return Ok(None);
+        };
+        let now = self.clock.now();
+        if now >= retry.until {
+            return Ok(None);
+        }
+        if record.client_id != client.client_id
+            || record.expires_at.is_some_and(|expiry| now >= expiry)
+        {
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+        #[cfg(feature = "dpop")]
+        if record.jkt.as_deref() != bound.jkt {
+            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
+        }
+        #[cfg(feature = "mtls")]
+        if record.x5t_s256.as_deref() != bound.cred.certificate.map(|c| c.thumbprint()) {
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+        let _ = bound;
+        let token = self
+            .introspect(&retry.response.access_token)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
+        if token.client_id != record.client_id
+            || token.subject != record.subject
+            || token.family_id.as_deref() != Some(record.family_id.as_str())
+            || token.grant_established_at != record.grant_established_at
+        {
+            return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+        let scope = requested_scope.unwrap_or(&record.scope);
+        if !record.scope.is_subset(&client.allowed_scopes) || *scope != token.scope {
+            return Err(ErrorResponse::new(ErrorCode::InvalidScope));
+        }
+        let resource = self.narrow_and_permit(&record.resource, requested_resources)?;
+        if resource.len() != token.resource.len()
+            || resource.iter().any(|r| !token.resource.contains(r))
+        {
+            return Err(ErrorResponse::new(ErrorCode::InvalidTarget));
+        }
+        if GrantedDetails::of_refresh(record).narrow(requested_details)?
+            != GrantedDetails::of_token(&token)
+        {
+            return Err(ErrorResponse::new(ErrorCode::InvalidAuthorizationDetails));
+        }
+        if let Some(next) = &retry.response.refresh_token {
+            let next = self
+                .store
+                .get_refresh_token(next)
+                .await
+                .map_err(storage_error)?
+                .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
+            if next.state != RefreshTokenState::Active || next.family_id != record.family_id {
+                return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
+            }
+        }
+        let mut response = retry.response.clone();
+        response.expires_in = token
+            .expires_at
+            .duration_since(self.clock.now())
+            .unwrap_or_default()
+            .as_secs();
+        Ok(Some(response))
     }
 
     /// Mint and persist an access token (and, when configured, a rotated refresh token).
@@ -5649,62 +5734,50 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 ErrorResponse::new(ErrorCode::ServerError)
             })?,
         };
-        let refused = self
-            .store
-            .put_token(IssuedToken {
-                // RFC 9449 s6: the binding is recorded on the AS side too, not only in the token,
-                // so that RFC 7662 introspection can report it and a resource server can check it
-                // without having to parse a token this server may have issued as opaque.
-                #[cfg(feature = "dpop")]
-                jkt: bound.jkt.map(Box::from),
-                // The record was written this way before there was anybody to read it, because the
-                // record is the half that cannot be added later; a registered resource server
-                // reads it now (`ServerConfig::resource_servers`).
-                //
-                // RFC 8705 s3, and the same argument as `jkt` immediately above: an opaque
-                // token carries its binding nowhere else, so s3.2 introspection could not
-                // report it if it were not written down here.
-                #[cfg(feature = "mtls")]
-                x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),
-                access_token: access_token.clone(),
-                client_id: client.client_id.clone(),
-                subject: subject.clone(),
-                scope: scope.clone(),
-                resource: resource.clone(),
-                // RFC 9396 s7: the details as granted, assigned to this access token. This
-                // is what introspection (s9.2) reports and what the s9.1 JWT claim carries.
-                #[cfg(feature = "rar")]
-                authorization_details: details.clone().into_details(),
-                issued_at: now,
-                // The GRANT's instant, not this issuance's: a barrier is compared against it, and
-                // a rotation writing at `now` must not thereby outlive the revocation that killed
-                // the decision it descends from.
-                grant_established_at,
-                // Computed at the top of this function, so the record, the signed `exp` and the
-                // `expires_in` below are one instant stated three times rather than three.
-                expires_at,
-                family_id: family_id.clone(),
-                // RFC 8693 s4.1: the token records who authority was delegated TO, so that RFC
-                // 7662 introspection can report it. An opaque token carries it nowhere else.
-                #[cfg(feature = "token-exchange")]
-                act: actor.act.clone(),
-                // RFC 9470 s6.2: the token reports the authentication behind it, so introspection can
-                // answer the question the resource server's challenge asked.
-                #[cfg(feature = "consent")]
-                authentication: authentication.authentication.clone(),
-            })
-            .await
-            .map_err(storage_error)?;
-        // The grant was revoked while this issuance was in flight, most likely across the signing
-        // await immediately above, which is a network round trip when the host's `Es256Signer`
-        // fronts a KMS. Nothing was written, so there is nothing to undo; the client is told its
-        // grant is invalid, which by now it is.
-        if refused.is_refused() {
-            return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
-                .with_description("the grant was revoked while this token was being issued"));
-        }
+        let access_record = IssuedToken {
+            // RFC 9449 s6: the binding is recorded on the AS side too, not only in the token,
+            // so that RFC 7662 introspection can report it and a resource server can check it
+            // without having to parse a token this server may have issued as opaque.
+            #[cfg(feature = "dpop")]
+            jkt: bound.jkt.map(Box::from),
+            // The record was written this way before there was anybody to read it, because the
+            // record is the half that cannot be added later; a registered resource server
+            // reads it now (`ServerConfig::resource_servers`).
+            //
+            // RFC 8705 s3, and the same argument as `jkt` immediately above: an opaque
+            // token carries its binding nowhere else, so s3.2 introspection could not
+            // report it if it were not written down here.
+            #[cfg(feature = "mtls")]
+            x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),
+            access_token: access_token.clone(),
+            client_id: client.client_id.clone(),
+            subject: subject.clone(),
+            scope: scope.clone(),
+            resource: resource.clone(),
+            // RFC 9396 s7: the details as granted, assigned to this access token. This
+            // is what introspection (s9.2) reports and what the s9.1 JWT claim carries.
+            #[cfg(feature = "rar")]
+            authorization_details: details.clone().into_details(),
+            issued_at: now,
+            // The GRANT's instant, not this issuance's: a barrier is compared against it, and
+            // a rotation writing at `now` must not thereby outlive the revocation that killed
+            // the decision it descends from.
+            grant_established_at,
+            // Computed at the top of this function, so the record, the signed `exp` and the
+            // `expires_in` below are one instant stated three times rather than three.
+            expires_at,
+            family_id: family_id.clone(),
+            // RFC 8693 s4.1: the token records who authority was delegated TO, so that RFC
+            // 7662 introspection can report it. An opaque token carries it nowhere else.
+            #[cfg(feature = "token-exchange")]
+            act: actor.act.clone(),
+            // RFC 9470 s6.2: the token reports the authentication behind it, so introspection can
+            // answer the question the resource server's challenge asked.
+            #[cfg(feature = "consent")]
+            authentication: authentication.authentication.clone(),
+        };
 
-        let refresh_token = if issues_refresh {
+        let mut refresh_record = if issues_refresh {
             let expires_at = match &chain {
                 Some(c) => c.expires_at,
                 None => self
@@ -5715,64 +5788,39 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // Drawn in the single `getrandom` call at the top of this function; `issues_refresh`
             // is what decided both that draw and this branch, so the value is always present.
             let rt = pending_refresh.expect("issues_refresh decided both");
-            let refused = self
-                .store
-                .put_refresh_token(RefreshTokenRecord {
-                    // RFC 9449 s5: the chain remembers the key it was issued to, and rotation
-                    // checks it. See the check in `refresh_token`.
-                    #[cfg(feature = "dpop")]
-                    jkt: bound.jkt.map(Box::from),
-                    // RFC 8705 s3: the chain remembers the certificate it was issued to, and
-                    // rotation checks it. See the check in `refresh_token`.
-                    #[cfg(feature = "mtls")]
-                    x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),
-                    refresh_token: rt.clone(),
-                    client_id: client.client_id.clone(),
-                    subject,
-                    scope: scope.clone(),
-                    // The chain remembers what it may narrow from on the next rotation.
-                    resource,
-                    #[cfg(feature = "rar")]
-                    authorization_details: details.clone().into_details(),
-                    expires_at,
-                    // CARRIED, never restamped: see `RefreshTokenRecord::grant_established_at`.
-                    grant_established_at,
-                    // Present whenever a refresh token is: `issues_refresh` is what decided both.
-                    family_id: family_id.unwrap_or_default(),
-                    state: RefreshTokenState::Active,
-                    // Carried, never restamped: see `RefreshTokenRecord::authentication`.
-                    #[cfg(feature = "consent")]
-                    authentication: authentication.authentication,
-                })
-                .await
-                .map_err(storage_error)?;
-            // Revoked BETWEEN the two writes. This is the case that needs undoing rather than
-            // merely refusing: the access token a few lines above is already in the store, and
-            // leaving it there would hand the caller a live credential minted from a grant that no
-            // longer exists, which is the resurrection defect wearing a different hat.
-            if refused.is_refused() {
-                self.undo_issuance(&access_token).await;
-                return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
-                    .with_description("the grant was revoked while this token was being issued"));
-            }
-            Some(rt)
+            Some(RefreshTokenRecord {
+                // RFC 9449 s5: the chain remembers the key it was issued to, and rotation
+                // checks it. See the check in `refresh_token`.
+                #[cfg(feature = "dpop")]
+                jkt: bound.jkt.map(Box::from),
+                // RFC 8705 s3: the chain remembers the certificate it was issued to, and
+                // rotation checks it. See the check in `refresh_token`.
+                #[cfg(feature = "mtls")]
+                x5t_s256: bound.cred.certificate.map(|c| Box::new(*c.thumbprint())),
+                refresh_token: rt,
+                client_id: client.client_id.clone(),
+                subject,
+                scope: scope.clone(),
+                // The chain remembers what it may narrow from on the next rotation.
+                resource,
+                #[cfg(feature = "rar")]
+                authorization_details: details.clone().into_details(),
+                expires_at,
+                // CARRIED, never restamped: see `RefreshTokenRecord::grant_established_at`.
+                grant_established_at,
+                // Present whenever a refresh token is: `issues_refresh` is what decided both.
+                family_id: family_id.unwrap_or_default(),
+                state: RefreshTokenState::Active,
+                retry: None,
+                // Carried, never restamped: see `RefreshTokenRecord::authentication`.
+                #[cfg(feature = "consent")]
+                authentication: authentication.authentication,
+            })
         } else {
             None
         };
 
-        // Emitted after BOTH records are persisted, so the event describes a token that exists.
-        if let Some(audit) = &audit {
-            self.hooks.emit(|| Event::TokenIssued {
-                client_id: client.client_id.as_str(),
-                grant_type,
-                subject: audit.0.as_deref(),
-                scope: &scope,
-                family_id: audit.1.as_deref(),
-                refresh_issued: refresh_token.is_some(),
-            });
-        }
-
-        Ok(TokenResponse {
+        let response = TokenResponse {
             access_token,
             // RFC 9449 s5: a token bound to a proof key is a `DPoP` token and not a `Bearer` one,
             // and the difference is exactly what tells the client, and any resource server reading
@@ -5793,13 +5841,128 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // `unwrap_or_default` is the fail-closed direction: a ceiling already in the past
             // yields zero rather than an underflow, and zero tells the client the token is spent.
             expires_in: expires_at.duration_since(now).unwrap_or_default().as_secs(),
-            refresh_token,
+            refresh_token: refresh_record.as_ref().map(|r| r.refresh_token.clone()),
             scope: (!scope.is_empty()).then(|| scope.to_string()),
             // RFC 9396 s7: what was GRANTED, from the same value that reaches the stored record
             // and the signed token, so the three cannot disagree about what this token authorizes.
             #[cfg(feature = "rar")]
             authorization_details: details.into_details(),
-        })
+        };
+
+        if let Some(expected) = chain.as_ref().and_then(|chain| chain.retry.as_deref()) {
+            if let Some(recovered) = Box::pin(self.commit_refresh_retry(
+                expected,
+                &access_record,
+                &mut refresh_record,
+                &response,
+                client,
+                bound,
+            ))
+            .await?
+            {
+                return Ok(recovered);
+            }
+        } else {
+            if self
+                .store
+                .put_token(access_record)
+                .await
+                .map_err(storage_error)?
+                .is_refused()
+            {
+                return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
+                    .with_description("the grant was revoked while this token was being issued"));
+            }
+            if let Some(record) = refresh_record {
+                if self
+                    .store
+                    .put_refresh_token(record)
+                    .await
+                    .map_err(storage_error)?
+                    .is_refused()
+                {
+                    self.undo_issuance(&response.access_token).await;
+                    return Err(
+                        ErrorResponse::new(ErrorCode::InvalidGrant).with_description(
+                            "the grant was revoked while this token was being issued",
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Emitted after BOTH records are persisted, so the event describes a token that exists.
+        if let Some(audit) = &audit {
+            self.hooks.emit(|| Event::TokenIssued {
+                client_id: client.client_id.as_str(),
+                grant_type,
+                subject: audit.0.as_deref(),
+                scope: &scope,
+                family_id: audit.1.as_deref(),
+                refresh_issued: response.refresh_token.is_some(),
+            });
+        }
+
+        Ok(response)
+    }
+
+    // Keep opt-in transaction/recovery state out of every ordinary issuance future.
+    async fn commit_refresh_retry(
+        &self,
+        expected: &RefreshTokenRecord,
+        access: &IssuedToken,
+        next: &mut Option<RefreshTokenRecord>,
+        response: &TokenResponse,
+        client: &Client,
+        bound: &Bound<'_>,
+    ) -> Result<Option<TokenResponse>, ErrorResponse> {
+        let until = saturating_deadline(access.issued_at, self.config.refresh_retry_window)
+            .min(access.expires_at)
+            .min(expected.expires_at.unwrap_or(access.expires_at));
+        let retry = Box::new(crate::token::RefreshTokenRetry {
+            response: response.clone(),
+            until,
+        });
+        let mut spent = expected.clone();
+        spent.state = RefreshTokenState::Spent;
+        spent.expires_at = spent.expires_at.or_else(|| {
+            Some(saturating_deadline(
+                access.issued_at,
+                self.config.refresh_reuse_window,
+            ))
+        });
+        spent.retry = Some(retry.clone());
+        if let Some(next) = next.as_mut() {
+            next.retry = Some(retry);
+        }
+        if !self
+            .store
+            .rotate_refresh_token(expected, &spent, access, next.as_ref())
+            .await
+            .map_err(storage_error)?
+        {
+            // Another node won, or a revocation removed the grant. Recover only
+            // that winner's still-live, equivalent response; never mint a branch.
+            let current = self
+                .store
+                .get_refresh_token(&expected.refresh_token)
+                .await
+                .map_err(storage_error)?
+                .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant))?;
+            return self
+                .refresh_retry_response(
+                    &current,
+                    client,
+                    bound,
+                    Some(&access.scope),
+                    &access.resource,
+                    &GrantedDetails::of_token(access),
+                )
+                .await?
+                .map(Some)
+                .ok_or_else(|| ErrorResponse::new(ErrorCode::InvalidGrant));
+        }
+        Ok(None)
     }
 
     /// Opaque-token introspection: `Ok(Some(_))` only for a known, unexpired token.

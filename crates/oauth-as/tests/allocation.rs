@@ -846,8 +846,18 @@ fn core_public_types_stay_within_their_size_budget() {
     const CIMD: usize = 8;
     #[cfg(not(feature = "cimd"))]
     const CIMD: usize = 0;
-    let server_budget =
-        832 + REVOCATION_BARRIERS + RESOURCE_SERVERS + PAR + JAR + RAR + TOKEN_ENDPOINT + CIMD;
+    // One Duration for the opt-in retry policy. It allocates nothing when disabled.
+    // Measured with all features: AuthorizationServer 1000 -> 1016 bytes.
+    const REFRESH_RETRY_WINDOW: usize = 16;
+    let server_budget = 832
+        + REVOCATION_BARRIERS
+        + RESOURCE_SERVERS
+        + PAR
+        + JAR
+        + RAR
+        + TOKEN_ENDPOINT
+        + CIMD
+        + REFRESH_RETRY_WINDOW;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
@@ -858,7 +868,7 @@ fn core_public_types_stay_within_their_size_budget() {
     // 0.9.2 the `resource_servers` boxed slice above, whose 16 bytes are attributed there.
     // MEASURED: 464 before that field, 488 as a `Vec`, 480 as a boxed slice.
     assert!(
-        size_of::<ServerConfig>() <= 448 + RESOURCE_SERVERS + RAR + CIMD,
+        size_of::<ServerConfig>() <= 448 + RESOURCE_SERVERS + RAR + CIMD + REFRESH_RETRY_WINDOW,
         "ServerConfig grew past its size budget: {}",
         size_of::<ServerConfig>()
     );

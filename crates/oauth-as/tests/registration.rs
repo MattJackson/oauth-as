@@ -729,9 +729,14 @@ fn a_host_that_never_registers_anything_pays_one_pointer() {
     // base for the same reason every other term here is named: a bare `+ 16` is a number nobody
     // can audit. `tests/allocation.rs` carries the measurements and the argument for the shape.
     const RESOURCE_SERVERS: usize = 16;
+    // Same opt-in Duration accounted for by the core allocation gate.
+    const REFRESH_RETRY_WINDOW: usize = 16;
     assert!(
         std::mem::size_of::<ServerConfig>()
-            <= 448 + RESOURCE_SERVERS + if cfg!(feature = "rar") { 24 } else { 0 },
+            <= 448
+                + RESOURCE_SERVERS
+                + REFRESH_RETRY_WINDOW
+                + if cfg!(feature = "rar") { 24 } else { 0 },
         "ServerConfig grew past its size budget: {}",
         std::mem::size_of::<ServerConfig>()
     );

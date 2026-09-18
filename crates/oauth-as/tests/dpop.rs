@@ -716,3 +716,41 @@ async fn a_signed_access_token_carries_both_bindings_when_the_client_holds_both(
         "the certificate binding must survive the DPoP binding, in claims {claims}"
     );
 }
+
+#[tokio::test]
+async fn refresh_retry_requires_the_original_dpop_key() {
+    let victim = EcdsaP256Key::generate("victim");
+    let thief = EcdsaP256Key::generate("thief");
+    let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
+    config.token_endpoint = Some(TOKEN_ENDPOINT.into());
+    config.refresh_retry_window = Duration::from_secs(30);
+    let srv = AuthorizationServer::new(config, MemoryStorage::new());
+    let token = mint_refresh_token(&srv, Some(&victim), "retry-seed").await;
+    let request = || TokenRequest::RefreshToken {
+        client_id: ClientId::new("app"),
+        client_secret: Some(SECRET.into()),
+        refresh_token: token.clone(),
+        scope: None,
+    };
+    let rotated = srv
+        .token_with_context(request(), with_proof(&proof(&victim, "retry-first")))
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.token_with_context(request(), with_proof(&proof(&thief, "retry-thief")))
+            .await
+            .unwrap_err()
+            .error,
+        ErrorCode::InvalidDpopProof
+    );
+    assert_eq!(
+        srv.token(request()).await.unwrap_err().error,
+        ErrorCode::InvalidDpopProof
+    );
+    let retried = srv
+        .token_with_context(request(), with_proof(&proof(&victim, "retry-owner")))
+        .await
+        .unwrap();
+    assert_eq!(retried.access_token, rotated.access_token);
+    assert_eq!(retried.refresh_token, rotated.refresh_token);
+}

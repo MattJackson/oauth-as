@@ -881,3 +881,51 @@ async fn records_written_by_0_9_0_survive_the_upgrade() {
         .expect("the pushed request is still there");
     assert_eq!(pushed.pushed_at, SystemTime::UNIX_EPOCH);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_atomic_refresh_rotation_cannot_outlive_family_revocation() {
+    const SCHEMA: &str = "oauth_as_race_atomic_refresh";
+    const CLIENT: &str = "atomic-client";
+    const FAMILY: &str = "atomic-family";
+    support::fresh_schema(SCHEMA).await;
+    let writer = support::store(SCHEMA, 1).await;
+    let revoker = support::store(SCHEMA, 1).await;
+    let bystander = support::pool(SCHEMA, 1).await;
+    let expected = refresh_record("predecessor", CLIENT, Some("owner"), FAMILY);
+    assert!(writer
+        .put_refresh_token(expected.clone())
+        .await
+        .unwrap()
+        .is_applied());
+    let held = blocker(&bystander,
+        "INSERT INTO oauth_as_access_tokens (access_token, client_id, subject, family_id, expires_at_ns, payload) VALUES ($1, $2, NULL, NULL, $3, '{}'::jsonb)",
+        &["atomic-access", CLIENT]).await;
+    let write = tokio::spawn(async move {
+        let mut spent = expected.clone();
+        spent.state = oauth_as::token::RefreshTokenState::Spent;
+        writer
+            .rotate_refresh_token(
+                &expected,
+                &spent,
+                &access_token("atomic-access", CLIENT, Some("owner"), Some(FAMILY)),
+                Some(&refresh_record("successor", CLIENT, Some("owner"), FAMILY)),
+            )
+            .await
+            .unwrap()
+    });
+    let revoke = tokio::spawn(async move {
+        revoker
+            .revoke_token_family(FAMILY, window_now())
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(REVOCATION_GRACE).await;
+    held.rollback().await.unwrap();
+    write.await.unwrap();
+    revoke.await.unwrap();
+    let after = support::store(SCHEMA, 1).await;
+    for name in ["predecessor", "successor"] {
+        assert!(after.get_refresh_token(name).await.unwrap().is_none());
+    }
+    assert!(after.get_token("atomic-access").await.unwrap().is_none());
+}
