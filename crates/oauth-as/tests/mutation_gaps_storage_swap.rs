@@ -291,6 +291,18 @@ impl Storage for Faulty {
         self.inner.take_refresh_token(refresh_token).await
     }
 
+    async fn rotate_refresh_token(
+        &self,
+        expected: &RefreshTokenRecord,
+        spent: &RefreshTokenRecord,
+        access: &IssuedToken,
+        next: Option<&RefreshTokenRecord>,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .rotate_refresh_token(expected, spent, access, next)
+            .await
+    }
+
     async fn revoke_token_family(
         &self,
         family_id: &str,

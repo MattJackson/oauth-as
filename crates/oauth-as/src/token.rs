@@ -966,7 +966,10 @@ pub struct RefreshTokenRecord {
     pub family_id: String,
     /// Whether this link is still redeemable, or is a retained rotated one.
     pub state: RefreshTokenState,
-    /// Completed rotation, shared by its spent predecessor and active successor.
+    /// Completed rotation, shared by its spent predecessor and active successor. `Box`, not
+    /// `Arc`: the two rows are written once and then serialized independently, so serde would need
+    /// its opt-in `rc` feature to round-trip an `Arc` here, and this crate does not pull that in.
+    /// The one extra clone is on the opt-in `refresh_retry_window` path only.
     /// Older rows default to strict single-use behavior. Hosts should not modify this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<Box<RefreshTokenRetry>>,

@@ -989,6 +989,11 @@ pub trait Storage: Send + Sync {
     /// The server puts a SPENT record back after a successful rotation (see
     /// [`crate::token::RefreshTokenState`]), so that a later presentation is recognisable as reuse
     /// rather than as an unknown string.
+    ///
+    /// This is the redemption path only under the default strict rotation. When a host opts into
+    /// [`crate::ServerConfig::refresh_retry_window`] the server keeps the predecessor in place and
+    /// redeems through [`Storage::rotate_refresh_token`] instead, so `take_refresh_token` is not on
+    /// the rotation path for that configuration.
     fn take_refresh_token(
         &self,
         refresh_token: &str,

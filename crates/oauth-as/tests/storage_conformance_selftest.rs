@@ -83,6 +83,16 @@ struct Faults {
     /// applies to every swap it writes, so a store that has it on one method almost always has it
     /// on the rest, and four separate faults would suggest four separate mistakes.
     swaps_read_then_write: bool,
+    /// `rotate_refresh_token` ignores `expected` and applies whenever the predecessor is THERE, so
+    /// two overlapping rotations of one predecessor both win. The compare-and-swap that makes a
+    /// retryable rotation single-winner is gone — the same shape `swaps_read_then_write` gives the
+    /// four `compare_and_swap_*` methods, on the method a host writes only for `refresh_retry_window`.
+    rotate_ignores_expected: bool,
+    /// `rotate_refresh_token` writes the spent predecessor and returns without writing the access
+    /// token and successor, so a loser (or a crash) commits half a rotation. The atomic-take and
+    /// swap faults cannot see it, because rotation is the only write that must land THREE records at
+    /// once; only a check that reads all three back afterwards can.
+    rotate_is_not_atomic: bool,
     /// The barrier refuses on IDENTITY ALONE, ignoring `RevocationWindow::recorded_at`. This is
     /// the shape 0.9.1 shipped before the audit found it, and it is the dangerous-looking-safe
     /// direction: every refusal check passes, because refusing more is never caught by a test that
@@ -1328,6 +1338,57 @@ impl Storage for NaiveStore {
             .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())))
     }
 
+    async fn rotate_refresh_token(
+        &self,
+        expected: &RefreshTokenRecord,
+        spent: &RefreshTokenRecord,
+        access: &IssuedToken,
+        next: Option<&RefreshTokenRecord>,
+    ) -> Result<bool, StorageError> {
+        let mut g = self.lock();
+        let present = g.refresh.get(&expected.refresh_token).cloned();
+        // The compare-and-swap: the whole predecessor must still match, or the rotation lost.
+        // `rotate_ignores_expected` drops the comparison and applies whenever the row is merely
+        // THERE, which is what lets two overlapping rotations both win.
+        let matched = present.as_deref() == Some(expected);
+        if self.faults.rotate_ignores_expected {
+            if present.is_none() {
+                return Ok(false);
+            }
+        } else if !matched {
+            return Ok(false);
+        }
+        if g.is_revoked(
+            &expected.client_id,
+            Some(&expected.family_id),
+            expected.subject.as_deref(),
+            expected.grant_established_at,
+        ) {
+            return Ok(false);
+        }
+        g.refresh.insert(
+            spent.refresh_token.clone(),
+            std::sync::Arc::new(spent.clone()),
+        );
+        // All-or-nothing: the access token and successor land in the SAME critical section as the
+        // spent marker. `rotate_is_not_atomic` returns here instead, committing only the first of
+        // the three writes.
+        if self.faults.rotate_is_not_atomic {
+            return Ok(true);
+        }
+        g.tokens.insert(
+            access.access_token.clone(),
+            std::sync::Arc::new(access.clone()),
+        );
+        if let Some(next) = next {
+            g.refresh.insert(
+                next.refresh_token.clone(),
+                std::sync::Arc::new(next.clone()),
+            );
+        }
+        Ok(true)
+    }
+
     async fn revoke_token_family(
         &self,
         family_id: &str,
@@ -1891,6 +1952,43 @@ async fn read_then_delete_is_caught_with_the_racers_on_the_runtime_too() {
             "atomic_take/take_refresh_token",
         ],
         "{violations:#?}"
+    );
+}
+
+/// A `rotate_refresh_token` that ignores `expected` tells every overlapping retry of one
+/// predecessor that it won, so two live successors are minted from one rotation — the retryable
+/// path's version of the double-spend the `take_*` checks catch for strict rotation. Atomic, so no
+/// take check sees it; only the rotation race check does, and it is asserted by name.
+#[tokio::test]
+async fn a_rotation_that_ignores_expected_is_caught() {
+    let violations = run_against(Faults {
+        rotate_ignores_expected: true,
+        ..Faults::default()
+    })
+    .await;
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["atomic_rotate/rotate_refresh_token"],
+        "a rotation that never compares `expected` must fail exactly the rotation race check: \
+         {violations:#?}"
+    );
+}
+
+/// A `rotate_refresh_token` that writes the spent predecessor and then returns without the access
+/// token and successor commits half a rotation. It is single-winner, so the race check passes; only
+/// reading all three records back afterwards catches the loser's — or the crash's — partial write.
+#[tokio::test]
+async fn a_rotation_that_is_not_atomic_is_caught() {
+    let violations = run_against(Faults {
+        rotate_is_not_atomic: true,
+        ..Faults::default()
+    })
+    .await;
+    assert_eq!(
+        checks_that_fired(&violations),
+        vec!["atomic_rotate/rotate_refresh_token"],
+        "a rotation that does not land all three records must fail the rotation atomicity check: \
+         {violations:#?}"
     );
 }
 
@@ -2640,6 +2738,11 @@ async fn every_violation_names_a_published_check() {
         // compare in a separate step and not compare at all, and the harness would only ever see
         // whichever branch runs.
         swaps_read_then_write: false,
+        // Both on the new rotation method, and they compose with everything above: one drops the
+        // compare so every racer wins, the other commits only the spent record. Both fire the
+        // rotation check, which is a published name like every other.
+        rotate_ignores_expected: true,
+        rotate_is_not_atomic: true,
         client_swap_upserts: true,
         index_overwrites: true,
         index_outlives_the_taken_grant: true,
@@ -4379,6 +4482,10 @@ fn planted_faults() -> Vec<(&'static str, Plant)> {
         ("round_trip/refresh_token", plant!(drops_family_id)),
         ("atomic_take/take_device_grant", plant!(read_then_delete)),
         ("atomic_take/take_refresh_token", plant!(read_then_delete)),
+        (
+            "atomic_rotate/rotate_refresh_token",
+            plant!(rotate_ignores_expected),
+        ),
         (
             "atomic_take/take_authorization_code",
             plant!(read_then_delete),

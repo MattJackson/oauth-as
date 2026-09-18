@@ -5438,8 +5438,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
         let now = self.clock.now();
         if now >= retry.until {
+            // Past the window: `Ok(None)` falls through to the caller's reuse block, which for the
+            // spent predecessor revokes the family. Reuse detection is delayed by the window, never
+            // disabled — see `ServerConfig::refresh_retry_window`.
             return Ok(None);
         }
+        // Every check below is EQUIVALENCE, and a miss is REFUSED for the window's duration rather
+        // than treated as reuse: this is deliberate and is the point of the feature. A lost-response
+        // retry is a byte-identical replay, so it matches; a presentation that differs (a proxy that
+        // adds or drops a resource, a client that renegotiated scope) is refused WITHOUT revoking,
+        // so one imperfect retry cannot log a healthy client out, and the SAME token presented
+        // correctly a moment later still coalesces (see the resource test). This trades a bounded,
+        // opt-in delay in theft detection for that robustness; RFC 9700 s4.14.2 makes revocation a
+        // SHOULD, and after `retry.until` above the strict behaviour resumes in full. A miss is only
+        // ever refused here, never granted, so no different effective grant can be issued.
         if record.client_id != client.client_id
             || record.expires_at.is_some_and(|expiry| now >= expiry)
         {

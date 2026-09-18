@@ -145,6 +145,7 @@ tests/persisted_record_contract.rs
 tests/rar.rs
 tests/rate_limit.rs
 tests/rate_limit_impl.rs
+tests/refresh_retry.rs
 tests/refresh_reuse.rs
 tests/refusal_cost.rs
 tests/registration.rs
@@ -177,6 +178,7 @@ tests/storage_contract.rs
 tests/storage_sweep.rs
 tests/support/alloc.rs
 tests/support/mod.rs
+tests/support/refresh_retry.rs
 tests/third_party_client.rs
 tests/token_exchange.rs
 tests/token_exchange_act_in_jwt.rs

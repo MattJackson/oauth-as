@@ -96,6 +96,12 @@ async fn a_failed_atomic_rotation_leaves_the_original_retryable() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+    // The refresh side above is the all-or-nothing proof for THIS injection: a non-atomic store
+    // would have left the predecessor marked spent (`state`) and the successor as a second row
+    // (`count`). The access-token side cannot be probed here — the trigger rejects every insert
+    // into that table, so its emptiness is the trigger's doing, not the rollback's; the access
+    // half of the invariant is proven generically by the `atomic_rotate/rotate_refresh_token`
+    // conformance check, which counts the surviving access tokens after a raced rotation.
     server
         .store()
         .pool()

@@ -176,6 +176,24 @@ ROWS=(
 # README.md's Cost section from the same run.
 budget_for() {
   case "$HOST_TRIPLE:$1" in
+    # RE-BASELINED 2026-09-18 for 0.9.5, aarch64-apple-darwin, rustc 1.98.0, ONE run of this script
+    # with --remap-path-prefix in force. WHAT BOUGHT IT: the opt-in `refresh_retry_window` feature
+    # (PR #10) adds the bounded atomic-rotation recovery path -- `refresh_retry_response` and
+    # `commit_refresh_retry` on the token endpoint, `RefreshTokenRetry` and its serde, and
+    # `MemoryStorage::rotate_refresh_token`. Because the window is a RUNTIME config, that code links
+    # into every build even when it is ZERO, so all six library rows rose ~16 KiB on `default` and
+    # proportionally above it. The `all-features` row rose further because `test-util` gained the
+    # `atomic_rotate/rotate_refresh_token` conformance check that proves a host's own store rotates
+    # atomically. This is genuine, called feature code (it inlines away under fat LTO rather than
+    # standing as a named symbol), not a regression, so the band moved with it.
+    #
+    # 0.9.5 MEASURED (delta over the matched baseline) and the +1.5%-rounded-up budget:
+    #   default 237,364 -> 236 KiB   http 441,249 -> 438 KiB   axum 680,926 -> 675 KiB
+    #   jwt (seam only) 272,886 -> 271 KiB   jwt-p256 309,366 -> 307 KiB
+    #   http,jwt 476,612 -> 473 KiB   all-features 1,420,273 -> 1408 KiB
+    # The per-row prose below is the 0.9.2/0.9.4 history that explains each row's COMPOSITION; its
+    # MEASURED figures are that older baseline, not the 0.9.5 numbers above.
+    #
     # ALL SEVEN MEASURED 2026-08-13 for 0.9.2, on aarch64-apple-darwin, rustc 1.97.0, by this
     # script, in ONE run, with --remap-path-prefix in force. Each budget is that measurement plus
     # 1.5% rounded up to the next KiB. The measured value is written beside every one of them, so a
@@ -207,7 +225,7 @@ budget_for() {
     # measured at 25,113 bytes when it landed and none of it has been given back; it is what stops
     # a contained token staying live because an issuance was already in flight across a signing
     # await.
-    aarch64-apple-darwin:default) echo 225280 ;;
+    aarch64-apple-darwin:default) echo 241664 ;;
     # + the HTTP service with a request dispatched to every route. MEASURED 423,691, against the
     # 438,009 this row was set from at 0.9.1: down 14,318. The `default` row underneath it accounts
     # for 13,463 of that; the remaining 855 is this surface's own, and is small enough that it is
@@ -215,13 +233,13 @@ budget_for() {
     # doubling the core is still what a wire surface costs: a router, a form and query parser, a
     # body reader, and one response serializer per endpoint.
     # Budget down from 442,368 to 430,080.
-    aarch64-apple-darwin:http) echo 430080 ;;
+    aarch64-apple-darwin:http) echo 448512 ;;
     # + the Router adapter AND a tokio multi-thread runtime with a bound listener, because that is
     # what a host turns this feature on to do. MEASURED 662,357, down 15,282 from the 677,639 this
     # row was set from. The 233 KiB over the `http` row is almost entirely the runtime, which is
     # the host's cost and not this crate's.
     # Budget down from 681,984 to 672,768.
-    aarch64-apple-darwin:axum) echo 672768 ;;
+    aarch64-apple-darwin:axum) echo 691200 ;;
     # + RFC 9068 signing over a HOST-SUPPLIED `Es256Signer`, the RFC 7517 JWKS, and the JWK parsing
     # the verification seam rests on. NO curve implementation: this is what a host with its key in
     # a KMS pays. MEASURED 256,106, essentially where it was at 0.9.1 (256,491, down 385) -- and
@@ -230,7 +248,7 @@ budget_for() {
     # the signing path. The row is flat; the code underneath it is not.
     # Budget down from 271,360 to 260,096. The old number was 15 KB above the measurement, which is
     # more slack than this row has ever needed.
-    aarch64-apple-darwin:"jwt (seam only)") echo 260096 ;;
+    aarch64-apple-darwin:"jwt (seam only)") echo 277504 ;;
     # + the built-in p256 backend, which is what every consumer of `jwt` had before the seam.
     # MEASURED 292,418, UP 749 from 291,669 at 0.9.1 -- the only gated row in the table that grew
     # across this release. 749 bytes is the seam's own overhead moving slightly and not a subsystem
@@ -239,12 +257,12 @@ budget_for() {
     # actually wants.
     # Budget down from 308,224 to 296,960, because 308,224 was 5.4% above a row that moved by 749
     # bytes all release.
-    aarch64-apple-darwin:jwt-p256) echo 296960 ;;
+    aarch64-apple-darwin:jwt-p256) echo 314368 ;;
     # the conformance server's own feature set: the HTTP surface plus the signing seam, with no
     # curve. MEASURED 458,484, down 14,036 from the 472,520 this row was set from, for the same
     # reason as `http`.
     # Budget down from 476,160 to 465,920.
-    aarch64-apple-darwin:"http,jwt") echo 465920 ;;
+    aarch64-apple-darwin:"http,jwt") echo 484352 ;;
     # every feature, every one exercised. MEASURED 1,380,383, down 22,175 from the 1,402,558 this
     # row was set from -- the largest absolute saving in the table, because this row links every
     # feature's scope handling at once and `ScopeSet` is in all of them.
@@ -267,7 +285,7 @@ budget_for() {
     #     marginal cost in a binary that already parses JSON for something else is 30,629 bytes.
     #     (The 24 KiB quoted for this before was taken pre-remap and pre-`ScopeSet`; 30,629 is the
     #     figure from this run.)
-    aarch64-apple-darwin:all-features) echo 1401856 ;;
+    aarch64-apple-darwin:all-features) echo 1441792 ;;
     *) echo "" ;;
   esac
 }
@@ -335,27 +353,35 @@ budget_for() {
 # carry against run-to-run variation.
 floor_for() {
   case "$HOST_TRIPLE:$1" in
+    # RE-BASELINED 2026-09-18 for 0.9.5 alongside the budgets above (see the note in `budget_for`
+    # for what bought the growth: the opt-in `refresh_retry_window` feature, PR #10). Each floor is
+    # the same 0.9.5 measurement minus 1.5%, rounded DOWN to the previous KiB. The per-row MEASURED
+    # figures in the older comments below are the 0.9.2 baseline, kept as history; the 0.9.5 numbers
+    # are: default 237,364 -> 228 KiB, http 441,249 -> 424 KiB, axum 680,926 -> 654 KiB,
+    # jwt (seam only) 272,886 -> 262 KiB, jwt-p256 309,366 -> 297 KiB, http,jwt 476,612 -> 458 KiB,
+    # all-features 1,420,273 -> 1366 KiB.
+    #
     # MEASURED 221,026, budget 225,280. 221,026 - 1.5% = 217,710, down to 212 KiB.
-    aarch64-apple-darwin:default) echo 217088 ;;
+    aarch64-apple-darwin:default) echo 233472 ;;
     # MEASURED 423,691, budget 430,080. Down to 407 KiB. This row is the core plus the HTTP
     # surface; if exercise_http::plane() stops dispatching, the row falls back to roughly the
     # `default` row's 221 KB and this floor is 195 KB above that.
-    aarch64-apple-darwin:http) echo 416768 ;;
+    aarch64-apple-darwin:http) echo 434176 ;;
     # MEASURED 662,357, budget 672,768. Down to 637 KiB.
-    aarch64-apple-darwin:axum) echo 652288 ;;
+    aarch64-apple-darwin:axum) echo 669696 ;;
     # MEASURED 256,106, budget 260,096. Down to 246 KiB. The tightest band in the table in
     # absolute terms after `default`, and the row the 0.9.2 notes describe as flat: it moved 385
     # bytes across a whole release, so 4 KB of downward slack is generous for it.
-    aarch64-apple-darwin:"jwt (seam only)") echo 251904 ;;
+    aarch64-apple-darwin:"jwt (seam only)") echo 268288 ;;
     # MEASURED 292,418, budget 296,960. Down to 281 KiB. The gap to the seam-only floor is what
     # stops the built-in p256 backend disappearing from the probe unnoticed.
-    aarch64-apple-darwin:jwt-p256) echo 287744 ;;
+    aarch64-apple-darwin:jwt-p256) echo 304128 ;;
     # MEASURED 458,484, budget 465,920. Down to 441 KiB.
-    aarch64-apple-darwin:"http,jwt") echo 451584 ;;
+    aarch64-apple-darwin:"http,jwt") echo 468992 ;;
     # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
     # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
     # before trusting this one to notice a single feature: it will not.
-    aarch64-apple-darwin:all-features) echo 1358848 ;;
+    aarch64-apple-darwin:all-features) echo 1398784 ;;
     *) echo "" ;;
   esac
 }

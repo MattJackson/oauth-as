@@ -846,6 +846,17 @@ jobs:
               "a_swap_rewrites_the_index_columns_and_not_only_the_payload",
               "a_withdrawal_cascades_a_code_the_swap_moved_to_that_subject",
               "a_round_tripped_token_keeps_its_feature_gated_fields",
+              # The opt-in bounded refresh-retry rotation (0.9.5), proven against real SQL rather
+              # than the in-memory store: that `rotate_refresh_token` is all-or-nothing when an
+              # injected failure aborts it, that a rotation racing a family revocation cannot
+              # outlive it, that an equivalent retry across independent connections (a lost
+              # response) recovers the one committed response, and that the shared retry contract
+              # holds on Postgres. Pinned by name for the same reason as every entry above: a test
+              # that exists and is not pinned can be deleted while this job stays green.
+              "a_failed_atomic_rotation_leaves_the_original_retryable",
+              "an_atomic_refresh_rotation_cannot_outlive_family_revocation",
+              "independent_connections_and_restart_recover_one_response",
+              "retry_contract_runs_against_postgres",
           ]
 
           # THE RED PROOFS, one required line PER DETECTOR. The naive-implementation tests print

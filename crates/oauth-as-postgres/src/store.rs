@@ -1052,6 +1052,11 @@ impl Storage for PostgresStorage {
         )
         .await?
         {
+            // Explicit rollback, as every other write path in this file does on its refusal
+            // branch: dropping `tx` only queues the ROLLBACK for the next use of the connection,
+            // which holds the transaction-scoped advisory locks taken by `lock_barrier_scopes`
+            // longer than a concurrent revocation of the same family should have to wait.
+            tx.rollback().await.map_err(|e| error::db(OP, e))?;
             return Ok(false);
         }
         // The row stays present throughout rotation. Other nodes wait for this
@@ -1065,6 +1070,9 @@ impl Storage for PostgresStorage {
         .map_err(|e| error::db(OP, e))?;
         let current: Option<RefreshTokenRecord> = payload_of(OP, row)?;
         if current.as_ref() != Some(expected) {
+            // Same reasoning as the barrier branch above: release the row `FOR UPDATE` lock and
+            // the advisory locks now, rather than at an unspecified later flush of the connection.
+            tx.rollback().await.map_err(|e| error::db(OP, e))?;
             return Ok(false);
         }
         write_record(&mut tx, spent).await?;

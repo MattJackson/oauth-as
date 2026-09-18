@@ -170,6 +170,7 @@ pub const CHECKS: &[&str] = &[
     SWAP_RETIRES_OLD_USER_CODE,
     SWAP_REFUSES_DUPLICATE_USER_CODE,
     ATOMIC_TAKE_REFRESH_TOKEN,
+    ATOMIC_ROTATE_REFRESH_TOKEN,
     ATOMIC_TAKE_AUTHORIZATION_CODE,
     INDEX_RETIRES_OLD_USER_CODE,
     INDEX_REFUSES_DUPLICATE_USER_CODE,
@@ -305,6 +306,7 @@ const SWAP_RETIRES_OLD_USER_CODE: &str = "compare_and_swap_device_grant/retires_
 const SWAP_REFUSES_DUPLICATE_USER_CODE: &str =
     "compare_and_swap_device_grant/refuses_a_duplicate_user_code";
 const ATOMIC_TAKE_REFRESH_TOKEN: &str = "atomic_take/take_refresh_token";
+const ATOMIC_ROTATE_REFRESH_TOKEN: &str = "atomic_rotate/rotate_refresh_token";
 const ATOMIC_TAKE_AUTHORIZATION_CODE: &str = "atomic_take/take_authorization_code";
 const INDEX_RETIRES_OLD_USER_CODE: &str = "user_code_index/retires_old_entry";
 const INDEX_REFUSES_DUPLICATE_USER_CODE: &str = "user_code_index/refuses_duplicate";
@@ -418,6 +420,7 @@ where
         self.compare_and_swap_device_grant_user_code_index(&mut report)
             .await;
         self.atomic_take_refresh_token(&mut report).await;
+        self.atomic_rotate_refresh_token(&mut report).await;
         self.atomic_take_authorization_code(&mut report).await;
         self.user_code_index(&mut report).await;
         self.sweep(&mut report).await;
@@ -2847,6 +2850,165 @@ where
                 );
             }
         }
+    }
+
+    /// The atomic retryable rotation (`rotate_refresh_token`), used only when a host opts into
+    /// [`crate::ServerConfig::refresh_retry_window`]. Under overlapping refreshes of one
+    /// predecessor exactly one caller may win the compare-and-swap, and the winner's spent record,
+    /// access token and successor must all commit together or not at all. A store that implements
+    /// this as separate writes, or without a real compare, silently reintroduces the out-of-order
+    /// and reuse defects the feature exists to prevent, and a single-node round-trip test cannot
+    /// see it — the same gap [`atomic_take_refresh_token`] exists to close for the strict path.
+    async fn atomic_rotate_refresh_token(&self, report: &mut Report) {
+        let store = self.store().await;
+        // ACTIVE: `sample_refresh` builds a spent record by default, but the predecessor of a
+        // rotation is live, and the compare-and-swap below can only tell the predecessor from the
+        // spent marker that replaces it if their states differ.
+        let mut seed = sample_refresh("rot-pred", "client-rot", "fam-rot");
+        seed.state = RefreshTokenState::Active;
+        if report
+            .ok(
+                ATOMIC_ROTATE_REFRESH_TOKEN,
+                "put_refresh_token",
+                store.put_refresh_token(seed).await,
+            )
+            .is_none()
+        {
+            return;
+        }
+        // Compare against the store's OWN view of the predecessor, not the value handed to `put`:
+        // a store that normalizes or drops a field on write is a round-trip defect for those checks
+        // to catch, and this check must still be able to name the predecessor the swap will see.
+        let predecessor = match report.ok(
+            ATOMIC_ROTATE_REFRESH_TOKEN,
+            "get_refresh_token after put",
+            store.get_refresh_token("rot-pred").await,
+        ) {
+            Some(Some(record)) => (*record).clone(),
+            _ => return,
+        };
+
+        // The predecessor's own slot, marked spent: every racer proposes the SAME spent record (the
+        // rotation replaces the predecessor in place) but a DISTINCT access token and successor, so
+        // that afterwards exactly one of each may survive. A second survivor is a loser that
+        // committed part of its rotation.
+        let mut spent = predecessor.clone();
+        spent.state = RefreshTokenState::Spent;
+        let expected = Arc::new(predecessor.clone());
+        let spent = Arc::new(spent);
+        let seq = AtomicUsize::new(0);
+        let results = self
+            .race(report, |gate| {
+                let store = Arc::clone(&store);
+                let expected = Arc::clone(&expected);
+                let spent = Arc::clone(&spent);
+                // Each racer claims a distinct proposal in this (non-`'static`) builder, so the
+                // winner is decided by the store's compare-and-swap, not by who picked which token.
+                let i = seq.fetch_add(1, Ordering::SeqCst);
+                let access =
+                    sample_token(&format!("rot-access-{i}"), "client-rot", Some("fam-rot"));
+                let next = sample_refresh(&format!("rot-next-{i}"), "client-rot", "fam-rot");
+                Box::pin(async move {
+                    gate.wait().await;
+                    // `Ok(true)` is the winner, mapped to the shape `judge_swap_race` counts: at
+                    // most one, never zero, and never a surfaced StorageError.
+                    store
+                        .rotate_refresh_token(
+                            expected.as_ref(),
+                            spent.as_ref(),
+                            &access,
+                            Some(&next),
+                        )
+                        .await
+                        .map(|won| if won { Some(()) } else { None })
+                })
+            })
+            .await;
+        let n = self.racers;
+        self.judge_swap_race(
+            report,
+            ATOMIC_ROTATE_REFRESH_TOKEN,
+            "one predecessor",
+            results,
+        );
+
+        // ALL-OR-NOTHING: the single winner wrote one access token and one successor, and every
+        // loser must have written neither. Two of either is a non-atomic implementation.
+        let mut access_present = 0usize;
+        let mut next_present = 0usize;
+        for i in 0..n {
+            if let Some(got) = report.ok(
+                ATOMIC_ROTATE_REFRESH_TOKEN,
+                "get_token after rotation",
+                store.get_token(&format!("rot-access-{i}")).await,
+            ) {
+                access_present += got.is_some() as usize;
+            }
+            if let Some(got) = report.ok(
+                ATOMIC_ROTATE_REFRESH_TOKEN,
+                "get_refresh_token after rotation",
+                store.get_refresh_token(&format!("rot-next-{i}")).await,
+            ) {
+                next_present += got.is_some() as usize;
+            }
+        }
+        if access_present != 1 || next_present != 1 {
+            report.fail(
+                ATOMIC_ROTATE_REFRESH_TOKEN,
+                format!(
+                    "after {n} concurrent rotations of one predecessor, {access_present} access \
+                     tokens and {next_present} successors survive; exactly one of each must, or a \
+                     loser committed part of its rotation and the write is not all-or-nothing"
+                ),
+            );
+        }
+
+        // HONOURS EXPECTED. The predecessor is now spent (the winner replaced it in place), so a
+        // rotation that still presents the ORIGINAL active predecessor must lose the compare and
+        // write nothing.
+        let stale_access = sample_token("rot-stale-access", "client-rot", Some("fam-rot"));
+        let stale_next = sample_refresh("rot-stale-next", "client-rot", "fam-rot");
+        if let Some(won) = report.ok(
+            ATOMIC_ROTATE_REFRESH_TOKEN,
+            "rotate with a stale expected",
+            store
+                .rotate_refresh_token(
+                    expected.as_ref(),
+                    spent.as_ref(),
+                    &stale_access,
+                    Some(&stale_next),
+                )
+                .await,
+        ) {
+            if won {
+                report.fail(
+                    ATOMIC_ROTATE_REFRESH_TOKEN,
+                    "a rotation whose expected predecessor no longer matches the stored record won \
+                     the compare: the record changed underneath it and the swap did not notice",
+                );
+            }
+        }
+        for (what, id) in [
+            ("access token", "rot-stale-access"),
+            ("successor", "rot-stale-next"),
+        ] {
+            let wrote = match what {
+                "access token" => store.get_token(id).await.map(|o| o.is_some()),
+                _ => store.get_refresh_token(id).await.map(|o| o.is_some()),
+            };
+            if let Some(true) =
+                report.ok(ATOMIC_ROTATE_REFRESH_TOKEN, "read-back after stale", wrote)
+            {
+                report.fail(
+                    ATOMIC_ROTATE_REFRESH_TOKEN,
+                    format!("a rotation that lost the compare still wrote its {what}"),
+                );
+            }
+        }
+        // The barrier half of rotation — a rotation completing BEHIND a family revocation must be
+        // refused — is a race between revoke and rotate rather than a sequential property, so it is
+        // proven where the race can be forced (the PostgreSQL `revocation_races` test) rather than
+        // here, exactly as the `revocation_barrier` checks prove the same property for `put_*`.
     }
 
     async fn atomic_take_authorization_code(&self, report: &mut Report) {
