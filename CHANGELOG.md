@@ -10,6 +10,51 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
+## [0.9.5] - 2026-09-18
+
+This release adds one **opt-in** feature and is otherwise behaviour-compatible: with the new
+configuration left at its default a host recompiles and behaves exactly as it did on 0.9.4. The
+new `Storage::rotate_refresh_token` is a trait method with a default implementation, and the new
+`RefreshTokenRecord::retry` field is `#[serde(default)]`, so an existing `Storage` implementation
+and existing persisted records both continue to compile and decode unchanged.
+
+### Added: bounded, opt-in recovery for concurrent refreshes (`ServerConfig::refresh_retry_window`)
+
+Two refreshes of one chain that overlap — a retried request, a lost response, two nodes racing —
+could force an otherwise healthy client back through browser login: the first rotation removes the
+predecessor, the second sees it gone and, on a later presentation, reads the spent record as reuse
+and revokes the family. This release adds an opt-in, time-bounded recovery window. When
+`refresh_retry_window` is nonzero, an atomic storage operation
+(`Storage::rotate_refresh_token`) compares the predecessor and persists its spent record, access
+token and successor together, and an equivalent retry — same client, binding, scope, resource and
+authorization details, with the access token still live — is coalesced to the same response
+instead of tripping reuse detection.
+
+The default is `Duration::ZERO`, which preserves strict single-use rotation exactly. When the
+window is enabled it **deliberately delays** theft detection for its duration: a holder of the same
+bearer token can recover the successor during the window, and any presentation that is not the
+equivalent retry is refused for the window's duration rather than revoking the family. After the
+window, strict reuse detection and family revocation resume in full. `MemoryStorage` and the
+PostgreSQL backend implement the atomic operation over their existing revocation boundaries; a
+custom `Storage` fails closed until it implements the new method. There is no new table or
+migration. Drain older or strict-policy nodes before enabling the same retry policy fleet-wide.
+
+The original feature is the work of Dominik Harz (@nud3l), PR #10.
+
+### Added: `test-util` conformance coverage for atomic rotation
+
+The `Storage` conformance harness gained an `atomic_rotate/rotate_refresh_token` check so a host
+that enables `refresh_retry_window` can verify its own store rotates atomically — a single winner
+under overlapping rotations, all-or-nothing across the spent/access/successor writes, and a refusal
+when the predecessor no longer matches — the same guarantee `atomic_take/*` already covers for the
+strict path.
+
+### Fixed: PostgreSQL `rotate_refresh_token` releases its locks on refusal
+
+The two refusal branches of the PostgreSQL implementation now roll the transaction back explicitly
+rather than dropping it, so the advisory and row locks are released immediately instead of at an
+unspecified later flush of the connection — matching every other write path in that file.
+
 ## [0.9.4] - 2026-09-06
 
 This release adds no protocol features and changes no API. It is a repository-hygiene and
