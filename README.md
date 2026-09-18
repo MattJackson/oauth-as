@@ -3,7 +3,7 @@
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/MattJackson)
 
 [![CI](https://github.com/MattJackson/oauth-as/actions/workflows/publish.yml/badge.svg?branch=main)](https://github.com/MattJackson/oauth-as/actions/workflows/publish.yml)
-[![Release](https://img.shields.io/github/v/release/MattJackson/oauth-as?display_name=tag&sort=semver)](https://github.com/MattJackson/oauth-as/releases)
+[![crates.io](https://img.shields.io/crates/v/oauth-as.svg)](https://crates.io/crates/oauth-as)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![MSRV 1.75](https://img.shields.io/badge/MSRV-1.75-blue.svg)](#minimum-supported-rust-version)
 [![Conformance](https://img.shields.io/badge/independent%20conformance-8%2F8-brightgreen.svg)](#evidence)
@@ -20,43 +20,18 @@ the consent experience; the library owns the protocol.
 oauth-as = "0.9"
 ```
 
-## Beta
+## Status
 
-**0.9.3 is a beta.** 0.9.0 was an alpha, published so it could be built against and reported on;
-this line of releases is meant to be tested in earnest, and each of them exists because auditing
-the one before it found things worth fixing. It is still pre-1.0 and the API is not frozen.
+**Beta, and pre-1.0.** The API is not yet frozen. Every release in the `0.9` line is meant to be
+tested in earnest, and each one exists because auditing the release before it found something worth
+fixing — an independent mutation sweep, real SSRF and revocation defects caught and closed, a
+concurrent-refresh race hardened. What each version changed, and how to migrate across the one
+breaking `Storage` change (0.9.1), is in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Nothing here breaks a 0.9.2 host.** There is no breaking section in this release: no `Storage`
-change, no renamed feature, no changed signature, and no new capability. A host that compiles
-against 0.9.2 compiles against this, and a store that passes `oauth_as::storage_conformance` still
-passes it. (Coming from 0.9.0 is a different matter: 0.9.1's breaking `Storage` change is still in
-front of you, and `CHANGELOG.md` has that migration.)
-
-**0.9.3 adds no feature. It closes the mutation gate.** A full `cargo mutants` sweep of the crate
-ran to completion, and every surviving mutant is now either killed by a test or argued equivalent
-in writing beside the code it mutates. Earlier releases said in this spot that mutation coverage was
-incomplete; that is no longer true, and the sentence that said so is gone because the thing it
-described is gone.
-
-The sweep was not just bookkeeping. Chasing its first survivor uncovered a real defect: the
-client-identifier-metadata SSRF filter accepted or refused the same address depending on how it was
-spelled, so a public address written one way was refused while the identical address written another
-was let through. That is fixed, with the acceptance coverage the test suite had never had. The full
-account, including the sweep numbers and every equivalence argument, is in `CHANGELOG.md`.
-
-If you are adopting the RFC 7662 introspection channel for a RESOURCE SERVER (added in 0.9.2), two
-things are still worth knowing:
-
-- **It is OFF until you configure it.** The channel opens only for clients named in
-  `ServerConfig::resource_servers`, which is empty by default. A deployment that sets nothing
-  answers as it always did — the token's own client and nobody else — and a resource server may
-  only read tokens whose RFC 8707 `resource` set names one of its own registered identifiers.
-- **It changes what your rate limiter sees.** A resource server authenticates once per call at the
-  protected resource it guards, not once per grant, and that traffic is charged to the same
-  per-`client_id` `Attempt::ClientAuthentication` budget a client's token requests are. Hence
-  `RateLimitConfig::with_client_authentication_capacity_for`, which gives one `client_id` its own
-  ceiling without raising anybody else's. Setting `resource_servers` without deciding this is how
-  a busy resource server throttles itself.
+**Upgrades within `0.9` are drop-in.** New capabilities land opt-in and off by default: leave the
+new configuration alone and the server compiles and behaves exactly as the previous version did. A
+store that passes `oauth_as::storage_conformance` keeps passing it, and persisted records decode
+unchanged across the upgrade.
 
 ## What it does
 
@@ -65,7 +40,7 @@ things are still worth knowing:
 | Authorization code grant | RFC 6749 s4.1 | PKCE required, `S256` only, exact redirect URI matching |
 | PKCE | RFC 7636 | Verified against the appendix B vector |
 | Device authorization grant | RFC 8628 | Full state machine: pending, `slow_down`, expiry, denial, single use |
-| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, reuse detection revokes the family, and the revocation cannot be undone by an issuance already in flight |
+| Refresh rotation | RFC 6749 s6 | Single use, absolute lifetime, reuse detection revokes the family, and the revocation cannot be undone by an issuance already in flight; an opt-in `refresh_retry_window` coalesces concurrent retries of one chain, off by default |
 | Client credentials | RFC 6749 s4.4 | Confidential clients only, no refresh token |
 | Server metadata | RFC 8414 | Derived from config, so an advertised endpoint is one that exists |
 | Token introspection | RFC 7662 | Answers the token's own client always, and the resource server it is addressed to once that server is declared in `ServerConfig::resource_servers` (empty by default, so the resource-server channel is off until configured); unknown, expired, other clients' and other resource servers' tokens all read `{"active": false}` |
