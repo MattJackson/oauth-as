@@ -286,7 +286,7 @@ serde = { version = "1", features = ["derive"] }
 # packages. Four fewer, not three, because serde_json itself counts alongside itoa, ryu and
 # memchr.
 serde_json = { version = "1", optional = true }
-getrandom = "0.3"
+getrandom = "0.4"
 sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
 base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
 
