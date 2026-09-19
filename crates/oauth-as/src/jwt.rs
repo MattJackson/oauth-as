@@ -10,7 +10,7 @@
 //! This module SIGNS in its first half and VERIFIES in its second, and the two jobs are not
 //! symmetric. The module doc used to be able to say this crate "never parses a JWT it did not
 //! make"; the `client-assertion` and `dpop` features ended that. An RFC 7523 client assertion and
-//! an RFC 9449 DPoP proof are both JWTs a CLIENT made, so [`CompactJws::parse`], [`PublicJwk`] and
+//! an RFC 9449 DPoP proof are both JWTs a CLIENT made, so [`CompactJws::parse`], [`Jwk`] and
 //! [`verify_es256`] are handling attacker-controlled input, and anyone verifying against them
 //! needs these three rules rather than a pointer at the source.
 //!
@@ -37,12 +37,12 @@
 //!
 //! A JWK presented to this module is also refused outright if it carries any PRIVATE or symmetric
 //! member (`d`, the RSA CRT parameters, `k`): RFC 9449 section 4.3 makes that a requirement, and
-//! [`PublicJwk::from_json`] is the only route from JSON into the type, including through `serde`,
+//! [`Jwk::from_json`] is the only route from JSON into the type, including through `serde`,
 //! whose `Deserialize` impl is routed through it rather than derived. The type's fields are sealed,
 //! so the other constructors are the only alternatives and neither can express a private member:
-//! [`PublicJwk::from_coordinates`] takes two P-256 coordinates and nothing else, and
-//! [`Jwk::to_public_jwk`] converts a key this crate PUBLISHED, which by construction has no private
-//! half in it. See [`PublicJwk`] on what each does and does not revalidate.
+//! [`Jwk::from_coordinates`] takes two P-256 coordinates and nothing else, and
+//! [`EcdsaP256Key::to_public_jwk`] converts a key this crate PUBLISHED, which by construction has no private
+//! half in it. See [`Jwk`] on what each does and does not revalidate.
 //!
 //! # Why this is hand-rolled
 //!
@@ -55,11 +55,11 @@
 //! # THE ES256 SEAM: the arithmetic is not in this feature
 //!
 //! The P-256 arithmetic is the one thing that genuinely needs an implementation, and after 0.9.0
-//! it is not one this feature brings. [`Es256Signer`] and [`Es256Verifier`] are the seam; the
+//! it is not one this feature brings. [`JwsSigner`] and [`JwsVerifier`] are the seam; the
 //! `jwt-p256` feature is the BACKEND this crate ships over `p256`, and a host may install its own
 //! instead. Two reasons, in the order they matter:
 //!
-//! 1. THE PRIVATE KEY NEED NOT BE IN THIS PROCESS. [`Es256Signer::sign`] is async precisely so it
+//! 1. THE PRIVATE KEY NEED NOT BE IN THIS PROCESS. [`JwsSigner::sign`] is async precisely so it
 //!    can be a cloud KMS or a PKCS#11 token, where the key never leaves its boundary and this
 //!    process holds only a handle. The signing key is the one secret whose compromise forges every
 //!    token the deployment will ever issue, and "the key is in the process" is exactly the property
@@ -67,7 +67,7 @@
 //! 2. It stops `jwt` adding a complete SECOND elliptic curve implementation (measured: 20 packages)
 //!    to a host that already has one through `rustls`, which is most Rust HTTP servers.
 //!
-//! [`Es256Verifier`] is SYNC, and the asymmetry is the design rather than an oversight: verifying
+//! [`JwsVerifier`] is SYNC, and the asymmetry is the design rather than an oversight: verifying
 //! holds only PUBLIC keys, so there is nothing to externalise, and it sits on the RFC 9449 DPoP hot
 //! path where an ES256 verification is already about 133 microseconds. Making it async would buy
 //! nothing and cost bytes on the token future.
@@ -98,20 +98,338 @@ use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+// =============================================================================================
+// THE ALGORITHM-TAGGED SEAM.
+//
+// The algorithm-tagged JWS seam of crypto agility, generalized off the ES256-hardcoded shape it
+// had through 0.9.x; the wired algorithms are ES256, RS256 and EdDSA. `JwsAlg` is a CLOSED enum on
+// purpose (see the module note): a new algorithm is a crate release with a new variant and new
+// match arms, which is where an algorithm belongs to be vetted, not a registry a deployment can extend.
+// =============================================================================================
+
+/// The elliptic curve of an `EC` key. Phase A ships only P-256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum EcCurve {
+    /// NIST P-256 (RFC 7518 section 6.2.1.1 `crv` value `P-256`).
+    P256,
+}
+
+impl EcCurve {
+    /// The RFC 7518 section 6.2.1.1 `crv` spelling.
+    pub fn jose_name(self) -> &'static str {
+        match self {
+            EcCurve::P256 => "P-256",
+        }
+    }
+}
+
+/// The Edwards curve of an `OKP` key. Phase C ships only Ed25519.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum OkpCurve {
+    /// Ed25519 (RFC 8037 section 3.1 `crv` value `Ed25519`). The ONLY OKP curve this crate wires:
+    /// Ed448 shares the `EdDSA` JOSE algorithm name but is a different curve, not implemented here.
+    Ed25519,
+}
+
+impl OkpCurve {
+    /// The RFC 8037 section 2 `crv` spelling.
+    pub fn jose_name(self) -> &'static str {
+        match self {
+            OkpCurve::Ed25519 => "Ed25519",
+        }
+    }
+}
+
+/// The KIND of key an algorithm signs with: the axis on which algorithm confusion happens.
+///
+/// [`consistent`] compares a [`JwsAlg`]'s key kind against a presented [`Jwk`]'s, so an `RS256`
+/// `alg` can never route a verification at an `EC` or `OKP` key, nor an `ES256`/`EdDSA` `alg` at an
+/// `RSA` key: the check that stops algorithm confusion across the three wired key kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum KeyKind {
+    /// An elliptic-curve key on the given curve.
+    Ec(EcCurve),
+    /// An RSA key (RFC 7518 section 6.3). One kind: the modulus size is a property of the key, not
+    /// a distinct KIND for the confusion check.
+    Rsa,
+    /// An octet-key-pair (Edwards-curve) key on the given curve (RFC 8037 section 2).
+    Okp(OkpCurve),
+}
+
+/// A JWS signing algorithm this crate can wire an asymmetric verification (and, for the ones it
+/// also signs, a signature) to.
+///
+/// A CLOSED enum, deliberately NOT `#[non_exhaustive]`: adding `Rs256` or `EdDsa` is a crate
+/// release that adds a variant here and forces every `match` in this file to grow an arm, which is
+/// exactly the review a new signature algorithm should compel. HMAC (`HS256`) is NOT a member and
+/// cannot be spelled here: it verifies with a secret both parties hold, has its own
+/// [`verify_hs256`] path, and must never reach a [`JwsVerifier`]. `none` is likewise absent, so no
+/// code path can route an unsigned JWS through this seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum JwsAlg {
+    /// ECDSA using P-256 and SHA-256 (RFC 7518 section 3.4).
+    Es256,
+    /// RSASSA-PKCS1-v1.5 using SHA-256 (RFC 7518 section 3.3).
+    Rs256,
+    /// EdDSA using Ed25519 (RFC 8037 section 3.1). `EdDSA` on the wire; Ed25519 only.
+    EdDsa,
+}
+
+impl JwsAlg {
+    /// Every wired algorithm, in a stable order.
+    pub const ALL: &'static [JwsAlg] = &[JwsAlg::Es256, JwsAlg::Rs256, JwsAlg::EdDsa];
+
+    /// The RFC 7515 section 4.1.1 `alg` spelling.
+    pub fn jose_name(self) -> &'static str {
+        match self {
+            JwsAlg::Es256 => "ES256",
+            JwsAlg::Rs256 => "RS256",
+            JwsAlg::EdDsa => "EdDSA",
+        }
+    }
+
+    /// The kind of key this algorithm uses, for [`consistent`].
+    pub fn key_kind(self) -> KeyKind {
+        match self {
+            JwsAlg::Es256 => KeyKind::Ec(EcCurve::P256),
+            JwsAlg::Rs256 => KeyKind::Rsa,
+            JwsAlg::EdDsa => KeyKind::Okp(OkpCurve::Ed25519),
+        }
+    }
+
+    /// The slot this algorithm occupies in a [`JwsVerifiers`], one per variant.
+    const fn slot(self) -> usize {
+        match self {
+            JwsAlg::Es256 => 0,
+            JwsAlg::Rs256 => 1,
+            JwsAlg::EdDsa => 2,
+        }
+    }
+}
+
+/// Classify a JOSE `alg` header value into the algorithm this crate would verify it under, or
+/// `None` for anything this seam refuses to route: `none`, any HMAC (`HS256`), and every value not
+/// yet wired.
+///
+/// EXHAUSTIVE and total: it is the one function that reads an `alg` string, and it cannot spell
+/// `none` or an HMAC, so neither can be turned into a [`JwsAlg`] no matter what a token header
+/// says. See [`expect_alg`], which is the only caller that reads a header's `alg` at all.
+pub fn classify_alg(name: &str) -> Option<JwsAlg> {
+    match name {
+        "ES256" => Some(JwsAlg::Es256),
+        "RS256" => Some(JwsAlg::Rs256),
+        // RFC 8037 s3.1: `EdDSA` is the JOSE name shared by Ed25519 and Ed448. This crate wires
+        // Ed25519 ONLY, and the verifier refuses any OKP key on another curve.
+        "EdDSA" => Some(JwsAlg::EdDsa),
+        // "none", "HS256", "PS256", "ES384", and everything not wired: refused, not routed.
+        _ => None,
+    }
+}
+
+/// How a call site decides which algorithm a JWS is allowed to carry.
+///
+/// [`AlgPolicy::Registered`] is the rule everywhere but DPoP: the REGISTRATION names the one
+/// algorithm, and the token header only gets to agree with it. [`AlgPolicy::AnyInstalled`] is the
+/// single documented exception, used ONLY by RFC 9449 DPoP, whose proof key is self-carried by
+/// design (section 4.3): there is no prior registration to name an algorithm, so the header selects
+/// among the algorithms this server actually has a verifier installed for, and nothing wider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum AlgPolicy {
+    /// The header's `alg` must be exactly this algorithm.
+    Registered(JwsAlg),
+    /// The header's `alg` may be any algorithm with an installed verifier. DPoP ONLY.
+    AnyInstalled,
+}
+
+/// Why [`expect_alg`] refused a JWS header's algorithm. Callers map this onto their own wire error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum AlgRefusal {
+    /// The header carried no `alg`, or it was not a string (RFC 7515 section 4.1.1 makes it
+    /// REQUIRED).
+    Missing,
+    /// The `alg` is one this seam refuses to route: `none`, an HMAC, or an unwired value. See
+    /// [`classify_alg`].
+    Unclassified,
+    /// The `alg` names a wired algorithm, but not the one the registration expects.
+    Mismatch,
+    /// The `alg` names a wired algorithm, but no verifier is installed for it (DPoP only).
+    NotInstalled,
+}
+
+/// Decide which [`JwsAlg`] a parsed JWS is allowed to be verified under.
+///
+/// This is the ONLY function in the crate that reads a JWS header's `alg` for the ASYMMETRIC seam,
+/// which is what makes "the algorithm is chosen by the verifier, never by the token" a property of
+/// one place rather than a rule spread over three. For [`AlgPolicy::Registered`] the `installed`
+/// set is not consulted (the registration already fixed the algorithm); for
+/// [`AlgPolicy::AnyInstalled`] it is the whole of the decision.
+pub fn expect_alg(
+    jws: &CompactJws<'_>,
+    policy: AlgPolicy,
+    installed: &JwsVerifiers,
+) -> Result<JwsAlg, AlgRefusal> {
+    let name = jws.header_str("alg").ok_or(AlgRefusal::Missing)?;
+    let alg = classify_alg(name).ok_or(AlgRefusal::Unclassified)?;
+    match policy {
+        AlgPolicy::Registered(expected) => {
+            if alg != expected {
+                return Err(AlgRefusal::Mismatch);
+            }
+        }
+        AlgPolicy::AnyInstalled => {
+            if installed.get(alg).is_none() {
+                return Err(AlgRefusal::NotInstalled);
+            }
+        }
+    }
+    Ok(alg)
+}
+
+/// Whether `key` is the KIND of key `alg` signs with.
+///
+/// REJECTS a mismatch; it never INFERS an algorithm from a key. The direction matters: an
+/// algorithm-confusion attack is a token whose header names one algorithm while the key it is
+/// verified against is another kind, and the safe check is "does the key match the algorithm the
+/// verifier already chose", not "what algorithm does this key imply". With ES256, RS256 and EdDSA
+/// all wired, the check genuinely bites: `consistent(JwsAlg::Rs256, ec_jwk)` is `false`.
+pub fn consistent(alg: JwsAlg, key: &Jwk) -> bool {
+    alg.key_kind() == key.key_kind()
+}
+
+/// A JWS signature, tagged with the algorithm that produced it.
+///
+/// The width is enforced by the variant's fixed-size array, which is what a host's backend cannot
+/// get wrong by returning too few or too many bytes: RFC 7518 section 3.4 fixes ES256 at the
+/// 64-byte `r || s` concatenation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub enum JwsSignature {
+    /// A 64-byte fixed-width `r || s` ES256 signature (RFC 7518 section 3.4).
+    Es256([u8; 64]),
+    /// An RS256 signature (RFC 7518 section 3.3). Its width is the modulus size `k` (256 bytes for
+    /// RSA-2048, 384 for 3072, 512 for 4096), so unlike the fixed-width curves it is boxed octets.
+    /// The `length == modulus` check is the verifier's, not the wire's: `rsa`'s parse is
+    /// length-lenient, so [`crate::backends::rsa::RsaVerifier`] guards it per key.
+    Rs256(Box<[u8]>),
+    /// A 64-byte fixed-width Ed25519 signature (RFC 8032 section 5.1; RFC 8037 section 3.1).
+    EdDsa([u8; 64]),
+}
+
+impl JwsSignature {
+    /// The algorithm that produced this signature.
+    pub fn alg(&self) -> JwsAlg {
+        match self {
+            JwsSignature::Es256(_) => JwsAlg::Es256,
+            JwsSignature::Rs256(_) => JwsAlg::Rs256,
+            JwsSignature::EdDsa(_) => JwsAlg::EdDsa,
+        }
+    }
+
+    /// The signature octets, exactly as they go on the wire.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            JwsSignature::Es256(bytes) => bytes,
+            JwsSignature::Rs256(bytes) => bytes,
+            JwsSignature::EdDsa(bytes) => bytes,
+        }
+    }
+
+    /// Build a signature of `alg` from wire octets, returning `None` when the width is wrong for the
+    /// algorithm. This is the width check the fixed-size arrays make impossible to skip.
+    ///
+    /// The fixed-width curves (ES256, EdDSA) require EXACTLY 64 bytes. RS256 accepts the decoded
+    /// octets as-is: an RS256 signature's width is the signer's modulus size, which is not known
+    /// here, so the `length == modulus` check is the verifier's (see [`JwsSignature::Rs256`]).
+    pub fn from_wire(alg: JwsAlg, raw: &[u8]) -> Option<Self> {
+        match alg {
+            JwsAlg::Es256 => raw.try_into().ok().map(JwsSignature::Es256),
+            JwsAlg::EdDsa => raw.try_into().ok().map(JwsSignature::EdDsa),
+            JwsAlg::Rs256 => Some(JwsSignature::Rs256(raw.into())),
+        }
+    }
+}
+
+/// The installed asymmetric verifiers, one slot per [`JwsAlg`] variant.
+///
+/// A fixed-slot array rather than a map: the algorithm set is closed and tiny, so a slot per
+/// variant is the whole of it, and `get` is an index rather than a hash. A verifier installs itself
+/// into the slot for its own [`JwsVerifier::alg`], so a host cannot register a verifier under the
+/// wrong algorithm.
+#[derive(Clone, Default)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub struct JwsVerifiers {
+    slots: [Option<Arc<dyn JwsVerifier>>; JwsAlg::ALL.len()],
+}
+
+impl JwsVerifiers {
+    /// An empty set: nothing installed.
+    pub fn new() -> Self {
+        JwsVerifiers::default()
+    }
+
+    /// Install `verifier` into the slot for its own algorithm, replacing any previous one.
+    pub fn install(&mut self, verifier: Arc<dyn JwsVerifier>) {
+        let slot = verifier.alg().slot();
+        self.slots[slot] = Some(verifier);
+    }
+
+    /// The verifier installed for `alg`, or `None`.
+    pub fn get(&self, alg: JwsAlg) -> Option<&dyn JwsVerifier> {
+        self.slots[alg.slot()].as_deref()
+    }
+
+    /// The algorithms that have a verifier installed, in [`JwsAlg::ALL`] order.
+    pub fn installed(&self) -> impl Iterator<Item = JwsAlg> + '_ {
+        JwsAlg::ALL
+            .iter()
+            .copied()
+            .filter(move |alg| self.slots[alg.slot()].is_some())
+    }
+}
+
+// mutants: equivalent — this Debug output is diagnostic, not a contract; no caller anywhere in the
+// crate depends on its content (nothing formats a `JwsVerifiers` and asserts on the result), so a
+// mutation that emptied it cannot change observable behaviour.
+impl fmt::Debug for JwsVerifiers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JwsVerifiers")
+            .field("installed", &self.installed().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// A key could not be loaded or exported. The message never contains key material.
-#[cfg(feature = "jwt-p256")]
-#[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
+///
+/// Gated on `jwt`, not on any one backend: `jwt-p256`, `jwt-rsa` and `jwt-ed25519` each hand back
+/// one of these from their key constructors, so a build enabling only RSA or only EdDSA needs it
+/// too.
+#[cfg(feature = "jwt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyError(String);
 
-#[cfg(feature = "jwt-p256")]
+#[cfg(feature = "jwt")]
+impl KeyError {
+    /// Describe a key-loading failure. Do not put key material in it.
+    pub fn new(message: impl Into<String>) -> Self {
+        KeyError(message.into())
+    }
+}
+
+#[cfg(feature = "jwt")]
 impl fmt::Display for KeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "signing key error: {}", self.0)
     }
 }
 
-#[cfg(feature = "jwt-p256")]
+#[cfg(feature = "jwt")]
 impl std::error::Error for KeyError {}
 
 /// A token could not be signed or serialized. The message never contains key material.
@@ -126,7 +444,10 @@ impl fmt::Display for JwtError {
 
 impl std::error::Error for JwtError {}
 
-/// A host's ES256 backend could not produce a signature.
+/// A signing backend could not produce a signature.
+///
+/// The generic signing error for the whole seam: [`EcdsaP256Key`], the RSA and Ed25519 backends,
+/// and any host [`JwsSigner`] all report failure through this one type, so it names no algorithm.
 ///
 /// One opaque type rather than an enum, and no source error: the caller in
 /// [`JwtConfig::sign_access_token`] has exactly one reaction to any of them (mint no token, answer
@@ -147,7 +468,7 @@ impl SignerError {
 
 impl fmt::Display for SignerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ES256 signer error: {}", self.0)
+        write!(f, "signer error: {}", self.0)
     }
 }
 
@@ -160,9 +481,9 @@ impl std::error::Error for SignerError {}
 ///
 /// # The two halves are deliberately different shapes
 ///
-/// [`Es256Signer::sign`] is ASYNC because it holds a SECRET, so it is the half that wants to leave
+/// [`JwsSigner::sign`] is ASYNC because it holds a SECRET, so it is the half that wants to leave
 /// the process, and leaving the process is a network round trip (or, for PKCS#11, a blocking call
-/// that belongs on a blocking pool). [`Es256Verifier`] is SYNC because it holds only public keys,
+/// that belongs on a blocking pool). [`JwsVerifier`] is SYNC because it holds only public keys,
 /// so there is nothing to externalise.
 ///
 /// # `public_jwk` is SYNC, and that is a REQUIREMENT ON YOU
@@ -202,25 +523,41 @@ impl std::error::Error for SignerError {}
 ///
 /// # Before you deploy one
 ///
-/// Run [`crate::signer_conformance`] against it, behind the `test-util` feature. A broken signer
-/// fails SILENTLY: a wrong signature is indistinguishable, at a resource server, from a tampered
-/// token. Emitting ASN.1 DER instead of the fixed-width form below is the obvious way to be wrong,
-/// and it is wrong in a way only a real client notices.
+/// Run [`crate::signer_conformance`] against it, behind the `test-util` feature. It validates
+/// ES256, RS256 and EdDSA signers, dispatching on this trait's [`JwsSigner::alg`] to select the
+/// matching published RFC known-answer vector. A broken signer fails SILENTLY: a wrong signature is
+/// indistinguishable, at a resource server, from a tampered token. For ES256, emitting ASN.1 DER
+/// instead of the fixed-width form below is the obvious way to be wrong, and it is wrong in a way
+/// only a real client notices.
 #[cfg(feature = "jwt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
-pub trait Es256Signer: Send + Sync {
-    /// The `ES256` signature over `signing_input`, which is the JWS Signing Input of RFC 7515
+pub trait JwsSigner: Send + Sync {
+    /// The algorithm this signer produces. This, not any token header, is what
+    /// [`JwtConfig`] writes into the JOSE `alg` and what [`crate::signer_conformance`] selects its
+    /// RFC test vector by.
+    fn alg(&self) -> JwsAlg;
+
+    /// The signature over `signing_input`, which is the JWS Signing Input of RFC 7515
     /// section 5.1 step 5: the ASCII of `BASE64URL(header) "." BASE64URL(payload)`.
     ///
-    /// The return is the FIXED-WIDTH `r || s` concatenation RFC 7518 section 3.4 mandates: 64
-    /// bytes, 32 per coordinate, leading zeros KEPT. It is **NOT** the ASN.1 DER
-    /// `SEQUENCE { r INTEGER, s INTEGER }` that OpenSSL and nearly every KMS return by default,
-    /// and converting is your job. The array type refuses the wrong LENGTH; it cannot refuse the
-    /// wrong ENCODING, which is what [`crate::signer_conformance`] is for.
+    /// Return the [`JwsSignature`] variant for your [`alg`](JwsSigner::alg), in that algorithm's
+    /// canonical JOSE encoding:
     ///
-    /// Sign the bytes as given. Do not hash them first: `ES256` is ECDSA/P-256/SHA-256, so the
-    /// SHA-256 is part of the signature scheme, and a KMS whose API wants a digest is a KMS you
-    /// hash for exactly once.
+    /// - `ES256` → [`JwsSignature::Es256`], the FIXED-WIDTH `r || s` of RFC 7518 section 3.4: 64
+    ///   bytes, 32 per coordinate, leading zeros KEPT. It is **NOT** the ASN.1 DER
+    ///   `SEQUENCE { r INTEGER, s INTEGER }` that OpenSSL and nearly every KMS return by default,
+    ///   and converting is your job.
+    /// - `RS256` → [`JwsSignature::Rs256`], the RSASSA-PKCS1-v1_5 signature of RFC 7518 section
+    ///   3.3, whose width is your modulus size `k` (boxed octets, not a fixed array).
+    /// - `EdDSA` → [`JwsSignature::EdDsa`], the 64-byte Ed25519 signature of RFC 8037 section 3.1.
+    ///
+    /// The fixed-width variants refuse the wrong LENGTH; no variant can refuse the wrong ENCODING,
+    /// which is what [`crate::signer_conformance`] is for.
+    ///
+    /// Sign the bytes as given. Do not hash them first: every wired algorithm folds its own hash
+    /// in (`ES256` is ECDSA/P-256/SHA-256, `RS256` is RSASSA-PKCS1-v1_5/SHA-256, `EdDSA`/Ed25519
+    /// hashes the message internally), so a KMS whose API wants a digest is one you feed the bytes
+    /// to exactly once.
     ///
     /// # What you may assume about `signing_input`, and what you MUST NOT do
     ///
@@ -240,7 +577,7 @@ pub trait Es256Signer: Send + Sync {
     fn sign(
         &self,
         signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send;
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send;
 
     /// The PUBLIC half, for the RFC 7517 JWKS document and the `kid` on every token header.
     ///
@@ -252,11 +589,15 @@ pub trait Es256Signer: Send + Sync {
 /// two servers in one process) without a newtype. `JwtConfig` erases to a `dyn` handle internally,
 /// so this costs nothing extra.
 #[cfg(feature = "jwt")]
-impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
+impl<T: JwsSigner + ?Sized> JwsSigner for Arc<T> {
+    fn alg(&self) -> JwsAlg {
+        (**self).alg()
+    }
+
     fn sign(
         &self,
         signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
         (**self).sign(signing_input)
     }
 
@@ -269,24 +610,30 @@ impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
 /// objects, RFC 7523 client assertions.
 ///
 /// Enable `jwt-p256` for the built-in [`P256Verifier`], or install your own with
-/// [`crate::AuthorizationServer::with_es256_verifier`]. With neither, every signed credential is
+/// [`crate::AuthorizationServer::with_jws_verifier`]. With neither, every signed credential is
 /// REFUSED: a server that cannot check a signature must never behave as though it had checked one.
 ///
 /// SYNC on purpose. This holds only PUBLIC keys, so there is no secret to externalise and nothing
 /// to be gained from a round trip; it also sits on the DPoP hot path, which runs once per token
-/// request. See the module docs on the asymmetry with [`Es256Signer`].
+/// request. See the module docs on the asymmetry with [`JwsSigner`].
 ///
 /// # The contract, and every clause of it is load bearing
 ///
-/// `true` means, and may only mean: `signature` is a valid `ES256` (ECDSA/P-256/SHA-256) signature
-/// over exactly `signing_input`, under exactly `key`. In particular:
+/// `true` means, and may only mean: `signature` is a valid signature UNDER THE ALGORITHM THIS
+/// VERIFIER IMPLEMENTS ([`alg`](JwsVerifier::alg)), over exactly `signing_input`, under exactly
+/// `key`, in that algorithm's one canonical JOSE encoding. In particular:
 ///
-/// - `signature` MUST be the 64-byte fixed-width `r || s` of RFC 7518 section 3.4. Reject any
-///   other length, and do NOT also accept the ASN.1 DER form: two encodings of one signature is
-///   signature malleability, and a value a deployment recorded as unique stops being unique.
-/// - `key` must be checked to be ON THE CURVE. That check is what an invalid-curve attack needs to
-///   find missing, and it is the reason this crate hands you a [`PublicJwk`] rather than a parsed
-///   point: the coordinates arrived from a client.
+/// - `signature` MUST be in the single canonical encoding for your algorithm, and every OTHER
+///   encoding of the same signature MUST be rejected: two encodings of one signature is signature
+///   malleability, and a value a deployment recorded as unique stops being unique. For `ES256`
+///   that is the 64-byte fixed-width `r || s` of RFC 7518 section 3.4 — reject any other length,
+///   and do NOT also accept the ASN.1 DER form; for `EdDSA`, the 64-byte Ed25519 signature; for
+///   `RS256`, the RSASSA-PKCS1-v1_5 octets of your key's modulus width and no other.
+/// - `key` must be checked to belong to your algorithm and be well-formed for it. For the curve
+///   algorithm (`ES256`) that means ON THE CURVE and not the point at infinity — the check an
+///   invalid-curve attack needs to find missing, and the reason this crate hands you a [`Jwk`]
+///   rather than a parsed point, because the coordinates arrived from a client. For `RS256` it
+///   means the modulus clears your size floor.
 /// - There is no `false` you may return for an error and no error you may return at all. A
 ///   malformed key, a wrong-length signature and a signature that simply does not verify all have
 ///   the same and only safe answer, and distinguishing them would only invite a caller to treat
@@ -296,6 +643,9 @@ impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
 ///
 /// The paragraph above says what `true` may mean. This one says what you are handed, because the
 /// clause "reject any other length" is the one an implementor reads as "the length will be 64".
+/// The concrete widths and key shape below are the `ES256` case (an `RS256` verifier is handed an
+/// RSA `Jwk` and an `EdDSA` one an OKP `Jwk`); the universal rule — attacker bytes of any length,
+/// never panic — is the same for all three.
 ///
 /// - **`signature` IS ATTACKER-CONTROLLED BYTES OF ANY LENGTH, INCLUDING ZERO.** It is the third
 ///   segment of a JWS somebody sent this server, base64url-decoded, and NOTHING between the wire
@@ -303,7 +653,7 @@ impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
 ///   assertion all arrive this way; on a 4 kilobyte DPoP header the third segment decodes to
 ///   anything from 0 to about 3000 bytes, and a token ending in a bare `.` decodes to an EMPTY
 ///   slice, which parses fine and reaches you.
-/// - **`key` HAS PASSED SHAPE VALIDATION AND NOTHING MORE.** [`PublicJwk::from_json`] guarantees
+/// - **`key` HAS PASSED SHAPE VALIDATION AND NOTHING MORE.** [`Jwk::from_json`] guarantees
 ///   `kty` is `EC`, `crv` is `P-256`, and that `x` and `y` are each exactly 32 base64url-decoded
 ///   bytes. It does NOT guarantee the point is on the curve, is not the point at infinity, or is a
 ///   point at all: those 64 bytes came from a client. See the on-curve clause above.
@@ -325,18 +675,28 @@ impl<T: Es256Signer + ?Sized> Es256Signer for Arc<T> {
 ///
 /// # Before you deploy one
 ///
-/// Run [`crate::signer_conformance`] against it. It carries the RFC 7515 appendix A.3 vector,
-/// which neither side of your deployment produced, and it is the only thing that can tell a
+/// Run [`crate::signer_conformance`] against it. It carries a published RFC known-answer vector per
+/// algorithm (RFC 7515 appendix A.3 for ES256, appendix A.2 for RS256, RFC 8037 appendix A.4 for
+/// EdDSA), which neither side of your deployment produced, and it is the only thing that can tell a
 /// verifier that is right from one that agrees with your signer.
 #[cfg(feature = "jwt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
-pub trait Es256Verifier: Send + Sync {
+pub trait JwsVerifier: Send + Sync {
+    /// The algorithm this verifier checks. A verifier installs itself into the
+    /// [`JwsVerifiers`] slot for this algorithm, so it can never be consulted for another.
+    fn alg(&self) -> JwsAlg;
+
     /// Does `signature` verify over `signing_input` under `key`? See the trait docs for what
     /// `true` is allowed to mean.
-    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool;
+    ///
+    /// Returns `false` (never panics) on ANY mismatch of key kind, coordinate width, or curve, as
+    /// well as on a signature that simply does not verify: the caller already chose the algorithm,
+    /// and a key of the wrong kind for it is one more thing that is not a valid signature rather
+    /// than an error to distinguish.
+    fn verify(&self, key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool;
 }
 
-/// The OBJECT-SAFE shadow of [`Es256Signer::sign`], so that [`JwtConfig`] can hold `Arc<dyn ...>`.
+/// The OBJECT-SAFE shadow of [`JwsSigner::sign`], so that [`JwtConfig`] can hold `Arc<dyn ...>`.
 ///
 /// Only `sign` needs shadowing: `public_jwk` is called ONCE, on the concrete type, before the
 /// signer is erased, and the `Jwk` it returned is what [`JwtConfig`] keeps.
@@ -355,19 +715,19 @@ pub trait Es256Verifier: Send + Sync {
 /// allocation and one indirect call against a signing operation that may be a network round trip is
 /// not measurable; that is.
 #[cfg(feature = "jwt")]
-trait DynEs256Signer: Send + Sync {
+trait DynJwsSigner: Send + Sync {
     fn dyn_sign<'a>(
         &'a self,
         signing_input: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<[u8; 64], SignerError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<JwsSignature, SignerError>> + Send + 'a>>;
 }
 
 #[cfg(feature = "jwt")]
-impl<T: Es256Signer> DynEs256Signer for T {
+impl<T: JwsSigner> DynJwsSigner for T {
     fn dyn_sign<'a>(
         &'a self,
         signing_input: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<[u8; 64], SignerError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<JwsSignature, SignerError>> + Send + 'a>> {
         Box::pin(self.sign(signing_input))
     }
 }
@@ -379,7 +739,7 @@ impl<T: Es256Signer> DynEs256Signer for T {
 /// signed under it has expired (RFC 7517 section 4.5; RFC 7515 section 4.1.4). Without a `kid` a
 /// verifier must trial every advertised key and rotation becomes a guessing game.
 ///
-/// THE BUILT-IN BACKEND, behind `jwt-p256`. It is an [`Es256Signer`] like any other; what makes it
+/// THE BUILT-IN BACKEND, behind `jwt-p256`. It is an [`JwsSigner`] like any other; what makes it
 /// the default choice is only that the key is a scalar in this process, which is the right answer
 /// for most deployments and the wrong one for a deployment whose policy says the key may not be.
 #[cfg(feature = "jwt-p256")]
@@ -480,14 +840,11 @@ impl EcdsaP256Key {
         // trimmed coordinate is the classic JWK interoperability bug).
         let x = point.x().expect("uncompressed point has an x coordinate");
         let y = point.y().expect("uncompressed point has a y coordinate");
-        Jwk {
-            kty: "EC",
-            crv: "P-256",
+        Jwk::Ec {
+            crv: EcCurve::P256,
             x: URL_SAFE_NO_PAD.encode(x),
             y: URL_SAFE_NO_PAD.encode(y),
-            kid: self.kid.clone(),
-            use_: "sig",
-            alg: "ES256",
+            kid: Some(self.kid.clone()),
         }
     }
 
@@ -543,14 +900,21 @@ impl Eq for EcdsaP256Key {}
 /// is in this process, so the future is ready on its first poll and there is no suspension point
 /// for the token path to pay for.
 #[cfg(feature = "jwt-p256")]
-impl Es256Signer for EcdsaP256Key {
+impl JwsSigner for EcdsaP256Key {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
     fn sign(
         &self,
         signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
         // Computed BEFORE the async block, so nothing borrows `signing_input` across a suspension
         // point that does not exist. The future this returns owns a `Result` and nothing else.
-        let signed = self.sign_es256(signing_input).map_err(|e| SignerError(e.0));
+        let signed = self
+            .sign_es256(signing_input)
+            .map(JwsSignature::Es256)
+            .map_err(|e| SignerError(e.0));
         async move { signed }
     }
 
@@ -571,84 +935,228 @@ impl Es256Signer for EcdsaP256Key {
 pub struct P256Verifier;
 
 #[cfg(feature = "jwt-p256")]
-impl Es256Verifier for P256Verifier {
-    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+impl JwsVerifier for P256Verifier {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
+    fn verify(&self, key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
         verify_es256(key, signing_input, signature)
     }
 }
 
-/// One RFC 7517 JWK: the PUBLIC parameters of an EC P-256 signing key and nothing else.
+/// One RFC 7517 JWK: the PUBLIC parameters of one key this crate signs with or verifies against.
 ///
-/// The fields are the complete set this crate ever emits. There is deliberately no `d`
-/// (RFC 7517 section 6.2.2.1, the private key parameter) and no way to add one.
+/// ONE `kty`-tagged type for BOTH jobs, where 0.9.x had a `Jwk` it serialized and a `Jwk` it
+/// parsed. The two jobs are still not symmetric, and this type keeps the asymmetry where it belongs
+/// rather than in a second type:
 ///
-/// THE FIELDS ARE PUBLIC, unlike [`PublicJwk`]'s, and the difference is what each type is for: this
-/// one is what a HOST FILLS IN. [`Es256Signer::public_jwk`] returns it, so every host implementing
-/// that seam over a KMS or a PKCS#11 token has to build one by hand, and sealing it would mean
-/// shipping a fallible constructor for a value the host already knows is correct.
+/// - PARSING attacker-controlled JSON (a DPoP proof's `jwk`, a stored client registration) goes
+///   through [`Jwk::from_json`], including through `serde`, whose `Deserialize` impl is routed
+///   through it rather than derived. There is therefore no route from JSON into this type that
+///   skips the PRIVATE-PARAMETER rejection (`d`, the RSA CRT parameters, `k`): RFC 9449 section 4.3
+///   makes that a MUST, and it generalises past DPoP.
+/// - SERVING it (the RFC 7517 JWKS document, and a registration read back out of a host's store)
+///   is [`Serialize`], which emits only the public members. A signer publishes one with
+///   [`JwsSigner::public_jwk`]; the JWKS document adds `use` and `alg` around it (see [`Jwks`]).
 ///
-/// What that costs is worth stating where the literal gets written: [`Jwk::to_public_jwk`] does not
-/// revalidate, so a `Jwk` literal whose `x` and `y` are not 32-byte base64url produces a
-/// [`PublicJwk`] that [`PublicJwk::from_json`] would have refused. It fails CLOSED — nothing
-/// verifies under such a key, so the effect is a signer whose signatures never check out and, on the
-/// DPoP path, a token bound to a thumbprint nobody can present — but it fails at verification time
-/// rather than here. [`crate::signer_conformance`] is the check that catches it: it verifies a real
-/// signature against the key the signer publishes, which is exactly the mismatch this shape allows.
-/// Run it against any signer before a deployment trusts it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Jwk {
-    /// Key type; always `EC` (RFC 7518 section 6.2).
-    pub kty: &'static str,
-    /// Curve; always `P-256`.
-    pub crv: &'static str,
-    /// Base64url (unpadded) x coordinate, fixed 32 byte width.
-    pub x: String,
-    /// Base64url (unpadded) y coordinate, fixed 32 byte width.
-    pub y: String,
-    /// The key identifier, matching the `kid` of every token signed with it.
-    pub kid: String,
-    /// Public key use; always `sig` (RFC 7517 section 4.2).
-    #[serde(rename = "use")]
-    pub use_: &'static str,
-    /// The algorithm this key is for; always `ES256` (RFC 7517 section 4.4).
-    pub alg: &'static str,
+/// The coordinate fields are OWNED strings because they arrive as strings, and the width check that
+/// [`Jwk::from_json`] and [`Jwk::from_coordinates`] run is what a construction from a JSON literal
+/// cannot skip. There is deliberately no variant carrying `d` and no way to add one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Jwk {
+    /// An elliptic-curve public key (RFC 7518 section 6.2).
+    Ec {
+        /// The curve. Phase A: only P-256.
+        crv: EcCurve,
+        /// Base64url (unpadded) x coordinate, fixed 32 byte width.
+        x: String,
+        /// Base64url (unpadded) y coordinate, fixed 32 byte width.
+        y: String,
+        /// The optional key identifier (RFC 7517 section 4.5).
+        kid: Option<String>,
+    },
+    /// An RSA public key (RFC 7518 section 6.3).
+    Rsa {
+        /// Base64urlUInt modulus `n` (RFC 7518 section 6.3.1.1): minimal big-endian bytes, no
+        /// leading zero octet, base64url without padding.
+        n: String,
+        /// Base64urlUInt exponent `e` (RFC 7518 section 6.3.1.2).
+        e: String,
+        /// The optional key identifier (RFC 7517 section 4.5).
+        kid: Option<String>,
+    },
+    /// An octet-key-pair (Edwards-curve) public key (RFC 8037 section 2).
+    Okp {
+        /// The curve. Phase C: only Ed25519.
+        crv: OkpCurve,
+        /// Base64url (unpadded) public key `x`, fixed 32 byte width for Ed25519.
+        x: String,
+        /// The optional key identifier (RFC 7517 section 4.5).
+        kid: Option<String>,
+    },
 }
 
-impl Jwk {
-    /// The same key in the VERIFYING shape.
-    ///
-    /// [`Jwk`] exists to be SERIALIZED, so every member this crate fixes is a `&'static str`;
-    /// [`PublicJwk`] is parsed from attacker-controlled JSON and is therefore a different type on
-    /// purpose (see its own docs). This is the one direction that is always safe, because these
-    /// parameters were produced here rather than received: a `Jwk` a signer published is by
-    /// construction `EC` / `P-256` with 32-byte coordinates.
-    ///
-    /// Used by [`crate::signer_conformance`] to check a signer's output against the key that
-    /// signer publishes, which is the one check that catches a `public_jwk()` belonging to some
-    /// other key.
-    ///
-    /// It REVALIDATES NOTHING, and cannot usefully: it is infallible, so there is no channel for a
-    /// refusal, and making it fallible would push a `Result` onto every caller for a value they
-    /// produced themselves. "Produced here" is doing the work, and [`Jwk`]'s own docs say plainly
-    /// what it means for a host that hand-builds one with coordinates that are not 32 bytes: this
-    /// hands back a [`PublicJwk`] that [`PublicJwk::from_json`] would have refused, which fails
-    /// closed at verification rather than being caught here.
-    pub fn to_public_jwk(&self) -> PublicJwk {
-        PublicJwk {
-            kty: self.kty.to_string(),
-            crv: self.crv.to_string(),
-            x: self.x.clone(),
-            y: self.y.clone(),
-            kid: Some(self.kid.clone()),
+/// The minimal RFC 7517 public members of a [`Jwk`], in the order 0.9.x's `Jwk` emitted them:
+/// `kty`, then the key-type members, then `kid`. This is what a stored client registration
+/// serializes to, and it is byte-for-byte what `Jwk` produced.
+#[derive(Serialize)]
+#[serde(tag = "kty")]
+enum JwkWire<'a> {
+    #[serde(rename = "EC")]
+    Ec {
+        crv: &'static str,
+        x: &'a str,
+        y: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kid: Option<&'a str>,
+    },
+    #[serde(rename = "RSA")]
+    Rsa {
+        n: &'a str,
+        e: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kid: Option<&'a str>,
+    },
+    #[serde(rename = "OKP")]
+    Okp {
+        crv: &'static str,
+        x: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kid: Option<&'a str>,
+    },
+}
+
+impl Serialize for Jwk {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Jwk::Ec { crv, x, y, kid } => JwkWire::Ec {
+                crv: crv.jose_name(),
+                x,
+                y,
+                kid: kid.as_deref(),
+            }
+            .serialize(serializer),
+            Jwk::Rsa { n, e, kid } => JwkWire::Rsa {
+                n,
+                e,
+                kid: kid.as_deref(),
+            }
+            .serialize(serializer),
+            Jwk::Okp { crv, x, kid } => JwkWire::Okp {
+                crv: crv.jose_name(),
+                x,
+                kid: kid.as_deref(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Jwk {
+    /// Routed through [`Jwk::from_json`] rather than derived, so that a JWK loaded from the host's
+    /// own client store is held to exactly the same rules as one arriving in a DPoP proof header. A
+    /// derived impl would IGNORE an unknown `d` member rather than reject it, and a registration
+    /// silently carrying a client's private key is precisely the state this type exists to make
+    /// unrepresentable.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        Jwk::from_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One RFC 7517 section 4 JWKS entry, as SERVED: the public members plus `use` and `alg`.
+///
+/// The published `use`/`alg` are hints a resource server reads to select a key; they are a function
+/// of the key's kind (an EC P-256 key serves as `sig`/`ES256`), and deriving them for the SERVING
+/// document is not the same as inferring an algorithm from a key for a VERIFICATION, which
+/// [`consistent`] forbids. Field order (`kty`, `crv`, `x`, `y`, `kid`, `use`, `alg`) is what 0.9.x
+/// emitted and is preserved byte-for-byte.
+#[derive(Serialize)]
+#[serde(tag = "kty")]
+enum JwksEntry<'a> {
+    #[serde(rename = "EC")]
+    Ec {
+        crv: &'static str,
+        x: &'a str,
+        y: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kid: Option<&'a str>,
+        #[serde(rename = "use")]
+        use_: &'static str,
+        alg: &'static str,
+    },
+    #[serde(rename = "RSA")]
+    Rsa {
+        n: &'a str,
+        e: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kid: Option<&'a str>,
+        #[serde(rename = "use")]
+        use_: &'static str,
+        alg: &'static str,
+    },
+    #[serde(rename = "OKP")]
+    Okp {
+        crv: &'static str,
+        x: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kid: Option<&'a str>,
+        #[serde(rename = "use")]
+        use_: &'static str,
+        alg: &'static str,
+    },
+}
+
+impl<'a> JwksEntry<'a> {
+    fn of(jwk: &'a Jwk) -> Self {
+        match jwk {
+            Jwk::Ec { crv, x, y, kid } => JwksEntry::Ec {
+                crv: crv.jose_name(),
+                x,
+                y,
+                kid: kid.as_deref(),
+                use_: "sig",
+                // The serving `alg` for an EC key is fixed by its curve; Phase A has one.
+                alg: match crv {
+                    EcCurve::P256 => "ES256",
+                },
+            },
+            Jwk::Rsa { n, e, kid } => JwksEntry::Rsa {
+                n,
+                e,
+                kid: kid.as_deref(),
+                use_: "sig",
+                alg: "RS256",
+            },
+            Jwk::Okp { crv, x, kid } => JwksEntry::Okp {
+                crv: crv.jose_name(),
+                x,
+                kid: kid.as_deref(),
+                use_: "sig",
+                alg: match crv {
+                    OkpCurve::Ed25519 => "EdDSA",
+                },
+            },
         }
     }
 }
 
 /// An RFC 7517 section 5 JWK Set: what the host serves at its `jwks_uri`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Jwks {
     /// The advertised keys.
     pub keys: Vec<Jwk>,
+}
+
+impl Serialize for Jwks {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let entries: Vec<JwksEntry<'_>> = self.keys.iter().map(JwksEntry::of).collect();
+        let mut state = serializer.serialize_struct("Jwks", 1)?;
+        state.serialize_field("keys", &entries)?;
+        state.end()
+    }
 }
 
 /// The `aud` claim, which RFC 9068 section 2.2 requires and RFC 7519 section 4.1.3 allows to be
@@ -879,7 +1387,7 @@ impl AccessTokenClaims {
 /// [`JwtConfig::rotate_to`] is the ONLY thing that rotates. Rotating in the KMS alone leaves this
 /// process advertising a cached public half that no longer signs, and every token the deployment
 /// issues then fails verification against its own published JWKS, silently. See
-/// [`Es256Signer::public_jwk`].
+/// [`JwsSigner::public_jwk`].
 ///
 /// `Clone` shares the signer rather than duplicating it (`Arc`), and `PartialEq` compares the
 /// PUBLISHED IDENTITY: the active and retired JWKs, the audience and the `jwks_uri`. There is no
@@ -887,18 +1395,22 @@ impl AccessTokenClaims {
 /// would make two configurations over one KMS key unequal for no reason a host could act on.
 #[derive(Clone)]
 pub struct JwtConfig {
-    /// The host's ES256 backend, which may be a key in this process or a handle to one in a KMS.
+    /// The host's signing backend (ES256, RS256, or EdDSA), which may be a key in this process or a
+    /// handle to one in a KMS.
     ///
     /// `Arc<dyn _>` and not a generic parameter. Making [`JwtConfig`] generic would put a THIRD
     /// monomorphization axis on `AuthorizationServer`, and the second one is MEASURED at 53,548
     /// bytes per additional `(Storage, Clock)` pair, 27% of this crate's whole default binary
     /// surface. One indirect call against a signing operation that may be a network round trip is
     /// not measurable; that is.
-    signer: Arc<dyn DynEs256Signer>,
+    signer: Arc<dyn DynJwsSigner>,
+    /// The algorithm the active signer produces, cached alongside its public half so the JOSE
+    /// header can be rebuilt at rotation without re-consulting the signer.
+    alg: JwsAlg,
     /// The ACTIVE key's public half, read from the signer ONCE, here.
     ///
     /// Cached rather than re-asked per call, and that is the other half of the contract
-    /// [`Es256Signer::public_jwk`] states: the JWKS document is a public, unauthenticated,
+    /// [`JwsSigner::public_jwk`] states: the JWKS document is a public, unauthenticated,
     /// cacheable thing any client may poll, and a signer that reaches a KMS to answer would put a
     /// network call behind it. It also keeps [`JwtConfig::kid`] able to return a `&str`.
     active: Jwk,
@@ -931,12 +1443,14 @@ pub struct JwtConfig {
 /// [`JwtConfig::new`] and [`JwtConfig::rotate_to`] fallible (or force an `expect` into a library
 /// that must not panic on a host's input) for an error that cannot occur. The header has exactly
 /// three members, two of them constants, and the third is a string; the only work is escaping it.
-fn encoded_jose_header(kid: &str) -> Box<str> {
-    // RFC 9068 s2.1 fixes `typ`; `alg` is a constant here, so no code path in this crate can emit
-    // an unsigned access token. Member order matches what `JoseHeader`'s derive produced, so the
-    // bytes on the wire are unchanged by this precomputation.
+fn encoded_jose_header(alg: JwsAlg, kid: &str) -> Box<str> {
+    // RFC 9068 s2.1 fixes `typ`; `alg` is the signer's OWN algorithm (`signer.alg().jose_name()`),
+    // so no code path in this crate can emit an unsigned access token, and the wire bytes are
+    // unchanged for a given algorithm. Member order matches what `JoseHeader`'s derive produced.
     let mut json = String::with_capacity(40 + kid.len());
-    json.push_str(r#"{"alg":"ES256","typ":"at+jwt","kid":""#);
+    json.push_str(r#"{"alg":""#);
+    json.push_str(alg.jose_name());
+    json.push_str(r#"","typ":"at+jwt","kid":""#);
     // RFC 8259 s7: a JSON string escapes the quote, the backslash, and everything below 0x20.
     // Nothing else needs escaping, and in particular a `kid` is not required to be ASCII.
     for c in kid.chars() {
@@ -960,15 +1474,17 @@ impl JwtConfig {
     /// Configure signing for one audience. The audience is REQUIRED (RFC 9068 section 2.2) and has
     /// no default: only the deployment knows which resource server a token is meant for, and a
     /// guessed `aud` is a token that is valid somewhere nobody intended.
-    /// `signer` is anything implementing [`Es256Signer`]: [`EcdsaP256Key`] under `jwt-p256`, an
+    /// `signer` is anything implementing [`JwsSigner`]: [`EcdsaP256Key`] under `jwt-p256`, an
     /// `Arc` of one shared with another configuration, or the host's own KMS-backed type. Its
-    /// public half is read HERE, once, and never again; see [`Es256Signer::public_jwk`] for what
+    /// public half is read HERE, once, and never again; see [`JwsSigner::public_jwk`] for what
     /// that requires of an implementor and for why rotation must come back through
     /// [`JwtConfig::rotate_to`].
-    pub fn new(signer: impl Es256Signer + 'static, audience: impl Into<String>) -> Self {
+    pub fn new(signer: impl JwsSigner + 'static, audience: impl Into<String>) -> Self {
+        let alg = signer.alg();
         let active = signer.public_jwk();
         JwtConfig {
-            encoded_header: encoded_jose_header(&active.kid),
+            encoded_header: encoded_jose_header(alg, active.kid().unwrap_or_default()),
+            alg,
             active,
             signer: Arc::new(signer),
             // A brand new configuration has retired nothing. The single-key deployment, which is
@@ -995,20 +1511,21 @@ impl JwtConfig {
     /// THE SIGNER IS DROPPED, not stored: what is retained of the outgoing key is its public half
     /// and nothing else, so a retired key cannot sign again by construction. For a KMS-backed
     /// signer this is also the ONLY correct way to rotate; rotating in the KMS while this process
-    /// holds the old cached public half is silent breakage (see [`Es256Signer::public_jwk`]).
-    pub fn rotate_to(mut self, new_active: impl Es256Signer + 'static) -> Self {
+    /// holds the old cached public half is silent breakage (see [`JwsSigner::public_jwk`]).
+    pub fn rotate_to(mut self, new_active: impl JwsSigner + 'static) -> Self {
+        self.alg = new_active.alg();
         let retiring = std::mem::replace(&mut self.active, new_active.public_jwk());
         // The previous signer is dropped by this assignment. There is deliberately nowhere else it
         // is written down.
         self.signer = Arc::new(new_active);
         // The header names the ACTIVE key, so it is rebuilt exactly here and nowhere else.
-        self.encoded_header = encoded_jose_header(&self.active.kid);
-        let active_kid = self.active.kid.as_str();
+        self.encoded_header = encoded_jose_header(self.alg, self.active.kid().unwrap_or_default());
+        let active_kid = self.active.kid();
         // A kid appears at most once in the published set: any older entry sharing a name with the
         // key just retired, or with the new active key, goes.
         self.retired
-            .retain(|jwk| jwk.kid != retiring.kid && jwk.kid != active_kid);
-        if retiring.kid != active_kid {
+            .retain(|jwk| jwk.kid() != retiring.kid() && jwk.kid() != active_kid);
+        if retiring.kid() != active_kid {
             // Most recently retired FIRST: it is the one with the most tokens still alive, so it
             // is the one a verifier is most likely to need after the active key itself.
             self.retired.insert(0, retiring);
@@ -1021,7 +1538,7 @@ impl JwtConfig {
     /// This is what a host consults to decide what it may drop: a key retired longer ago than
     /// [`crate::ServerConfig::access_token_ttl`] has no live tokens left.
     pub fn retired_kids(&self) -> impl Iterator<Item = &str> {
-        self.retired.iter().map(|jwk| jwk.kid.as_str())
+        self.retired.iter().map(|jwk| jwk.kid().unwrap_or_default())
     }
 
     /// Stop publishing the retired key named `kid`. THIS BREAKS EVERY UNEXPIRED TOKEN SIGNED UNDER
@@ -1047,7 +1564,7 @@ impl JwtConfig {
     // dead code rather than a misconfiguration. It sat here alone, on one of twenty-nine such
     // builders, which taught a reader a rule the other twenty-eight did not follow.
     pub fn forget_retired_key_breaking_its_live_tokens(mut self, kid: &str) -> Self {
-        self.retired.retain(|jwk| jwk.kid != kid);
+        self.retired.retain(|jwk| jwk.kid() != Some(kid));
         self
     }
 
@@ -1089,7 +1606,7 @@ impl JwtConfig {
 
     /// The signing key's identifier.
     pub fn kid(&self) -> &str {
-        &self.active.kid
+        self.active.kid().unwrap_or_default()
     }
 
     /// The RFC 7517 key set to serve: public parameters only, ACTIVE key first, then every retired
@@ -1118,7 +1635,7 @@ impl JwtConfig {
 
     /// Serialize and sign one access token into RFC 7515 section 3.1 compact form.
     ///
-    /// ASYNC because [`Es256Signer::sign`] is, which is because the key may not be in this
+    /// ASYNC because [`JwsSigner::sign`] is, which is because the key may not be in this
     /// process. With the in-process [`EcdsaP256Key`] backend the future is ready on its first poll
     /// and there is no suspension point.
     pub async fn sign_access_token(&self, claims: &AccessTokenClaims) -> Result<String, JwtError> {
@@ -1168,9 +1685,11 @@ impl JwtConfig {
         // token that is close to a kilobyte: one to build the signing input, one to build the
         // result from it. Appending instead means the bytes are written once.
         //
-        // The capacity is EXACT, not an estimate, so the buffer is allocated once and never grown:
-        // base64url without padding is ceil(n * 4 / 3) characters, and an ES256 signature is a
-        // fixed 64 bytes, which is 86.
+        // The capacity is sized for the fixed-width signatures (ES256 and EdDSA are 64 bytes, which
+        // is 86 base64url characters without padding: ceil(n * 4 / 3)), so the buffer holding
+        // "header.payload.signature" is allocated once and never grown for those. An RS256
+        // signature is the modulus width (256-512 bytes), larger than the reserve, so that path
+        // grows the buffer once when the signature is appended — the common ES256/EdDSA path does not.
         let mut compact =
             String::with_capacity(header.len() + 1 + base64_len(claims_json.len()) + 1 + 86);
         compact.push_str(header);
@@ -1189,9 +1708,9 @@ impl JwtConfig {
             // The host's own detail is DISCARDED here rather than wrapped: the host wrote the
             // signer, so it already has the real error on its own channel, and `server.rs` maps
             // this onto RFC 6749 s5.2 `server_error` without echoing anything about the key.
-            .map_err(|_| JwtError("the ES256 signer could not sign".into()))?;
+            .map_err(|_| JwtError("the JWS signer could not sign".into()))?;
         compact.push('.');
-        URL_SAFE_NO_PAD.encode_string(signature, &mut compact);
+        URL_SAFE_NO_PAD.encode_string(signature.as_bytes(), &mut compact);
         Ok(compact)
     }
 }
@@ -1243,8 +1762,9 @@ pub enum AccessTokenFormat {
     /// and for a resource server the token is addressed to).
     #[default]
     Opaque,
-    /// RFC 9068 `at+jwt` access tokens, signed with ES256. The record is still persisted, so
-    /// introspection and revocation continue to work on the exact string the client presents.
+    /// RFC 9068 `at+jwt` access tokens, signed with the [`JwtConfig`]'s configured algorithm
+    /// (ES256, RS256, or EdDSA). The record is still persisted, so introspection and revocation
+    /// continue to work on the exact string the client presents.
     ///
     /// BOXED deliberately. [`JwtConfig`] carries a signing key, an audience and a `jwks_uri`, and
     /// inlining that here put all of it in every [`crate::server::ServerConfig`], which grew
@@ -1262,6 +1782,24 @@ pub(crate) fn unix_seconds(t: SystemTime) -> Result<u64, JwtError> {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| JwtError("clock is before the Unix epoch".into()))
+}
+
+/// A well-formed EC P-256 [`Jwk`], for the backend unit tests that need a key of the WRONG kind to
+/// prove an RSA/EdDSA verifier refuses it (algorithm-confusion guard). Coordinates are the RFC 7515
+/// appendix A.3 P-256 public key.
+///
+/// Gated on `jwt-ed25519` because that is the ONLY backend whose tests call it (the RS256 tests in
+/// `backends/rsa.rs` build their own EC `Jwk` inline). In a single-backend build that has this
+/// helper compiled but no caller — a `--features jwt-rsa` or `--features jwt-p256` test build —
+/// leaving it at a bare `#[cfg(test)]` is dead code that fails `clippy -D warnings`, so the gate is
+/// the feature that actually reaches it rather than a blanket `#[allow(dead_code)]`.
+#[cfg(all(test, feature = "jwt-ed25519"))]
+pub(crate) fn sample_ec_jwk_for_tests() -> Jwk {
+    Jwk::from_coordinates(
+        "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+    )
+    .expect("a valid P-256 coordinate pair")
 }
 
 #[cfg(test)]
@@ -1309,59 +1847,12 @@ impl std::error::Error for VerifyError {}
 /// where only a public half was expected. Neither is a request worth serving.
 const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
-/// The PUBLIC parameters of one EC P-256 key, as received from a client.
-///
-/// This is the VERIFYING counterpart of [`Jwk`], which exists to be SERIALIZED and therefore holds
-/// `&'static str` for every member this crate fixes. This one is parsed from attacker-controlled
-/// JSON, so it is a separate type rather than a relaxation of that one: making [`Jwk`]'s members
-/// owned so it could be deserialized would also make it possible to SERVE a `kty` this crate never
-/// signs with.
-///
-/// Deserialization goes through [`PublicJwk::from_json`], including through `serde`, so there is no
-/// route from JSON into this type that skips the private-parameter rejection. The two other
-/// constructors take no JSON at all: [`PublicJwk::from_coordinates`] takes the two coordinates and
-/// runs the same width check, and [`Jwk::to_public_jwk`] converts a key this crate published, which
-/// has no private half to reject (see that method on what it does not revalidate).
-///
-/// The FIELDS ARE SEALED, which is what makes the sentence above true. They were public through
-/// 0.9, and a struct literal was exactly such a route: an `AssertionKeys::PublicKeys` built by hand
-/// could carry a `kty` this crate never verifies, or coordinates of any width, and
-/// [`PublicJwk::thumbprint`] would then hand back a `cnf.jkt` over it. Verification revalidates and
-/// so fails closed, but a thumbprint is a value a host WRITES DOWN, and a token bound to a key
-/// nobody can present is a token nobody can use. Read them with the accessors; build them with
-/// [`PublicJwk::from_json`] or [`PublicJwk::from_coordinates`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PublicJwk {
-    /// Key type; only `EC` is accepted.
-    kty: String,
-    /// Curve; only `P-256` is accepted.
-    crv: String,
-    /// Base64url (unpadded) x coordinate, exactly 32 bytes decoded.
-    x: String,
-    /// Base64url (unpadded) y coordinate, exactly 32 bytes decoded.
-    y: String,
-    /// The optional key identifier (RFC 7517 section 4.5).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kid: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for PublicJwk {
-    /// Routed through [`PublicJwk::from_json`] rather than derived, so that a JWK loaded from the
-    /// host's own client store is held to exactly the same rules as one arriving in a DPoP proof
-    /// header. A derived impl would IGNORE an unknown `d` member rather than reject it, and a
-    /// registration silently carrying a client's private key is precisely the state this type
-    /// exists to make unrepresentable.
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(d)?;
-        PublicJwk::from_json(&value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl PublicJwk {
-    /// Parse and validate one JWK.
+impl Jwk {
+    /// Parse and validate one JWK, from either a client's attacker-controlled JSON or a host's own
+    /// store.
     ///
-    /// Rejects, in this order: a non-object, any member of `PRIVATE_JWK_MEMBERS`, a `kty` other
-    /// than `EC`, a `crv` other than `P-256`, and coordinates that are not exactly 32 bytes of
+    /// Rejects, PRIVATE MEMBERS FIRST (RFC 9449 section 4.3), then: a non-object, a `kty` this crate
+    /// does not verify, a `crv` it does not, and coordinates that are not exactly 32 bytes of
     /// base64url. The width check is not pedantry: RFC 7518 section 6.2.1.2 fixes the octet length
     /// at the curve's field size and requires leading zeros to be KEPT, so a trimmed coordinate is
     /// a different point, and accepting it is the classic JWK interoperability bug.
@@ -1369,6 +1860,8 @@ impl PublicJwk {
         let object = value
             .as_object()
             .ok_or_else(|| VerifyError::new("a JWK must be a JSON object"))?;
+        // PRIVATE members are rejected FIRST, before any other member is read, so that a JWK
+        // carrying `d` is refused whatever else is wrong or right about it.
         for member in PRIVATE_JWK_MEMBERS {
             if object.contains_key(*member) {
                 return Err(VerifyError::new(
@@ -1383,60 +1876,85 @@ impl PublicJwk {
                 .map(str::to_string)
                 .ok_or_else(|| VerifyError::new("the JWK is missing a required member"))
         };
-        let kty = string("kty")?;
-        if kty != "EC" {
-            return Err(VerifyError::new("only EC keys are supported"));
-        }
-        let crv = string("crv")?;
-        if crv != "P-256" {
-            return Err(VerifyError::new("only the P-256 curve is supported"));
-        }
-        let x = string("x")?;
-        let y = string("y")?;
-        let coordinate = |b64: &str| -> Result<(), VerifyError> {
-            match URL_SAFE_NO_PAD.decode(b64) {
-                Ok(bytes) if bytes.len() == 32 => Ok(()),
-                _ => Err(VerifyError::new(
-                    "a P-256 coordinate is exactly 32 base64url-encoded bytes",
-                )),
-            }
-        };
-        coordinate(&x)?;
-        coordinate(&y)?;
-        Ok(PublicJwk {
-            kty,
-            crv,
-            x,
-            y,
-            kid: object
+        let kid = || {
+            object
                 .get("kid")
                 .and_then(|v| v.as_str())
-                .map(str::to_string),
-        })
+                .map(str::to_string)
+        };
+        let kty = string("kty")?;
+        match kty.as_str() {
+            "EC" => {
+                let crv = string("crv")?;
+                if crv != "P-256" {
+                    return Err(VerifyError::new("only the P-256 curve is supported"));
+                }
+                let x = string("x")?;
+                let y = string("y")?;
+                check_coordinate(&x)?;
+                check_coordinate(&y)?;
+                Ok(Jwk::Ec {
+                    crv: EcCurve::P256,
+                    x,
+                    y,
+                    kid: kid(),
+                })
+            }
+            "RSA" => {
+                // The private members (`d`, and the CRT parameters `p`, `q`, `dp`, `dq`, `qi`,
+                // `oth`) were already rejected above, before any member was read. What remains is
+                // the public pair, both REQUIRED (RFC 7518 section 6.3.1). The base64urlUInt width
+                // is not fixed the way a P-256 coordinate is, so there is no length check here; the
+                // `length == modulus` guard belongs at verification, per key.
+                let n = string("n")?;
+                let e = string("e")?;
+                if URL_SAFE_NO_PAD.decode(&n).is_err() || URL_SAFE_NO_PAD.decode(&e).is_err() {
+                    return Err(VerifyError::new(
+                        "an RSA n/e is base64urlUInt (unpadded base64url)",
+                    ));
+                }
+                Ok(Jwk::Rsa { n, e, kid: kid() })
+            }
+            "OKP" => {
+                // `d` (the private seed) was rejected above. RFC 8037 section 2: `crv` and `x` are
+                // required, and this crate wires Ed25519 only (Ed448 shares the `EdDSA` alg name
+                // but is a different curve).
+                let crv = string("crv")?;
+                if crv != "Ed25519" {
+                    return Err(VerifyError::new("only the Ed25519 curve is supported"));
+                }
+                let x = string("x")?;
+                match URL_SAFE_NO_PAD.decode(&x) {
+                    Ok(bytes) if bytes.len() == 32 => {}
+                    _ => {
+                        return Err(VerifyError::new(
+                            "an Ed25519 public key is exactly 32 base64url-encoded bytes",
+                        ))
+                    }
+                }
+                Ok(Jwk::Okp {
+                    crv: OkpCurve::Ed25519,
+                    x,
+                    kid: kid(),
+                })
+            }
+            _ => Err(VerifyError::new("only EC, RSA, and OKP keys are supported")),
+        }
     }
 
     /// One P-256 public key from its two RFC 7518 section 6.2.1.2 coordinates, exactly as they
     /// appear in a JWK: base64url, unpadded, 32 bytes each.
     ///
-    /// The constructor for a host that holds the coordinates rather than a JSON document, and the
-    /// reason the sealed fields cost nobody anything. `kty` and `crv` are not arguments because
-    /// there is exactly one pair this crate verifies with, so admitting others would only admit a
-    /// key that cannot be used. The same width check [`PublicJwk::from_json`] performs runs here:
-    /// a constructor that skipped it would be the hole the fields were sealed to close.
+    /// The constructor for a host that holds the coordinates rather than a JSON document. `kty` and
+    /// `crv` are not arguments because this constructor builds only the P-256 `EC` key; an RSA or
+    /// Ed25519 key has its own constructor, so admitting other `kty`/`crv` values here would only
+    /// admit a key it cannot produce. The same width check [`Jwk::from_json`] performs runs here: a
+    /// constructor that skipped it would be a hole.
     pub fn from_coordinates(x: &str, y: &str) -> Result<Self, VerifyError> {
-        let coordinate = |b64: &str| -> Result<(), VerifyError> {
-            match URL_SAFE_NO_PAD.decode(b64) {
-                Ok(bytes) if bytes.len() == 32 => Ok(()),
-                _ => Err(VerifyError::new(
-                    "a P-256 coordinate is exactly 32 base64url-encoded bytes",
-                )),
-            }
-        };
-        coordinate(x)?;
-        coordinate(y)?;
-        Ok(PublicJwk {
-            kty: "EC".to_string(),
-            crv: "P-256".to_string(),
+        check_coordinate(x)?;
+        check_coordinate(y)?;
+        Ok(Jwk::Ec {
+            crv: EcCurve::P256,
             x: x.to_string(),
             y: y.to_string(),
             kid: None,
@@ -1445,36 +1963,65 @@ impl PublicJwk {
 
     /// Name this key, with the RFC 7517 section 4.5 `kid` a client publishes it under.
     ///
-    /// Deliberately NOT part of the thumbprint: see [`PublicJwk::thumbprint`] on why relabelling a
-    /// key must not change what a token is bound to.
-    pub fn with_kid(mut self, kid: &str) -> Self {
-        self.kid = Some(kid.to_string());
-        self
+    /// Deliberately NOT part of the thumbprint: see [`Jwk::thumbprint`] on why relabelling a key
+    /// must not change what a token is bound to.
+    pub fn with_kid(self, kid: &str) -> Self {
+        let kid = Some(kid.to_string());
+        match self {
+            Jwk::Ec { crv, x, y, .. } => Jwk::Ec { crv, x, y, kid },
+            Jwk::Rsa { n, e, .. } => Jwk::Rsa { n, e, kid },
+            Jwk::Okp { crv, x, .. } => Jwk::Okp { crv, x, kid },
+        }
     }
 
-    /// Key type. Always `EC`: nothing else parses.
+    /// The KIND of key this is, for [`consistent`].
+    pub fn key_kind(&self) -> KeyKind {
+        match self {
+            Jwk::Ec { crv, .. } => KeyKind::Ec(*crv),
+            Jwk::Rsa { .. } => KeyKind::Rsa,
+            Jwk::Okp { crv, .. } => KeyKind::Okp(*crv),
+        }
+    }
+
+    /// Key type: `EC`, `RSA`, or `OKP`.
     pub fn kty(&self) -> &str {
-        &self.kty
+        match self {
+            Jwk::Ec { .. } => "EC",
+            Jwk::Rsa { .. } => "RSA",
+            Jwk::Okp { .. } => "OKP",
+        }
     }
 
-    /// Curve. Always `P-256`: nothing else parses.
-    pub fn crv(&self) -> &str {
-        &self.crv
+    /// Curve, for an EC key; `None` for RSA and OKP keys.
+    pub fn crv(&self) -> Option<EcCurve> {
+        match self {
+            Jwk::Ec { crv, .. } => Some(*crv),
+            Jwk::Rsa { .. } | Jwk::Okp { .. } => None,
+        }
     }
 
-    /// The base64url x coordinate.
+    /// The base64url x coordinate, for an EC or OKP key; the empty string for RSA (which has no
+    /// `x`). Callers that need to distinguish should match on the variant.
     pub fn x(&self) -> &str {
-        &self.x
+        match self {
+            Jwk::Ec { x, .. } | Jwk::Okp { x, .. } => x,
+            Jwk::Rsa { .. } => "",
+        }
     }
 
-    /// The base64url y coordinate.
+    /// The base64url y coordinate, for an EC key; the empty string otherwise.
     pub fn y(&self) -> &str {
-        &self.y
+        match self {
+            Jwk::Ec { y, .. } => y,
+            Jwk::Rsa { .. } | Jwk::Okp { .. } => "",
+        }
     }
 
     /// The RFC 7517 section 4.5 `kid`, if the key carries one.
     pub fn kid(&self) -> Option<&str> {
-        self.kid.as_deref()
+        match self {
+            Jwk::Ec { kid, .. } | Jwk::Rsa { kid, .. } | Jwk::Okp { kid, .. } => kid.as_deref(),
+        }
     }
 
     /// The RFC 7638 section 3 JWK Thumbprint of this key: SHA-256, base64url without padding.
@@ -1485,22 +2032,60 @@ impl PublicJwk {
     /// LEXICOGRAPHIC order, with no whitespace and no other member. `kid`, `use` and `alg` are
     /// deliberately excluded, which is what makes the thumbprint a property of the KEY rather than
     /// of one description of it; including any of them would let the same key produce two
-    /// thumbprints and so two tokens a resource server could not tell were bound to one client.
+    /// thumbprints and so two tokens a resource server could not tell were bound to one client. The
+    /// required-member set and its order are per key TYPE (RFC 7638 section 3.2).
     pub fn thumbprint(&self) -> String {
         // Built by hand rather than through `serde_json`, because a serializer's member order is a
         // property of a struct declaration and this order is a property of the RFC. For `EC` the
         // required set is `crv`, `kty`, `x`, `y`, which is already lexicographic.
-        let mut json = String::with_capacity(40 + self.crv.len() + self.x.len() + self.y.len());
-        json.push_str("{\"crv\":\"");
-        json.push_str(&self.crv);
-        json.push_str("\",\"kty\":\"");
-        json.push_str(&self.kty);
-        json.push_str("\",\"x\":\"");
-        json.push_str(&self.x);
-        json.push_str("\",\"y\":\"");
-        json.push_str(&self.y);
-        json.push_str("\"}");
-        URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+        match self {
+            Jwk::Ec { crv, x, y, .. } => {
+                let crv = crv.jose_name();
+                let mut json = String::with_capacity(40 + crv.len() + x.len() + y.len());
+                json.push_str("{\"crv\":\"");
+                json.push_str(crv);
+                json.push_str("\",\"kty\":\"EC\",\"x\":\"");
+                json.push_str(x);
+                json.push_str("\",\"y\":\"");
+                json.push_str(y);
+                json.push_str("\"}");
+                URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+            }
+            // RFC 7638 section 3.2: the RSA required set is `e`, `kty`, `n`, already lexicographic
+            // (`e` < `k` < `n`).
+            Jwk::Rsa { n, e, .. } => {
+                let mut json = String::with_capacity(24 + n.len() + e.len());
+                json.push_str("{\"e\":\"");
+                json.push_str(e);
+                json.push_str("\",\"kty\":\"RSA\",\"n\":\"");
+                json.push_str(n);
+                json.push_str("\"}");
+                URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+            }
+            // OKP required set is `crv`, `kty`, `x` (RFC 8037 section 2; the order every
+            // interoperable JOSE library uses), already lexicographic (`c` < `k` < `x`).
+            Jwk::Okp { crv, x, .. } => {
+                let crv = crv.jose_name();
+                let mut json = String::with_capacity(28 + crv.len() + x.len());
+                json.push_str("{\"crv\":\"");
+                json.push_str(crv);
+                json.push_str("\",\"kty\":\"OKP\",\"x\":\"");
+                json.push_str(x);
+                json.push_str("\"}");
+                URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+            }
+        }
+    }
+}
+
+/// The RFC 7518 section 6.2.1.2 coordinate width check, shared by [`Jwk::from_json`] and
+/// [`Jwk::from_coordinates`] so the two cannot drift on what a coordinate is.
+fn check_coordinate(b64: &str) -> Result<(), VerifyError> {
+    match URL_SAFE_NO_PAD.decode(b64) {
+        Ok(bytes) if bytes.len() == 32 => Ok(()),
+        _ => Err(VerifyError::new(
+            "a P-256 coordinate is exactly 32 base64url-encoded bytes",
+        )),
     }
 }
 
@@ -1640,21 +2225,31 @@ impl<'a> CompactJws<'a> {
 ///
 /// THIS IS THE BUILT-IN BACKEND'S BODY, and it is the crate's ONE implementation of ES256
 /// verification. Everything inside the crate reaches it through [`P256Verifier`] and the
-/// [`Es256Verifier`] seam; it stays public because a host writing the resource-server half of RFC
+/// [`JwsVerifier`] seam; it stays public because a host writing the resource-server half of RFC
 /// 9449 in the same tree needs it directly, and because it is what every existing consumer calls.
+///
+/// A `key` that is not an EC P-256 key is `false`, never a panic: the caller already chose ES256,
+/// and a key of the wrong kind is one more thing that is not a valid ES256 signature.
 #[cfg(feature = "jwt-p256")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
-pub fn verify_es256(jwk: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+pub fn verify_es256(key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
+    // Read the EC P-256 coordinates, refusing any other key KIND with `false` rather than a panic.
+    let Jwk::Ec {
+        crv: EcCurve::P256,
+        x,
+        y,
+        ..
+    } = key
+    else {
+        return false;
+    };
     // RFC 7518 section 3.4 fixes the ES256 signature as the fixed-width `r || s` concatenation, 64
     // bytes. The DER form OpenSSL emits by default is NOT this, and accepting both would give one
     // signature two encodings.
     if signature.len() != 64 {
         return false;
     }
-    let (Ok(x), Ok(y)) = (
-        URL_SAFE_NO_PAD.decode(&jwk.x),
-        URL_SAFE_NO_PAD.decode(&jwk.y),
-    ) else {
+    let (Ok(x), Ok(y)) = (URL_SAFE_NO_PAD.decode(x), URL_SAFE_NO_PAD.decode(y)) else {
         return false;
     };
     if x.len() != 32 || y.len() != 32 {
@@ -1767,10 +2362,11 @@ impl EcdsaP256Key {
             .map(|s| s.to_vec())
     }
 
-    /// The public half in the VERIFYING shape, for a host registering this key as a client's
-    /// `private_key_jwt` key. Same parameters as [`EcdsaP256Key::public_jwk`], which produces the
-    /// SERVING shape; there is still no method anywhere in this crate that emits `d`.
-    pub fn to_public_jwk(&self) -> PublicJwk {
-        Jwk::to_public_jwk(&self.public_jwk())
+    /// The public half as a [`Jwk`], for a host registering this key as a client's
+    /// `private_key_jwt` key. Identical to [`EcdsaP256Key::public_jwk`] now that one [`Jwk`] serves
+    /// both jobs; retained so existing callers keep compiling. There is still no method anywhere in
+    /// this crate that emits `d`.
+    pub fn to_public_jwk(&self) -> Jwk {
+        self.public_jwk()
     }
 }
