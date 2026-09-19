@@ -10,6 +10,145 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
+## [0.10.0] - 2026-09-18
+
+Two pieces of work, both pre-1.0 and both stated plainly. **Crypto agility** replaces the
+ES256-only JWS seam with one that also speaks RS256 and EdDSA/Ed25519, and it is a BREAKING
+change: no backward-compatible alias was kept, because pre-1.0 is exactly the point at which that
+cost is worth paying once rather than carrying forward. **FAPI 2.0 conformance** adds an opt-in
+switch to turn off refresh rotation, a runnable fixture, and a manual CI job that exercises the
+OIDF FAPI 2.0 Security Profile `plain_oauth` suite. Neither is certified. Nothing here claims a
+green run, a certification, or that RS256/EdDSA have seen real-world traffic yet — they are new
+this release.
+
+### BREAKING: the JWS signing seam is generalized — `Es256Signer` / `Es256Verifier` / `Jwk` /
+`PublicJwk` are replaced by `JwsAlg` / `JwsSigner` / `JwsVerifier` / a single `kty`-tagged `Jwk`
+
+The ES256-only seam hardcoded its algorithm in the trait signatures themselves
+(`Es256Signer::sign` returning a fixed `[u8; 64]`, `Jwk`'s fields fixed to `kty: "EC"` / `crv:
+"P-256"`), which is exactly what made it impossible to add a second algorithm without a second,
+parallel seam. 0.10.0 replaces it in place:
+
+- **`JwsAlg`** is a closed enum: `Es256`, `Rs256`, `EdDsa`. It is deliberately NOT
+  `#[non_exhaustive]` — adding a fourth algorithm (PS256, ES384, a post-quantum scheme) is a crate
+  release that the compiler forces through every `match` on it, which is the property this crate
+  wants for a security-critical dispatch: every algorithm this crate speaks is enumerated and
+  vetted in one place, and nothing a host does can add one silently.
+- **`JwsSigner`** and **`JwsVerifier`** replace `Es256Signer` and `Es256Verifier`. Each trait
+  carries its own `alg() -> JwsAlg`; `JwsSigner::sign` now returns a `JwsSignature` rather than a
+  fixed `[u8; 64]`, since RS256 and EdDSA signatures are not P-256's width; `JwsVerifier::verify`
+  takes the algorithm as an explicit argument from the caller (the registration, or the verifier's
+  own configuration) rather than reading it off the token's header. **The algorithm a token is
+  verified under is always chosen by the verifier or the client's registration, never by the JOSE
+  header the token carries** — the same posture this crate already held for ES256, now stated as
+  an invariant the new dispatch enforces rather than a happy accident of there being only one
+  algorithm. This is what keeps alg-confusion and `"alg":"none"` unreachable, and it is why HS256
+  remains its own, separate `client_secret_jwt` path rather than joining `JwsAlg`: HS256 is a MAC
+  verified with the same secret used to authenticate the client, which is a different trust
+  boundary than a public-key signature a resource server or this AS's own JWKS can hand out.
+- **`Jwk`** and the old, separate `PublicJwk` are merged into one `kty`-tagged enum —
+  `Jwk::Ec { crv, x, y, kid }`, `Jwk::Rsa { n, e, kid }`, `Jwk::Okp { crv, x, kid }` — instead of
+  two single-shaped, EC-only structs. There is deliberately no variant carrying a private `d`, and
+  no way to add one.
+- **`AuthorizationServer::with_jws_verifier(...)`** replaces `with_es256_verifier(...)`.
+- **`AssertionKeys::PublicKeys`** (the `private_key_jwt` registration shape) gains an `alg: JwsAlg`
+  field, since a registered key set is no longer implicitly ES256.
+- **`RequestObjectAlg` is deleted.** RFC 9101 request-object algorithm selection now goes through
+  the same `JwsAlg` every other signed credential uses, rather than its own parallel type.
+
+**Migration.** A host that never touched the JWT seam directly — the common case, everything
+built on the `jwt-p256` built-in backend and not hand-building a `Jwk` — is **behaviourally
+unaffected**: `EcdsaP256Key` and `P256Verifier` are rewired onto the new traits with
+`JwsAlg::Es256`, the wire bytes are unchanged, and the only thing that happens on upgrade is a
+recompile. A host that implemented `Es256Signer` or `Es256Verifier` itself, or built a `Jwk` /
+`PublicJwk` by hand (a KMS-backed signer, a custom verifier, a hand-rolled JWKS entry), does not
+compile until it is ported to `JwsSigner` / `JwsVerifier` and the new `Jwk::Ec` variant — there is
+no deprecated alias, for the same reason 0.9.1's `Hooks` and `http` consent renames carried none: a
+silent shim would leave two names for one seam in a public API about to be depended on in earnest.
+A host calling `with_es256_verifier(...)` renames the call to `with_jws_verifier(...)` and
+otherwise changes nothing.
+
+### Added: RS256, behind the off-by-default `jwt-rsa` feature (`dep: rsa` 0.9)
+
+RFC 7515 RSASSA-PKCS1-v1_5 signing and verification, dispatched through the same `JwsSigner` /
+`JwsVerifier` seam as ES256, wired across access tokens, JWKS, `private_key_jwt`, DPoP, and JAR
+exactly where ES256 was. A verifying key below **2048 bits is refused outright** — RFC 7518
+section 3.3's floor, enforced by this crate rather than left to whatever the `rsa` crate happens to
+accept.
+
+**RSA in-process signing carries RUSTSEC-2023-0071 (the Marvin timing-sidechannel attack against
+`rsa`'s PKCS#1 v1.5 implementation).** This crate does not vendor a mitigation for it, and does not
+claim one: a host that needs RSA signing under a real threat model should sign through a KMS or
+HSM behind an async `JwsSigner`, not with this crate's in-process RSA path. Verification is not
+believed to be affected — only signing, over a private key this crate never holds for a
+KMS-backed `JwsSigner` — but the advisory is against the dependency this feature adds, and hosts
+should read it themselves rather than take this paragraph's word for it.
+
+### Added: EdDSA/Ed25519, behind the off-by-default `jwt-ed25519` feature (`dep: ed25519-dalek` ~2.1)
+
+RFC 8032 Ed25519 signing and verification, same seam, `JwsAlg::EdDsa`, wired across the same call
+sites as RS256 and ES256. `ed25519-dalek` is pinned to the `~2.1` line because this crate's MSRV is
+1.75 and the `2.2`/`3.0` lines need a newer Rust than that; moving off the pin is a deliberate,
+tested decision tied to raising the MSRV, not a routine bump.
+
+Both `jwt-rsa` and `jwt-ed25519` are purely additive: the default feature set is still empty, `jwt`
+alone still builds nothing but the seam, and `jwt-p256` is unaffected. `signer_conformance` (behind
+`test-util`) now validates ES256, RS256, and EdDSA signers against RFC test vectors, not ES256
+alone. Adding a further algorithm later (PS256, ES384) is the bounded, compiler-guided change the
+closed `JwsAlg` enum exists to make possible — a new variant, the match arms it forces open, and a
+new backend feature beside these two.
+
+### Added: `ServerConfig::refresh_rotation` — an opt-in, FAPI-2.0-only switch that turns off refresh
+token rotation
+
+FAPI 2.0 Security Profile section 5.3.2.1-9 forbids refresh token rotation; this crate rotates by
+default (single-use refresh tokens, reuse detection revoking the family — OAuth 2.1 section 6.1,
+RFC 9700 section 4.14.2), and through 0.9.5 that was not configurable. The new `RefreshRotation`
+enum, set via `ServerConfig::with_refresh_rotation`, has two members:
+
+- **`RefreshRotation::Rotate`** (the default) is byte-for-byte the existing behaviour. Every
+  0.9.x deployment is on this today and stays on it without changing anything.
+- **`RefreshRotation::Reuse`** issues a fresh access token on each redemption and returns the SAME
+  refresh token unrotated: no spent record is written, and no family is revoked on a later
+  re-presentation. **This is a deliberate downgrade of the reuse detection OAuth 2.1 section 6.1
+  otherwise provides, and it must never be selected outside FAPI 2.0.** FAPI 2.0 accepts the trade
+  because it mandates sender-constrained tokens (DPoP or mutual-TLS), so a bearer copy alone is not
+  redeemable; a deployment that has not sender-constrained its tokens has no such backstop and must
+  leave this at `Rotate`.
+
+`refresh_retry_window` (0.9.5's overlapping-refresh coalescing) is inert under `Reuse`: there is no
+rotated successor to coalesce, so that path is skipped entirely rather than consulted.
+
+### Added: a FAPI 2.0 Security Profile conformance fixture and a manual, non-gating CI job
+
+`examples/fapi2_conformance_server.rs` serves the AS over HTTPS with a self-signed certificate,
+registers two static `private_key_jwt` clients, makes PAR mandatory, sets `RefreshRotation::Reuse`,
+and stands up a DPoP-verifying protected resource that answers JSON only for a sender-constrained
+access token — the two items `EXTERNAL-TOOLING.md` section 2.3 named as the actual blockers to
+running the OIDF suite's `plain_oauth` variant against this crate.
+
+`.github/workflows/fapi2-conformance.yml` is a `workflow_dispatch`-only job (not on `push`, not
+part of `dev.yml` or `qa.yml`) that runs `scripts/fapi2-conformance.sh`: clone and build the suite,
+build and launch the fixture, run
+`fapi2-security-profile-final-test-plan[openid=plain_oauth][client_auth_type=private_key_jwt][sender_constrain=dpop][fapi_profile=plain_fapi]`,
+and upload the logs. `crates/oauth-as-conformance/fapi2/config.json` carries the suite
+configuration with the fixture's real client ids, keys and resource URL, no longer the
+placeholders 0.9.x's scaffolding shipped.
+
+**Running the suite this way needs no OIDF payment or membership — nothing here conditions test
+execution on either.** Certification is a separate, manual step: publishing the run's log package,
+obtaining a payment code, and submitting through `https://submissions.openid.net/`, per
+`EXTERNAL-TOOLING.md` section 2.4. This release makes the run possible; it does not run it, and it
+does not claim a result. **No FAPI 2.0 certification is held or claimed by this crate.**
+
+### Note: the advertised `request_object_signing_alg_values_supported` metadata value is unchanged
+
+RS256 and EdDSA keys can be registered for `private_key_jwt` and for JAR verification, but the
+authorization server's discovery metadata still advertises `request_object_signing_alg_values_supported:
+["ES256"]` when it is present at all (gated on the `jwt-p256` backend being installed, as before).
+RS256/EdDSA request-object *keys* work; they are not yet reflected in the advertised list. Do not
+read this release as adding RS256/EdDSA to the JAR-advertised algorithm set.
+
 ## [0.9.5] - 2026-09-18
 
 This release adds one **opt-in** feature and is otherwise behaviour-compatible: with the new

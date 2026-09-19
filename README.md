@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/MattJackson/oauth-as/actions/workflows/publish.yml/badge.svg?branch=main)](https://github.com/MattJackson/oauth-as/actions/workflows/publish.yml)
 [![crates.io](https://img.shields.io/crates/v/oauth-as.svg)](https://crates.io/crates/oauth-as)
+[![codecov](https://codecov.io/gh/MattJackson/oauth-as/graph/badge.svg)](https://codecov.io/gh/MattJackson/oauth-as)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![MSRV 1.75](https://img.shields.io/badge/MSRV-1.75-blue.svg)](#minimum-supported-rust-version)
 [![Conformance](https://img.shields.io/badge/independent%20conformance-8%2F8-brightgreen.svg)](#evidence)
@@ -17,7 +18,7 @@ the consent experience; the library owns the protocol.
 
 ```toml
 [dependencies]
-oauth-as = "0.9"
+oauth-as = "0.10"
 ```
 
 ## Status
@@ -53,7 +54,7 @@ Behind off-by-default features:
 
 | Capability | Spec | Feature |
 | ---------- | ---- | ------- |
-| JWT access tokens and JWKS | RFC 9068 / 7517 | `jwt` |
+| JWT access tokens and JWKS | RFC 9068 / 7517 | `jwt`, plus one of `jwt-p256` (ES256), `jwt-rsa` (RS256) or `jwt-ed25519` (EdDSA/Ed25519) |
 | JWT client authentication | RFC 7523 | `client-assertion` |
 | DPoP sender-constrained tokens | RFC 9449 | `dpop` |
 | mTLS client auth and certificate-bound tokens | RFC 8705 | `mtls` |
@@ -73,20 +74,27 @@ Plus the seams a real deployment needs: an audit **event sink**, a **rate limiti
 secret verifier** so hosts store a hash rather than a secret, a **consent** seam, and **CSRF**
 protection on the device verification form.
 
+A runnable FAPI 2.0 Security Profile fixture (`examples/fapi2_conformance_server.rs`) and a manual,
+`workflow_dispatch`-only CI job exist so the OIDF `plain_oauth` suite can be run against this crate
+on demand; running it needs no OIDF payment or membership, but certification is a separate, manual
+submission and **nothing is certified**. See "What is not claimed", below.
+
 What is missing today is in "What is not claimed", below. It is written down rather than left to be
 discovered.
 
 ## Features
 
-Sixteen features. The default set is **empty**, and stays that way.
+Eighteen features. The default set is **empty**, and stays that way.
 
 | Feature | Adds | Implies | Cost in dependencies |
 | ------- | ---- | ------- | -------------------- |
 | *(default)* | The protocol core | | `serde`, `getrandom`, `sha2`, `base64` |
 | `http` | An HTTP service over the server: `http::Request` in, `http::Response` out, **no web framework and no async runtime** | | `http`, `http-body`, `bytes` |
 | `axum` | `impl From<AuthorizationService> for axum::Router`, plus the runtime to bind a listener with. About thirty lines, and the whole of this crate's exposure to a pre-1.0 framework | `http` | `axum` 0.8, `tokio` |
-| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, over the `Es256Signer` / `Es256Verifier` seam | | `serde_json` |
+| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, over the algorithm-tagged `JwsSigner` / `JwsVerifier` seam (`JwsAlg::{Es256,Rs256,EdDsa}`); no backend, so no key is minted or verified until one of the three below is enabled or the host installs its own | | `serde_json` |
 | `jwt-p256` | The built-in ES256 backend for that seam, for a host with no opinion about where its signing key lives | `jwt` | `p256` |
+| `jwt-rsa` | The built-in RS256 backend (`rsa` 0.9). Off by default: an RSA signature and key are far larger than ES256's, and in-process RSA *signing* carries RUSTSEC-2023-0071 (Marvin) — verification is unaffected, but a regulated deployment should prefer a KMS/HSM-backed async `JwsSigner` for signing | `jwt` | `rsa` |
+| `jwt-ed25519` | The built-in EdDSA (Ed25519 only) backend, over `ed25519-dalek` pinned to `~2.1` for this crate's 1.75 MSRV | `jwt` | `ed25519-dalek` |
 | `jwt-pkcs8` | `EcdsaP256Key::from_pkcs8_der` / `to_pkcs8_der`, for a host whose key arrives as DER rather than as a raw scalar | `jwt-p256` | one crate, `pkcs8`; `der`, `spki` and `const_oid` are already in a `jwt-p256` tree via `sec1` |
 | `client-assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
 | `dpop` | RFC 9449 sender-constrained tokens | `jwt` | none of its own |
@@ -100,13 +108,16 @@ Sixteen features. The default set is **empty**, and stays that way.
 | `cimd` | draft-ietf-oauth-client-id-metadata-document-01 client identifier metadata documents (the module docs carry a table mapping every section number it cites onto -02's renumbering). **Validation only: this crate makes no outbound HTTP request, so the host fetches the document and hands in the bytes.** See the module docs for the duties that leaves with the host | | `serde_json` |
 | `test-util` | A runnable `Storage` conformance harness for hosts to run against their own store | | none |
 
-Five of the sixteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
+Five of the eighteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
 `token-exchange`, `resource-metadata` and `test-util` are serde shapes and comparisons over what is
 already there. Three more (`client-assertion`, `dpop`, `jar`) add no crate of their own; they turn
-on `jwt`, which brings `serde_json`. The other eight each bring at least one crate: `serde_json`
+on `jwt`, which brings `serde_json`. The other ten each bring at least one crate: `serde_json`
 for `jwt`, `mtls`, `rar` and `cimd` (it is optional as of 0.9.0, so a default build no longer carries it),
-`http`/`http-body`/`bytes` for `http`, `axum` and `tokio` for `axum`, `p256` for `jwt-p256`, and
-`pkcs8` for `jwt-pkcs8`. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
+`http`/`http-body`/`bytes` for `http`, `axum` and `tokio` for `axum`, `p256` for `jwt-p256`, `rsa`
+for `jwt-rsa`, `ed25519-dalek` for `jwt-ed25519`, and `pkcs8` for `jwt-pkcs8`. `jwt-p256`,
+`jwt-rsa` and `jwt-ed25519` are additive, not exclusive: a tree that enables more than one compiles
+and the host's own installed signer, if any, always wins because it was installed rather than
+selected by feature. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
 whose major has never moved, so they can appear in this crate's public signatures without making a
 framework upgrade in your tree a breaking change here. If you want a `Router`, turn on `axum` as
 well; if you are on a different axum major, leave it off and mount the service directly.
@@ -128,53 +139,61 @@ difference between two linked binaries, one with the crate and one without, buil
 
 | You enable | It costs | Into a host that already has serde_json, http, bytes and sha2 |
 | ---------- | -------- | ------------------------------------------------------------ |
-| *(default)* the protocol core | **216 KiB** | 204 KiB |
-| `jwt` | 250 KiB | 233 KiB |
-| `http` | 414 KiB | not measured |
-| `http` + `jwt` | 448 KiB | 375 KiB |
-| `axum` (with a tokio runtime and a bound listener) | 647 KiB | not measured |
-| everything, all sixteen features | 1348 KiB | 1267 KiB |
+| *(default)* the protocol core | **233 KiB** | 222 KiB |
+| `jwt` | 270 KiB | 252 KiB |
+| `http` | 432 KiB | not measured |
+| `http` + `jwt` | 473 KiB | 400 KiB |
+| `axum` (with a tokio runtime and a bound listener) | 666 KiB | not measured |
+| everything, all nineteen features | 1571 KiB | 1490 KiB |
 
 What each optional feature adds on top of the core:
 
 | Feature | Adds | Feature | Adds |
 | ------- | ---- | ------- | ---- |
-| `mtls` | 6 KiB | `jwt` | 34 KiB (the seam and the JWS surface: NO curve implementation) |
-| `resource-metadata` | 6 KiB | `jwt-p256` | 70 KiB (`jwt` plus the built-in backend, so 35 KiB over `jwt`) |
-| `token-exchange` | 12 KiB | `rar` | 98 KiB |
-| `par` | 18 KiB | `test-util` | 230 KiB |
-| `consent` | 32 KiB | `http` | 198 KiB |
-| `cimd` | 88 KiB |  |  |
-|  |  | `axum` | 431 KiB (233 of it over `http`, and nearly all of that is tokio) |
+| `mtls` | 6 KiB | `jwt` | 36 KiB (the seam and the JWS surface: NO curve implementation) |
+| `resource-metadata` | 6 KiB | `jwt-p256` | 75 KiB (`jwt` plus the built-in backend, so 39 KiB over `jwt`) |
+| `token-exchange` | 12 KiB | `rar` | 104 KiB |
+| `par` | 18 KiB | `test-util` | 243 KiB |
+| `consent` | 31 KiB | `http` | 199 KiB |
+| `cimd` | 93 KiB | `axum` | 433 KiB (234 of it over `http`, and nearly all of that is tokio) |
 
-and on top of `jwt-p256`: `dpop` 45 KiB, `jar` 46 KiB, `client-assertion` 52 KiB, `jwt-pkcs8`
+and on top of `jwt-p256`: `dpop` 45 KiB, `jar` 45 KiB, `client-assertion` 53 KiB, `jwt-pkcs8`
 30 KiB.
 
-`cimd`'s 88 KiB is almost entirely `serde_json`'s deserializer instantiated for one more
-document shape, which is the same cost `rar` pays at 98 KiB. In a build that already has
-another JSON-carrying feature the marginal figure is smaller: building `--all-features` with and
-without it moved that row by 30 KiB, because the parser core is already there.
+The other two built-in backends are RS256 and EdDSA, both hanging off the `jwt` seam like
+`jwt-p256`. Over that seam: `jwt-ed25519` is 42 KiB (`ed25519-dalek`), and `jwt-ed25519-pkcs8`
+adds a further 10 KiB for the PKCS#8 DER codec. `jwt-rsa` is by far the heaviest at 143 KiB over
+the seam, almost all of it `num-bigint-dig`'s modular exponentiation: an RS256 signature is 256
+bytes against ES256's 64, and it costs proportionally to link. ES256 stays the recommended
+profile; RS256 is there for interop with resource servers that accept nothing else.
+
+`cimd`'s 93 KiB is almost entirely `serde_json`'s deserializer instantiated for one more
+document shape, which is the same cost `rar` pays at 104 KiB. In a build that already has
+another JSON-carrying feature the marginal figure is smaller, because the parser core is already
+there.
 
 `test-util` is the largest single feature, and it is larger than the whole HTTP surface. That is
-the conformance harness a host runs against its own `Storage` implementation, and it is that size
-because it gained twenty-seven planted-fault checks in 0.9.1. It is a dev-dependency feature:
-nothing that ships to production should enable it, and no other row in this table includes it.
+the conformance harness a host runs against its own `Storage` implementation. It is a
+dev-dependency feature: nothing that ships to production should enable it, and no other row in this
+table includes it.
 
 A host that brings its own ES256 backend (a cloud KMS, an HSM, or the `ring` it already links
-through `rustls`) pays 34 KiB for `jwt` and takes no second elliptic curve implementation. A host
-with no opinion enables `jwt-p256` and pays 70 KiB, of which 35 KiB is the built-in backend. That
+through `rustls`) pays 36 KiB for `jwt` and takes no elliptic curve implementation. A host
+with no opinion enables `jwt-p256` and pays 75 KiB, of which 39 KiB is the built-in backend. That
 split is what the signing seam bought, and it is why both rows are gated separately in CI: they are
 two different consumers with two different costs.
 
 **Read the caveats, because they change what the numbers mean.**
 
-- **Platform and profile:** `aarch64-apple-darwin`, `rustc 1.97.0`, `lto = "fat"`,
+- **Platform and profile:** `aarch64-apple-darwin`, `rustc 1.98.0`, `lto = "fat"`,
   `codegen-units = 1`, `opt-level = 3`, `panic = "unwind"`. Code size is a property of the target's
   instruction encoding, so an x86-64 figure is a different figure. **Nothing in this repository's
   `[profile.release]` reaches you**: cargo honors profiles only for the workspace being built, so
   you compile this crate with YOUR profile and get YOUR numbers. A build without LTO will be
-  larger, in some rows considerably. Every figure above is from one run on 2026-08-13 under
-  `rustc 1.97.0`.
+  larger, in some rows considerably. Every figure above is from one run on 2026-09-18 under
+  `rustc 1.98.0`, re-measured for 0.10.0 when the JWS seam became algorithm-agnostic (`Jwk` is now a
+  three-variant enum and verification dispatches through a `JwsVerifiers` set) and the `jwt-rsa`,
+  `jwt-ed25519` and `jwt-ed25519-pkcs8` backends joined the everything row.
 - **The measurement does not depend on where you cloned it.** The probe used to link absolute panic
   `Location` strings, so the byte count included the length of the checkout directory — 240 bytes
   of spread between two paths, which was enough to put this gate red on CI and green locally on the
@@ -209,10 +228,12 @@ two different consumers with two different costs.
 
 **CI fails the build when any of `default`, `jwt`, `jwt-p256`, `http`, `http,jwt`, `axum` or
 `--all-features` grows past a recorded budget**, and the budgets carry their reasoning next to them
-in `scripts/size-report.sh`. When one is blown, the design gets fixed, not the number. Every budget
-was re-derived from the run these figures come from, and each is its measurement plus 1.5% rounded
-up to the next KiB — so a budget also comes DOWN when a row does, which is the only way it stays a
-gate on that row.
+in `scripts/size-report.sh`. When one is blown, the design gets fixed, not the number. Each budget
+is its measurement plus 1.5% rounded up to the next KiB (and each floor its measurement minus 1.5%
+rounded down) — so a budget also comes DOWN when a row does, which is the only way it stays a gate
+on that row. For 0.10.0 the two rows the crypto-agility work actually moved past their band,
+`jwt-p256` and `--all-features`, were re-derived from this run; the other five gated rows still sit
+inside their 0.9.5 bands and were left untouched rather than re-tightened for churn.
 
 ### Allocations
 
@@ -301,12 +322,21 @@ checked at the floor, and cannot be without dragging every dev-dependency back, 
 tests".
 
 `axum` is the only feature that raises the floor, and it raises it because a dependency it pulls
-in says so, not because of anything in this crate. Of the other fifteen, five add no crate at all
+in says so, not because of anything in this crate. Of the other eighteen, five add no crate at all
 (`par`, `consent`, `token-exchange`, `resource-metadata`, `test-util`) and so add no floor, and the
 rest add only crates whose own declared floor is below this one: `serde_json` 1.71 for `jwt` (and
 so for `client-assertion`, `dpop` and `jar`, which turn it on), for `mtls`, for `rar` and for
 `cimd`, `http` 1.57 / `http-body` 1.61 / `bytes` 1.57 for `http`, `p256` 1.65 for `jwt-p256`, and
 `pkcs8` 1.65 for `jwt-pkcs8`.
+
+The three built-in backends that landed in 0.10.0 declare floors below this one too: `rsa` 1.65
+(with `num-bigint-dig` 1.56 and `pkcs1` 1.60) for `jwt-rsa`, `ed25519-dalek` 1.60 (with `ed25519`,
+`curve25519-dalek` and `signature`, all 1.60) for `jwt-ed25519`, and the `pkcs8`/`der`/`spki` 1.65
+tree already counted above for `jwt-ed25519-pkcs8`. These floors are the crates' DECLARED
+`rust-version`s, not a CI measurement: the `MSRV build` job builds `default`, `jwt`, `jwt-p256` and
+`jwt-pkcs8` only, so `jwt-rsa` and `jwt-ed25519` are not compiled at 1.75 on every push the way the
+first four are. If a future bump to either backend raises its own floor past this crate's, that is
+where the number would move, and the job would need a row to catch it.
 
 1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower
 would mean `Box<dyn Future>` there, a heap allocation on every storage call, paid forever by every
@@ -355,9 +385,14 @@ What IS now claimable, and was not before:
   the gate is on anything NEW rather than on zero.
 
 Still not claimable, and stated so it stays that way: any certification, any OpenID Foundation
-conformance run, any MCP conformance claim. A FAPI 2.0 `plain_oauth` run is achievable and the
-remaining work is written down in `crates/oauth-as-conformance/EXTERNAL-TOOLING.md`, but it has not
-been done. A headless OAuch run is impossible by design and its authors say so.
+conformance run, any MCP conformance claim. A runnable FAPI 2.0 Security Profile fixture
+(`examples/fapi2_conformance_server.rs`) and a manual, `workflow_dispatch`-only CI job
+(`.github/workflows/fapi2-conformance.yml`) now exist and can run the OIDF `plain_oauth` suite's
+`fapi2-security-profile-final-test-plan` against this crate on demand, at no OIDF cost — but running
+the suite is not the same as certifying against it. Certification is a separate, manual step
+(publishing the run's logs, obtaining a payment code, and submitting through
+`https://submissions.openid.net/`, per `EXTERNAL-TOOLING.md` section 2.4) that has not been taken,
+and no result is claimed here. A headless OAuch run is impossible by design and its authors say so.
 
 The 0.x version is deliberate. If you need a battle hardened server today, use one. If you want an
 embeddable, host agnostic OAuth 2.1 core with its evidence and its gaps both in the open, this is
