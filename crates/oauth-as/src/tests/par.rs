@@ -170,7 +170,7 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
 
 #[cfg(feature = "jar")]
 // `jwt-p256`, the built-in ES256 backend: every test in here has to SIGN a request object, and
-// after the `Es256Signer` seam landed `jar` implies the verification surface, not a curve.
+// after the `JwsSigner` seam landed `jar` implies the verification surface, not a curve.
 #[cfg(feature = "jwt-p256")]
 mod jar {
     use super::*;
@@ -611,7 +611,7 @@ mod jar {
     ///
     /// WHAT MOVED, and it moved for a reason worth stating: whether the point is actually ON P-256
     /// is no longer checked here. It cannot be, because `--features jar` no longer contains an
-    /// elliptic curve at all (the ES256 arithmetic is behind the `Es256Verifier` seam, and the
+    /// elliptic curve at all (the ES256 arithmetic is behind the `JwsVerifier` seam, and the
     /// `jwt-p256` backend is one implementation of it). The check still happens, in the installed
     /// verifier, once per request, and it still FAILS CLOSED, which
     /// [`an_off_curve_key_registers_but_verifies_nothing`] is what proves. What is lost is only
@@ -641,7 +641,7 @@ mod jar {
         let registered =
             RegisteredRequestObjectKey::es256_from_jwk_coordinates(Some("k".into()), &x, &y)
                 .expect("a JWK's own coordinates register");
-        assert_eq!(registered.alg(), RequestObjectAlg::Es256);
+        assert_eq!(registered.alg(), crate::jwt::JwsAlg::Es256);
         assert_eq!(registered.kid(), Some("k"));
         // The public key is not a secret, but the Debug form is still only what an operator needs.
         assert!(format!("{registered:?}").contains("Es256"));

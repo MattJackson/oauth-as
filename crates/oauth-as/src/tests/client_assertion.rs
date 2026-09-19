@@ -15,9 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use super::*;
-use crate::jwt::{compact_jws, hmac_sha256, EcdsaP256Key, PublicJwk};
+use crate::jwt::{compact_jws, hmac_sha256, EcdsaP256Key, Jwk, JwsAlg};
 
-/// The crate's built-in ES256 backend. Verification now goes through the [`crate::jwt::Es256Verifier`] seam,
+/// The crate's built-in ES256 backend. Verification now goes through the [`crate::jwt::JwsVerifier`] seam,
 /// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
 /// default, which is what keeps these tests measuring the behaviour they always measured.
 const VERIFIER: &crate::jwt::P256Verifier = &crate::jwt::P256Verifier;
@@ -77,6 +77,7 @@ fn secret_keys() -> AssertionKeys {
 fn key_pair() -> (EcdsaP256Key, AssertionKeys) {
     let key = EcdsaP256Key::generate("client-key-1");
     let keys = AssertionKeys::PublicKeys {
+        alg: JwsAlg::Es256,
         keys: vec![key.to_public_jwk()],
     };
     (key, keys)
@@ -269,6 +270,7 @@ fn one_of_several_registered_keys_is_enough() {
     let old = EcdsaP256Key::generate("old");
     let new = EcdsaP256Key::generate("new");
     let keys = AssertionKeys::PublicKeys {
+        alg: JwsAlg::Es256,
         keys: vec![old.to_public_jwk(), new.to_public_jwk()],
     };
     let assertion = es256(&new, &json!({"alg": "ES256"}), &claims());
@@ -531,7 +533,7 @@ fn a_jwk_carrying_a_private_parameter_is_refused() {
         let mut value = serde_json::to_value(key.to_public_jwk()).unwrap();
         value[member] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert!(
-            PublicJwk::from_json(&value).is_err(),
+            Jwk::from_json(&value).is_err(),
             "a JWK carrying {member} must be refused"
         );
     }
@@ -545,7 +547,7 @@ fn a_jwk_with_a_trimmed_coordinate_is_refused() {
     let key = EcdsaP256Key::generate("k");
     let mut value = serde_json::to_value(key.to_public_jwk()).unwrap();
     value["x"] = json!("AAAA");
-    assert!(PublicJwk::from_json(&value).is_err());
+    assert!(Jwk::from_json(&value).is_err());
 }
 
 // -------------------------------------------------------------- the exact edges of each window

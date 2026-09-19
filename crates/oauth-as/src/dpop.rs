@@ -53,7 +53,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::jwt::{CompactJws, Es256Verifier, PublicJwk};
+use crate::jwt::{consistent, expect_alg, AlgPolicy, CompactJws, Jwk, JwsVerifiers};
 
 /// RFC 9449 section 4.2: the `typ` a DPoP proof MUST carry.
 pub const DPOP_PROOF_TYP: &str = "dpop+jwt";
@@ -65,13 +65,16 @@ pub const DPOP_TOKEN_TYPE: &str = "DPoP";
 /// RFC 9449 section 4: the request header a proof travels in.
 pub const DPOP_HEADER: &str = "DPoP";
 
-/// The JWS algorithms this server accepts on a proof, and exactly what it advertises as
-/// `dpop_signing_alg_values_supported` (RFC 9449 section 5.1).
+/// The built-in `ES256` baseline this server advertises as `dpop_signing_alg_values_supported`
+/// (RFC 9449 section 5.1).
 ///
-/// One entry, and the list must stay honest: RFC 9449 section 4.2 requires an ASYMMETRIC algorithm,
-/// and this crate implements ES256 and nothing else (see `Cargo.toml` on why `p256` and not a JOSE
-/// framework). Advertising an algorithm the verifier will refuse is worse than advertising fewer,
-/// because a client that picks it has no way to find out except by failing.
+/// The list must stay honest: RFC 9449 section 4.2 requires an ASYMMETRIC algorithm, and
+/// advertising one the verifier will refuse is worse than advertising fewer, because a client that
+/// picks it has no way to find out except by failing. This constant is only the `jwt-p256`
+/// backend's entry (see `Cargo.toml` on why `p256` and not a JOSE framework); the RS256 and EdDSA
+/// backends, where their verifiers resolve, are added to the advertised list by
+/// [`crate::metadata`], and `verify_proof` accepts a proof under ANY installed algorithm
+/// ([`crate::jwt::AlgPolicy::AnyInstalled`], the RFC 9449 self-carried-key path).
 pub const DPOP_SIGNING_ALG_VALUES_SUPPORTED: &[&str] = &["ES256"];
 
 /// How old a proof's `iat` may be (RFC 9449 section 4.3 (10): "within an acceptable window").
@@ -248,10 +251,13 @@ pub fn htu_of(url: &str) -> &str {
 /// cannot substitute their key without invalidating the signature, and cannot re-sign without the
 /// private half.
 ///
-/// `verifier` is the ES256 backend, which after 0.9.0 is the host's to choose: enable `jwt-p256`
-/// for [`crate::jwt::P256Verifier`], or pass your own. It is a PARAMETER rather than something
-/// this function reaches for, because there is no "none" that could be safe here: a caller with no
-/// verifier has nothing to pass and must refuse the request instead, which is what
+/// `verifiers` is the installed verifier SET, not a single backend: a DPoP proof carries its own
+/// key and names its own algorithm (RFC 9449 self-carried key), so it is checked under whichever of
+/// ES256/RS256/EdDSA the set has a verifier installed for
+/// ([`crate::jwt::AlgPolicy::AnyInstalled`]); the built-in backends come from
+/// `jwt-p256`/`jwt-rsa`/`jwt-ed25519`, or a host installs its own. It is a PARAMETER rather than
+/// something this function reaches for, because there is no "none" that could be safe here: a
+/// caller with no verifier has nothing to pass and must refuse the request instead, which is what
 /// `AuthorizationServer` does.
 ///
 /// PUBLIC because [`VerifiedProof`] and [`DpopFailure`] are, and a type with no reachable producer
@@ -268,7 +274,7 @@ pub fn htu_of(url: &str) -> &str {
 /// skipping it leaves a proof bound to a key and a request line but not to a token. See the
 /// module docs.
 pub fn verify_proof(
-    verifier: &dyn Es256Verifier,
+    verifiers: &JwsVerifiers,
     proof: &str,
     htm: &str,
     htu: &str,
@@ -297,23 +303,34 @@ pub fn verify_proof(
         return Err(DpopFailure::NotAProof);
     }
 
-    // (4) and (5): an asymmetric `alg` this server implements. Checked BEFORE the key is read, so
-    // no attacker-chosen algorithm ever reaches a verification routine. A symmetric `alg` is
-    // refused here rather than failing later on key type, because the reason it is wrong is
-    // structural: a MAC is verified with a key both parties hold, which proves possession of
-    // nothing this server does not already have, and would turn proof-of-possession back into a
-    // bearer scheme.
-    match jws.header_str("alg") {
-        Some(alg) if DPOP_SIGNING_ALG_VALUES_SUPPORTED.contains(&alg) => {}
-        _ => return Err(DpopFailure::UnsupportedAlgorithm),
-    }
+    // (4) and (5): an asymmetric `alg` this server has a verifier INSTALLED for. This is the ONE
+    // documented use of `AlgPolicy::AnyInstalled`: a DPoP proof carries its own key by RFC 9449
+    // design (there is no prior registration to name an algorithm), so the header selects among the
+    // algorithms this server can actually check and NOTHING WIDER. `expect_alg` is the only reader
+    // of the header `alg`, and it cannot classify a symmetric `alg` or `none` into a `JwsAlg` at
+    // all (see `classify_alg`), so a MAC never reaches a verification routine: that would prove
+    // possession of nothing this server does not already hold and turn proof-of-possession back
+    // into a bearer scheme. Checked BEFORE the key is read.
+    let alg = expect_alg(&jws, AlgPolicy::AnyInstalled, verifiers)
+        .map_err(|_| DpopFailure::UnsupportedAlgorithm)?;
 
     // (4) The proof key, which MUST be a public key and MUST NOT carry a private one. `from_json`
     // is where that is enforced, for every JWK this crate parses; see `PRIVATE_JWK_MEMBERS`.
     let jwk = jws.header.get("jwk").ok_or(DpopFailure::BadProofKey)?;
-    let jwk = PublicJwk::from_json(jwk).map_err(|_| DpopFailure::BadProofKey)?;
+    let jwk = Jwk::from_json(jwk).map_err(|_| DpopFailure::BadProofKey)?;
 
-    // (6) The signature, under the proof's own key, over the bytes that arrived.
+    // The key must be the KIND the chosen algorithm signs with. `expect_alg` fixed `alg` from the
+    // installed set and this crate never infers an algorithm from a key; `consistent` is the guard
+    // that a self-carried proof key cannot be a different kind from the `alg` it was checked under.
+    if !consistent(alg, &jwk) {
+        return Err(DpopFailure::BadProofKey);
+    }
+
+    // (6) The signature, under the proof's own key, over the bytes that arrived. The verifier for
+    // `alg` is present because `expect_alg` under `AnyInstalled` required it.
+    let Some(verifier) = verifiers.get(alg) else {
+        return Err(DpopFailure::UnsupportedAlgorithm);
+    };
     if !verifier.verify(&jwk, jws.signing_input.as_bytes(), &jws.signature) {
         return Err(DpopFailure::BadSignature);
     }
@@ -384,7 +401,7 @@ pub fn verify_proof(
 }
 
 // The unit tests need a key that can SIGN, so they need `jwt-p256`, the built-in ES256 backend.
-// `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at all, and a
+// `jwt` alone carries the `JwsSigner`/`JwsVerifier` seam and no curve arithmetic at all, and a
 // test that cannot produce a signature cannot test a verifier.
 #[cfg(all(test, feature = "jwt-p256"))]
 #[path = "tests/dpop.rs"]

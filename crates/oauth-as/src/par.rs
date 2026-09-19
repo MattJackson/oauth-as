@@ -32,8 +32,9 @@
 //!    whoever wrote the token, so trusting its `alg` is the classic JWS algorithm confusion attack
 //!    (RFC 8725 sections 3.1 and 3.2, which RFC 9101 section 6.2 requires be applied here). This
 //!    module compares the presented `alg` against the one registered for the client and refuses
-//!    anything else; `none` can never match, because [`RequestObjectAlg`] has no variant that
-//!    spells it and no constructor that could produce one.
+//!    anything else; `none` can never match, because the registered algorithm is a
+//!    [`crate::jwt::JwsAlg`], which has no variant that spells `none` and no constructor that could
+//!    produce one.
 //!
 //! # What is deliberately NOT implemented
 //!
@@ -395,9 +396,13 @@ impl PushedAuthorizationRequest {
 /// The signing algorithms this server will verify a request object with, in the spelling RFC 8414
 /// / RFC 9101 section 4 `request_object_signing_alg_values_supported` uses.
 ///
-/// ES256 and nothing else, for the reason `Cargo.toml` gives for the RFC 9068 signer: this crate
-/// carries one curve and no JOSE framework, and an algorithm list is a menu of things an attacker
-/// may ask for. `none` is absent and unreachable: see [`RequestObjectAlg`].
+/// ES256 is the one algorithm ADVERTISED here, because an algorithm list is a menu of things an
+/// attacker may ask for and ES256 is this crate's recommended profile; it is a deliberately
+/// conservative default, not the limit of what the crate can verify. RS256 (`Jwk::Rsa`) and EdDSA
+/// (`Jwk::Okp`) request-object keys are wired through [`RegisteredRequestObjectKey::from_jwk`] and
+/// are verified when the client registered one and the matching [`crate::jwt::JwsVerifier`] is
+/// installed. `none` is absent and unreachable: a registered algorithm is a [`crate::jwt::JwsAlg`],
+/// which cannot spell it.
 #[cfg(feature = "jar")]
 pub const REQUEST_OBJECT_SIGNING_ALGS: &[&str] = &["ES256"];
 
@@ -405,6 +410,18 @@ pub const REQUEST_OBJECT_SIGNING_ALGS: &[&str] = &["ES256"];
 /// parameter that RFC 9101 section 10.8 recommends for a new deployment.
 #[cfg(feature = "jar")]
 pub const REQUEST_OBJECT_TYP: &str = "oauth-authz-req+jwt";
+
+/// The largest signed request object this server will decode, in bytes.
+///
+/// 64 KiB — the same ceiling `crate::http::MAX_BODY_BYTES` puts on a PAR-pushed body, so a pushed
+/// request object is unaffected and only the browser-facing `GET /authorize` `request` parameter,
+/// which no body cap ever bounded, gains a limit. It mirrors the size-first refusal every other
+/// untrusted-JWS entry in this crate makes ([`crate::dpop::MAX_PROOF_BYTES`],
+/// [`crate::client_assertion::MAX_ASSERTION_BYTES`]): a request object is base64-decoded and
+/// SHA-256 hashed in full before its signature (which may fail) is judged, so an uncapped one buys
+/// O(n) CPU and allocation per unauthenticated request.
+#[cfg(feature = "jar")]
+pub const MAX_REQUEST_OBJECT_BYTES: usize = 64 * 1024;
 
 /// RFC 9101 configuration. `None` on [`crate::server::ServerConfig::jar`] means signed request
 /// objects are OFF: nothing is advertised and a `request` parameter is refused.
@@ -464,29 +481,6 @@ impl Default for JarConfig {
     }
 }
 
-/// A signature algorithm a client may register for its request objects.
-///
-/// A one-variant enum on purpose. The value that matters is the one that is NOT here: RFC 9101
-/// section 10.5 requires `alg: none` to be rejected, and the cheapest way to guarantee that is a
-/// type in which "none" cannot be spelled, so no configuration mistake and no future edit to a
-/// string comparison can reintroduce it.
-#[cfg(feature = "jar")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RequestObjectAlg {
-    /// ECDSA using P-256 and SHA-256 (RFC 7518 section 3.4).
-    Es256,
-}
-
-#[cfg(feature = "jar")]
-impl RequestObjectAlg {
-    /// The registered JOSE `alg` spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RequestObjectAlg::Es256 => "ES256",
-        }
-    }
-}
-
 /// A public key was not usable as a request object verification key. Carries no key material.
 ///
 /// The payload is sealed and read through [`RequestObjectKeyError::detail`], matching
@@ -528,9 +522,9 @@ impl std::error::Error for RequestObjectKeyError {}
 #[cfg(feature = "jar")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredRequestObjectKey {
-    alg: RequestObjectAlg,
+    alg: crate::jwt::JwsAlg,
     kid: Option<String>,
-    /// The public key, in the ONE shape this crate's [`crate::jwt::Es256Verifier`] seam takes.
+    /// The public key, in the ONE shape this crate's [`crate::jwt::JwsVerifier`] seam takes.
     ///
     /// It was an uncompressed SEC 1 point (`0x04 || x || y`) through 0.9.0, alongside a PRIVATE
     /// second copy of ES256 verification in this file that knew how to read one. The seam collapsed
@@ -542,7 +536,7 @@ pub struct RegisteredRequestObjectKey {
     /// ONE CONSEQUENCE, stated because it is a real change rather than a refactor: the "is this
     /// point actually on P-256" check no longer happens at REGISTRATION, because this crate no
     /// longer contains an elliptic curve. It moved into the installed verifier, per request, where
-    /// [`crate::jwt::Es256Verifier`] states it as a MUST and names what it is for (an
+    /// [`crate::jwt::JwsVerifier`] states it as a MUST and names what it is for (an
     /// invalid-curve attack is what a missing on-curve check buys). What the constructors below
     /// still catch at registration time is every encoding mistake (a trimmed coordinate, a wrong
     /// length, non-base64url), which is what a host actually gets wrong when it copies a JWK out
@@ -556,7 +550,7 @@ pub struct RegisteredRequestObjectKey {
     /// not currently present an off-curve key, so a green run there does not cover this clause.
     /// A host whose backend hands raw coordinates to a library that skips point validation should
     /// test that clause itself until the harness carries it.
-    key: crate::jwt::PublicJwk,
+    key: crate::jwt::Jwk,
 }
 
 #[cfg(feature = "jar")]
@@ -591,7 +585,7 @@ impl RegisteredRequestObjectKey {
         // constructors cannot disagree about what they accepted: whatever `x` and `y` spelled, what
         // is stored is the canonical unpadded base64url of exactly 32 bytes.
         Ok(RegisteredRequestObjectKey {
-            alg: RequestObjectAlg::Es256,
+            alg: crate::jwt::JwsAlg::Es256,
             kid,
             key: public_jwk(&x, &y)?,
         })
@@ -617,14 +611,35 @@ impl RegisteredRequestObjectKey {
             ));
         }
         Ok(RegisteredRequestObjectKey {
-            alg: RequestObjectAlg::Es256,
+            alg: crate::jwt::JwsAlg::Es256,
             kid,
             key: public_jwk(&sec1[1..33], &sec1[33..])?,
         })
     }
 
+    /// Register a key of any wired algorithm from an already-parsed public [`crate::jwt::Jwk`],
+    /// refusing a key whose KIND does not match the algorithm (an RSA key registered for ES256, an
+    /// EC key for RS256): that mismatch is an algorithm-confusion registration, and
+    /// [`crate::jwt::consistent`] is the one check that rejects it.
+    ///
+    /// The ES256 constructors above stay for the common case where a host holds raw coordinates;
+    /// this is the general door RS256 (`Jwk::Rsa`) and EdDSA (`Jwk::Okp`) come through, and the one
+    /// a host that already has a parsed `Jwk` uses directly.
+    pub fn from_jwk(
+        alg: crate::jwt::JwsAlg,
+        key: crate::jwt::Jwk,
+    ) -> Result<Self, RequestObjectKeyError> {
+        if !crate::jwt::consistent(alg, &key) {
+            return Err(RequestObjectKeyError(
+                "the registered key kind does not match the registered algorithm".into(),
+            ));
+        }
+        let kid = key.kid().map(str::to_string);
+        Ok(RegisteredRequestObjectKey { alg, kid, key })
+    }
+
     /// The registered algorithm. This, not the token header, decides.
-    pub fn alg(&self) -> RequestObjectAlg {
+    pub fn alg(&self) -> crate::jwt::JwsAlg {
         self.alg
     }
 
@@ -712,6 +727,12 @@ impl RequestObjectClaims {
 /// `&'static str`, so the refusal borrows a constant instead of formatting one. There are exactly
 /// three call sites and three sentences (below), and this is the authorization endpoint: nothing
 /// has authenticated at this point, so the caller chooses how many of these it asks for.
+/// Base64url-decode one JWS segment, refusing with a per-SEGMENT description. See
+/// `verified_request_object` on why this staged decode is kept rather than folded into
+/// [`crate::jwt::CompactJws::parse`].
+///
+/// `refusal` is the WHOLE description rather than the name of the segment, and it is
+/// `&'static str`, so the refusal borrows a constant instead of formatting one.
 #[cfg(feature = "jar")]
 fn decode_segment(segment: &str, refusal: &'static str) -> Result<Vec<u8>, ErrorResponse> {
     URL_SAFE_NO_PAD
@@ -728,16 +749,16 @@ const PAYLOAD_NOT_BASE64URL: &str = "the payload is not base64url";
 #[cfg(feature = "jar")]
 const SIGNATURE_NOT_BASE64URL: &str = "the signature is not base64url";
 
-/// One [`crate::jwt::PublicJwk`] from two 32-byte coordinates.
+/// One [`crate::jwt::Jwk`] from two 32-byte coordinates.
 ///
 /// THE SEAM NOTE THAT USED TO BE HERE IS DISCHARGED. Through 0.9.0 this file carried its own
 /// private `verify_es256` over `p256::ecdsa::VerifyingKey`, a second copy of the same twenty lines
 /// that `src/jwt.rs` held for RFC 7523 client assertions and RFC 9449 DPoP proofs, with a comment
 /// promising it would become a call to them. It now is one: this function converts the registered
-/// key into the shape the [`crate::jwt::Es256Verifier`] seam takes, and the verification itself
+/// key into the shape the [`crate::jwt::JwsVerifier`] seam takes, and the verification itself
 /// happens in the single implementation behind that trait.
 #[cfg(feature = "jar")]
-fn public_jwk(x: &[u8], y: &[u8]) -> Result<crate::jwt::PublicJwk, RequestObjectKeyError> {
+fn public_jwk(x: &[u8], y: &[u8]) -> Result<crate::jwt::Jwk, RequestObjectKeyError> {
     // RFC 7518 section 6.2.1.2 fixes both coordinates at the curve's full byte length, so a
     // trimmed leading zero is a different (and unusable) key rather than the same one.
     if x.len() != 32 || y.len() != 32 {
@@ -745,7 +766,7 @@ fn public_jwk(x: &[u8], y: &[u8]) -> Result<crate::jwt::PublicJwk, RequestObject
             "a P-256 coordinate is exactly 32 bytes".into(),
         ));
     }
-    crate::jwt::PublicJwk::from_coordinates(&URL_SAFE_NO_PAD.encode(x), &URL_SAFE_NO_PAD.encode(y))
+    crate::jwt::Jwk::from_coordinates(&URL_SAFE_NO_PAD.encode(x), &URL_SAFE_NO_PAD.encode(y))
         .map_err(|_| RequestObjectKeyError("a P-256 coordinate is exactly 32 bytes".into()))
 }
 
@@ -1172,6 +1193,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Verify a JWS-signed request object and extract its authorization request parameters
     /// (RFC 9101 section 6.2 and section 6.3).
     ///
+    /// Refuses any object larger than [`MAX_REQUEST_OBJECT_BYTES`] before decoding it.
+    ///
     /// `client_id` is the client the request CLAIMS to be, taken from the authenticated client at
     /// the PAR endpoint or from the `client_id` query parameter at the authorization endpoint
     /// (RFC 9101 section 5 makes it REQUIRED there). It selects the verification key, and section
@@ -1189,6 +1212,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             return Err(ErrorResponse::new(ErrorCode::RequestNotSupported)
                 .with_description("this server does not accept signed request objects"));
         }
+        // Refuse on SIZE before any decode, parse or hash, the same size-first bound every other
+        // untrusted-JWS entry in this crate makes (`MAX_PROOF_BYTES`, `MAX_ASSERTION_BYTES`,
+        // `MAX_AUTHORIZATION_DETAILS_BYTES`). This function is reached UNAUTHENTICATED through the
+        // browser-facing `GET /authorize` `request` parameter, which no body cap bounds (see
+        // `crate::http::MAX_BODY_BYTES`); without this, an uncapped object is base64-decoded and
+        // SHA-256 hashed in full for a signature check that will fail, buying O(n) CPU and
+        // allocation per request.
+        if request_object.len() > MAX_REQUEST_OBJECT_BYTES {
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                .with_description("the request object exceeds the maximum accepted size"));
+        }
         let keys = self.hooks().request_object_keys().ok_or_else(|| {
             // A server with no key source cannot check a signature, and "cannot check" must never
             // read as "checked out".
@@ -1199,18 +1233,29 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             ErrorResponse::new(ErrorCode::InvalidRequestObject)
                 .with_description("the client registered no request object key")
         })?;
-        // The SAME refusal shape, one seam along: with no ES256 backend installed this server
-        // cannot check the signature, and a server that cannot check a signature must never behave
-        // as though it had checked one. Resolved before any segment is decoded, so an unverifiable
-        // request object costs an unauthenticated caller nothing but the lookup.
-        let verifier = self.es256_verifier().ok_or_else(|| {
+        // The SAME refusal shape, one seam along: with no verifier installed for the registered
+        // algorithm this server cannot check the signature, and a server that cannot check a
+        // signature must never behave as though it had checked one. Resolved before any segment is
+        // decoded, so an unverifiable request object costs an unauthenticated caller nothing but
+        // the lookup.
+        let verifier = self.jws_verifier(registered.alg()).ok_or_else(|| {
             ErrorResponse::new(ErrorCode::InvalidRequestObject)
-                .with_description("no ES256 verifier is installed")
+                .with_description("no verifier is installed for the registered algorithm")
         })?;
 
         // RFC 7515 section 3.1 compact serialization: exactly three parts. A five-part token is a
         // JWE, which RFC 9101 section 6.1 defines and this server does not implement; refusing it
         // by shape is what stops it being read as an unsigned JWS.
+        //
+        // THE PARSE IS STAGED BY HAND rather than through [`crate::jwt::CompactJws::parse`], and
+        // that is a deliberate exception to this crate's one-parser rule. Two properties this path
+        // owes callers cannot be expressed on `CompactJws`, which decodes and JSON-parses all three
+        // segments up front: (1) a per-SEGMENT base64url refusal ("the header is not base64url" vs
+        // "the payload is not base64url" vs "the signature is not base64url"), and (2) the PAYLOAD
+        // being decoded only AFTER the signature verifies, so a spoiled payload surfaces as a
+        // signature failure rather than as a parse error a caller could read before authentication.
+        // `tests/refusal_cost.rs` pins both. The one thing that DID move onto the new machinery is
+        // the algorithm gate below, which is where the confusion attacks live.
         let mut parts = request_object.split('.');
         let (header_b64, payload_b64, signature_b64) =
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -1228,30 +1273,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         .with_description("the header is not JSON")
                 },
             )?;
-        let alg = header
-            .get("alg")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                ErrorResponse::new(ErrorCode::InvalidRequestObject)
-                    .with_description("the header has no alg")
-            })?;
 
         // RFC 7515 section 4.1.11 `crit`. Same rule as `CompactJws::reject_unknown_crit`, spelled
-        // out here because this path parses the header by hand (it must read `alg` and `kid`
-        // BEFORE choosing a verifier, so it cannot go through `CompactJws::parse` first). The two
-        // must stay in agreement; if this path ever moves onto `CompactJws`, delete this and call
-        // that.
-        //
-        // A JWS whose header names an extension the recipient does
-        // not understand is INVALID, unconditionally: the point of the member is that the producer
-        // is saying "this one changes the meaning, refuse me if you cannot process it". This
-        // verifier implements NO extensions, so any `crit` at all is a refusal, and the empty
-        // array is a refusal too because the section forbids it ("MUST NOT be used ... with an
-        // empty list").
-        //
-        // Checked BEFORE `alg`, and before any signature work, for the same reason `alg` is checked
-        // before the signature: a header that says the recipient cannot process this object is
-        // answered without spending an ECDSA verification on it.
+        // out here because this path parses the header by hand (it reads `alg` and `kid` before
+        // choosing a verifier). A JWS whose header names an extension the recipient does not
+        // understand is INVALID unconditionally, and the empty array is a refusal too because the
+        // section forbids it. Checked BEFORE the algorithm, and before any signature work.
         match header.get("crit") {
             None => {}
             Some(serde_json::Value::Array(names)) => {
@@ -1273,11 +1300,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             }
         }
 
-        // THE algorithm check. The registration decides; the header only gets to agree with it.
-        // This is what makes `alg: none` and every other substitution (RFC 8725 sections 3.1 and
-        // 3.2) a refusal rather than a verification path, and it is the reason `alg` is compared
-        // BEFORE any signature work is attempted.
-        if alg != registered.alg.as_str() {
+        // THE algorithm check, through the new algorithm-tagged machinery. The REGISTRATION decides
+        // and the header only gets to agree with it: `classify_alg` maps the header `alg` to the
+        // one wired [`crate::jwt::JwsAlg`] it names, or to `None` for `alg: none`, any HMAC, and
+        // every substitution (RFC 8725 sections 3.1 and 3.2). A `None`, or a `Some(other)`, is a
+        // refusal rather than a verification path, and this is compared BEFORE any signature work.
+        // (This site reads the header `alg` directly rather than through `expect_alg`, which takes a
+        // `CompactJws` this staged parse deliberately does not build; the security property — the
+        // registration, never the token, chooses the algorithm — is identical.)
+        let alg = header
+            .get("alg")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ErrorResponse::new(ErrorCode::InvalidRequestObject)
+                    .with_description("the header has no alg")
+            })?;
+        if crate::jwt::classify_alg(alg) != Some(registered.alg()) {
             return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
                 .with_description("alg does not match the algorithm registered for this client"));
         }
@@ -1311,15 +1349,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let signature = decode_segment(signature_b64, SIGNATURE_NOT_BASE64URL)?;
         // The JWS Signing Input is the ASCII of "header.payload" (RFC 7515 section 5.2 step 8),
         // taken from the ORIGINAL text rather than re-encoded: re-encoding would verify a
-        // normalisation of the token instead of the token, which is how a signature check gets
-        // decoupled from what it is supposed to be checking.
+        // normalisation of the token instead of the token.
         let signing_input = &request_object.as_bytes()[..header_b64.len() + 1 + payload_b64.len()];
         if !verifier.verify(&registered.key, signing_input, &signature) {
             return Err(ErrorResponse::new(ErrorCode::InvalidRequestObject)
                 .with_description("the signature did not verify"));
         }
 
-        // Only now is anything in the payload worth reading.
+        // Only now is anything in the payload worth reading — decoded AFTER the signature verifies,
+        // so a spoiled payload is a signature failure rather than a parse error read before auth.
         let payload: serde_json::Value =
             serde_json::from_slice(&decode_segment(payload_b64, PAYLOAD_NOT_BASE64URL)?).map_err(
                 |_| {
@@ -1360,7 +1398,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // authorization server, replayed here by whoever intercepted it, is the mix-up that `aud`
         // exists to stop. When it does not, the object is still accepted, because SHOULD is not
         // MUST and refusing would break conforming clients.
-        if let Some(aud) = payload.get("aud") {
+        if let Some(aud) = claims.get("aud") {
             let issuer = self.issuer_identifier();
             let addressed_here = match aud {
                 serde_json::Value::String(one) => one == issuer,
@@ -1406,7 +1444,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // these with `as_u64`, which answers `None` for every legal non-integer spelling and every
         // illegal one alike, and then treated both as "the claim is absent".
         let numeric_date = |name: &str| -> Result<Option<f64>, ErrorResponse> {
-            match payload.get(name) {
+            match claims.get(name) {
                 None => Ok(None),
                 Some(v) => v.as_f64().map(Some).ok_or_else(|| {
                     ErrorResponse::new(ErrorCode::InvalidRequestObject).with_description(format!(

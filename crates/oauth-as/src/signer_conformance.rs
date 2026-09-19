@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
-//! A RUNNABLE conformance harness for the [`Es256Signer`] and [`Es256Verifier`] contracts, behind
+//! A RUNNABLE conformance harness for the [`JwsSigner`] and [`JwsVerifier`] contracts, behind
 //! the `test-util` cargo feature (off by default), for a HOST to run from its OWN test suite
 //! against the backend it is about to deploy.
+//!
+//! It validates ES256, RS256 and EdDSA (Ed25519) backends: [`SignerConformance::run`] dispatches on
+//! the signer's own [`JwsSigner::alg`] and selects the matching published RFC known-answer vector
+//! (RFC 7515 appendix A.3 for ES256, appendix A.2 for RS256, RFC 8037 appendix A.4 for EdDSA),
+//! signature width, and public-JWK key kind. The ES256-only encoding hazards — the ASN.1 DER
+//! versus fixed-width `r || s` ambiguity of RFC 7518 section 3.4, and the off-curve public key —
+//! are checked for an ES256 signer and skipped for RS256/EdDSA, which have neither.
 //!
 //! # Why this exists
 //!
@@ -24,7 +31,7 @@
 //!   KMS that hashes it again, or one that signs a digest where the API wanted a message, produces
 //!   64 well-formed bytes that verify against nothing.
 //! - **A `public_jwk()` that is not the public half of the signing key.** A copy-pasted JWK, or a
-//!   key rotated in the KMS while this process cached the old public half (see [`Es256Signer`] on
+//!   key rotated in the KMS while this process cached the old public half (see [`JwsSigner`] on
 //!   why rotation must go through [`crate::jwt::JwtConfig::rotate_to`]). The JWKS then advertises a
 //!   key that does not sign, and EVERY token the deployment issues fails verification against its
 //!   own published document.
@@ -44,8 +51,8 @@
 //! ```no_run
 //! use oauth_as::signer_conformance::SignerConformance;
 //!
-//! # use oauth_as::jwt::{Es256Signer, Es256Verifier};
-//! # async fn doc(my_signer: impl Es256Signer, my_verifier: impl Es256Verifier) {
+//! # use oauth_as::jwt::{JwsSigner, JwsVerifier};
+//! # async fn doc(my_signer: impl JwsSigner, my_verifier: impl JwsVerifier) {
 //! let violations = SignerConformance::new(my_signer, my_verifier).run().await;
 //! assert!(violations.is_empty(), "{violations:#?}");
 //! # }
@@ -65,15 +72,15 @@
 //! bytes it was handed, verifies under the key the signer publishes, and that the signer does not
 //! PANIC either.
 //!
-//! Those five are the exact list [`crate::jwt::Es256Verifier`]'s MUST NOT PANIC clause enumerates
+//! Those five are the exact list [`crate::jwt::JwsVerifier`]'s MUST NOT PANIC clause enumerates
 //! ("a zero-length signature, a 63-byte one, a 65-byte one, an off-curve key, an empty signing
 //! input"), and every one of them is reachable by an unauthenticated client, so a harness that
 //! presented only some of them left the rest enforced NOWHERE.
 //!
 //! WHAT IT DOES NOT PROVE:
 //!
-//! - **That the verifier checks the key is ON THE CURVE**, which [`crate::jwt::Es256Verifier`]
-//!   requires and which [`crate::jwt::PublicJwk`] deliberately does not do for it. The off-curve
+//! - **That the verifier checks the key is ON THE CURVE**, which [`crate::jwt::JwsVerifier`]
+//!   requires and which [`crate::jwt::Jwk`] deliberately does not do for it. The off-curve
 //!   key IS presented, so a verifier that decodes the point with an `unwrap` is caught, and that is
 //!   the failure that actually reaches production. What stays invisible is the quiet half: handed
 //!   an off-curve key and any signature, a verifier that VALIDATES and one that merely fails to
@@ -105,7 +112,7 @@ use std::panic::AssertUnwindSafe;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
-use crate::jwt::{Es256Signer, Es256Verifier, Jwk, PublicJwk, SignerError};
+use crate::jwt::{Jwk, JwsAlg, JwsSigner, JwsVerifier, OkpCurve, SignerError};
 
 /// One way in which a signer or a verifier failed its contract.
 ///
@@ -229,9 +236,9 @@ const OTHER_Y: &str = "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM";
 /// A pair of coordinates of the RIGHT WIDTH that is NOT a point on P-256: the appendix A.3 key's
 /// `x` with its `y` altered in the lowest bit.
 ///
-/// This is not a hypothetical input. [`crate::jwt::PublicJwk::from_json`] checks `kty`, `crv` and
+/// This is not a hypothetical input. [`crate::jwt::Jwk::from_json`] checks `kty`, `crv` and
 /// that each coordinate is exactly 32 bytes, and deliberately does NOT check the curve equation,
-/// because doing so would mean this crate carrying the arithmetic the [`Es256Verifier`] seam exists
+/// because doing so would mean this crate carrying the arithmetic the [`JwsVerifier`] seam exists
 /// to externalise. RFC 9449 section 4.3 hands the `jwk` straight out of a DPoP proof header, so
 /// these 64 bytes are whatever an unauthenticated client typed, and a verifier written
 /// `VerifyingKey::from_sec1_bytes(&sec1).unwrap()` PANICS on them while passing every other check
@@ -248,14 +255,105 @@ const OFF_CURVE_Y: &str = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a4";
 const INPUT_A: &str = "oauth-as.signer-conformance.a";
 const INPUT_B: &str = "oauth-as.signer-conformance.b";
 
-/// The [`Es256Signer`] and [`Es256Verifier`] conformance harness. See the module docs, in
+// ------------------------------------------------------------------ the RS256 vector (RFC 7515 A.2)
+
+/// The JWS Signing Input of RFC 7515 appendix A.2: `{"alg":"RS256"}` over the appendix's claim set.
+/// Quoted from the RFC, the same discipline as the A.3 ES256 vector above.
+const A2_SIGNING_INPUT: &str = concat!(
+    "eyJhbGciOiJSUzI1NiJ9",
+    ".",
+    "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+);
+/// The RFC 7515 appendix A.2 RSA public key modulus `n` (RFC 7518 base64urlUInt); `e` is `AQAB`.
+const A2_N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
+/// The RFC 7518 exponent shared by both RSA keys below (`AQAB` == 65537).
+const RSA_E: &str = "AQAB";
+/// The RFC 7515 appendix A.2 signature (256 bytes / 2048-bit modulus, base64url).
+const A2_SIGNATURE: &str = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+/// A second, well-formed 2048-bit RSA public key, used as the key an A.2 signature must NOT verify
+/// under. Generated offline; its private half is not this crate's, so it can only ever reject. The
+/// A.2 key is not reused for this job (that would pass the foreign-key check for the worst reason:
+/// a host whose signer IS the RFC example key), which is reported under its own check instead.
+const OTHER_RSA_N: &str = "4-QFArXj8EHf7YtUPQelHj3thYoTF0_9V1onh-E-UeHXjJoFS1Mfw_LKNhJD_lwHdefGCSdVuMGtFeXUNtN0XTA9_Z4Q2YSS0mVo_HM25e_phlKkk6Nxy7JfmSnto0O-enYCSIJx4MJ2NOqvpZrv0C8HRSilH5PJ9b82jnxV4n2153xQsTNBIVc5N9McB3TIF1zYh3O3h1fGfP3JsR6qLQerehoJc8FQ9bD_0y2CEpHLaeYn6qgv279-dQo-wuw3Xsj8loaqZW0WPyhjE9TZsaMM9SR3J7RBUf2fKvqki7tgIuiZQ7J0XeJ3rdsPsmF1hP7Muvre1MtPmeC_7VDlKQ";
+
+// ------------------------------------------------------------------ the EdDSA vector (RFC 8037 A.4)
+
+/// The JWS Signing Input of RFC 8037 appendix A.4: `{"alg":"EdDSA"}` over the payload
+/// `Example of Ed25519 signing`. Quoted from the RFC.
+const A4_SIGNING_INPUT: &str = "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc";
+/// The RFC 8037 appendix A.4 Ed25519 public key `x` (32 bytes, base64url).
+const A4_X: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+/// The RFC 8037 appendix A.4 signature (64 bytes, base64url).
+const A4_SIGNATURE: &str =
+    "hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg";
+/// A second, well-formed Ed25519 public key (RFC 8032 section 7.1 test 2), used as the foreign key,
+/// for the same reason the A.4 key is not reused for it.
+const OTHER_OKP_X: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+
+/// The published RFC known-answer vector for one algorithm, plus a same-KIND foreign key the
+/// signature must not verify under. [`SignerConformance::run`] selects one of these on the signer's
+/// own [`JwsSigner::alg`], so an RS256 or EdDSA backend is held to its own RFC vector rather than to
+/// the ES256 one.
+struct AlgProfile {
+    /// The JWS Signing Input the vector signs.
+    signing_input: &'static [u8],
+    /// The public key the vector verifies under.
+    vector_key: Jwk,
+    /// The RFC vector's signature octets.
+    vector_signature: Vec<u8>,
+    /// A second, well-formed key of the SAME kind, under which the vector must NOT verify.
+    foreign_key: Jwk,
+}
+
+fn rsa_jwk(n: &str) -> Jwk {
+    Jwk::Rsa {
+        n: n.to_string(),
+        e: RSA_E.to_string(),
+        kid: None,
+    }
+}
+
+fn okp_jwk(x: &str) -> Jwk {
+    Jwk::Okp {
+        crv: OkpCurve::Ed25519,
+        x: x.to_string(),
+        kid: None,
+    }
+}
+
+/// The [`AlgProfile`] for `alg`. Its constants are quoted from the cited RFC, so neither side of a
+/// host's deployment produced the vector it is checked against.
+fn alg_profile(alg: JwsAlg) -> AlgProfile {
+    match alg {
+        JwsAlg::Es256 => AlgProfile {
+            signing_input: A3_SIGNING_INPUT.as_bytes(),
+            vector_key: jwk(A3_X, A3_Y),
+            vector_signature: decode(A3_SIGNATURE),
+            foreign_key: jwk(OTHER_X, OTHER_Y),
+        },
+        JwsAlg::Rs256 => AlgProfile {
+            signing_input: A2_SIGNING_INPUT.as_bytes(),
+            vector_key: rsa_jwk(A2_N),
+            vector_signature: decode(A2_SIGNATURE),
+            foreign_key: rsa_jwk(OTHER_RSA_N),
+        },
+        JwsAlg::EdDsa => AlgProfile {
+            signing_input: A4_SIGNING_INPUT.as_bytes(),
+            vector_key: okp_jwk(A4_X),
+            vector_signature: decode(A4_SIGNATURE),
+            foreign_key: okp_jwk(OTHER_OKP_X),
+        },
+    }
+}
+
+/// The [`JwsSigner`] and [`JwsVerifier`] conformance harness. See the module docs, in
 /// particular the honest account of what a green run does not prove.
 pub struct SignerConformance<S, V> {
     signer: S,
     verifier: V,
 }
 
-impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
+impl<S: JwsSigner, V: JwsVerifier> SignerConformance<S, V> {
     /// Build a harness over the backend a host is about to install.
     ///
     /// BOTH halves, together, because that is how they are deployed and because the interesting
@@ -269,7 +367,17 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
     /// Run every check in [`CHECKS`] and return what failed. An empty vector is a pass.
     pub async fn run(&self) -> Vec<Violation> {
         let mut out = Vec::new();
-        self.check_verifier(&mut out);
+        match self.signer.alg() {
+            // ES256 carries encoding hazards RS256 and EdDSA do not: the ASN.1 DER versus
+            // fixed-width `r || s` ambiguity of RFC 7518 s3.4, and an off-curve public key. Its
+            // verifier checks are their own routine (below); RS256 and EdDSA share the
+            // algorithm-independent core, selected by the signer's own algorithm.
+            JwsAlg::Es256 => self.check_verifier(&mut out),
+            JwsAlg::Rs256 | JwsAlg::EdDsa => {
+                let profile = alg_profile(self.signer.alg());
+                self.check_verifier_generic(&profile, &mut out);
+            }
+        }
         self.check_signer(&mut out).await;
         out
     }
@@ -302,7 +410,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
     fn verify(
         &self,
         context: &str,
-        key: &PublicJwk,
+        key: &Jwk,
         signing_input: &[u8],
         signature: &[u8],
         out: &mut Vec<Violation>,
@@ -434,13 +542,13 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             });
         }
 
-        // THE OTHER TWO INPUTS THE CONTRACT NAMES. `Es256Verifier`'s MUST NOT PANIC clause lists
+        // THE OTHER TWO INPUTS THE CONTRACT NAMES. `JwsVerifier`'s MUST NOT PANIC clause lists
         // five: a zero-length signature, a 63-byte one, a 65-byte one, an OFF-CURVE KEY, and an
         // EMPTY SIGNING INPUT. The lengths are below; these two are here, and until they were
         // presented a verifier could panic on either one and collect a green run from this file.
         //
         // Both are unauthenticated-reachable. The key is the `jwk` member of a DPoP proof header,
-        // which `PublicJwk::from_json` width-checks and does not curve-check; the signing input is
+        // which `Jwk::from_json` width-checks and does not curve-check; the signing input is
         // empty for a JWS whose first two segments are empty, which parses.
         //
         // A `true` here is reported under the rejection check it violates rather than under a name
@@ -457,7 +565,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             out.push(Violation {
                 check: VERIFIER_REJECTS_A_FOREIGN_KEY,
                 detail: "a signature verified under coordinates that are NOT a point on P-256. \
-                         PublicJwk only width-checks the coordinates, so the curve check is the \
+                         Jwk only width-checks the coordinates, so the curve check is the \
                          verifier's, and it is what an invalid-curve attack needs to find missing"
                     .to_string(),
             });
@@ -483,7 +591,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
     ///
     /// That was the harness failing at exactly its own stated purpose. The host's backend is
     /// unreachable from this crate's tests, so an obligation this harness does not exercise is
-    /// enforced NOWHERE, and the obligation in question is the one [`crate::jwt::Es256Verifier`]
+    /// enforced NOWHERE, and the obligation in question is the one [`crate::jwt::JwsVerifier`]
     /// states most explicitly. Worse, it is the obligation whose input is reachable by anyone:
     /// `signature` is the third JWS segment base64url-decoded, so a DPoP proof, a request object or
     /// a client assertion ending in a bare `.` hands the verifier a ZERO-LENGTH slice, and a 4
@@ -492,12 +600,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
     /// The cases are DERIVED FROM THE VALID SIGNATURE rather than made of random bytes, so the only
     /// thing wrong with each one is its length: a verifier that rejects them for being noise would
     /// prove nothing about a verifier that pads. Every one must be `false`.
-    fn check_wrong_length_signatures(
-        &self,
-        key: &PublicJwk,
-        signature: &[u8],
-        out: &mut Vec<Violation>,
-    ) {
+    fn check_wrong_length_signatures(&self, key: &Jwk, signature: &[u8], out: &mut Vec<Violation>) {
         // 65 bytes is the valid signature with one trailing zero, which is what an encoder that
         // emits a length prefix or a DER-style sign pad produces; a verifier that reads a 64-byte
         // PREFIX and ignores the rest accepts it.
@@ -510,7 +613,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         let leading_zero = decode(LEADING_ZERO_SIGNATURE);
         let a3 = A3_SIGNING_INPUT.as_bytes();
 
-        let cases: [(&str, &PublicJwk, &[u8], &[u8]); 6] = [
+        let cases: [(&str, &Jwk, &[u8], &[u8]); 6] = [
             // The one that arrives from the wire for free: a token ending in a bare `.`.
             ("0 bytes (an empty third JWS segment)", key, a3, &[]),
             ("1 byte", key, a3, &signature[..1]),
@@ -558,12 +661,128 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         }
     }
 
+    /// The RS256/EdDSA verifier routine: the algorithm-independent core of [`check_verifier`], run
+    /// against the profile's published RFC vector. It presents the known-answer test, the same
+    /// three rejections (a foreign key, a tampered signing input, a tampered signature), the empty
+    /// signing input, and three wrong LENGTHS (zero, one short, one long). It omits the two checks
+    /// that are meaningful only for ES256: the DER re-encoding (RS256 and EdDSA have a single
+    /// canonical signature form, no DER-versus-raw ambiguity) and the off-curve key (RSA has no
+    /// curve, and an Ed25519 point is validated by the verifier's own decode).
+    fn check_verifier_generic(&self, profile: &AlgProfile, out: &mut Vec<Violation>) {
+        let key = &profile.vector_key;
+        let signature = &profile.vector_signature;
+        let input = profile.signing_input;
+        let alg = self.signer.alg().jose_name();
+
+        // The known-answer test, from a vector neither side of the deployment produced.
+        if !self.verify(
+            "the published RFC known-answer vector",
+            key,
+            input,
+            signature,
+            out,
+        ) {
+            out.push(Violation {
+                check: VERIFIER_RFC7515_A3,
+                detail: format!(
+                    "the published {alg} RFC known-answer vector did not verify. Either the \
+                     verifier is not {alg}, or it expects a signature encoding this crate does not \
+                     produce"
+                ),
+            });
+        }
+
+        // The three rejections: a key it should not use, a message it should cover, a signature it
+        // should check. Each is a separate defect with a separate blast radius.
+        if self.verify(
+            "the vector under a foreign key",
+            &profile.foreign_key,
+            input,
+            signature,
+            out,
+        ) {
+            out.push(Violation {
+                check: VERIFIER_REJECTS_A_FOREIGN_KEY,
+                detail:
+                    "a valid signature verified under a DIFFERENT public key of the same kind. \
+                         The verifier is not using the key it was given, so no token is bound to \
+                         any issuer"
+                        .to_string(),
+            });
+        }
+
+        let mut tampered = input.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        if self.verify("a tampered signing input", key, &tampered, signature, out) {
+            out.push(Violation {
+                check: VERIFIER_REJECTS_A_TAMPERED_INPUT,
+                detail: "a signature verified over a signing input that was not the one signed. \
+                         The verifier is not covering the whole message, so a token's claims can \
+                         be edited without invalidating it"
+                    .to_string(),
+            });
+        }
+
+        let mut bad_signature = signature.clone();
+        bad_signature[0] ^= 0x01;
+        if self.verify("a byte-flipped signature", key, input, &bad_signature, out) {
+            out.push(Violation {
+                check: VERIFIER_REJECTS_A_TAMPERED_SIGNATURE,
+                detail: "a corrupted signature verified. The verifier is not checking the \
+                         signature at all, which makes every unsigned token a valid one"
+                    .to_string(),
+            });
+        }
+
+        // The empty signing input a JWS whose first two segments are empty produces.
+        if self.verify("an EMPTY signing input", key, &[], signature, out) {
+            out.push(Violation {
+                check: VERIFIER_REJECTS_A_TAMPERED_INPUT,
+                detail: "a valid signature verified over an EMPTY signing input. The verifier is \
+                         not hashing the message it was handed, so a signature made over one token \
+                         is good for every other"
+                    .to_string(),
+            });
+        }
+
+        // Wrong LENGTHS, derived from the valid signature so the only thing wrong with each is its
+        // length. A fixed-width scheme (EdDSA: 64 bytes) and RS256 (the modulus length) both admit
+        // exactly one width; the zero-length case is the one a token ending in a bare `.` produces.
+        let mut too_long = signature.clone();
+        too_long.push(0x00);
+        let truncated = &signature[..signature.len() - 1];
+        let cases: [(&str, &[u8]); 3] = [
+            ("0 bytes (an empty third JWS segment)", &[]),
+            ("the valid signature truncated by one byte", truncated),
+            ("the valid signature with a trailing zero byte", &too_long),
+        ];
+        for (description, wrong) in cases {
+            if self.verify(
+                &format!("a wrong-length signature: {description}"),
+                key,
+                input,
+                wrong,
+                out,
+            ) {
+                out.push(Violation {
+                    check: VERIFIER_REJECTS_A_WRONG_LENGTH_SIGNATURE,
+                    detail: format!(
+                        "a signature of {description} VERIFIED. A {alg} signature has one width \
+                         (64 bytes for EdDSA; the RSA modulus length for RS256), so anything else \
+                         must be false"
+                    ),
+                });
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------- the signer
 
     /// EVERY call this harness makes to the signer under test goes through here, and a PANIC is
     /// reported as [`SIGNER_DOES_NOT_PANIC`] and then handed on as an `Err`.
     ///
-    /// [`crate::jwt::Es256Signer::sign`] says "**MUST NOT PANIC, for any input, ever**" and says
+    /// [`crate::jwt::JwsSigner::sign`] says "**MUST NOT PANIC, for any input, ever**" and says
     /// why: a panic unwinds out of `JwtConfig::sign_access_token` and into the host's token
     /// endpoint, where a runtime that aborts takes the whole server down and one that does not
     /// leaves a poisoned task. Until this existed, that clause was checked NOWHERE — the verifier
@@ -591,7 +810,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         context: &str,
         signing_input: &[u8],
         out: &mut Vec<Violation>,
-    ) -> Result<[u8; 64], SignerError> {
+    ) -> Result<Vec<u8>, SignerError> {
         let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
             Box::pin(self.signer.sign(signing_input))
         }));
@@ -608,7 +827,11 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             Err(_) => None,
         };
         match signed {
-            Some(result) => result,
+            // The wire octets, whatever their width: 64 bytes for ES256/EdDSA, the modulus length
+            // for RS256. The per-algorithm width contract is enforced by the wrong-length checks and
+            // by verification, not here, so this returns the bytes as produced.
+            Some(Ok(signature)) => Ok(signature.as_bytes().to_vec()),
+            Some(Err(e)) => Err(e),
             None => {
                 out.push(Violation {
                     check: SIGNER_DOES_NOT_PANIC,
@@ -628,6 +851,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
     }
 
     async fn check_signer(&self, out: &mut Vec<Violation>) {
+        let profile = alg_profile(self.signer.alg());
         let published = self.signer.public_jwk();
 
         // Shape first, because every check below reads this key and a malformed one would make
@@ -637,7 +861,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         // RFC 7515 s4.1.4: the `kid` is what lets a verifier SELECT rather than trial, and it is
         // what makes `JwtConfig::rotate_to` non-destructive. A signer with no name for its key
         // gives a deployment no rotation story at all.
-        if published.kid.is_empty() {
+        if published.kid().unwrap_or_default().is_empty() {
             out.push(Violation {
                 check: SIGNER_PUBLIC_JWK_HAS_A_KID,
                 detail: "public_jwk().kid is empty. Every token this server signs carries it \
@@ -660,14 +884,21 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             });
         }
 
-        // The RFC's own example key has its PRIVATE half printed in appendix A.3.1. A deployment
-        // signing with it is not signing with anything.
-        if published.x == A3_X && published.y == A3_Y {
+        // The RFC's own example key has its PRIVATE half printed in the appendix. A deployment
+        // signing with it is not signing with anything. The comparison is per algorithm: the ES256
+        // example is RFC 7515 A.3, RS256 is RFC 7515 A.2, EdDSA is RFC 8037 A.4.
+        let is_published_example_key = match self.signer.alg() {
+            JwsAlg::Es256 => published.x() == A3_X && published.y() == A3_Y,
+            JwsAlg::Rs256 => {
+                matches!(&published, Jwk::Rsa { n, e, .. } if n.as_str() == A2_N && e.as_str() == RSA_E)
+            }
+            JwsAlg::EdDsa => matches!(&published, Jwk::Okp { x, .. } if x.as_str() == A4_X),
+        };
+        if is_published_example_key {
             out.push(Violation {
                 check: SIGNER_IS_NOT_THE_PUBLISHED_EXAMPLE_KEY,
-                detail: "the signing key is the RFC 7515 appendix A.3 example key, whose private \
-                         half is printed in the RFC. Anyone can forge every token this server \
-                         issues"
+                detail: "the signing key is the published RFC example key, whose private half is \
+                         printed in the RFC. Anyone can forge every token this server issues"
                     .to_string(),
             });
         }
@@ -699,7 +930,16 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         // from its total length. Two fixed bytes plus a plausible length is about one chance in
         // two million of a false accusation against a random R || S, and the check is advisory
         // anyway: `signer/verifies_under_its_own_public_jwk` catches this too, less legibly.
-        if signature[0] == 0x30 && signature[2] == 0x02 && (0x40..=0x48).contains(&signature[1]) {
+        //
+        // ES256 ONLY: the DER-versus-raw ambiguity is specific to ECDSA's `r || s`. RS256 and EdDSA
+        // each have a single canonical signature form, so there is nothing here for them to get
+        // wrong, and their signatures are not the 64 bytes this heuristic reads.
+        if self.signer.alg() == JwsAlg::Es256
+            && signature.len() >= 3
+            && signature[0] == 0x30
+            && signature[2] == 0x02
+            && (0x40..=0x48).contains(&signature[1])
+        {
             out.push(Violation {
                 check: SIGNER_IS_NOT_DER,
                 detail: "the signature looks like an ASN.1 DER SEQUENCE (it begins 0x30 with a \
@@ -710,7 +950,7 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
             });
         }
 
-        let public = published.to_public_jwk();
+        let public = published.clone();
         if !self.verify(
             "the signer's own signature under its own JWK",
             &public,
@@ -720,17 +960,19 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         ) {
             out.push(Violation {
                 check: SIGNER_VERIFIES_UNDER_ITS_OWN_JWK,
-                detail: "the signature did not verify under the signer's OWN public_jwk(). Either \
-                         public_jwk() is not the public half of the signing key, or the signature \
-                         is not ES256 over the bytes it was handed. Every token this server \
-                         issues would fail verification against its own published JWKS"
-                    .to_string(),
+                detail: format!(
+                    "the signature did not verify under the signer's OWN public_jwk(). Either \
+                     public_jwk() is not the public half of the signing key, or the signature is \
+                     not {} over the bytes it was handed. Every token this server issues would \
+                     fail verification against its own published JWKS",
+                    self.signer.alg().jose_name()
+                ),
             });
         }
 
         if self.verify(
             "the signer's own signature under a foreign key",
-            &jwk(OTHER_X, OTHER_Y),
+            &profile.foreign_key,
             INPUT_A.as_bytes(),
             &signature,
             out,
@@ -804,38 +1046,50 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
         let mut wrong = Vec::new();
         // RFC 7518 s6.2 and RFC 7517 s4.2/s4.4. These are the members a resource server reads to
         // decide whether it can use the key at all, so a wrong one makes the JWKS unusable even
-        // though the arithmetic underneath it is right.
-        if published.kty != "EC" {
-            wrong.push(format!("kty is {:?}, must be \"EC\"", published.kty));
+        // though the arithmetic underneath it is right. The seam is algorithm-tagged now, so the
+        // key's kind is checked against the signer's OWN algorithm rather than against a fixed
+        // "ES256": a Phase B/C RS256 signer must publish an RSA key, not an EC one.
+        let alg = self.signer.alg();
+        if published.key_kind() != alg.key_kind() {
+            wrong.push(format!(
+                "public_jwk() is a {:?} key but the signer's algorithm {} needs a {:?} key",
+                published.key_kind(),
+                alg.jose_name(),
+                alg.key_kind()
+            ));
         }
-        if published.crv != "P-256" {
-            wrong.push(format!("crv is {:?}, must be \"P-256\"", published.crv));
-        }
-        if published.alg != "ES256" {
-            wrong.push(format!("alg is {:?}, must be \"ES256\"", published.alg));
-        }
-        if published.use_ != "sig" {
-            wrong.push(format!("use is {:?}, must be \"sig\"", published.use_));
-        }
-        // RFC 7518 s6.2.1.2 fixes the octet length at the curve's field size and requires leading
-        // zeros to be KEPT. A trimmed coordinate is a different point, and it is the classic JWK
-        // interoperability bug: it works for 255 keys out of 256 and then does not.
-        for (name, value) in [("x", &published.x), ("y", &published.y)] {
-            match URL_SAFE_NO_PAD.decode(value) {
-                Ok(bytes) if bytes.len() == 32 => {}
-                Ok(bytes) => wrong.push(format!(
-                    "{name} decodes to {} bytes, must be exactly 32 with leading zeros kept \
-                     (RFC 7518 s6.2.1.2)",
-                    bytes.len()
-                )),
-                Err(_) => wrong.push(format!("{name} is not unpadded base64url")),
+        // The remaining members, per key TYPE. For ES256 (and EdDSA) RFC 7518 s6.2.1.2 / RFC 8037
+        // s2 fix each coordinate at exactly 32 octets with leading zeros KEPT — a trimmed coordinate
+        // is a different point, the classic JWK interoperability bug that works for 255 keys out of
+        // 256 and then does not. For RS256 the RFC 7518 s6.3.1 base64urlUInt `n`/`e` have no fixed
+        // width, so only their encoding is checked here; the `length == modulus` guard is the
+        // verifier's, per key.
+        match alg {
+            JwsAlg::Es256 => {
+                for (name, value) in [("x", published.x()), ("y", published.y())] {
+                    check_32_byte_coordinate(name, value, &mut wrong);
+                }
+            }
+            JwsAlg::EdDsa => check_32_byte_coordinate("x", published.x(), &mut wrong),
+            JwsAlg::Rs256 => {
+                if let Jwk::Rsa { n, e, .. } = published {
+                    for (name, value) in [("n", n.as_str()), ("e", e.as_str())] {
+                        match URL_SAFE_NO_PAD.decode(value) {
+                            Ok(bytes) if !bytes.is_empty() => {}
+                            _ => wrong.push(format!(
+                                "{name} is not a non-empty base64urlUInt (RFC 7518 s6.3.1)"
+                            )),
+                        }
+                    }
+                }
             }
         }
         if !wrong.is_empty() {
             out.push(Violation {
                 check: SIGNER_PUBLIC_JWK_IS_ES256,
                 detail: format!(
-                    "public_jwk() is not a usable ES256 JWK: {}",
+                    "public_jwk() is not a usable {} JWK: {}",
+                    alg.jose_name(),
                     wrong.join("; ")
                 ),
             });
@@ -843,11 +1097,25 @@ impl<S: Es256Signer, V: Es256Verifier> SignerConformance<S, V> {
     }
 }
 
+/// RFC 7518 s6.2.1.2 / RFC 8037 s2: a P-256 coordinate or an Ed25519 public key is exactly 32
+/// base64url-decoded octets, leading zeros kept. Appends a human-readable reason to `wrong` when it
+/// is not.
+fn check_32_byte_coordinate(name: &str, value: &str, wrong: &mut Vec<String>) {
+    match URL_SAFE_NO_PAD.decode(value) {
+        Ok(bytes) if bytes.len() == 32 => {}
+        Ok(bytes) => wrong.push(format!(
+            "{name} decodes to {} bytes, must be exactly 32 with leading zeros kept",
+            bytes.len()
+        )),
+        Err(_) => wrong.push(format!("{name} is not unpadded base64url")),
+    }
+}
+
 /// One of the harness's own fixed keys. The coordinates are constants in this file, so a failure
 /// here would be a defect in the harness rather than in the backend under test, which is why it
 /// panics rather than reporting a violation against the host.
-fn jwk(x: &str, y: &str) -> PublicJwk {
-    PublicJwk::from_coordinates(x, y).expect("the harness's own fixed vectors are well formed")
+fn jwk(x: &str, y: &str) -> Jwk {
+    Jwk::from_coordinates(x, y).expect("the harness's own fixed vectors are well formed")
 }
 
 fn decode(b64: &str) -> Vec<u8> {
@@ -895,7 +1163,7 @@ mod tests {
 
     /// `der` encodes an all-zero 32-byte integer as the single zero octet: `02 01 00`.
     ///
-    /// Kills `signer_conformance.rs:872 replace - with +` and `replace - with /` in `der::integer`.
+    /// Kills `replace - with +` and `replace - with /` in `der::integer`.
     /// `position(|b| *b != 0)` returns `None` only for an all-zero coordinate, and
     /// `unwrap_or(value.len() - 1)` is what keeps the single trailing zero as the integer's body.
     /// `value.len() + 1` indexes one past the end (`&value[33..]` on a 32-byte half panics), and

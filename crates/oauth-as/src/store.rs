@@ -900,7 +900,7 @@ pub trait Storage: Send + Sync {
     ///
     /// This is the write that makes revocation mean something under concurrency. A token minted
     /// from a grant that was revoked while the signature was being computed is a token the user
-    /// was told did not exist, and with a host `Es256Signer` fronting a KMS that window is a
+    /// was told did not exist, and with a host `JwsSigner` fronting a KMS that window is a
     /// network round trip wide.
     fn put_token(
         &self,

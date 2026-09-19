@@ -493,7 +493,7 @@ async fn a_rotation_survives_an_absurd_reuse_window_rather_than_panicking() {
 #[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
 #[test]
 fn the_dummy_assertion_material_costs_a_complete_es256_verification() {
-    use crate::jwt::Es256Verifier as _;
+    use crate::jwt::JwsVerifier as _;
     assert!(
         crate::jwt::P256Verifier.verify(
             &dummy_assertion_key(),
@@ -502,6 +502,175 @@ fn the_dummy_assertion_material_costs_a_complete_es256_verification() {
         ),
         "the dummy signature must verify under the dummy key, or the verification short-circuits"
     );
+}
+
+/// The per-algorithm dummy material must reach the FULL verification for each wired algorithm, the
+/// same property the ES256 test above checks: a signature of the wrong WIDTH, or a key of the wrong
+/// KIND, is refused in a length or format guard for a fraction of the real cost, which is the timing
+/// leak `dummy_assertion_verify` exists to close, reintroduced one algorithm at a time. The RS256
+/// signature is the 2048-bit modulus width (256 bytes) so the verifier's `sig.len() == modulus`
+/// guard passes and the modular exponentiation runs; the EdDSA signature is a real 64-byte one so
+/// `verify_strict` reaches the scalar multiplication. Neither is ACCEPTED — the material is a COST,
+/// not a credential — so the shape is what is checked here, plus a no-panic drive through the
+/// crate's own backend wherever one is compiled.
+#[cfg(feature = "client-assertion")]
+#[test]
+fn the_per_algorithm_dummy_material_has_the_width_each_verifier_requires() {
+    use crate::jwt::{Jwk, JwsAlg};
+
+    let (es_key, es_sig) = dummy_assertion_material(JwsAlg::Es256);
+    assert!(matches!(es_key, Jwk::Ec { .. }));
+    assert_eq!(es_sig.len(), 64, "an ES256 signature is the 64-byte r||s");
+
+    let (rs_key, rs_sig) = dummy_assertion_material(JwsAlg::Rs256);
+    assert!(matches!(rs_key, Jwk::Rsa { .. }));
+    assert_eq!(
+        rs_sig.len(),
+        256,
+        "an RS256 signature is the 2048-bit modulus width"
+    );
+
+    let (ed_key, ed_sig) = dummy_assertion_material(JwsAlg::EdDsa);
+    assert!(matches!(ed_key, Jwk::Okp { .. }));
+    assert_eq!(ed_sig.len(), 64, "an Ed25519 signature is 64 bytes");
+
+    // Where the backend is compiled, drive it: the material must run to a (false) answer without
+    // panicking, which is "complete verification" observed at runtime.
+    #[cfg(feature = "jwt-rsa")]
+    {
+        use crate::jwt::JwsVerifier as _;
+        assert!(
+            !crate::backends::rsa::RsaVerifier.verify(
+                &rs_key,
+                DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
+                &rs_sig,
+            ),
+            "the RS256 dummy is a cost, not a credential: it must not verify"
+        );
+    }
+    #[cfg(feature = "jwt-ed25519")]
+    {
+        use crate::jwt::JwsVerifier as _;
+        assert!(
+            !crate::backends::ed25519::Ed25519Verifier.verify(
+                &ed_key,
+                DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
+                &ed_sig,
+            ),
+            "the EdDSA dummy is a cost, not a credential: it must not verify"
+        );
+    }
+}
+
+/// The dummy verification a refused assertion pays must go through the verifier for the algorithm
+/// the PRESENTED assertion header names, not a hardcoded one. Timing cannot be unit tested, so this
+/// is the STRUCTURAL check underneath it: two counting verifiers are installed, and the dummy is
+/// driven for each algorithm in turn; each call must land on exactly the verifier for the algorithm
+/// it was handed. A regression to the old ES256-hardcoded shape sends the RS256 call to the ES256
+/// verifier and this goes red.
+#[cfg(all(feature = "client-assertion", feature = "jwt"))]
+#[test]
+fn the_dummy_assertion_verification_uses_the_presented_algorithms_verifier() {
+    use crate::jwt::{Jwk, JwsAlg, JwsVerifier};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingVerifier {
+        alg: JwsAlg,
+        count: Arc<AtomicUsize>,
+    }
+    impl JwsVerifier for CountingVerifier {
+        fn alg(&self) -> JwsAlg {
+            self.alg
+        }
+        fn verify(&self, _key: &Jwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    let es = Arc::new(AtomicUsize::new(0));
+    let rs = Arc::new(AtomicUsize::new(0));
+    let srv = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        crate::store::MemoryStorage::new(),
+    )
+    .with_jws_verifier(Arc::new(CountingVerifier {
+        alg: JwsAlg::Es256,
+        count: es.clone(),
+    }))
+    .with_jws_verifier(Arc::new(CountingVerifier {
+        alg: JwsAlg::Rs256,
+        count: rs.clone(),
+    }));
+
+    // An RS256 header must drive the RS256 dummy and nothing else.
+    srv.dummy_assertion_verify(Some(JwsAlg::Rs256));
+    assert_eq!(
+        rs.load(Ordering::SeqCst),
+        1,
+        "an RS256 assertion must pay an RS256 verification"
+    );
+    assert_eq!(
+        es.load(Ordering::SeqCst),
+        0,
+        "the presented alg, not a hardcoded ES256, decides the dummy"
+    );
+
+    // An ES256 header drives the ES256 dummy and does not re-run the RS256 one.
+    srv.dummy_assertion_verify(Some(JwsAlg::Es256));
+    assert_eq!(es.load(Ordering::SeqCst), 1, "an ES256 header drives ES256");
+    assert_eq!(rs.load(Ordering::SeqCst), 1, "and leaves RS256 untouched");
+
+    // A None (HS256 / client_secret_jwt, or an alg with no installed verifier) touches neither
+    // asymmetric verifier: it pays the HMAC fallback instead.
+    srv.dummy_assertion_verify(None);
+    assert_eq!(
+        (es.load(Ordering::SeqCst), rs.load(Ordering::SeqCst)),
+        (1, 1),
+        "the HMAC fallback goes through no installed JwsVerifier"
+    );
+}
+
+/// [`AuthorizationServer::presented_assertion_alg`] reads the header's `alg` and routes exactly the
+/// three wired asymmetric algorithms, refusing everything a `JwsVerifier` cannot: an HMAC, `none`,
+/// an unwired value, and an assertion past the size cap (refused before it is parsed, on the same
+/// terms as `verify_assertion`).
+#[cfg(feature = "client-assertion")]
+#[test]
+fn presented_assertion_alg_reads_the_header_and_refuses_the_unroutable() {
+    use crate::jwt::JwsAlg;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    let assertion_with_alg = |alg: &str| {
+        let header = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"{alg}","typ":"JWT"}}"#));
+        let payload = URL_SAFE_NO_PAD.encode("{}");
+        format!("{header}.{payload}.AA")
+    };
+    let alg_of = |assertion: &str| {
+        AuthorizationServer::<crate::store::MemoryStorage>::presented_assertion_alg(assertion)
+    };
+
+    assert_eq!(alg_of(&assertion_with_alg("ES256")), Some(JwsAlg::Es256));
+    assert_eq!(alg_of(&assertion_with_alg("RS256")), Some(JwsAlg::Rs256));
+    assert_eq!(alg_of(&assertion_with_alg("EdDSA")), Some(JwsAlg::EdDsa));
+
+    // Unroutable: an HMAC, the unsecured `none`, and an unwired asymmetric alg all fall to None,
+    // which is the HMAC-fallback path in `dummy_assertion_verify`.
+    assert_eq!(alg_of(&assertion_with_alg("HS256")), None);
+    assert_eq!(alg_of(&assertion_with_alg("none")), None);
+    assert_eq!(alg_of(&assertion_with_alg("PS256")), None);
+
+    // A garbage string is not a compact JWS: None, never a panic.
+    assert_eq!(alg_of("not-a-jws"), None);
+
+    // Past the size cap: refused before the parse, so an oversized assertion cannot make the dummy
+    // do more work than the known-id path (which checks the same cap first).
+    let oversized =
+        assertion_with_alg("ES256") + &"A".repeat(crate::client_assertion::MAX_ASSERTION_BYTES);
+    assert!(oversized.len() > crate::client_assertion::MAX_ASSERTION_BYTES);
+    assert_eq!(alg_of(&oversized), None);
 }
 
 /// The largest `SystemTime` this platform can represent: the point beyond which `checked_add`

@@ -61,7 +61,7 @@
 //!   sender-constrained tokens), `mtls` (RFC 8705 certificate-bound tokens and client
 //!   authentication), `client-assertion` (RFC 7523 `private_key_jwt` and `client_secret_jwt`).
 //! - `jwt-p256`, THE BUILT-IN ES256 BACKEND, and the one to reach for first: `jwt` compiles the
-//!   RFC 7515 machinery and the [`jwt::Es256Signer`] / [`jwt::Es256Verifier`] seams but SIGNS
+//!   RFC 7515 machinery and the [`jwt::JwsSigner`] / [`jwt::JwsVerifier`] seams but SIGNS
 //!   NOTHING BY ITSELF, because where a private key lives is the host's decision (see the
 //!   [`jwt`] module docs). `jwt-p256` supplies [`jwt::EcdsaP256Key`] and installs
 //!   [`jwt::P256Verifier`] as the default, which is what a host with no opinion about its key
@@ -246,6 +246,11 @@ pub mod grant;
 // PRIVATE, and one function long: the lower-case hex encoder that `server` (device codes,
 // authorization codes, opaque tokens) and `client` (the stored secret verifier) both need. It sits
 // here for the reason `skew` does, and it was two copies of one loop until 0.9.1.
+/// The pluggable JWS backends (`jwt-rsa`, `jwt-ed25519`). `jwt-p256`'s backend still lives inline
+/// in [`jwt`]; this module carries the additive Phase B/C ones.
+#[cfg(any(feature = "jwt-rsa", feature = "jwt-ed25519"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jwt-rsa", feature = "jwt-ed25519"))))]
+pub mod backends;
 mod hex;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
@@ -271,7 +276,7 @@ pub mod registration;
 pub mod resource_metadata;
 pub mod scope;
 pub mod server;
-// A RUNNABLE conformance harness for the `Es256Signer` and `Es256Verifier` contracts, for a HOST
+// A RUNNABLE conformance harness for the `JwsSigner` and `JwsVerifier` contracts, for a HOST
 // to run against the ES256 backend it is about to deploy. Behind `test-util`, which adds nothing
 // to a default build. The module's own `//!` docs are the documentation.
 #[cfg(all(feature = "test-util", feature = "jwt"))]
@@ -348,22 +353,32 @@ pub use http::AuthenticationReporter;
 // THE `jwt` MODULE'S ROOT PRESENCE, added in 0.9.1. Every other module's headline types are
 // re-exported here, and this list stepped from `metadata` straight to `mtls`, so the type of a
 // `pub` field on `ServerConfig` (`AccessTokenFormat`), the type `AuthorizationServer::jwks`
-// returns (`Jwks`), and the two traits the `jwt` feature exists to publish (`Es256Signer`,
-// `Es256Verifier`) had no path from the crate root at all. The gate below is EACH ITEM'S OWN
+// returns (`Jwks`), and the two traits the `jwt` feature exists to publish (`JwsSigner`,
+// `JwsVerifier`) had no path from the crate root at all. The gate below is EACH ITEM'S OWN
 // `#[cfg]`, not a convenient wider one: a re-export narrower than its item is an absence rather
 // than an error, and this crate has already shipped that bug once (see `token::Confirmation`).
 #[cfg(feature = "jwt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub use jwt::{classify_alg, consistent, expect_alg};
+#[cfg(feature = "jwt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
 pub use jwt::{
-    AccessTokenFormat, Audience, Es256Signer, Es256Verifier, Jwk, Jwks, JwtConfig, JwtError,
-    PublicJwk, SignerError, VerifyError,
+    AccessTokenFormat, AlgPolicy, AlgRefusal, Audience, EcCurve, Jwk, Jwks, JwsAlg, JwsSignature,
+    JwsSigner, JwsVerifier, JwsVerifiers, JwtConfig, JwtError, KeyError, KeyKind, OkpCurve,
+    SignerError, VerifyError,
 };
-// NARROWER on purpose: these three are the BUILT-IN backend, which `jwt` deliberately does not
-// carry (see the `jwt-p256` note in Cargo.toml). `KeyError` comes with them because it is what
-// `EcdsaP256Key`'s constructors return, and a host that cannot name it cannot match on it.
+// NARROWER on purpose: these are the BUILT-IN backends, which `jwt` deliberately does not carry
+// (see the `jwt-p256`/`jwt-rsa`/`jwt-ed25519` notes in Cargo.toml). `KeyError` is with `jwt` above
+// now, because every backend's constructors return it and an RSA/EdDSA-only build needs it too.
+#[cfg(feature = "jwt-ed25519")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-ed25519")))]
+pub use backends::ed25519::{Ed25519Signer, Ed25519Verifier};
+#[cfg(feature = "jwt-rsa")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt-rsa")))]
+pub use backends::rsa::{RsaSigner, RsaVerifier};
 #[cfg(feature = "jwt-p256")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
-pub use jwt::{EcdsaP256Key, KeyError, P256Verifier};
+pub use jwt::{EcdsaP256Key, P256Verifier};
 pub use metadata::{well_known_path, AuthorizationServerMetadata, WELL_KNOWN_PATH};
 #[cfg(feature = "mtls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mtls")))]
@@ -376,8 +391,8 @@ pub use mtls::{
 #[cfg(feature = "jar")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jar")))]
 pub use par::{
-    JarConfig, RegisteredRequestObjectKey, RequestObjectAlg, RequestObjectKeyError,
-    RequestObjectKeys, REQUEST_OBJECT_SIGNING_ALGS, REQUEST_OBJECT_TYP,
+    JarConfig, RegisteredRequestObjectKey, RequestObjectKeyError, RequestObjectKeys,
+    MAX_REQUEST_OBJECT_BYTES, REQUEST_OBJECT_SIGNING_ALGS, REQUEST_OBJECT_TYP,
 };
 #[cfg(feature = "par")]
 #[cfg_attr(docsrs, doc(cfg(feature = "par")))]
@@ -409,9 +424,9 @@ pub use scope::{Scope, ScopeSet};
 // it to tell "unknown code" from "too many attempts", and having to reach into `server::` for the
 // error type of a re-exported method was an oversight rather than a decision.
 pub use server::{
-    AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, ResourceServerRegistration,
-    ServerConfig, SystemClock, TokenRequest, TokenRequestContext, UserApproval,
-    MAX_RESOURCE_INDICATORS, MIN_USER_CODE_LENGTH,
+    AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, RefreshRotation,
+    ResourceServerRegistration, ServerConfig, SystemClock, TokenRequest, TokenRequestContext,
+    UserApproval, MAX_RESOURCE_INDICATORS, MIN_USER_CODE_LENGTH,
 };
 // `RevocationBarrier` and `WriteOutcome` are here for the reason the comment above gives: a
 // re-export narrower than its item is an absence rather than an error. A host implementing

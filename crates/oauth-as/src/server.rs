@@ -421,6 +421,25 @@ pub struct ServerConfig {
     /// a thief with the same bearer token can also recover its successor during it.
     /// The deadline never slides and cannot exceed the chain or access-token expiry.
     pub refresh_retry_window: Duration,
+    /// Whether a refresh grant ROTATES its token (the default and only safe posture for a
+    /// general-purpose deployment) or REUSES it. See [`RefreshRotation`].
+    ///
+    /// Defaults to [`RefreshRotation::Rotate`], which is the behaviour every other field on this
+    /// type assumes: single-use refresh tokens, with OAuth 2.1 draft section 6.1 / RFC 9700
+    /// section 4.14.2 reuse detection revoking the family on a replay. [`RefreshRotation::Reuse`]
+    /// exists ONLY so an AS can be run against the FAPI 2.0 Security Profile, which forbids rotation
+    /// (section 5.3.2.1-9, "the AS shall not use refresh token rotation"); it is a deliberate
+    /// downgrade of that reuse protection and a non-FAPI host must never set it. The switch is read
+    /// in the private `AuthorizationServer::refresh_token` (kept as a code span, not an intra-doc
+    /// link, because it is not part of the public API).
+    ///
+    /// Interaction with [`ServerConfig::refresh_retry_window`]: that window coalesces the
+    /// concurrent retries of a ROTATING chain (it delays reuse detection so a lost-response retry
+    /// recovers the same successor). Under `Reuse` there is no rotation and therefore no successor
+    /// to coalesce onto, so the retry window is inert: the same token simply works again, every
+    /// time, until it expires. The two are orthogonal and safe to leave both configured, but only
+    /// `refresh_rotation` has any effect once it is `Reuse`.
+    pub refresh_rotation: RefreshRotation,
     /// RFC 9449: whether EVERY token request must carry a DPoP proof.
     ///
     /// `false` by default, which means "DPoP is available, and a client that wants a
@@ -799,6 +818,37 @@ impl fmt::Debug for UserApproval<'_> {
 /// worse failure than one that answers `server_error`.
 const USER_CODE_GENERATION_ATTEMPTS: usize = 8;
 
+/// Whether a refresh grant rotates its token or reuses it, selected by
+/// [`ServerConfig::refresh_rotation`].
+///
+/// This is a SECURITY posture, not a convenience. The default, [`RefreshRotation::Rotate`], is the
+/// behaviour of every other part of this crate; [`RefreshRotation::Reuse`] is a deliberate,
+/// off-by-default downgrade that exists only for FAPI 2.0 conformance and must never be selected by
+/// a general-purpose deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshRotation {
+    /// ROTATE (the default): a refresh grant is single use. Each redemption mints a NEW refresh
+    /// token, marks the presented one spent, and a later presentation of the spent token is
+    /// detected as reuse (OAuth 2.1 draft section 6.1, RFC 9700 section 4.14.2) and revokes the
+    /// whole family. This is the only posture a non-FAPI host should ever run.
+    Rotate,
+    /// REUSE: a refresh grant is NOT single use. Each redemption issues a fresh access token and
+    /// returns a still-valid refresh token (the same value), the presented token is NOT rotated
+    /// away or marked spent, and re-presenting it neither trips reuse detection nor revokes the
+    /// family — it simply mints again, within the chain's normal lifetime.
+    ///
+    /// This EXISTS ONLY FOR FAPI 2.0, whose Security Profile (section 5.3.2.1-9) forbids refresh
+    /// token rotation. It is a deliberate downgrade of the OAuth 2.1 draft section 6.1 / RFC 9700
+    /// section 4.14.2 reuse protection that this crate otherwise provides: a refresh token
+    /// exfiltrated under `Reuse` is a credential the thief can redeem repeatedly and the AS has no
+    /// signal to revoke on. FAPI 2.0 accepts that trade because it requires sender-constrained
+    /// tokens (DPoP or mutual-TLS) so a bearer copy alone is not enough; a deployment that has NOT
+    /// made tokens sender-constrained must not select this. Off by default, and a non-FAPI host
+    /// must leave it that way. The chain's absolute lifetime ([`ServerConfig::refresh_token_ttl`])
+    /// and every other revocation path (client, consent, family) still apply.
+    Reuse,
+}
+
 impl ServerConfig {
     /// A config with RFC-shaped defaults; `issuer` and `verification_uri` have no sane default and
     /// are required.
@@ -852,10 +902,24 @@ impl ServerConfig {
             // a stale token is still recognised as reuse rather than as noise.
             refresh_reuse_window: Duration::from_secs(30 * 24 * 60 * 60),
             refresh_retry_window: Duration::ZERO,
+            // ROTATE. Reuse is a FAPI-only downgrade of reuse detection; see `RefreshRotation`.
+            refresh_rotation: RefreshRotation::Rotate,
             #[cfg(feature = "dpop")]
             require_dpop: false,
             user_code_length: MIN_USER_CODE_LENGTH,
         }
+    }
+
+    /// Set the refresh-token rotation policy (see [`RefreshRotation`]).
+    ///
+    /// The default is [`RefreshRotation::Rotate`] and a general-purpose deployment must leave it
+    /// there. Passing [`RefreshRotation::Reuse`] is a deliberate, FAPI-2.0-only downgrade of reuse
+    /// detection and is documented as such on the enum: do not call this with `Reuse` unless the
+    /// deployment is being run against the FAPI 2.0 Security Profile and has sender-constrained its
+    /// tokens.
+    pub fn with_refresh_rotation(mut self, policy: RefreshRotation) -> Self {
+        self.refresh_rotation = policy;
+        self
     }
 }
 
@@ -1331,8 +1395,9 @@ pub(crate) fn try_random_hex(n_bytes: usize) -> Option<String> {
 /// was briefly unavailable.
 /// The fixed input [`AuthorizationServer::dummy_assertion_verify`] verifies over.
 ///
-/// It is not a JWS signing input and does not need to be: an ES256 verification costs the same
-/// whatever it is handed, and the string exists only so the operation is well defined.
+/// It is not a JWS signing input and does not need to be: a signature verification of any of the
+/// wired algorithms costs the same whatever it is handed, and the string exists only so the
+/// operation is well defined.
 #[cfg(feature = "client-assertion")]
 const DUMMY_ASSERTION_SIGNING_INPUT: &str = "oauth-as dummy verification input";
 
@@ -1351,26 +1416,91 @@ const DUMMY_ASSERTION_SIGNATURE: [u8; 64] = [
     47,
 ];
 
-/// The public half of that throwaway key.
+/// The public half of that throwaway ES256 key.
 ///
 /// BUILT PER CALL, not cached in a `OnceLock`: this crate promises no global statics and no lazy
 /// singletons (the crate docs say so, and `tests/allocation.rs` enforces it), and the four small
-/// allocations a [`crate::jwt::PublicJwk`] costs are invisible beside the ES256 verification they
+/// allocations a [`crate::jwt::Jwk`] costs are invisible beside the ES256 verification they
 /// are there to feed — which is the whole point, since the KNOWN-id path this is matching pays
 /// that verification too. The `Jwk` literal is the crate's own publishing shape, whose coordinates
 /// are by construction the 32-byte base64url a verifier expects.
 #[cfg(feature = "client-assertion")]
-fn dummy_assertion_key() -> crate::jwt::PublicJwk {
-    crate::jwt::Jwk {
-        kty: "EC",
-        crv: "P-256",
+fn dummy_assertion_key() -> crate::jwt::Jwk {
+    crate::jwt::Jwk::Ec {
+        crv: crate::jwt::EcCurve::P256,
         x: "LIZkYOSRaSLc5uMxzlzV9pgt1ARaDl_3tZfRkt9mzFY".to_string(),
         y: "fBSzqWfCploda0TpKf3N56v6fk-fORAiVsXUmkWYWkw".to_string(),
-        kid: "oauth-as-dummy-verification-key".to_string(),
-        use_: "sig",
-        alg: "ES256",
+        kid: Some("oauth-as-dummy-verification-key".to_string()),
     }
-    .to_public_jwk()
+}
+
+/// The 2048-bit RSA modulus of the dummy RS256 key (RFC 7515 appendix A.2's public key), with
+/// exponent `AQAB`. A THROWAWAY public value, not a credential: no registration names it, and the
+/// dummy signature below does not verify under it. It exists only so an RS256 dummy verification
+/// clears the verifier's `n.bits() >= 2048` floor and reaches the modular exponentiation, which is
+/// the whole cost a real RS256 `private_key_jwt` client pays.
+#[cfg(feature = "client-assertion")]
+const DUMMY_RS256_MODULUS_B64: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
+
+/// The dummy RS256 public key: [`DUMMY_RS256_MODULUS_B64`] with exponent `AQAB`.
+#[cfg(feature = "client-assertion")]
+fn dummy_rs256_key() -> crate::jwt::Jwk {
+    crate::jwt::Jwk::Rsa {
+        n: DUMMY_RS256_MODULUS_B64.to_string(),
+        e: "AQAB".to_string(),
+        kid: Some("oauth-as-dummy-verification-key".to_string()),
+    }
+}
+
+/// The base64url `x` of the dummy Ed25519 key (RFC 8037 appendix A.4's public key). A THROWAWAY
+/// public value on the same terms as the RSA modulus above.
+#[cfg(feature = "client-assertion")]
+const DUMMY_EDDSA_X_B64: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+
+/// A REAL Ed25519 signature (RFC 8037 appendix A.4's signature) over a DIFFERENT message than
+/// [`DUMMY_ASSERTION_SIGNING_INPUT`], so it decodes to a canonical `(R, S)` and drives
+/// `verify_strict` all the way through the scalar multiplication before failing the equation — the
+/// same cost a real EdDSA client's non-matching signature would pay. A random 64 bytes could be
+/// rejected earlier, at a non-canonical `R`, which would undercount.
+#[cfg(feature = "client-assertion")]
+const DUMMY_EDDSA_SIGNATURE: [u8; 64] = [
+    134, 12, 152, 210, 41, 127, 48, 96, 163, 63, 66, 115, 150, 114, 214, 27, 83, 207, 58, 222, 254,
+    211, 211, 198, 114, 243, 32, 220, 2, 27, 65, 30, 157, 89, 184, 98, 141, 195, 81, 226, 72, 184,
+    139, 41, 70, 142, 14, 65, 133, 91, 15, 183, 216, 59, 177, 91, 233, 2, 191, 204, 184, 205, 10,
+    2,
+];
+
+/// The dummy Ed25519 public key: OKP/Ed25519 with [`DUMMY_EDDSA_X_B64`].
+#[cfg(feature = "client-assertion")]
+fn dummy_eddsa_key() -> crate::jwt::Jwk {
+    crate::jwt::Jwk::Okp {
+        crv: crate::jwt::OkpCurve::Ed25519,
+        x: DUMMY_EDDSA_X_B64.to_string(),
+        kid: Some("oauth-as-dummy-verification-key".to_string()),
+    }
+}
+
+/// The throwaway public key and a fixed dummy signature for a dummy verification of `alg`, each of
+/// the WIDTH the verifier for that algorithm requires so the verification runs to completion rather
+/// than being refused cheaply in a length or format guard.
+///
+/// COST, NOT CREDENTIAL, for all three variants, exactly as the individual keys above are: no
+/// registration names any of these keys, and each signature is a fixed constant that does not
+/// verify, so nothing authenticates by presenting the bytes it was built from. The signature widths
+/// are what make the cost real — 64 bytes for ES256 and EdDSA (RFC 7518 s3.4, RFC 8037 s3.1), and
+/// exactly the modulus width for RS256, filled with a value below the modulus so the modular
+/// exponentiation runs. See [`AuthorizationServer::dummy_assertion_verify`].
+#[cfg(feature = "client-assertion")]
+fn dummy_assertion_material(alg: crate::jwt::JwsAlg) -> (crate::jwt::Jwk, Vec<u8>) {
+    use crate::jwt::JwsAlg;
+    match alg {
+        JwsAlg::Es256 => (dummy_assertion_key(), DUMMY_ASSERTION_SIGNATURE.to_vec()),
+        // The dummy signature is `k` octets (the modulus width, 256 for RSA-2048) so the verifier's
+        // `sig.len() == modulus` guard passes; every byte is `0x01`, an integer far below the
+        // 2048-bit modulus, so the RSA verify performs the full modular exponentiation.
+        JwsAlg::Rs256 => (dummy_rs256_key(), vec![0x01u8; 256]),
+        JwsAlg::EdDsa => (dummy_eddsa_key(), DUMMY_EDDSA_SIGNATURE.to_vec()),
+    }
 }
 
 fn randomness_error() -> ErrorResponse {
@@ -1842,11 +1972,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         self
     }
 
-    /// Install the ES256 backend this server VERIFIES signatures with: RFC 9449 DPoP proofs, RFC
-    /// 9101 request objects, RFC 7523 client assertions.
+    /// Install a JWS verifier this server VERIFIES signatures with, for its own algorithm (ES256,
+    /// RS256, or EdDSA): RFC 9449 DPoP proofs, RFC 9101 request objects, RFC 7523 client assertions.
     ///
-    /// Required unless `jwt-p256` is compiled in, which installs [`crate::jwt::P256Verifier`] as
-    /// the default. With neither, every signed credential is REFUSED, exactly as an absent
+    /// Required for an algorithm unless a built-in backend covers it: `jwt-p256`, `jwt-rsa` and
+    /// `jwt-ed25519` install [`crate::jwt::P256Verifier`], the RSA and Ed25519 verifiers
+    /// respectively as defaults. With no verifier for a presented algorithm, every signed
+    /// credential under it is REFUSED, exactly as an absent
     /// [`crate::par::RequestObjectKeys`] or an absent registration policy refuses: a server that
     /// cannot check a signature must never behave as though it had checked one.
     ///
@@ -1861,33 +1993,79 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     // marked builder out of twenty-nine is the state that gate exists to refuse.
     #[cfg(feature = "jwt")]
     #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
-    pub fn with_es256_verifier(
+    pub fn with_jws_verifier(
         mut self,
-        verifier: std::sync::Arc<dyn crate::jwt::Es256Verifier>,
+        verifier: std::sync::Arc<dyn crate::jwt::JwsVerifier>,
     ) -> Self {
-        self.hooks.install_es256_verifier(verifier);
+        self.hooks.install_jws_verifier(verifier);
         self
     }
 
-    /// The ES256 verifier this server will use, or `None` when it has none and must refuse.
+    /// The verifier this server will use for `alg`, or `None` when it has none and must refuse.
     ///
-    /// THE ONE PLACE the precedence rule lives: the host's installed verifier, else the built-in
-    /// `jwt-p256` backend when that feature is compiled in, else nothing. Every caller
-    /// (`verify_dpop`, the RFC 7523 assertion check, the RFC 9101 request object check) asks here
-    /// and refuses on `None`, so there is exactly one definition of "no backend installed" and no
-    /// path that can accidentally read it as "checked out".
+    /// THE ONE PLACE the precedence rule lives: the host's installed verifier for the algorithm,
+    /// else the built-in `jwt-p256` backend when that feature is compiled in and the algorithm is
+    /// one it implements, else nothing. Every single-algorithm caller (the RFC 7523 assertion
+    /// check, the RFC 9101 request object check) asks here and refuses on `None`, so there is
+    /// exactly one definition of "no backend installed" and no path that can accidentally read it
+    /// as "checked out".
     // Gated on the features that actually VERIFY rather than on `jwt`: a build that signs and
-    // never checks anybody else's signature has no caller for this, and an uncalled resolver is
-    // one more thing a reader has to work out is not reachable.
+    // never checks anybody else's signature has no caller for this.
     #[cfg(any(feature = "dpop", feature = "jar", feature = "client-assertion"))]
-    pub(crate) fn es256_verifier(&self) -> Option<&dyn crate::jwt::Es256Verifier> {
-        match self.hooks.es256_verifier() {
-            Some(installed) => Some(&**installed),
-            #[cfg(feature = "jwt-p256")]
-            None => Some(&crate::jwt::P256Verifier),
-            #[cfg(not(feature = "jwt-p256"))]
-            None => None,
+    pub(crate) fn jws_verifier(
+        &self,
+        alg: crate::jwt::JwsAlg,
+    ) -> Option<&dyn crate::jwt::JwsVerifier> {
+        if let Some(installed) = self.hooks.jws_verifiers().and_then(|vs| vs.get(alg)) {
+            return Some(installed);
         }
+        // The built-in fallbacks, one per compiled backend feature. Written as independent guarded
+        // returns rather than a `match` so the arm set is exactly the features that are on: no
+        // exhaustiveness gap when a backend is off, no unreachable arm when several are on.
+        #[cfg(feature = "jwt-p256")]
+        if alg == crate::jwt::JwsAlg::Es256 {
+            return Some(&crate::jwt::P256Verifier);
+        }
+        #[cfg(feature = "jwt-rsa")]
+        if alg == crate::jwt::JwsAlg::Rs256 {
+            return Some(&crate::backends::rsa::RsaVerifier);
+        }
+        #[cfg(feature = "jwt-ed25519")]
+        if alg == crate::jwt::JwsAlg::EdDsa {
+            return Some(&crate::backends::ed25519::Ed25519Verifier);
+        }
+        let _ = alg;
+        None
+    }
+
+    /// The full set of verifiers this server resolves, HOST-installed plus the built-in `jwt-p256`
+    /// fallback for any algorithm the host did not install one for. Owned, so it can carry the
+    /// static fallback alongside the host's `Arc`s; built once per request that needs it.
+    ///
+    /// Used by the DPoP path, which is the one site that reads the algorithm off the proof header
+    /// ([`crate::jwt::AlgPolicy::AnyInstalled`], the RFC 9449 self-carried-key exception) and so
+    /// needs the whole installed set rather than one algorithm.
+    #[cfg(feature = "dpop")]
+    pub(crate) fn resolved_jws_verifiers(&self) -> crate::jwt::JwsVerifiers {
+        // `mut` only matters when a built-in backend is compiled to install a fallback below; a
+        // `dpop`-only build (no jwt-p256/jwt-rsa/jwt-ed25519) returns the host set untouched.
+        #[allow(unused_mut)]
+        let mut verifiers = self.hooks.jws_verifiers().cloned().unwrap_or_default();
+        #[cfg(feature = "jwt-p256")]
+        if verifiers.get(crate::jwt::JwsAlg::Es256).is_none() {
+            verifiers.install(std::sync::Arc::new(crate::jwt::P256Verifier));
+        }
+        #[cfg(feature = "jwt-rsa")]
+        if verifiers.get(crate::jwt::JwsAlg::Rs256).is_none() {
+            verifiers.install(std::sync::Arc::new(crate::backends::rsa::RsaVerifier));
+        }
+        #[cfg(feature = "jwt-ed25519")]
+        if verifiers.get(crate::jwt::JwsAlg::EdDsa).is_none() {
+            verifiers.install(std::sync::Arc::new(
+                crate::backends::ed25519::Ed25519Verifier,
+            ));
+        }
+        verifiers
     }
 
     /// The installed host seams, for a host that wants to emit its own events onto the same
@@ -1994,7 +2172,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// carrying it as `jti` when the host configured signing.
     ///
     /// SYNC, and it stops one step short of the signature, which is what the awkward return type
-    /// buys. The host's [`crate::jwt::Es256Signer`] may be a network round trip, so signing is
+    /// buys. The host's [`crate::jwt::JwsSigner`] may be a network round trip, so signing is
     /// async; if this function were async instead, the whole [`AccessTokenClaims`] value below
     /// would live across that suspension point and join the token endpoint's coroutine frame,
     /// which `tests/allocation.rs` holds under tokio's 2048-byte debug boxing threshold. Splitting
@@ -2183,7 +2361,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// of what the document promises depends on a seam the host INSTALLED on the server. RFC 7523
     /// `private_key_jwt` is the case that forced this. It is ES256, so it is honest exactly when
     /// this server can check an ES256 signature, and that is a property of
-    /// [`AuthorizationServer::with_es256_verifier`] plus the `jwt-p256` feature, neither of which
+    /// [`AuthorizationServer::with_jws_verifier`] plus the `jwt-p256` feature, neither of which
     /// a `&ServerConfig` can see. A method the document names and the token endpoint refuses
     /// every time is not a defect a client can work around: it did what it was told.
     ///
@@ -2194,12 +2372,16 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     pub fn metadata(&self) -> crate::metadata::AuthorizationServerMetadata {
         #[allow(unused_mut)]
         let mut meta = crate::metadata::AuthorizationServerMetadata::from_config(&self.config);
-        // Only the ES256-dependent members need adjusting, and only in a build that could verify
-        // at all: the `cfg` is exactly the set `es256_verifier` is gated on, because those three
-        // features are the three that advertise something an ES256 signature check has to back.
+        // Only the verifier-dependent members need adjusting, and only in a build that could verify
+        // at all: the `cfg` is exactly the set `jws_verifier` is gated on. Every wired algorithm
+        // whose verifier actually RESOLVES (the built-in backend for its feature, or a host's
+        // installed one) is advertised; an algorithm with no resolvable verifier is not, which is
+        // the honesty rule the ES256 list already followed, now per algorithm.
         #[cfg(any(feature = "client-assertion", feature = "jar", feature = "dpop"))]
-        if self.es256_verifier().is_some() {
-            meta.es256_verification_is_available();
+        for &alg in crate::jwt::JwsAlg::ALL {
+            if self.jws_verifier(alg).is_some() {
+                meta.mark_alg_verifiable(alg);
+            }
         }
         meta
     }
@@ -2525,59 +2707,95 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let _ = std::hint::black_box(dummy.verify_with(Some(presented), verifier));
     }
 
-    /// [`AuthorizationServer::dummy_verify`]'s twin for RFC 7523 client assertions: one ES256
+    /// The asymmetric [`crate::jwt::JwsAlg`] a presented client assertion's header names, or `None`
+    /// when it names an HMAC (`HS256`), `none`, an unwired algorithm, no algorithm at all, or the
+    /// assertion does not parse — every case a `JwsVerifier` refuses to route.
+    ///
+    /// UNSIGNED and untrusted, read for exactly one purpose: to decide which algorithm's DUMMY
+    /// verification [`AuthorizationServer::dummy_assertion_verify`] performs so its cost tracks the
+    /// KNOWN-id path, which pays a verification of the REGISTRATION's algorithm. This is not a real
+    /// verification and chooses no real key: see the invariant note on `dummy_assertion_verify`. The
+    /// [`crate::client_assertion::MAX_ASSERTION_BYTES`] guard is the same one `verify_assertion`
+    /// applies BEFORE it parses, so an oversized assertion is refused here at the same point rather
+    /// than parsed, which keeps the dummy from doing more work than the known-id path would.
+    #[cfg(feature = "client-assertion")]
+    fn presented_assertion_alg(assertion: &str) -> Option<crate::jwt::JwsAlg> {
+        if assertion.len() > crate::client_assertion::MAX_ASSERTION_BYTES {
+            return None;
+        }
+        let jws = crate::jwt::CompactJws::parse(assertion).ok()?;
+        crate::jwt::classify_alg(jws.header_str("alg")?)
+    }
+
+    /// [`AuthorizationServer::dummy_verify`]'s twin for RFC 7523 client assertions: one signature
     /// verification through the installed seam, over a key nobody registered, answer discarded.
     ///
     /// WHY IT IS NEEDED SEPARATELY. A `private_key_jwt` request carries a `client_assertion` and
     /// NO `client_secret` — `authenticate_by_assertion` refuses a request carrying both — so
     /// `dummy_verify` was handed `None` and returned immediately, while a KNOWN id on the same
-    /// request went on to a real ES256 verification, which `crate::jwt` prices at about 133
-    /// microseconds. The probed id is attacker-chosen and free: `crate::http` reads it from the
-    /// UNSIGNED `sub` of the assertion when the form carries no `client_id`, and a garbage
-    /// signature never reaches `claim_replay_id`, so the probe is repeatable and averageable while
-    /// per-id throttling sees exactly one request per candidate — the same shape the secret case
-    /// above describes.
+    /// request went on to a real asymmetric verification, which `crate::jwt` prices at about 133
+    /// microseconds for ES256 (and MORE for RS256). The probed id is attacker-chosen and free:
+    /// `crate::http` reads it from the UNSIGNED `sub` of the assertion when the form carries no
+    /// `client_id`, and a garbage signature never reaches `claim_replay_id`, so the probe is
+    /// repeatable and averageable while per-id throttling sees exactly one request per candidate —
+    /// the same shape the secret case above describes.
     ///
-    /// WHICH VERIFICATION, and why it is not always the ES256 one. RFC 7523 has TWO client
-    /// authentication methods and this crate implements both: `private_key_jwt` is ES256 through
-    /// the installed seam, and `client_secret_jwt` is an HS256 HMAC over the registered secret,
-    /// which `verify_assertion` performs itself and which therefore needs no seam at all. So the
-    /// real cost of a known id depends on the deployment, and the dummy tracks it: an ES256
-    /// verification where a verifier is installed, and an HS256 tag verification where none is,
-    /// which is exactly the shape of a `client_secret_jwt`-only deployment. This used to return
-    /// early on a missing verifier on the grounds that "the real path refuses without verifying
-    /// anything either", and that was true only of `private_key_jwt`: a `client_secret_jwt`
-    /// deployment with no ES256 backend had its known ids paying an HMAC while unknown ids paid
-    /// nothing.
+    /// WHICH VERIFICATION, and why it is DRIVEN BY THE PRESENTED HEADER. RFC 7523 has TWO client
+    /// authentication methods and this crate implements both, and after crypto agility a
+    /// `private_key_jwt` registration names one of THREE asymmetric algorithms (ES256, RS256,
+    /// EdDSA), three orders of magnitude apart in cost. The KNOWN-id path pays a verification of the
+    /// REGISTRATION's algorithm, and `verify_assertion` reaches that verification only when the
+    /// token header's `alg` EQUALS it (a header mismatch is refused before any signature work). So
+    /// the cost a known id pays for a given request is the cost of verifying the algorithm the
+    /// header PRESENTS, and this dummy matches it: it classifies the presented header's `alg`
+    /// ([`AuthorizationServer::presented_assertion_alg`]) and, when a verifier is installed for that
+    /// algorithm, performs a dummy verification of THAT algorithm against a throwaway key of the
+    /// matching kind ([`dummy_assertion_material`]). With no classifiable algorithm or no installed
+    /// verifier it falls back to an HS256 HMAC, which is the `client_secret_jwt` cost. Through 0.9.x
+    /// this always did the ES256 verification, so an RS256-only deployment — an ES256 verifier not
+    /// installed — paid its known RS256 ids a full RSA verify while unknown ids paid an HMAC, the
+    /// leak pointing the other way.
+    ///
+    /// THE INVARIANT, because this is timing-security code touching an attacker-chosen `alg`: the
+    /// header drives only which DUMMY runs, against a key NOBODY registered, and the result is
+    /// discarded. It NEVER selects a real key or changes a real accept/reject decision — those stay
+    /// with `authenticate_by_assertion`, where `keys.asymmetric_alg()` (the REGISTRATION) chooses
+    /// the verifier and the key. "The algorithm is chosen by the registration for real verifies"
+    /// (rule 2 of the verification banner in `crate::jwt`) is untouched: this path performs no real
+    /// verify at all.
     ///
     /// WHAT REMAINS, stated rather than left to be discovered: a deployment running BOTH methods
     /// can still be timed to tell which method a KNOWN, EXISTING client is registered for, because
-    /// an HMAC and an ES256 verification are three orders of magnitude apart and no single dummy
-    /// can be both. That is a much weaker fact than the one this closes: it says nothing about
-    /// whether an id exists, so it is not an enumeration primitive, and it is only readable for an
-    /// id the attacker already knows is registered.
+    /// no single request lets the dummy be two algorithms at once. That is a much weaker fact than
+    /// the one this closes: it says nothing about whether an id exists, so it is not an enumeration
+    /// primitive, and it is only readable for an id the attacker already knows is registered.
     ///
     /// WHAT IT COSTS, stated rather than left to be found: a probe that could have reached a
-    /// verification now buys one of this server's time whether or not its id exists. That is a
-    /// denial-of-service consideration, it was already true for every KNOWN id, and the
-    /// [`RateLimiter`] is charged for the attempt either way. The aim of the whole mechanism is
-    /// that the two ids cost the same; see the residuals section on
-    /// [`AuthorizationServer::authenticate_client`] for where they still do not, because that
-    /// claim has now been false in three different ways across three audit rounds and stating it
-    /// without the exceptions is what let each one survive.
+    /// verification now buys one of this server's time whether or not its id exists, and — new with
+    /// the per-algorithm dummy — an attacker who sends RS256 assertions for unknown ids forces an
+    /// RSA verification, the most expensive of the three. That is ACCEPTABLE: it is exactly the cost
+    /// a real RS256 `private_key_jwt` client already imposes on every request, it is bounded above
+    /// by the [`crate::client_assertion::MAX_ASSERTION_BYTES`] cap (4 KiB, checked before any
+    /// parse) and by the [`RateLimiter`], which is charged for the attempt either way, and refusing
+    /// to pay it is the timing leak. The aim of the whole mechanism is that the two ids cost the
+    /// same; see the residuals section on [`AuthorizationServer::authenticate_client`] for where
+    /// they still do not, because that claim has now been false in several ways across the audit
+    /// rounds and stating it without the exceptions is what let each one survive.
     #[cfg(feature = "client-assertion")]
-    fn dummy_assertion_verify(&self) {
-        match self.es256_verifier() {
-            Some(verifier) => {
+    fn dummy_assertion_verify(&self, presented_alg: Option<crate::jwt::JwsAlg>) {
+        match presented_alg.and_then(|alg| self.jws_verifier(alg).map(|verifier| (alg, verifier))) {
+            Some((alg, verifier)) => {
+                let (key, signature) = dummy_assertion_material(alg);
                 let _ = std::hint::black_box(verifier.verify(
-                    &dummy_assertion_key(),
+                    &key,
                     DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
-                    &DUMMY_ASSERTION_SIGNATURE,
+                    &signature,
                 ));
             }
-            // The `client_secret_jwt` cost. The secret is the signing input itself, which is a
-            // constant: as with the ES256 signature above this is a COST and not a credential, and
-            // an HMAC costs the same whatever key it is handed.
+            // The `client_secret_jwt` cost, and the fallback for any presented `alg` this server has
+            // no verifier for. The secret is the signing input itself, which is a constant: as with
+            // the signatures above this is a COST and not a credential, and an HMAC costs the same
+            // whatever key it is handed.
             None => {
                 let _ = std::hint::black_box(crate::jwt::verify_hs256(
                     DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
@@ -2711,11 +2929,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// beside it.
     ///
     /// SECOND, WHICH RFC 7523 METHOD an id that is known to exist is registered for, in a
-    /// deployment running both. `private_key_jwt` costs an ES256 verification and
-    /// `client_secret_jwt` costs an HMAC, three orders of magnitude apart, and one dummy cannot be
-    /// both; [`AuthorizationServer::dummy_assertion_verify`] picks whichever matches the
-    /// deployment. This is not an enumeration primitive: it says nothing about whether an id
-    /// exists, and it is readable only for one the attacker already knows does.
+    /// deployment running both. `private_key_jwt` costs an asymmetric verification (ES256, RS256 or
+    /// EdDSA) and `client_secret_jwt` costs an HMAC, and no single dummy on one request can be more
+    /// than one of those; [`AuthorizationServer::dummy_assertion_verify`] picks the algorithm the
+    /// request's assertion HEADER presents, which is the one a known id would actually verify under.
+    /// This is not an enumeration primitive: it says nothing about whether an id exists, and it is
+    /// readable only for one the attacker already knows does.
     ///
     /// THIRD, and in the same class: a `ConfidentialSecret` registration compares its secret with
     /// [`crate::client::constant_time_eq`], two SHA-256 digests, while the dummy an unknown id pays
@@ -2839,7 +3058,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         }
         #[cfg(feature = "client-assertion")]
         if !paid.assertion && Self::assertion_could_be_verified(cred) {
-            self.dummy_assertion_verify();
+            // `assertion_could_be_verified` already guaranteed the assertion is present. Its header
+            // decides which algorithm's dummy runs, so the cost tracks what a known id registered
+            // for that algorithm would pay; see `dummy_assertion_verify` on why the header may drive
+            // the DUMMY without driving any real verification.
+            let presented_alg = cred
+                .client_assertion
+                .and_then(Self::presented_assertion_alg);
+            self.dummy_assertion_verify(presented_alg);
         }
     }
 
@@ -3097,8 +3323,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // practice (OpenID Connect Core section 9), the issuer identifier.
         //
         // The verifier is resolved and PASSED ALONG rather than required here, because only one of
-        // the two methods needs one. `private_key_jwt` is ES256 and `verify_assertion` refuses it
-        // on a `None` (an unchecked credential has authenticated nobody). `client_secret_jwt` is
+        // the two methods needs one. `private_key_jwt` names one asymmetric algorithm (ES256,
+        // RS256, or EdDSA) and `verify_assertion` refuses it on a `None` (an unchecked credential
+        // has authenticated nobody). `client_secret_jwt` is
         // an HS256 HMAC over the registered secret and touches no curve at all, so requiring a
         // backend on that path refused a valid credential for a reason no RFC gives. Which one
         // this registration is, is `client.auth`'s to say, and `AssertionKeys` is what says it.
@@ -3108,8 +3335,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // one gap this leaves is the refusals `verify_assertion` makes before it reaches a
         // signature; see the FOURTH residual on `authenticate_client`, and `CredentialCost`.
         paid.assertion = true;
+        // The registration's algorithm chooses the verifier, never the token header. A
+        // `private_key_jwt` registration names one asymmetric `JwsAlg` (ES256, RS256, or EdDSA) and
+        // `verify_assertion` refuses it on a `None` verifier; `client_secret_jwt` is HS256 over the
+        // registered secret and needs none.
+        let assertion_verifier = keys.asymmetric_alg().and_then(|alg| self.jws_verifier(alg));
         let verified = verify_assertion(
-            self.es256_verifier(),
+            assertion_verifier,
             keys,
             assertion,
             client.client_id.as_str(),
@@ -3192,14 +3424,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Resolved BEFORE the proof is parsed: with no backend there is nothing that could make
         // this proof acceptable, so an unauthenticated caller does not get to spend a base64 decode
         // and a JSON parse finding that out.
-        let verifier = self.es256_verifier().ok_or_else(|| {
+        let verifiers = self.resolved_jws_verifiers();
+        if verifiers.installed().next().is_none() {
             // EMITTED, and this is the refusal it matters most to emit. `jwt` carries the verifier
             // seam and `jwt-p256` carries the arithmetic, so a build with `dpop` and neither an
             // installed verifier nor that backend refuses EVERY proof: the deployment is
             // misconfigured, not the client, and through 0.9.0 this was the one refusal the audit
             // channel never heard about at all. `UnsupportedAlgorithm` is the honest reading of
-            // `DpopFailure`'s existing vocabulary — with no backend, ES256 is not an algorithm
-            // this build accepts, whatever `dpop_signing_alg_values_supported` advertises.
+            // `DpopFailure`'s existing vocabulary — with no backend, no algorithm is one this build
+            // accepts, whatever `dpop_signing_alg_values_supported` advertises.
             self.hooks.emit(|| Event::DpopProofRefused {
                 failure: crate::dpop::DpopFailure::UnsupportedAlgorithm,
             });
@@ -3207,10 +3440,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // which is where `dpop.rs` says the distinction belongs; the description would have
             // put it on the wire, and `verify_dpop` runs BEFORE any client authentication, so an
             // anonymous caller could read a deployment misconfiguration off a refusal.
-            ErrorResponse::new(ErrorCode::InvalidDpopProof)
-        })?;
+            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
+        }
         let verified = verify_proof(
-            verifier,
+            &verifiers,
             proof,
             "POST",
             self.token_endpoint(),
@@ -4858,7 +5091,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // A COMPARE-AND-SWAP against the record this function wrote itself, not a blind put, and
         // the expectation is exactly the `Consumed { None, None }` written before issuance. Two
         // things can have happened during the issuance above, which may have suspended on the
-        // host's `Es256Signer` for a network round trip:
+        // host's `JwsSigner` for a network round trip:
         //
         // - A REPLAY was detected and marked the record `Replayed`. The swap fails, and it must:
         //   the replay path already decided this grant is compromised and found nothing to revoke
@@ -5159,9 +5392,20 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             return Err(ErrorResponse::new(ErrorCode::UnauthorizedClient));
         }
 
+        // FAPI 2.0 no-rotation mode. `Reuse` keeps the presented token LIVE — it is not taken,
+        // not rotated away, and not marked spent — so every branch below that treats a spent
+        // predecessor as evidence of compromise is skipped, and issuance returns the SAME token
+        // rather than a successor. See `RefreshRotation::Reuse`; a non-FAPI host never reaches
+        // this path because the default is `Rotate`. All the sender-binding and scope-ceiling
+        // checks between here and issuance still run: `Reuse` gives up reuse DETECTION, not the
+        // bindings that decide whether this presenter may redeem at all.
+        let reuse = self.config.refresh_rotation == RefreshRotation::Reuse;
+
         // Retryable rotations keep the predecessor present and atomically replace
         // it with the completed response. Strict stores retain their take contract.
-        let record = if self.config.refresh_retry_window.is_zero() {
+        // `Reuse` reads without taking for the same reason retry does: the live token must
+        // survive the redemption so it can be presented again.
+        let record = if !reuse && self.config.refresh_retry_window.is_zero() {
             self.store
                 .take_refresh_token(refresh_token)
                 .await
@@ -5184,7 +5428,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
 
-        if !self.config.refresh_retry_window.is_zero() {
+        // Retry coalescing is a ROTATION feature: it recovers the successor of a spent token for a
+        // lost-response retry. `Reuse` has no successor and never spends the token, so the window
+        // is inert here and is skipped rather than consulted. See `ServerConfig::refresh_rotation`.
+        if !reuse && !self.config.refresh_retry_window.is_zero() {
             if let Some(response) = self
                 .refresh_retry_response(
                     &record,
@@ -5210,7 +5457,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // When the revocation SUCCEEDS it removes every record carrying this id, including this
         // one, so there is nothing to put back. When it fails there is, and that is the whole of
         // the paragraph below.
-        if record.state == RefreshTokenState::Spent {
+        //
+        // `Reuse` never enters this branch: it never writes a `Spent` record, so a live token
+        // re-presented reads as `Active` and mints again. That is the FAPI-2.0 posture and the
+        // whole point of the switch — reuse DETECTION is what is given up. See
+        // `RefreshRotation::Reuse`.
+        if !reuse && record.state == RefreshTokenState::Spent {
             // THE STORE FAILING HERE MUST NOT PROPAGATE, and the reason is the same one the
             // authorization-code replay path states above: the wire cannot carry this news. The
             // answer to a reused refresh token is `invalid_grant` however badly the store is
@@ -5365,6 +5617,40 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let family_id = record.family_id.clone();
         let authentication = GrantedAuthentication::from_refresh(&record);
         let grant_established_at = record.grant_established_at;
+
+        // FAPI 2.0 no-rotation issuance. Mint a fresh access token bound to the SAME family, but
+        // do NOT rotate: `allow_refresh = false` stops `issue` drawing a new refresh token, and
+        // the presented record was read (not taken) so it is still `Active` in the store. The SAME
+        // refresh token value is handed back and will mint again next time, within the chain's
+        // lifetime. No spent record is written and no family is revoked, which is exactly the
+        // reuse protection FAPI 2.0 forbids and this switch gives up. See `RefreshRotation::Reuse`.
+        if reuse {
+            let mut response = self
+                .issue_boxed(
+                    &client,
+                    bound,
+                    GrantType::RefreshToken,
+                    grant_established_at,
+                    subject,
+                    scope,
+                    resource,
+                    details,
+                    Some(RefreshChain {
+                        family_id,
+                        expires_at: chain_expires_at,
+                        retry: None,
+                    }),
+                    // NOT a new refresh token: the presented one is returned unrotated below.
+                    false,
+                    authentication,
+                    GrantedActor::default(),
+                    None,
+                )
+                .await?;
+            response.refresh_token = Some(refresh_token.to_string());
+            return Ok(response);
+        }
+
         let retry = if self.config.refresh_retry_window.is_zero() {
             // Strict rotation arms reuse detection before issuance. A failed mint
             // remains fail-closed, as it did before retry support was enabled.
@@ -5719,7 +6005,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `audit`, `subject`, `scope`, `resource`, `details`, `authentication`, `client` and
         // `bound` are all built above and read below, so they are all in the frame. The SIZE
         // claim is unaffected and is gated by `tests/allocation.rs`; the description was simply
-        // wrong, and it matters because that await is the host's `Es256Signer` and is unbounded.
+        // wrong, and it matters because that await is the host's `JwsSigner` and is unbounded.
         #[cfg(feature = "jwt")]
         let prepared = self.access_token_signing_input(
             client,

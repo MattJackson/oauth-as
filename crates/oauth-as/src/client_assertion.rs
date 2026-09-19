@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::jwt::{verify_hs256, CompactJws, Es256Verifier, PublicJwk};
+use crate::jwt::{verify_hs256, CompactJws, Jwk, JwsAlg, JwsVerifier};
 
 /// RFC 7521 section 4.2: the `client_assertion_type` a JWT bearer assertion must carry.
 pub const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -73,7 +73,7 @@ pub const MIN_CLIENT_SECRET_JWT_KEY_LENGTH: usize = 22;
 /// field is the only spelling Rust has for "this cannot be reached by a struct literal", and a
 /// floor a caller can skip by writing `AssertionKeys::ClientSecret { secret: "abc".into() }` is not
 /// a floor. Deserialization is routed through the same check for the same reason
-/// [`crate::jwt::PublicJwk`]'s is: a registration read back out of the host's store must be held to
+/// [`crate::jwt::Jwk`]'s is: a registration read back out of the host's store must be held to
 /// what the constructor holds a fresh one to, or the store becomes the way around it.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -130,8 +130,12 @@ impl fmt::Display for WeakClientSecret {
 
 impl std::error::Error for WeakClientSecret {}
 
-/// The `token_endpoint_auth_signing_alg_values_supported` this server advertises (RFC 8414
-/// section 2), which is exactly what [`AssertionKeys::signing_alg`] can return.
+/// The built-in `token_endpoint_auth_signing_alg_values_supported` baseline this server advertises
+/// (RFC 8414 section 2): `client_secret_jwt`'s HS256, plus the `jwt-p256` backend's ES256.
+///
+/// Only the baseline. A [`AssertionKeys::PublicKeys`] registration under RS256 or EdDSA makes
+/// [`AssertionKeys::signing_alg`] return that algorithm too, and [`crate::metadata`] adds it to the
+/// advertised list where the matching verifier resolves.
 pub const ASSERTION_SIGNING_ALGS: &[&str] = &["HS256", "ES256"];
 
 /// The longest `exp - now` this server will accept on an assertion.
@@ -168,8 +172,10 @@ pub use crate::skew::CLOCK_SKEW_LEEWAY;
 ///
 /// WHY 4 KiB, from what an assertion actually contains. RFC 7523 section 3 fixes the claim set:
 /// `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, over a header carrying `alg` and at most `typ`
-/// and `kid`, with either a 32-byte HMAC or a 64-byte ECDSA signature. Base64url encoded that is a
-/// few hundred bytes in practice, and 4096 leaves generous room for a long issuer URL, a verbose
+/// and `kid`, with the signature a 32-byte HMAC (HS256), a 64-byte ECDSA (ES256) or Ed25519 (EdDSA)
+/// signature, or a modulus-width RSASSA-PKCS1-v1_5 signature (RS256, 256–512 bytes). Base64url
+/// encoded even the RSA case is under a kilobyte, and 4096 leaves generous room for a long issuer
+/// URL, a verbose
 /// `kid` and claims a deployment adds, while refusing a megabyte of `client_assertion` parameter
 /// before any of it is decoded. An assertion this cap refuses is not one any conforming client
 /// sends.
@@ -199,13 +205,17 @@ pub enum AssertionKeys {
         /// past by writing the variant out by hand.
         secret: ClientSecretKey,
     },
-    /// `private_key_jwt` (RFC 7523 section 2.2 with a digital signature): ECDSA P-256 under a key
-    /// only the client holds. This is the variant to reach for.
+    /// `private_key_jwt` (RFC 7523 section 2.2 with a digital signature): an asymmetric signature
+    /// under a key only the client holds. This is the variant to reach for.
     PublicKeys {
+        /// The ONE algorithm this registration's assertions may carry — any wired [`JwsAlg`]
+        /// (ES256, RS256, or EdDSA). Singular on purpose (see [`AssertionKeys::signing_alg`]): a
+        /// registration that accepted a SET would be one where an attacker picks from the set.
+        alg: JwsAlg,
         /// The registered public keys. Several are allowed so a client can rotate: it publishes the
         /// new key alongside the old, signs with either during the overlap, and retires the old one
         /// when it is done. A server that accepted only one key would make rotation an outage.
-        keys: Vec<PublicJwk>,
+        keys: Vec<Jwk>,
     },
 }
 
@@ -220,9 +230,11 @@ impl fmt::Debug for AssertionKeys {
                 .debug_struct("ClientSecret")
                 .field("secret", &"[redacted]")
                 .finish(),
-            AssertionKeys::PublicKeys { keys } => {
-                f.debug_struct("PublicKeys").field("keys", keys).finish()
-            }
+            AssertionKeys::PublicKeys { alg, keys } => f
+                .debug_struct("PublicKeys")
+                .field("alg", alg)
+                .field("keys", keys)
+                .finish(),
         }
     }
 }
@@ -244,7 +256,17 @@ impl AssertionKeys {
     pub fn signing_alg(&self) -> &'static str {
         match self {
             AssertionKeys::ClientSecret { .. } => "HS256",
-            AssertionKeys::PublicKeys { .. } => "ES256",
+            AssertionKeys::PublicKeys { alg, .. } => alg.jose_name(),
+        }
+    }
+
+    /// The asymmetric [`JwsAlg`] a `private_key_jwt` registration verifies under, so the caller can
+    /// resolve the right [`JwsVerifier`]. `None` for `client_secret_jwt`, whose HS256 is an HMAC
+    /// over the registered secret and needs no verifier at all.
+    pub(crate) fn asymmetric_alg(&self) -> Option<JwsAlg> {
+        match self {
+            AssertionKeys::ClientSecret { .. } => None,
+            AssertionKeys::PublicKeys { alg, .. } => Some(*alg),
         }
     }
 }
@@ -354,24 +376,25 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 ///    up telling an attacker which client ids exist.
 /// 3. Everything after that is the section 3 claim set, in the section's own order.
 ///
-/// `verifier` is the ES256 backend, the host's to choose after 0.9.0: enable `jwt-p256` for
-/// [`crate::jwt::P256Verifier`], or pass your own.
+/// `verifier` is the backend for the registration's asymmetric algorithm, the host's to choose
+/// after 0.9.0: enable `jwt-p256`/`jwt-rsa`/`jwt-ed25519` for a built-in [`crate::jwt::JwsVerifier`]
+/// (ES256, RS256, EdDSA), or pass your own.
 ///
 /// It is an `Option`, and unlike [`crate::dpop::verify_proof`]'s it HAS to be, because only ONE of
-/// the two RFC 7523 methods involves a curve at all. `private_key_jwt` is ES256 and `None` refuses
-/// it, for that function's reason: a caller holding no verifier must refuse the credential rather
-/// than verify it leniently. `client_secret_jwt` is HS256 over the registered secret (RFC 7518
-/// section 3.2), and there is no elliptic curve on that path, no key for a verifier to check and
-/// nothing for a backend to contribute. Taking a verifier by value here made a build with
-/// `client-assertion` and no ES256 backend refuse a perfectly valid HMAC, which is a refusal no
-/// RFC asks for.
+/// the two RFC 7523 methods carries an asymmetric signature at all. `private_key_jwt` names one
+/// asymmetric algorithm and `None` refuses it, for that function's reason: a caller holding no
+/// verifier must refuse the credential rather than verify it leniently. `client_secret_jwt` is
+/// HS256 over the registered secret (RFC 7518 section 3.2), with no asymmetric key on that path,
+/// nothing for a verifier to check and nothing for a backend to contribute. Taking a verifier by
+/// value here made a build with `client-assertion` and no asymmetric backend refuse a perfectly
+/// valid HMAC, which is a refusal no RFC asks for.
 ///
 /// PUBLIC because [`VerifiedAssertion`] and [`AssertionFailure`] are, and a type no consumer can
 /// obtain is a type that should not have been exported. It is also the other half of
 /// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
 /// while hiding the verification it exists to feed left the safe path out of reach.
 pub fn verify_assertion(
-    verifier: Option<&dyn Es256Verifier>,
+    verifier: Option<&dyn JwsVerifier>,
     keys: &AssertionKeys,
     assertion: &str,
     client_id: &str,
@@ -422,7 +445,7 @@ pub fn verify_assertion(
         // failure to one bare `invalid_client` anyway (see `authenticate_by_assertion`), and a
         // distinct "this deployment has no backend" outcome would be a fact about the server's
         // configuration that an unauthenticated caller could read off the wire.
-        AssertionKeys::PublicKeys { keys } => match verifier {
+        AssertionKeys::PublicKeys { keys, .. } => match verifier {
             Some(verifier) => keys
                 .iter()
                 .any(|key| verifier.verify(key, jws.signing_input.as_bytes(), &jws.signature)),
@@ -545,7 +568,7 @@ fn audience_matches(jws: &CompactJws<'_>, audiences: &[&str]) -> bool {
 }
 
 // The unit tests need a key that can SIGN, so they need `jwt-p256`, the built-in ES256 backend.
-// `jwt` alone carries the `Es256Signer`/`Es256Verifier` seam and no curve arithmetic at all, and a
+// `jwt` alone carries the `JwsSigner`/`JwsVerifier` seam and no curve arithmetic at all, and a
 // test that cannot produce a signature cannot test a verifier.
 #[cfg(all(test, feature = "jwt-p256"))]
 #[path = "tests/client_assertion.rs"]

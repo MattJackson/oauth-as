@@ -1433,7 +1433,7 @@ where
 ///
 /// The latency half is the host's outright. A handler makes a bounded NUMBER of store calls, but
 /// each one is the host's [`crate::store::Storage`] and this crate sets no timeout anywhere, on
-/// anything; the token path additionally awaits [`crate::jwt::Es256Signer`], which that trait's
+/// anything; the token path additionally awaits [`crate::jwt::JwsSigner`], which that trait's
 /// own docs say may be a network round trip to a KMS. Nor is the latency all waiting:
 /// a host-installed [`crate::client::SecretVerifier`] runs its KDF INLINE on the executor thread
 /// polling the request — that trait prices argon2id at ordinary parameters at roughly 200 ms, paid

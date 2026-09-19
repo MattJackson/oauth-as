@@ -35,7 +35,7 @@
 //! - [`Hooks`] is ONE pointer wide. The seams behind it are four in a default build (an
 //!   [`EventSink`], a [`RateLimiter`], a [`crate::client::SecretVerifier`] and a
 //!   [`crate::registration::RegistrationPolicy`]) and six with `jar` and `jwt` (a
-//!   `RequestObjectKeys` and an `Es256Verifier`). Held as separate `Option<Box<dyn _>>` fields they
+//!   `RequestObjectKeys` and an `JwsVerifier`). Held as separate `Option<Box<dyn _>>` fields they
 //!   would be 16 bytes each on every [`crate::server::AuthorizationServer`] value, so 64 bytes paid
 //!   by every host and 96 by one enabling both features; instead they live inside a boxed struct
 //!   that is not allocated at all until something is installed.
@@ -631,11 +631,12 @@ struct Installed {
     registration_policy: Option<Box<dyn RegistrationPolicy>>,
     #[cfg(feature = "jar")]
     request_object_keys: Option<Box<dyn crate::par::RequestObjectKeys>>,
-    /// The host's ES256 backend for VERIFICATION (RFC 9449 DPoP proofs, RFC 9101 request objects,
-    /// RFC 7523 client assertions). `Arc` rather than `Box` because it is also what a host hands
-    /// to [`crate::signer_conformance`] and may share with its own resource-server half.
+    /// The host's installed asymmetric verifiers, one slot per [`crate::jwt::JwsAlg`], for
+    /// VERIFICATION (RFC 9449 DPoP proofs, RFC 9101 request objects, RFC 7523 client assertions).
+    /// Each verifier is an `Arc` because it is also what a host hands to
+    /// [`crate::signer_conformance`] and may share with its own resource-server half.
     #[cfg(feature = "jwt")]
-    es256_verifier: Option<std::sync::Arc<dyn crate::jwt::Es256Verifier>>,
+    jws_verifiers: crate::jwt::JwsVerifiers,
 }
 
 /// The server's slot for the host seams: exactly one pointer wide, and null until the host
@@ -699,27 +700,25 @@ impl Hooks {
         self.installed().request_object_keys = Some(keys);
     }
 
-    /// Install the ES256 backend used to VERIFY signatures, replacing any previous one.
+    /// Install an asymmetric verifier used to VERIFY signatures, into the slot for its own
+    /// algorithm, replacing any previous one for that algorithm.
     #[cfg(feature = "jwt")]
-    pub(crate) fn install_es256_verifier(
+    pub(crate) fn install_jws_verifier(
         &mut self,
-        verifier: std::sync::Arc<dyn crate::jwt::Es256Verifier>,
+        verifier: std::sync::Arc<dyn crate::jwt::JwsVerifier>,
     ) {
-        self.installed().es256_verifier = Some(verifier);
+        self.installed().jws_verifiers.install(verifier);
     }
 
-    /// The installed ES256 verifier, or `None`.
+    /// The verifiers the HOST installed, or `None` when nothing is installed.
     ///
-    /// `None` is NOT read as "accept anything": every caller refuses instead. Callers inside this
-    /// crate reach the verifier through a private resolver on `AuthorizationServer`, which is what
-    /// applies the `jwt-p256` fallback; this method reports only what the HOST installed, so that
-    /// fallback lives in exactly one place.
+    /// `None` (and an empty set) is NOT read as "accept anything": every caller refuses instead.
+    /// Callers inside this crate reach the verifiers through a private resolver on
+    /// [`crate::AuthorizationServer`], which is what applies the `jwt-p256` fallback; this method
+    /// reports only what the HOST installed, so that fallback lives in exactly one place.
     #[cfg(feature = "jwt")]
-    pub fn es256_verifier(&self) -> Option<&std::sync::Arc<dyn crate::jwt::Es256Verifier>> {
-        match &self.0 {
-            Some(installed) => installed.es256_verifier.as_ref(),
-            None => None,
-        }
+    pub fn jws_verifiers(&self) -> Option<&crate::jwt::JwsVerifiers> {
+        self.0.as_ref().map(|installed| &installed.jws_verifiers)
     }
 
     /// The installed RFC 9101 request object key source.

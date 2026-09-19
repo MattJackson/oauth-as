@@ -566,7 +566,7 @@ pub enum AuthorizationCodeState {
     /// It exists to be read by a redemption that is still running. The interleaving it closes:
     /// redeemer A takes the code, writes `Consumed { access_token: None, .. }` before issuing (so
     /// that a store failure cannot disarm the alarm), and then SUSPENDS on the host's
-    /// [`crate::jwt::Es256Signer`], which is a network round trip when that signer fronts a KMS.
+    /// [`crate::jwt::JwsSigner`], which is a network round trip when that signer fronts a KMS.
     /// Replayer B arrives in that window, finds `Consumed { access_token: None }`, and correctly
     /// concludes there is nothing to revoke, because nothing has been issued YET. B refuses the
     /// replay and puts the record back.

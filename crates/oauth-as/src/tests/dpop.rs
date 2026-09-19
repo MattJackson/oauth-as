@@ -18,12 +18,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use super::*;
-use crate::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};
+use crate::jwt::{compact_jws, hmac_sha256, EcdsaP256Key, Jwk, JwsVerifiers, P256Verifier};
 
-/// The crate's built-in ES256 backend. Verification now goes through the [`crate::jwt::Es256Verifier`] seam,
-/// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
-/// default, which is what keeps these tests measuring the behaviour they always measured.
-const VERIFIER: &crate::jwt::P256Verifier = &crate::jwt::P256Verifier;
+/// The crate's built-in ES256 backend, in a [`JwsVerifiers`] set. Verification goes through the
+/// [`crate::jwt::JwsVerifier`] seam, and DPoP selects among the INSTALLED algorithms, so a proof is
+/// checked against a set rather than one verifier; this installs the one a consumer who enables
+/// `jwt-p256` gets by default, which keeps these tests measuring the behaviour they always did.
+fn verifiers() -> JwsVerifiers {
+    let mut verifiers = JwsVerifiers::new();
+    verifiers.install(std::sync::Arc::new(P256Verifier));
+    verifiers
+}
 
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000)
@@ -62,7 +67,7 @@ fn proof_with(
 }
 
 fn verify(proof: &str) -> Result<VerifiedProof, DpopFailure> {
-    verify_proof(VERIFIER, proof, HTM, HTU, now())
+    verify_proof(&verifiers(), proof, HTM, HTU, now())
 }
 
 // -------------------------------------------------------------------------------- happy paths
@@ -83,7 +88,7 @@ fn the_request_uri_is_compared_without_its_query_or_fragment() {
     let key = EcdsaP256Key::generate("k");
     let proof = proof_with(&key, &header(&key), &claims());
     assert!(verify_proof(
-        VERIFIER,
+        &verifiers(),
         &proof,
         HTM,
         "https://as.example/token?x=1#f",
@@ -362,14 +367,14 @@ fn no_proof_outlives_the_deadline_it_asked_to_be_remembered_until() {
         let proof = proof_with(&key, &header(&key), &c);
         let verified = verify(&proof).unwrap();
         assert_eq!(
-            verify_proof(VERIFIER, &proof, HTM, HTU, verified.replay_until),
+            verify_proof(&verifiers(), &proof, HTM, HTU, verified.replay_until),
             Err(DpopFailure::StaleProof),
             "a proof issued {age}s ago is still accepted at its own replay_until"
         );
         // And it is accepted right up to there, so the window is closed rather than shortened.
         assert!(
             verify_proof(
-                VERIFIER,
+                &verifiers(),
                 &proof,
                 HTM,
                 HTU,
@@ -396,7 +401,7 @@ fn the_thumbprint_is_the_rfc_7638_construction_and_nothing_else() {
     let jwk = key.to_public_jwk();
     let canonical = format!(
         r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
-        jwk.crv(),
+        jwk.crv().unwrap().jose_name(),
         jwk.kty(),
         jwk.x(),
         jwk.y()
@@ -418,7 +423,7 @@ fn the_thumbprint_ignores_kid_and_any_other_optional_member() {
         relabelled.clone().with_kid("kid-two").thumbprint(),
         original
     );
-    let unnamed = PublicJwk::from_coordinates(relabelled.x(), relabelled.y())
+    let unnamed = Jwk::from_coordinates(relabelled.x(), relabelled.y())
         .expect("the same point, with no kid at all");
     assert_eq!(unnamed.thumbprint(), original);
 }

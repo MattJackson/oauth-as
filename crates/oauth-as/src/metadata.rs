@@ -514,15 +514,41 @@ impl AuthorizationServerMetadata {
     ///
     /// [`AuthorizationServerMetadata::from_config`] cannot see one: `jwt-p256` compiles the
     /// built-in backend in, and a host may install its own with
-    /// [`crate::AuthorizationServer::with_es256_verifier`], and neither is reachable from a
+    /// [`crate::AuthorizationServer::with_jws_verifier`], and neither is reachable from a
     /// `&ServerConfig`. So `from_config` advertises the ES256-dependent members only when the
     /// built-in backend is compiled in, and [`crate::AuthorizationServer::metadata`] calls this
     /// when the server resolves a verifier.
     ///
     /// IDEMPOTENT, and it has to be: with `jwt-p256` on, `from_config` has already added all of
     /// this, and a document that named `private_key_jwt` twice would be a defect of its own.
-    #[cfg(any(feature = "client-assertion", feature = "jar", feature = "dpop"))]
+    ///
+    /// Kept as the ES256 spelling for the crate's own tests; it delegates to the per-algorithm
+    /// [`AuthorizationServerMetadata::mark_alg_verifiable`], which the server now calls once per
+    /// algorithm whose verifier resolves (ES256, RS256, EdDSA). Test-only: production code reaches
+    /// `mark_alg_verifiable` directly.
+    ///
+    /// Gated on `client-assertion` alone, its one caller's feature: `mark_alg_verifiable` also
+    /// serves `jar`/`dpop`, but the only test that drives THIS ES256 spelling lives behind
+    /// `client-assertion`, so compiling it under `jar` or `dpop` without it is dead code.
+    #[cfg(all(test, feature = "client-assertion"))]
     pub(crate) fn es256_verification_is_available(&mut self) {
+        self.mark_alg_verifiable(crate::jwt::JwsAlg::Es256);
+    }
+
+    /// Add back every advertisement that is honest only when a VERIFIER for `alg` exists.
+    ///
+    /// The generalization of [`AuthorizationServerMetadata::es256_verification_is_available`] to
+    /// every wired [`crate::jwt::JwsAlg`]. [`AuthorizationServerMetadata::from_config`] can see only
+    /// the FEATURE-guaranteed ES256 baseline (`jwt-p256`); it cannot see an installed verifier, nor
+    /// the built-in RSA/EdDSA backends' resolvability, so [`crate::AuthorizationServer::metadata`]
+    /// calls this once per algorithm it actually resolves a verifier for. Every push is idempotent,
+    /// so calling it for an algorithm `from_config` already listed is a no-op.
+    ///
+    /// All three wired algorithms are asymmetric SIGNATURES, so each makes `private_key_jwt`
+    /// honest; only HS256 (which never reaches this seam) is the symmetric exception.
+    #[cfg(any(feature = "client-assertion", feature = "jar", feature = "dpop"))]
+    pub(crate) fn mark_alg_verifiable(&mut self, alg: crate::jwt::JwsAlg) {
+        let name = alg.jose_name();
         #[cfg(feature = "client-assertion")]
         {
             let method = crate::client_assertion::PRIVATE_KEY_JWT.to_string();
@@ -532,8 +558,8 @@ impl AuthorizationServerMetadata {
             let algs = self
                 .token_endpoint_auth_signing_alg_values_supported
                 .get_or_insert_with(Vec::new);
-            if !algs.iter().any(|a| a == "ES256") {
-                algs.push("ES256".to_string());
+            if !algs.iter().any(|a| a == name) {
+                algs.push(name.to_string());
             }
         }
         #[cfg(feature = "jar")]
@@ -543,23 +569,26 @@ impl AuthorizationServerMetadata {
             // is the one signal here for "RFC 9101 is configured" that does not depend on the
             // very thing this method is adjusting.
             if self.require_signed_request_object.is_some() {
-                self.request_object_signing_alg_values_supported = Some(
-                    crate::par::REQUEST_OBJECT_SIGNING_ALGS
-                        .iter()
-                        .map(|alg| alg.to_string())
-                        .collect(),
-                );
+                let algs = self
+                    .request_object_signing_alg_values_supported
+                    .get_or_insert_with(Vec::new);
+                if !algs.iter().any(|a| a == name) {
+                    algs.push(name.to_string());
+                }
             }
         }
         #[cfg(feature = "dpop")]
         {
-            self.dpop_signing_alg_values_supported = Some(
-                crate::dpop::DPOP_SIGNING_ALG_VALUES_SUPPORTED
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect(),
-            );
+            let algs = self
+                .dpop_signing_alg_values_supported
+                .get_or_insert_with(Vec::new);
+            if !algs.iter().any(|a| a == name) {
+                algs.push(name.to_string());
+            }
         }
+        // Under a build with only one of the three verify-features, `name` is used by that arm; the
+        // binding cannot be unused because at least one of the three cfgs above is on (the method's
+        // own gate). No `let _ = name;` is needed and adding one would be dead.
     }
 }
 

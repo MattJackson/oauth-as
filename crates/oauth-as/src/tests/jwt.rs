@@ -102,3 +102,126 @@ fn a_crit_header_is_refused_in_every_shape_rfc_7515_allows_it_to_arrive_in() {
         );
     }
 }
+
+/// [`super::consistent`] is the algorithm-confusion guard: it must REFUSE a key whose kind is not
+/// the kind the chosen algorithm signs with, and ACCEPT the matching kind. The verifiers each carry
+/// their own key-kind guard as well (defense in depth), so a `consistent` that always returned
+/// `true` would still be caught end-to-end — but the invariant lives here, and this pins it
+/// directly: a mutant that made `consistent` unconditionally `true` fails every cross-kind
+/// assertion below.
+#[test]
+fn consistent_refuses_a_key_of_the_wrong_kind_for_the_algorithm() {
+    // Coordinates/parameters are irrelevant to `consistent`; only the KIND is read. Empty strings
+    // are fine because the function inspects the variant, not the bytes.
+    let ec = Jwk::Ec {
+        crv: EcCurve::P256,
+        x: String::new(),
+        y: String::new(),
+        kid: None,
+    };
+    let rsa = Jwk::Rsa {
+        n: String::new(),
+        e: String::new(),
+        kid: None,
+    };
+    let okp = Jwk::Okp {
+        crv: OkpCurve::Ed25519,
+        x: String::new(),
+        kid: None,
+    };
+
+    // Matching kind: accepted.
+    assert!(consistent(JwsAlg::Es256, &ec));
+    assert!(consistent(JwsAlg::Rs256, &rsa));
+    assert!(consistent(JwsAlg::EdDsa, &okp));
+
+    // Cross-kind: refused. Each of these is a case a mutant returning `true` gets wrong.
+    assert!(!consistent(JwsAlg::Rs256, &ec));
+    assert!(!consistent(JwsAlg::EdDsa, &ec));
+    assert!(!consistent(JwsAlg::Es256, &rsa));
+    assert!(!consistent(JwsAlg::EdDsa, &rsa));
+    assert!(!consistent(JwsAlg::Es256, &okp));
+    assert!(!consistent(JwsAlg::Rs256, &okp));
+}
+
+/// Invariant #1: the algorithm is chosen by the REGISTRATION, and the token header only gets to
+/// agree with it. [`super::expect_alg`] under [`super::AlgPolicy::Registered`] must accept a header
+/// whose `alg` matches and refuse one that does not. The comparison is `alg != expected`; a mutant
+/// flipping it to `==` accepts the mismatch and refuses the match, so both assertions here go red.
+#[test]
+fn expect_alg_pins_the_registered_algorithm_against_the_header() {
+    // The `installed` set is not consulted on the `Registered` path, so an empty one is enough.
+    let installed = JwsVerifiers::new();
+    let sign = |_: &str| vec![0u8; 64];
+
+    // Header agrees with the registration: accepted, and yields the registered algorithm.
+    let matching = compact_jws(br#"{"alg":"ES256"}"#, br#"{"iss":"someone"}"#, sign);
+    let jws = CompactJws::parse(&matching).expect("a well formed JWS");
+    assert_eq!(
+        expect_alg(&jws, AlgPolicy::Registered(JwsAlg::Es256), &installed),
+        Ok(JwsAlg::Es256),
+    );
+
+    // Header names a different (but wired) algorithm: refused as a mismatch, NEVER honoured.
+    let mismatch = compact_jws(br#"{"alg":"RS256"}"#, br#"{"iss":"someone"}"#, sign);
+    let jws = CompactJws::parse(&mismatch).expect("a well formed JWS");
+    assert_eq!(
+        expect_alg(&jws, AlgPolicy::Registered(JwsAlg::Es256), &installed),
+        Err(AlgRefusal::Mismatch),
+    );
+}
+
+/// [`super::JwsSignature::from_wire`] is the width check the fixed-size arrays make impossible to
+/// skip: the fixed-width curves require EXACTLY 64 bytes, RS256 takes the decoded octets as-is. A
+/// mutant returning `None` for every input fails the `Some` round-trips below.
+#[test]
+fn from_wire_accepts_the_right_width_and_round_trips() {
+    // ES256: exactly 64 bytes, round-tripped by value.
+    let es = JwsSignature::from_wire(JwsAlg::Es256, &[7u8; 64]).expect("64 bytes is a valid ES256");
+    assert_eq!(es.alg(), JwsAlg::Es256);
+    assert_eq!(es.as_bytes(), &[7u8; 64]);
+    assert!(JwsSignature::from_wire(JwsAlg::Es256, &[0u8; 63]).is_none());
+    assert!(JwsSignature::from_wire(JwsAlg::Es256, &[0u8; 65]).is_none());
+
+    // EdDSA: same fixed 64-byte width.
+    let ed = JwsSignature::from_wire(JwsAlg::EdDsa, &[9u8; 64]).expect("64 bytes is a valid EdDSA");
+    assert_eq!(ed.alg(), JwsAlg::EdDsa);
+    assert_eq!(ed.as_bytes(), &[9u8; 64]);
+    assert!(JwsSignature::from_wire(JwsAlg::EdDsa, &[0u8; 32]).is_none());
+
+    // RS256: octets as-is, so a 256-byte (RSA-2048) modulus width is taken verbatim.
+    let rs = JwsSignature::from_wire(JwsAlg::Rs256, &[1u8; 256]).expect("RS256 takes octets as-is");
+    assert_eq!(rs.alg(), JwsAlg::Rs256);
+    assert_eq!(rs.as_bytes(), &[1u8; 256]);
+}
+
+/// The ES256 PKCS#8 round-trip, pinned BY VALUE: [`super::EcdsaP256Key::to_pkcs8_der`] must emit
+/// non-empty DER (a `PrivateKeyInfo` SEQUENCE) that [`super::EcdsaP256Key::from_pkcs8_der`] reads
+/// back into the SAME public key. A mutant returning `Ok(vec![])` or `Ok(vec![0])` fails the
+/// non-empty / DER-tag assertions; a mutant returning `Ok(Default::default())` from the loader
+/// fails the public-JWK equality.
+#[cfg(feature = "jwt-pkcs8")]
+#[test]
+fn ecdsa_p256_pkcs8_der_round_trips_by_value() {
+    // A deterministic key (fixed scalar) so the round-trip is a known answer, not a coin flip.
+    let scalar = [0x42u8; 32];
+    let key = EcdsaP256Key::from_scalar_bytes("pkcs8-kid", &scalar)
+        .expect("0x42-repeated is a valid P-256 scalar");
+
+    let der = key
+        .to_pkcs8_der()
+        .expect("PKCS#8 export succeeds for a loaded key");
+    assert!(!der.is_empty(), "PKCS#8 export must not be empty");
+    assert_eq!(
+        der[0], 0x30,
+        "a PKCS#8 PrivateKeyInfo is a DER SEQUENCE (tag 0x30)"
+    );
+
+    let reloaded =
+        EcdsaP256Key::from_pkcs8_der("pkcs8-kid", &der).expect("the DER we just wrote round-trips");
+    assert_eq!(
+        reloaded.public_jwk(),
+        key.public_jwk(),
+        "the reloaded key must be the same key by its public half",
+    );
+}
