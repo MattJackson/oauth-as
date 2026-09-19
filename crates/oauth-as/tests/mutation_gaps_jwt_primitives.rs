@@ -20,7 +20,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
-use oauth_as::jwt::{hmac_sha256, AccessTokenClaims, Audience, EcdsaP256Key, JwtConfig, PublicJwk};
+use oauth_as::jwt::{hmac_sha256, AccessTokenClaims, Audience, EcdsaP256Key, Jwk, JwtConfig};
 
 const SCALAR: [u8; 32] = [0x2a; 32];
 const AUDIENCE: &str = "https://rs.example";
@@ -218,12 +218,12 @@ fn a_jwk_coordinate_that_is_not_thirty_two_bytes_cannot_be_constructed() {
         (X, long.as_str(), "a long y"),
     ] {
         assert!(
-            PublicJwk::from_coordinates(x, y).is_err(),
+            Jwk::from_coordinates(x, y).is_err(),
             "from_coordinates must refuse {what}"
         );
         let json = serde_json::json!({"kty": "EC", "crv": "P-256", "x": x, "y": y});
         assert!(
-            PublicJwk::from_json(&json).is_err(),
+            Jwk::from_json(&json).is_err(),
             "from_json must refuse {what}"
         );
     }

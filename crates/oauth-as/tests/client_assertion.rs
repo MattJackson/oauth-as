@@ -17,7 +17,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::client_assertion::{AssertionKeys, ClientSecretKey, CLIENT_ASSERTION_TYPE};
-use oauth_as::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};
+use oauth_as::jwt::{compact_jws, hmac_sha256, EcdsaP256Key, JwsAlg};
 use oauth_as::{
     AuthorizationServer, AuthorizationServerMetadata, Client, ClientAuth, ClientCredential,
     ClientId, ErrorCode, GrantType, MemoryStorage, ScopeSet, ServerConfig, Storage, TokenRequest,
@@ -185,6 +185,7 @@ async fn a_private_key_jwt_client_gets_a_token_without_ever_holding_a_shared_sec
         "pkjwt",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },
@@ -241,6 +242,7 @@ async fn the_same_assertion_cannot_be_spent_twice() {
         "replay-me",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },
@@ -275,6 +277,7 @@ async fn a_fresh_jti_from_the_same_client_still_works_after_a_replay_was_refused
         "still-fine",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },
@@ -314,6 +317,7 @@ async fn two_clients_may_use_the_same_jti_without_locking_each_other_out() {
             id,
             ClientAuth::ConfidentialAssertion {
                 keys: AssertionKeys::PublicKeys {
+                    alg: JwsAlg::Es256,
                     keys: vec![key.to_public_jwk()],
                 },
             },
@@ -357,6 +361,7 @@ async fn a_spent_jti_is_reclaimed_by_the_host_s_sweep() {
         "sweepable",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },
@@ -458,6 +463,7 @@ async fn presenting_a_secret_and_an_assertion_together_is_refused() {
         "both",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },
@@ -484,6 +490,7 @@ async fn an_assertion_with_the_wrong_or_missing_client_assertion_type_is_refused
         "typed",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },
@@ -543,6 +550,7 @@ async fn an_unknown_client_and_a_bad_assertion_are_the_same_answer_on_the_wire()
         "known",
         ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![key.to_public_jwk()],
             },
         },

@@ -29,8 +29,8 @@
 use std::time::Duration;
 
 use oauth_as::jwt::{
-    verify_es256, AccessTokenClaims, AccessTokenFormat, Audience, CompactJws, EcdsaP256Key, Jwks,
-    JwtConfig, PublicJwk,
+    verify_es256, AccessTokenClaims, AccessTokenFormat, Audience, CompactJws, EcdsaP256Key, Jwk,
+    Jwks, JwtConfig,
 };
 use oauth_as::{
     AuthorizationServer, Client, ClientAuth, ClientId, GrantType, MemoryStorage, ScopeSet,
@@ -50,13 +50,13 @@ fn verifies_against(jwks: &Jwks, token: &str) -> bool {
     let Some(kid) = jws.header_str("kid") else {
         panic!("RFC 9068 tokens from this crate always carry a kid");
     };
-    let Some(jwk) = jwks.keys.iter().find(|k| k.kid == kid) else {
+    let Some(jwk) = jwks.keys.iter().find(|k| k.kid() == Some(kid)) else {
         return false;
     };
     // Round-tripped through JSON rather than field-by-field: this is what a resource server
     // actually has, the serialized document, and it keeps the test honest about the SERVED shape
     // of `Jwk` rather than about a struct only this crate can see.
-    let public = PublicJwk::from_json(&serde_json::to_value(jwk).expect("a JWK serializes"))
+    let public = Jwk::from_json(&serde_json::to_value(jwk).expect("a JWK serializes"))
         .expect("a served JWK must be acceptable as a verifying key");
     verify_es256(&public, jws.signing_input.as_bytes(), &jws.signature)
 }
@@ -74,7 +74,10 @@ fn claims(jti: &str) -> AccessTokenClaims {
 }
 
 fn kids(jwks: &Jwks) -> Vec<String> {
-    jwks.keys.iter().map(|k| k.kid.clone()).collect()
+    jwks.keys
+        .iter()
+        .map(|k| k.kid().unwrap().to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oauth_as::jwt::{compact_jws, EcdsaP256Key, Es256Verifier, PublicJwk, SignerError};
+use oauth_as::jwt::{compact_jws, EcdsaP256Key, Jwk, JwsAlg, JwsVerifier, SignerError};
 use oauth_as::{
     AuthorizationServer, Client, ClientAuth, ClientId, ErrorCode, GrantType, MemoryStorage,
     ScopeSet, ServerConfig, TokenRequest, TokenRequestContext,
@@ -72,8 +72,12 @@ impl FixedAnswer {
     }
 }
 
-impl Es256Verifier for FixedAnswer {
-    fn verify(&self, _key: &PublicJwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
+impl JwsVerifier for FixedAnswer {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
+    fn verify(&self, _key: &Jwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.answer
     }
@@ -157,7 +161,7 @@ fn with_proof(proof: &str) -> TokenRequestContext<'_> {
 async fn an_installed_verifier_that_refuses_beats_the_built_in_backend() {
     let verifier = FixedAnswer::new(false);
     let srv = AuthorizationServer::new(config(), MemoryStorage::new())
-        .with_es256_verifier(verifier.clone() as Arc<dyn Es256Verifier>);
+        .with_jws_verifier(verifier.clone() as Arc<dyn JwsVerifier>);
     srv.register_client(confidential_client()).await.unwrap();
 
     let key = EcdsaP256Key::generate("device");
@@ -182,7 +186,7 @@ async fn an_installed_verifier_that_refuses_beats_the_built_in_backend() {
 async fn an_installed_verifier_that_accepts_beats_the_built_in_backend() {
     let verifier = FixedAnswer::new(true);
     let srv = AuthorizationServer::new(config(), MemoryStorage::new())
-        .with_es256_verifier(verifier.clone() as Arc<dyn Es256Verifier>);
+        .with_jws_verifier(verifier.clone() as Arc<dyn JwsVerifier>);
     srv.register_client(confidential_client()).await.unwrap();
 
     let key = EcdsaP256Key::generate("device");
@@ -224,14 +228,21 @@ async fn with_no_verifier_installed_the_built_in_backend_refuses_an_unsigned_pro
 async fn the_hooks_accessor_reports_the_installed_verifier_rather_than_the_fallback() {
     let plain = AuthorizationServer::new(config(), MemoryStorage::new());
     assert!(
-        plain.hooks().es256_verifier().is_none(),
+        plain
+            .hooks()
+            .jws_verifiers()
+            .and_then(|v| v.get(JwsAlg::Es256))
+            .is_none(),
         "nothing was installed, and the built-in backend is not something the host installed"
     );
 
     let srv = AuthorizationServer::new(config(), MemoryStorage::new())
-        .with_es256_verifier(FixedAnswer::new(true) as Arc<dyn Es256Verifier>);
+        .with_jws_verifier(FixedAnswer::new(true) as Arc<dyn JwsVerifier>);
     assert!(
-        srv.hooks().es256_verifier().is_some(),
+        srv.hooks()
+            .jws_verifiers()
+            .and_then(|v| v.get(JwsAlg::Es256))
+            .is_some(),
         "a verifier the host installed must be readable back"
     );
 }
@@ -252,7 +263,7 @@ fn a_signer_error_prints_its_message() {
         "the host's own detail must survive: {printed:?}"
     );
     assert!(
-        printed.contains("ES256 signer error"),
+        printed.contains("signer error"),
         "and it must say what kind of failure it is: {printed:?}"
     );
 }

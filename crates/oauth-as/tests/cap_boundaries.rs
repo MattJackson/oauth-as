@@ -34,7 +34,11 @@ use support::{server_with, ManualClock, PUBLIC_REDIRECT, RFC7636_VERIFIER};
     feature = "jwt-p256",
     any(feature = "dpop", feature = "client-assertion")
 ))]
-const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
+fn verifiers() -> oauth_as::jwt::JwsVerifiers {
+    let mut v = oauth_as::jwt::JwsVerifiers::new();
+    v.install(std::sync::Arc::new(oauth_as::jwt::P256Verifier));
+    v
+}
 
 /// `MAX_RESOURCE_INDICATORS` at the TOKEN endpoint. The authorization endpoint's half of this pair
 /// has had an at-cap acceptance case since the cap was added; the token endpoint's had only the
@@ -142,7 +146,7 @@ fn a_proof_of_exactly_the_cap_is_accepted() {
         "the whole point of this test is that the proof is EXACTLY the cap"
     );
     assert!(
-        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now).is_ok(),
+        verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now).is_ok(),
         "a proof of exactly MAX_PROOF_BYTES is inside the cap and must verify; refusing it would \
          be `>=` where the constant means `>`"
     );

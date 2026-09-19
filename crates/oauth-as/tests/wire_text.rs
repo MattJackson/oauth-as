@@ -555,7 +555,10 @@ fn assertion_keys_report_the_registered_auth_method_and_never_print_the_secret()
     let symmetric = AssertionKeys::ClientSecret {
         secret: ClientSecretKey::new("s3cr3t-not-for-logs-and-long-enough").unwrap(),
     };
-    let asymmetric = AssertionKeys::PublicKeys { keys: Vec::new() };
+    let asymmetric = AssertionKeys::PublicKeys {
+        alg: oauth_as::jwt::JwsAlg::Es256,
+        keys: Vec::new(),
+    };
 
     assert_eq!(
         symmetric.token_endpoint_auth_method(),
@@ -573,7 +576,10 @@ fn assertion_keys_report_the_registered_auth_method_and_never_print_the_secret()
     let printed = format!("{symmetric:?}");
     assert_eq!(printed, "ClientSecret { secret: \"[redacted]\" }");
     assert!(!printed.contains("s3cr3t-not-for-logs"));
-    assert_eq!(format!("{asymmetric:?}"), "PublicKeys { keys: [] }");
+    assert_eq!(
+        format!("{asymmetric:?}"),
+        "PublicKeys { alg: Es256, keys: [] }"
+    );
 }
 
 /// RFC 9449 section 4.3 lists the checks a proof must pass. Each refusal below is one of them, and
@@ -910,10 +916,9 @@ fn unknown_token_type_identifier_display_quotes_the_rejected_value() {
 #[cfg(feature = "jwt")]
 #[test]
 fn jwk_verify_error_display_is_prefixed_and_carries_the_reason() {
-    use oauth_as::jwt::PublicJwk;
+    use oauth_as::jwt::Jwk;
 
-    let err =
-        PublicJwk::from_json(&serde_json::Value::from(1u8)).expect_err("a number is not a JWK");
+    let err = Jwk::from_json(&serde_json::Value::from(1u8)).expect_err("a number is not a JWK");
     assert_eq!(
         err.to_string(),
         "JWS verification error: a JWK must be a JSON object"

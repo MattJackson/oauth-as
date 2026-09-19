@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::client::{SecretHash, SecretVerifier};
-use oauth_as::jwt::{Es256Verifier, PublicJwk};
+use oauth_as::jwt::{Jwk, JwsAlg, JwsVerifier};
 use oauth_as::server::{ClientCredential, TokenRequestContext};
 use oauth_as::{
     AuthorizationServer, Client, ClientAuth, ClientId, Clock, DynamicRegistration, ErrorCode,
@@ -93,8 +93,11 @@ impl SecretVerifier for CountingSecrets {
 /// Stands in for the ES256 backend. `false` always, for the same reason.
 struct CountingEs256(Meter);
 
-impl Es256Verifier for CountingEs256 {
-    fn verify(&self, _key: &PublicJwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
+impl JwsVerifier for CountingEs256 {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+    fn verify(&self, _key: &Jwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
         self.0.es256.fetch_add(1, Ordering::SeqCst);
         false
     }
@@ -142,6 +145,17 @@ enum Presented {
 }
 
 const CLIENT: &str = "probed-client";
+
+/// A syntactically WELL-FORMED compact JWS carrying an `ES256` header, with a garbage payload and
+/// signature: the shape a `private_key_jwt` probe has. It PARSES, so the dummy path reads its
+/// header's `alg` and pays an ES256 verification for it — which is what makes the unknown-id control
+/// cost an es256 verification below. The header `alg` matters now that
+/// `AuthorizationServer::dummy_assertion_verify` pays for the algorithm the assertion PRESENTS
+/// rather than a hardcoded ES256; an assertion that did not parse (the earlier `"x.y.z"`) would fall
+/// to the HMAC path and the control would no longer reach the counted es256 seam. It verifies under
+/// nobody, so it is still a junk credential in every sense that matters to a refusal.
+#[cfg(feature = "client-assertion")]
+const JUNK_ASSERTION: &str = "eyJhbGciOiJFUzI1NiJ9.e30.AA";
 
 fn client_with(auth: ClientAuth, registration: Option<DynamicRegistration>) -> Client {
     Client {
@@ -222,7 +236,7 @@ async fn cost(kind: Registration, presented: Presented) -> (usize, usize) {
         ManualClock(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
     )
     .with_secret_verifier(Box::new(CountingSecrets(meter.clone())))
-    .with_es256_verifier(Arc::new(CountingEs256(meter.clone())));
+    .with_jws_verifier(Arc::new(CountingEs256(meter.clone())));
     if let Some(client) = registration_fixture(kind) {
         srv.register_client(client).await.unwrap();
     }
@@ -237,11 +251,11 @@ async fn cost(kind: Registration, presented: Presented) -> (usize, usize) {
     #[cfg(feature = "client-assertion")]
     match presented {
         Presented::Assertion | Presented::AssertionAndSecret => {
-            cred.client_assertion = Some("x.y.z");
+            cred.client_assertion = Some(JUNK_ASSERTION);
             cred.client_assertion_type = Some(oauth_as::CLIENT_ASSERTION_TYPE);
         }
         Presented::AssertionWrongType => {
-            cred.client_assertion = Some("x.y.z");
+            cred.client_assertion = Some(JUNK_ASSERTION);
             cred.client_assertion_type = Some("urn:example:not-a-real-assertion-type");
         }
         Presented::Nothing | Presented::JunkSecret => {}
@@ -299,14 +313,18 @@ async fn every_refusal_costs_what_the_unknown_id_costs_for_the_same_request() {
     for presented in presentations {
         let control = cost(Registration::Unknown, presented).await;
         for kind in registrations {
-            // THE ONE KNOWN GAP, pinned rather than hidden. An assertion-registered client handed a
-            // MALFORMED assertion is refused by `verify_assertion` before it reaches any signature
-            // work, so it pays nothing while the unknown id pays one dummy verification. That is
-            // the FOURTH residual documented on `authenticate_client`: closing it needs
-            // `verify_assertion` to report whether it reached the signature, which is a change to a
-            // public function rather than to the exit this file is about. If this cell ever starts
-            // AGREEING, that residual has been closed and this exception must be deleted — which is
-            // why it is written as an expectation rather than as a skip.
+            // THE ONE KNOWN GAP, pinned rather than hidden. This assertion registration is
+            // `client_secret_jwt` (HS256), and `JUNK_ASSERTION` carries an `ES256` header, so
+            // `verify_assertion` refuses it at the AlgorithmMismatch check — before any signature
+            // work — and it pays nothing, while the unknown id pays one ES256 dummy verification for
+            // the algorithm the header PRESENTED. That is the FOURTH residual documented on
+            // `authenticate_client`: an assertion refused before the signature (over the size cap,
+            // not a compact JWS, or an alg that is not the registration's) costs nothing on the
+            // known path while the unknown id pays the dummy. Closing it needs `verify_assertion` to
+            // report whether it reached the signature, which is a change to a public function rather
+            // than to the exit this file is about. If this cell ever starts AGREEING, that residual
+            // has been closed and this exception must be deleted — which is why it is written as an
+            // expectation rather than as a skip.
             #[cfg(feature = "client-assertion")]
             if kind == Registration::Assertion && presented == Presented::Assertion {
                 let observed = cost(kind, presented).await;
@@ -388,7 +406,7 @@ async fn a_throttled_attempt_buys_no_verification() {
         ManualClock(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
     )
     .with_secret_verifier(Box::new(CountingSecrets(meter.clone())))
-    .with_es256_verifier(Arc::new(CountingEs256(meter.clone())))
+    .with_jws_verifier(Arc::new(CountingEs256(meter.clone())))
     .with_rate_limiter(Box::new(DenyAll));
 
     let refused = srv

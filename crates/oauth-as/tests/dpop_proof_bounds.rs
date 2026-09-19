@@ -34,7 +34,11 @@ use oauth_as::jwt::{compact_jws, EcdsaP256Key};
 /// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
 /// default, which is what keeps these tests measuring the behaviour they always measured.
 #[cfg(feature = "jwt-p256")]
-const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
+fn verifiers() -> oauth_as::jwt::JwsVerifiers {
+    let mut v = oauth_as::jwt::JwsVerifiers::new();
+    v.install(std::sync::Arc::new(oauth_as::jwt::P256Verifier));
+    v
+}
 
 const TOKEN_ENDPOINT: &str = "https://as.example/token";
 
@@ -108,7 +112,7 @@ fn an_iat_of_u64_max_is_refused_rather_than_panicking() {
     );
 
     assert_eq!(
-        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::StaleProof),
         "an iat that cannot be represented is outside every acceptance window"
     );
@@ -129,7 +133,7 @@ fn an_iat_near_u64_max_is_refused_rather_than_panicking() {
             }),
         );
         assert_eq!(
-            verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
+            verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()),
             Err(DpopFailure::StaleProof),
             "iat {iat} is in the future and must be refused"
         );
@@ -173,7 +177,7 @@ fn a_proof_larger_than_the_cap_is_refused_before_it_is_parsed() {
     );
 
     assert_eq!(
-        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::Malformed),
         "a proof past the cap is refused on size, whatever it would have parsed as"
     );
@@ -199,7 +203,7 @@ fn an_ordinary_proof_is_far_inside_the_cap() {
         "a conforming proof is {} bytes; a cap of {MAX_PROOF_BYTES} must leave room to spare",
         proof.len()
     );
-    assert!(verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()).is_ok());
+    assert!(verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()).is_ok());
 }
 
 // ---------------------------------------------------------------------------- the retained jti
@@ -229,7 +233,7 @@ fn a_jti_past_the_cap_is_refused_even_though_the_proof_is_well_inside_the_proof_
         proof.len()
     );
     assert_eq!(
-        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::Malformed),
         "a jti this server would have to remember must be refused on length"
     );
@@ -247,7 +251,7 @@ fn a_jti_of_exactly_the_cap_is_accepted() {
     let jti = "j".repeat(MAX_JTI_BYTES);
     let proof = signed_proof(&key, &claims_with_jti(&jti));
 
-    let verified = verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now())
+    let verified = verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now())
         .expect("a jti of exactly the cap is inside it");
     assert_eq!(verified.jti, jti);
 }
@@ -262,7 +266,7 @@ fn the_jti_cap_leaves_room_for_the_values_conforming_clients_use() {
         assert!(jti.len() <= MAX_JTI_BYTES);
         let proof = signed_proof(&key, &claims_with_jti(jti));
         assert_eq!(
-            verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now())
+            verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now())
                 .expect("a UUID or a 128-bit random is a conforming jti")
                 .jti,
             jti
@@ -292,7 +296,7 @@ fn a_proof_whose_header_names_an_unknown_crit_extension_is_refused() {
     let proof = signed_proof_with_header(&key, &header, &claims_with_jti("crit-1"));
 
     assert_eq!(
-        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::Malformed),
         "a crit naming an extension this server does not implement makes the JWS invalid"
     );
@@ -309,7 +313,7 @@ fn a_proof_whose_header_has_an_empty_crit_is_refused() {
     let proof = signed_proof_with_header(&key, &header, &claims_with_jti("crit-2"));
 
     assert_eq!(
-        verify_proof(VERIFIER, &proof, "POST", TOKEN_ENDPOINT, now()),
+        verify_proof(&verifiers(), &proof, "POST", TOKEN_ENDPOINT, now()),
         Err(DpopFailure::Malformed),
         "RFC 7515 s4.1.11 forbids an empty crit outright"
     );

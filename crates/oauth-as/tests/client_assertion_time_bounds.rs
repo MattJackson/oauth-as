@@ -19,7 +19,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oauth_as::client_assertion::{verify_assertion, AssertionFailure, AssertionKeys};
-use oauth_as::jwt::{compact_jws, EcdsaP256Key};
+use oauth_as::jwt::{compact_jws, EcdsaP256Key, JwsAlg};
 
 /// The crate's built-in ES256 backend. Verification now goes through the [`oauth_as::jwt::Es256Verifier`] seam,
 /// so a verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
@@ -36,6 +36,7 @@ fn now() -> SystemTime {
 
 fn keys(key: &EcdsaP256Key) -> AssertionKeys {
     AssertionKeys::PublicKeys {
+        alg: JwsAlg::Es256,
         keys: vec![key.to_public_jwk()],
     }
 }

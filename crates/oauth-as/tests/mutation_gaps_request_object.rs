@@ -54,9 +54,9 @@ async fn server(key: &EcdsaP256Key) -> AuthorizationServer<MemoryStorage, Frozen
     cfg.jar = Some(Box::new(JarConfig::new()));
     let jwk = key.public_jwk();
     let registered = RegisteredRequestObjectKey::es256_from_jwk_coordinates(
-        Some(jwk.kid.clone()),
-        &jwk.x,
-        &jwk.y,
+        jwk.kid().map(str::to_string),
+        jwk.x(),
+        jwk.y(),
     )
     .expect("a JWK this crate emitted registers");
     let server = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), FrozenClock)

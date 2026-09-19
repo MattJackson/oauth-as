@@ -26,7 +26,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use oauth_as::jwt::{EcdsaP256Key, Es256Signer};
+use oauth_as::jwt::{EcdsaP256Key, JwsSigner};
 use oauth_as::{
     AuthorizationError, AuthorizationServer, Client, ClientAuth, ClientId, ErrorCode, GrantType,
     JarConfig, MemoryStorage, RegisteredRequestObjectKey, RequestObjectKeys, ScopeSet,
@@ -58,8 +58,12 @@ fn client() -> Client {
 
 fn registered_key(key: &EcdsaP256Key) -> RegisteredRequestObjectKey {
     let jwk = key.public_jwk();
-    RegisteredRequestObjectKey::es256_from_jwk_coordinates(Some(jwk.kid.clone()), &jwk.x, &jwk.y)
-        .expect("a JWK this crate emitted registers")
+    RegisteredRequestObjectKey::es256_from_jwk_coordinates(
+        jwk.kid().map(str::to_string),
+        jwk.x(),
+        jwk.y(),
+    )
+    .expect("a JWK this crate emitted registers")
 }
 
 async fn server(key: &EcdsaP256Key) -> AuthorizationServer<MemoryStorage> {
@@ -76,14 +80,14 @@ async fn signed_object(key: &EcdsaP256Key, claims: &str) -> String {
     let header = URL_SAFE_NO_PAD.encode(
         format!(
             r#"{{"alg":"ES256","typ":"oauth-authz-req+jwt","kid":"{}"}}"#,
-            key.public_jwk().kid
+            key.public_jwk().kid().unwrap()
         )
         .as_bytes(),
     );
     let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
     let input = format!("{header}.{payload}");
     let signature = key.sign(input.as_bytes()).await.expect("sign");
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.as_bytes()))
 }
 
 fn claims(extra: &str) -> String {

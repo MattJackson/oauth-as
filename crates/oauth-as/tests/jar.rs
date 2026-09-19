@@ -64,8 +64,12 @@ fn config(jar: Option<JarConfig>) -> ServerConfig {
 /// able to SIGN with it (as an issuer, further down); a host would only ever hold the public half.
 fn registered_key(key: &EcdsaP256Key) -> RegisteredRequestObjectKey {
     let jwk = key.public_jwk();
-    RegisteredRequestObjectKey::es256_from_jwk_coordinates(Some(jwk.kid.clone()), &jwk.x, &jwk.y)
-        .expect("a JWK this crate emitted registers")
+    RegisteredRequestObjectKey::es256_from_jwk_coordinates(
+        jwk.kid().map(str::to_string),
+        jwk.x(),
+        jwk.y(),
+    )
+    .expect("a JWK this crate emitted registers")
 }
 
 async fn server(key: &EcdsaP256Key, jar: Option<JarConfig>) -> AuthorizationServer<MemoryStorage> {

@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 
 use oauth_as::client_assertion::AssertionKeys;
 use oauth_as::http::{AuthorizationService, ServiceBuilder};
-use oauth_as::jwt::{compact_jws, EcdsaP256Key};
+use oauth_as::jwt::{compact_jws, EcdsaP256Key, JwsAlg};
 use oauth_as::{
     AuthorizationServer, Client, ClientAuth, ClientId, GrantType, MemoryStorage,
     RegisteredRequestObjectKey, RequestObjectKeys, ScopeSet, ServerConfig, SystemClock,
@@ -108,11 +108,13 @@ impl RequestObjectKeys for JarKeys {
         if client_id.as_str() != JAR_ID {
             return None;
         }
+        // Since 0.10.0's crypto-agility work `Jwk` is an enum whose members are read through
+        // accessors rather than public fields; this is the EC key `request_object_key` produces.
         let jwk = request_object_key().public_jwk();
         RegisteredRequestObjectKey::es256_from_jwk_coordinates(
-            Some(jwk.kid.clone()),
-            &jwk.x,
-            &jwk.y,
+            jwk.kid().map(str::to_string),
+            jwk.x(),
+            jwk.y(),
         )
         .ok()
     }
@@ -194,6 +196,9 @@ pub fn server() -> &'static std::sync::Arc<AuthorizationServer<MemoryStorage, Sy
                     ASSERTION_ID,
                     ClientAuth::ConfidentialAssertion {
                         keys: AssertionKeys::PublicKeys {
+                            // The ONE `alg` this registration's `private_key_jwt` assertions may
+                            // carry (0.10.0 made this member mandatory); the fixture key is ES256.
+                            alg: JwsAlg::Es256,
                             keys: vec![assertion_key().to_public_jwk()],
                         },
                     },

@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use oauth_as::jwt::{compact_jws, Es256Verifier, PublicJwk};
+use oauth_as::jwt::{compact_jws, Jwk, JwsAlg, JwsVerifier};
 
 /// Thirty-two bytes of base64url, which is what RFC 7518 section 6.2.1.2 fixes a P-256 coordinate
 /// at. Not a point on any curve, and nothing in this file needs it to be: with `jwt-p256` off this
@@ -51,21 +51,25 @@ fn coordinate(fill: u8) -> String {
 // `http,jwt,par,jar`, for one -- leaves this function with no caller, and `-D warnings` makes dead
 // code an error.
 #[cfg(any(feature = "dpop", feature = "client-assertion"))]
-fn a_public_jwk() -> PublicJwk {
-    PublicJwk::from_coordinates(&coordinate(0x11), &coordinate(0x22))
+fn a_public_jwk() -> Jwk {
+    Jwk::from_coordinates(&coordinate(0x11), &coordinate(0x22))
         .expect("32 byte coordinates are a well formed JWK")
 }
 
 /// Says yes to everything. See the module docs.
 struct AlwaysVerifies;
 
-impl Es256Verifier for AlwaysVerifies {
-    fn verify(&self, _key: &PublicJwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
+impl JwsVerifier for AlwaysVerifies {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
+    fn verify(&self, _key: &Jwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
         true
     }
 }
 
-fn verifier() -> Arc<dyn Es256Verifier> {
+fn verifier() -> Arc<dyn JwsVerifier> {
     Arc::new(AlwaysVerifies)
 }
 
@@ -165,7 +169,7 @@ mod dpop {
     /// backend and not about the proof.
     #[tokio::test]
     async fn the_same_proof_is_honoured_once_a_verifier_is_installed() {
-        let srv = server().await.with_es256_verifier(verifier());
+        let srv = server().await.with_jws_verifier(verifier());
         let proof = proof();
         let response = srv
             .token_with_context(
@@ -270,7 +274,7 @@ mod jar {
 
     #[tokio::test]
     async fn the_same_request_object_is_honoured_once_a_verifier_is_installed() {
-        let srv = server().await.with_es256_verifier(verifier());
+        let srv = server().await.with_jws_verifier(verifier());
         let request = srv
             .validate_signed_authorization_request("app", &request_object())
             .await
@@ -326,6 +330,7 @@ mod client_assertion {
             client_id: ClientId::new("app"),
             auth: ClientAuth::ConfidentialAssertion {
                 keys: AssertionKeys::PublicKeys {
+                    alg: JwsAlg::Es256,
                     keys: vec![a_public_jwk()],
                 },
             },
@@ -372,7 +377,7 @@ mod client_assertion {
 
     #[tokio::test]
     async fn the_same_assertion_authenticates_once_a_verifier_is_installed() {
-        let srv = server().await.with_es256_verifier(verifier());
+        let srv = server().await.with_jws_verifier(verifier());
         let assertion = assertion();
         srv.token_with_context(request(), context(&assertion))
             .await

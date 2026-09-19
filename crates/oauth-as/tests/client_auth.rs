@@ -684,6 +684,7 @@ async fn a_replay_store_outage_is_not_reported_as_a_captured_and_replayed_assert
             client_id: ClientId::new("pkjwt"),
             auth: ClientAuth::ConfidentialAssertion {
                 keys: AssertionKeys::PublicKeys {
+                    alg: oauth_as::jwt::JwsAlg::Es256,
                     keys: vec![key.to_public_jwk()],
                 },
             },
@@ -894,12 +895,15 @@ async fn an_unknown_client_id_costs_an_es256_verification_on_the_assertion_path_
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use oauth_as::client_assertion::AssertionKeys;
-    use oauth_as::jwt::{Es256Verifier, Jwk, PublicJwk};
+    use oauth_as::jwt::{EcCurve, Jwk, JwsAlg, JwsVerifier};
     use oauth_as::server::{ClientCredential, TokenRequestContext};
 
     struct Counting(Arc<AtomicUsize>);
-    impl Es256Verifier for Counting {
-        fn verify(&self, _key: &PublicJwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
+    impl JwsVerifier for Counting {
+        fn alg(&self) -> JwsAlg {
+            JwsAlg::Es256
+        }
+        fn verify(&self, _key: &Jwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
             self.0.fetch_add(1, Ordering::SeqCst);
             // Never authenticates anything. The property under test is the COST, and a verifier
             // that said yes would be answering about a client nobody registered.
@@ -909,22 +913,19 @@ async fn an_unknown_client_id_costs_an_es256_verification_on_the_assertion_path_
 
     // A key of the shape a `private_key_jwt` registration holds. Its coordinates are a real P-256
     // point so that nothing refuses it before the verifier is reached.
-    let registered = Jwk {
-        kty: "EC",
-        crv: "P-256",
+    let registered = Jwk::Ec {
+        crv: EcCurve::P256,
         x: "LIZkYOSRaSLc5uMxzlzV9pgt1ARaDl_3tZfRkt9mzFY".to_string(),
         y: "fBSzqWfCploda0TpKf3N56v6fk-fORAiVsXUmkWYWkw".to_string(),
-        kid: "client-key".to_string(),
-        use_: "sig",
-        alg: "ES256",
-    }
-    .to_public_jwk();
+        kid: Some("client-key".to_string()),
+    };
 
     let calls = Arc::new(AtomicUsize::new(0));
     let srv = server_with(vec![Client {
         client_id: ClientId::new("pkjwt-client"),
         auth: ClientAuth::ConfidentialAssertion {
             keys: AssertionKeys::PublicKeys {
+                alg: JwsAlg::Es256,
                 keys: vec![registered],
             },
         },
@@ -936,7 +937,7 @@ async fn an_unknown_client_id_costs_an_es256_verification_on_the_assertion_path_
         registration: None,
     }])
     .await
-    .with_es256_verifier(Arc::new(Counting(calls.clone())));
+    .with_jws_verifier(Arc::new(Counting(calls.clone())));
 
     // One well-formed assertion per id, differing only in whom it names. Neither verifies; the
     // point is what each COSTS on the way to the identical `invalid_client`.
@@ -1011,12 +1012,15 @@ async fn an_unknown_client_id_costs_an_es256_verification_on_the_assertion_path_
 async fn a_registered_client_that_does_not_use_assertions_costs_what_an_unknown_id_costs() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use oauth_as::jwt::{Es256Verifier, PublicJwk};
+    use oauth_as::jwt::{Jwk, JwsAlg, JwsVerifier};
     use oauth_as::server::{ClientCredential, TokenRequestContext};
 
     struct Counting(Arc<AtomicUsize>);
-    impl Es256Verifier for Counting {
-        fn verify(&self, _key: &PublicJwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
+    impl JwsVerifier for Counting {
+        fn alg(&self) -> JwsAlg {
+            JwsAlg::Es256
+        }
+        fn verify(&self, _key: &Jwk, _signing_input: &[u8], _signature: &[u8]) -> bool {
             self.0.fetch_add(1, Ordering::SeqCst);
             false
         }
@@ -1082,7 +1086,7 @@ async fn a_registered_client_that_does_not_use_assertions_costs_what_an_unknown_
             registration: None,
         }])
         .await
-        .with_es256_verifier(Arc::new(Counting(calls.clone())));
+        .with_jws_verifier(Arc::new(Counting(calls.clone())));
 
         probe(&srv, "secret-client", assertion_type).await;
         let known = calls.load(Ordering::SeqCst);

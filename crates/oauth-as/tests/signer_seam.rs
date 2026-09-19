@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use oauth_as::jwt::{AccessTokenClaims, Audience, Es256Signer, Jwk, JwtConfig, SignerError};
+use oauth_as::jwt::{
+    AccessTokenClaims, Audience, EcCurve, Jwk, JwsAlg, JwsSignature, JwsSigner, JwtConfig,
+    SignerError,
+};
 
 /// A signer that records what it was asked to sign and answers with a fixed 64 bytes.
 ///
@@ -60,11 +63,15 @@ impl RecordingSigner {
     }
 }
 
-impl Es256Signer for RecordingSigner {
+impl JwsSigner for RecordingSigner {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
     fn sign(
         &self,
         signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
         // Recorded BEFORE the await point, so the order in `seen` is call order and not
         // completion order.
         self.seen
@@ -73,20 +80,17 @@ impl Es256Signer for RecordingSigner {
             .push(String::from_utf8(signing_input.to_vec()).expect("a JWS signing input is ASCII"));
         self.calls.fetch_add(1, Ordering::SeqCst);
         let fill = self.fill;
-        async move { Ok([fill; 64]) }
+        async move { Ok(JwsSignature::Es256([fill; 64])) }
     }
 
     fn public_jwk(&self) -> Jwk {
         // The coordinates are arbitrary but WELL FORMED: 32 bytes each, base64url unpadded, which
         // is what RFC 7518 section 6.2.1.2 fixes and what a resource server will parse.
-        Jwk {
-            kty: "EC",
-            crv: "P-256",
+        Jwk::Ec {
+            crv: EcCurve::P256,
             x: URL_SAFE_NO_PAD.encode([0x11u8; 32]),
             y: URL_SAFE_NO_PAD.encode([0x22u8; 32]),
-            kid: self.kid.to_string(),
-            use_: "sig",
-            alg: "ES256",
+            kid: Some(self.kid.to_string()),
         }
     }
 }
@@ -95,29 +99,30 @@ impl Es256Signer for RecordingSigner {
 /// deployment's IAM policy has been tightened under it.
 struct BrokenSigner;
 
-impl Es256Signer for BrokenSigner {
+impl JwsSigner for BrokenSigner {
     // Written in the `-> impl Future + Send` form the TRAIT declares rather than as `async fn`,
     // which clippy suggests. The explicit form keeps the `Send` bound visible at the impl, and a
     // host writing a real KMS signer will copy this shape: a signer whose future is not `Send`
     // cannot be used from a multi-threaded runtime, and discovering that from a trait-solver error
     // is much worse than reading it here.
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn sign(
         &self,
         _signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
         async { Err(SignerError::new("the key service refused")) }
     }
 
     fn public_jwk(&self) -> Jwk {
-        Jwk {
-            kty: "EC",
-            crv: "P-256",
+        Jwk::Ec {
+            crv: EcCurve::P256,
             x: URL_SAFE_NO_PAD.encode([0x33u8; 32]),
             y: URL_SAFE_NO_PAD.encode([0x44u8; 32]),
-            kid: "broken".to_string(),
-            use_: "sig",
-            alg: "ES256",
+            kid: Some("broken".to_string()),
         }
     }
 }
@@ -206,25 +211,26 @@ async fn the_public_half_is_read_once_at_construction_and_never_per_request() {
         reads: AtomicUsize,
     }
 
-    impl Es256Signer for DriftingSigner {
+    impl JwsSigner for DriftingSigner {
+        fn alg(&self) -> JwsAlg {
+            JwsAlg::Es256
+        }
+
         #[allow(clippy::manual_async_fn)] // Same reason as BrokenSigner above.
         fn sign(
             &self,
             _signing_input: &[u8],
-        ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
-            async { Ok([0u8; 64]) }
+        ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
+            async { Ok(JwsSignature::Es256([0u8; 64])) }
         }
 
         fn public_jwk(&self) -> Jwk {
             let n = self.reads.fetch_add(1, Ordering::SeqCst);
-            Jwk {
-                kty: "EC",
-                crv: "P-256",
+            Jwk::Ec {
+                crv: EcCurve::P256,
                 x: URL_SAFE_NO_PAD.encode([0x55u8; 32]),
                 y: URL_SAFE_NO_PAD.encode([0x66u8; 32]),
-                kid: format!("read-{n}"),
-                use_: "sig",
-                alg: "ES256",
+                kid: Some(format!("read-{n}")),
             }
         }
     }
@@ -239,7 +245,7 @@ async fn the_public_half_is_read_once_at_construction_and_never_per_request() {
     assert_eq!(config.kid(), "read-0");
     for _ in 0..5 {
         assert_eq!(config.kid(), "read-0", "the public half is cached");
-        assert_eq!(config.jwks().keys[0].kid, "read-0");
+        assert_eq!(config.jwks().keys[0].kid(), Some("read-0"));
         let token = config
             .sign_access_token(&claims("jti"))
             .await
@@ -306,8 +312,8 @@ async fn rotation_retires_a_public_half_and_drops_the_signer_that_made_it() {
     // token minted a moment before the swap still verifies.
     let jwks = config.jwks();
     assert_eq!(jwks.keys.len(), 2);
-    assert_eq!(jwks.keys[0].kid, "new-kid");
-    assert_eq!(jwks.keys[1].kid, "old-kid");
+    assert_eq!(jwks.keys[0].kid(), Some("new-kid"));
+    assert_eq!(jwks.keys[1].kid(), Some("old-kid"));
     assert_eq!(config.retired_kids().collect::<Vec<_>>(), vec!["old-kid"]);
 }
 

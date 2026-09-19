@@ -47,8 +47,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
 use oauth_as::jwt::{
-    verify_es256, EcdsaP256Key, Es256Signer, Es256Verifier, Jwk, P256Verifier, PublicJwk,
-    SignerError,
+    verify_es256, EcCurve, EcdsaP256Key, Jwk, JwsAlg, JwsSignature, JwsSigner, JwsVerifier,
+    P256Verifier, SignerError,
 };
 use oauth_as::signer_conformance::{SignerConformance, Violation, CHECKS};
 
@@ -109,7 +109,7 @@ fn decode(b64: &str) -> Vec<u8> {
     URL_SAFE_NO_PAD.decode(b64).expect("a base64url constant")
 }
 
-fn run(signer: impl Es256Signer, verifier: impl Es256Verifier) -> Vec<Violation> {
+fn run(signer: impl JwsSigner, verifier: impl JwsVerifier) -> Vec<Violation> {
     futures_lite_block_on(SignerConformance::new(signer, verifier).run())
 }
 
@@ -207,11 +207,15 @@ impl Fixture {
     }
 }
 
-impl Es256Signer for Fixture {
+impl JwsSigner for Fixture {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
     fn sign(
         &self,
         signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
         self.asked
             .lock()
             .expect("no test here panics while holding this")
@@ -233,7 +237,7 @@ impl Es256Signer for Fixture {
             );
             buf
         };
-        async move { Ok(out) }
+        async move { Ok(JwsSignature::Es256(out)) }
     }
 
     fn public_jwk(&self) -> Jwk {
@@ -253,14 +257,11 @@ impl Es256Signer for Fixture {
 #[test]
 fn a_key_sharing_one_coordinate_with_the_rfc_example_is_not_accused_of_being_it() {
     let mut fixture = Fixture::correct();
-    fixture.published = Jwk {
-        kty: "EC",
-        crv: "P-256",
+    fixture.published = Jwk::Ec {
+        crv: EcCurve::P256,
         x: A3_X.to_string(),
         y: OTHER_Y.to_string(),
-        kid: "half-a-collision".to_string(),
-        use_: "sig",
-        alg: "ES256",
+        kid: Some("half-a-collision".to_string()),
     };
     let violations = run(fixture, P256Verifier);
     assert!(
@@ -401,8 +402,12 @@ struct AcceptsCanonicalDer {
     canonical: Vec<u8>,
 }
 
-impl Es256Verifier for AcceptsCanonicalDer {
-    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+impl JwsVerifier for AcceptsCanonicalDer {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
+    fn verify(&self, key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
         if signature == self.canonical.as_slice() {
             return true;
         }
@@ -439,7 +444,7 @@ fn the_der_the_harness_presents_is_the_canonical_encoding() {
 /// the wrong vector: the key here is the RFC's, and the signature verifies under it.
 #[test]
 fn the_rfc_7515_a3_vector_restated_here_is_self_consistent() {
-    let key = PublicJwk::from_coordinates(A3_X, A3_Y).expect("the RFC's coordinates are 32 bytes");
+    let key = Jwk::from_coordinates(A3_X, A3_Y).expect("the RFC's coordinates are 32 bytes");
     let signing_input = concat!(
         "eyJhbGciOiJFUzI1NiJ9",
         ".",
@@ -480,8 +485,12 @@ struct AcceptsExactSignature {
     accept: Vec<u8>,
 }
 
-impl Es256Verifier for AcceptsExactSignature {
-    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+impl JwsVerifier for AcceptsExactSignature {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
+    fn verify(&self, key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
         signature == self.accept.as_slice() || verify_es256(key, signing_input, signature)
     }
 }
@@ -492,8 +501,12 @@ struct AcceptsExactInput {
     accept_input: Vec<u8>,
 }
 
-impl Es256Verifier for AcceptsExactInput {
-    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+impl JwsVerifier for AcceptsExactInput {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Es256
+    }
+
+    fn verify(&self, key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
         signing_input == self.accept_input.as_slice() || verify_es256(key, signing_input, signature)
     }
 }

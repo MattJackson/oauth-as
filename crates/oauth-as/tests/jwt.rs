@@ -672,14 +672,20 @@ mod empty_audience {
 #[test]
 fn verify_es256_fails_closed_on_a_short_coordinate_rather_than_panicking() {
     let key = EcdsaP256Key::generate("short-coordinate");
-    let mut jwk = key.public_jwk();
+    let jwk = key.public_jwk();
     // Trim one byte off `y`, the way a library that strips a leading zero emits it: now 31 bytes.
     let mut y = URL_SAFE_NO_PAD
-        .decode(&jwk.y)
+        .decode(jwk.y())
         .expect("this crate emits base64url");
     y.remove(0);
-    jwk.y = URL_SAFE_NO_PAD.encode(&y);
-    let public = jwk.to_public_jwk();
+    // Hand-built (the enum variant's fields are public), which is exactly the route that skips the
+    // width check `Jwk::from_json`/`from_coordinates` run: a 31-byte coordinate reaches the guard.
+    let public = oauth_as::jwt::Jwk::Ec {
+        crv: oauth_as::jwt::EcCurve::P256,
+        x: jwk.x().to_string(),
+        y: URL_SAFE_NO_PAD.encode(&y),
+        kid: jwk.kid().map(str::to_string),
+    };
     assert!(
         !oauth_as::jwt::verify_es256(&public, b"any signing input", &[0u8; 64]),
         "a JWK whose coordinate is not 32 bytes must fail closed at verification, not panic"

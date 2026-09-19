@@ -165,23 +165,23 @@ fn a_weak_client_secret_does_not_survive_deserialization() {
 #[cfg(feature = "jwt")]
 #[test]
 fn public_jwk_is_reachable_only_through_a_validating_constructor() {
-    use oauth_as::jwt::PublicJwk;
+    use oauth_as::jwt::Jwk;
 
     // RFC 7515 Appendix A.3.1's P-256 public key.
     const X: &str = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
     const Y: &str = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
 
-    let key = PublicJwk::from_coordinates(X, Y).expect("a well formed P-256 point");
+    let key = Jwk::from_coordinates(X, Y).expect("a well formed P-256 point");
     assert_eq!(key.kty(), "EC");
-    assert_eq!(key.crv(), "P-256");
+    assert_eq!(key.crv().unwrap().jose_name(), "P-256");
     assert_eq!(key.x(), X);
     assert_eq!(key.y(), Y);
     assert_eq!(key.kid(), None);
     assert_eq!(key.clone().with_kid("2026-08").kid(), Some("2026-08"));
 
     // The width check RFC 7518 s6.2.1.2 requires, on the constructor and not only on the parser.
-    assert!(PublicJwk::from_coordinates("AAAA", Y).is_err());
-    assert!(PublicJwk::from_coordinates(X, "not base64url!!").is_err());
+    assert!(Jwk::from_coordinates("AAAA", Y).is_err());
+    assert!(Jwk::from_coordinates(X, "not base64url!!").is_err());
 }
 
 /// `subject_token_type` is what stops RFC 8693's type parameter being decorative: the exchange

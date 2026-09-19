@@ -56,7 +56,21 @@ default-features = false
 # `jwt-p256` rather than `jwt`: every one of these targets has to PRODUCE the credential it then
 # corrupts, and since the ES256 seam landed `jwt` is the trait surface and carries no curve. A
 # fuzzer that cannot sign cannot reach the verifier it exists to fuzz.
-features = ["http", "jwt-p256", "rar", "par", "jar", "dpop", "client-assertion", "mtls"]
+# `jwt-rsa` and `jwt-ed25519` pull the RSA and Ed25519 backends (`RsaVerifier`, `Ed25519Verifier`,
+# the `Jwk::Rsa`/`Jwk::Okp` variants) into the fuzz build, so the crypto-agility parse/verify paths
+# added in 0.10.0 are reachable by a target rather than compiled out.
+features = [
+    "http",
+    "jwt-p256",
+    "jwt-rsa",
+    "jwt-ed25519",
+    "rar",
+    "par",
+    "jar",
+    "dpop",
+    "client-assertion",
+    "mtls",
+]
 
 # The shared fixtures (the server under test, the JWS builders, the RFC charset predicates). A
 # `lib` rather than an `#[path]` include in each target, so there is ONE definition of "the
@@ -143,6 +157,27 @@ bench = false
 [[bin]]
 name = "par_request_object"
 path = "fuzz_targets/par_request_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jws_signature_from_wire"
+path = "fuzz_targets/jws_signature_from_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rsa_verify"
+path = "fuzz_targets/rsa_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed25519_verify"
+path = "fuzz_targets/ed25519_verify.rs"
 test = false
 doc = false
 bench = false

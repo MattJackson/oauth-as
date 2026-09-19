@@ -498,9 +498,9 @@ async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
     let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
     let jwk = key.public_jwk();
     let registered = oauth_as::par::RegisteredRequestObjectKey::es256_from_jwk_coordinates(
-        Some(jwk.kid.clone()),
-        &jwk.x,
-        &jwk.y,
+        jwk.kid().map(str::to_string),
+        jwk.x(),
+        jwk.y(),
     )
     .expect("a JWK this crate emitted registers");
 

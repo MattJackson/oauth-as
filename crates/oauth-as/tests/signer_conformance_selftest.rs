@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use oauth_as::jwt::{
-    EcdsaP256Key, Es256Signer, Es256Verifier, Jwk, P256Verifier, PublicJwk, SignerError,
+    EcdsaP256Key, Jwk, JwsSignature, JwsSigner, JwsVerifier, P256Verifier, SignerError,
 };
 use oauth_as::signer_conformance::{SignerConformance, Violation, CHECKS};
 
@@ -176,11 +176,15 @@ impl FaultySigner {
     }
 }
 
-impl Es256Signer for FaultySigner {
+impl JwsSigner for FaultySigner {
+    fn alg(&self) -> oauth_as::jwt::JwsAlg {
+        oauth_as::jwt::JwsAlg::Es256
+    }
+
     fn sign(
         &self,
         signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
         let faults = self.faults;
         if faults.signer_panics_while_building_the_request {
             // Before the future exists at all: this is the half a `catch_unwind` around the
@@ -220,7 +224,7 @@ impl Es256Signer for FaultySigner {
                 let n = der.len().min(64);
                 signature[..n].copy_from_slice(&der[..n]);
             }
-            Ok(signature)
+            Ok(JwsSignature::Es256(signature))
         }
     }
 
@@ -230,22 +234,33 @@ impl Es256Signer for FaultySigner {
         } else {
             &self.key
         };
-        let mut jwk = source.public_jwk();
+        let Jwk::Ec {
+            crv,
+            x,
+            mut y,
+            mut kid,
+        } = source.public_jwk()
+        else {
+            unreachable!("EcdsaP256Key always publishes an EC JWK");
+        };
         if self.faults.public_jwk_drifts {
-            jwk.kid = format!("drift-{}", self.reads.fetch_add(1, Ordering::SeqCst));
+            kid = Some(format!(
+                "drift-{}",
+                self.reads.fetch_add(1, Ordering::SeqCst)
+            ));
         }
         if self.faults.public_jwk_trims_a_coordinate {
             // One byte short, the way a big-integer library that strips leading zeros emits it.
-            let mut y = URL_SAFE_NO_PAD
-                .decode(&jwk.y)
+            let mut yb = URL_SAFE_NO_PAD
+                .decode(&y)
                 .expect("this crate emits base64url");
-            y.remove(0);
-            jwk.y = URL_SAFE_NO_PAD.encode(y);
+            yb.remove(0);
+            y = URL_SAFE_NO_PAD.encode(yb);
         }
         if self.faults.public_jwk_has_no_kid {
-            jwk.kid = String::new();
+            kid = Some(String::new());
         }
-        jwk
+        Jwk::Ec { crv, x, y, kid }
     }
 }
 
@@ -253,8 +268,12 @@ struct FaultyVerifier {
     faults: Faults,
 }
 
-impl Es256Verifier for FaultyVerifier {
-    fn verify(&self, key: &PublicJwk, signing_input: &[u8], signature: &[u8]) -> bool {
+impl JwsVerifier for FaultyVerifier {
+    fn alg(&self) -> oauth_as::jwt::JwsAlg {
+        oauth_as::jwt::JwsAlg::Es256
+    }
+
+    fn verify(&self, key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
         let real = P256Verifier;
         if self.faults.verifier_unwraps_an_off_curve_key {
             // Written as an implementor writes it after reading that `key` is a P-256 public key.
@@ -279,7 +298,7 @@ impl Es256Verifier for FaultyVerifier {
             return true;
         }
         if self.faults.verifier_ignores_the_key {
-            let baked = PublicJwk::from_coordinates(A3_X, A3_Y).expect("the RFC's key parses");
+            let baked = Jwk::from_coordinates(A3_X, A3_Y).expect("the RFC's key parses");
             return real.verify(&baked, signing_input, signature);
         }
         if self.faults.verifier_ignores_the_input {

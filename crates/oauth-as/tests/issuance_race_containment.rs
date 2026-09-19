@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use oauth_as::jwt::{AccessTokenFormat, Es256Signer, Jwk, JwtConfig, SignerError};
+use oauth_as::jwt::{AccessTokenFormat, Jwk, JwsSigner, JwtConfig, SignerError};
 use oauth_as::{
     AuthorizationServer, ClientId, ErrorCode, MemoryStorage, ServerConfig, TokenRequest,
 };
@@ -82,12 +82,16 @@ impl GatedSigner {
     }
 }
 
-impl Es256Signer for GatedSigner {
+impl JwsSigner for GatedSigner {
+    fn alg(&self) -> oauth_as::jwt::JwsAlg {
+        oauth_as::jwt::JwsAlg::Es256
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn sign(
         &self,
         _signing_input: &[u8],
-    ) -> impl Future<Output = Result<[u8; 64], SignerError>> + Send {
+    ) -> impl Future<Output = Result<oauth_as::jwt::JwsSignature, SignerError>> + Send {
         async move {
             if self.armed.load(Ordering::SeqCst) {
                 self.entered.store(true, Ordering::SeqCst);
@@ -97,19 +101,16 @@ impl Es256Signer for GatedSigner {
             }
             // Not a real signature, and nothing on this path checks one: what is under test is
             // the ORDER of the writes around it. `tests/signer_seam.rs` states the same reasoning.
-            Ok([0x5A; 64])
+            Ok(oauth_as::jwt::JwsSignature::Es256([0x5A; 64]))
         }
     }
 
     fn public_jwk(&self) -> Jwk {
-        Jwk {
-            kty: "EC",
-            crv: "P-256",
+        Jwk::Ec {
+            crv: oauth_as::jwt::EcCurve::P256,
             x: URL_SAFE_NO_PAD.encode([0x11u8; 32]),
             y: URL_SAFE_NO_PAD.encode([0x22u8; 32]),
-            kid: "gated".to_string(),
-            use_: "sig",
-            alg: "ES256",
+            kid: Some("gated".to_string()),
         }
     }
 }

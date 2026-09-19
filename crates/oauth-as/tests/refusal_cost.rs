@@ -120,9 +120,9 @@ fn request_object_refusals_borrow_their_description() {
     let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
     let jwk = key.public_jwk();
     let registered = RegisteredRequestObjectKey::es256_from_jwk_coordinates(
-        Some(jwk.kid.clone()),
-        &jwk.x,
-        &jwk.y,
+        jwk.kid().map(str::to_string),
+        jwk.x(),
+        jwk.y(),
     )
     .expect("the crate's own JWK must parse");
 
@@ -155,7 +155,7 @@ fn request_object_refusals_borrow_their_description() {
     // fixture is genuinely SIGNED over its spoiled payload: `src/par.rs` decodes the payload only
     // after the signature verifies, so an unsigned fixture would stop at "the signature did not
     // verify" and never reach the third constant either.
-    let kid = jwk.kid.clone();
+    let kid = jwk.kid().unwrap().to_string();
     let header_b64 =
         URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"ES256","kid":"{kid}"}}"#).as_bytes());
     let payload_b64 = URL_SAFE_NO_PAD.encode(br#"{"client_id":"app"}"#);

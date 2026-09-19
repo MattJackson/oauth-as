@@ -104,9 +104,9 @@ async fn server_at(
     cfg.par = par.map(Box::new);
     let jwk = key.public_jwk();
     let registered = RegisteredRequestObjectKey::es256_from_jwk_coordinates(
-        Some(jwk.kid.clone()),
-        &jwk.x,
-        &jwk.y,
+        jwk.kid().map(str::to_string),
+        jwk.x(),
+        jwk.y(),
     )
     .expect("a JWK this crate emitted registers");
     let server = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), clock)
@@ -137,7 +137,10 @@ fn signed(key: &EcdsaP256Key, header: &str, extra: &str) -> String {
 }
 
 fn plain_header(key: &EcdsaP256Key) -> String {
-    format!(r#"{{"alg":"ES256","kid":"{}"}}"#, key.public_jwk().kid)
+    format!(
+        r#"{{"alg":"ES256","kid":"{}"}}"#,
+        key.public_jwk().kid().unwrap()
+    )
 }
 
 /// The `exp` an ordinary conforming client sends: comfortably inside the default ceiling, so
@@ -227,6 +230,48 @@ async fn a_request_object_with_no_expiry_is_refused_rather_than_replayable_forev
             .is_err(),
         "and it is still refused ten years later, which is how long it used to work for"
     );
+}
+
+/// SIZE is refused before the object is decoded, hashed or verified. `verified_request_object` is
+/// reached unauthenticated through the browser-facing `GET /authorize` `request` parameter, which
+/// no body cap bounds, so an object larger than [`oauth_as::par::MAX_REQUEST_OBJECT_BYTES`] would
+/// otherwise buy O(n) CPU and allocation per request for a signature check that then fails. The
+/// object below is GENUINELY SIGNED and carries a live `exp`, so the ONLY thing wrong with it is
+/// its size: the assertion on the error's own description is what makes this fail if the cap is
+/// removed (an oversized-but-valid object would then be accepted, not refused with this message).
+#[tokio::test]
+async fn an_oversized_request_object_is_refused_on_size_before_it_is_decoded() {
+    let key = EcdsaP256Key::generate("client-key");
+    let server = server(&key, Some(JarConfig::new()), None).await;
+    let padding = "A".repeat(oauth_as::par::MAX_REQUEST_OBJECT_BYTES);
+    let object = signed(
+        &key,
+        &plain_header(&key),
+        &format!(r#","exp":{},"padding":"{padding}""#, BASE + 30),
+    );
+    assert!(
+        object.len() > oauth_as::par::MAX_REQUEST_OBJECT_BYTES,
+        "the fixture must actually exceed the cap"
+    );
+
+    match server
+        .validate_signed_authorization_request("app", &object)
+        .await
+    {
+        Err(AuthorizationError::Direct(error)) => {
+            assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+            assert!(
+                error
+                    .error_description
+                    .as_deref()
+                    .is_some_and(|d| d.contains("maximum accepted size")),
+                "must be refused on SIZE specifically, not decoded and refused for another \
+                 reason: {:?}",
+                error.error_description
+            );
+        }
+        other => panic!("an oversized request object must be refused, got {other:?}"),
+    }
 }
 
 /// The ceiling, which is the other half of the same defence: a client cannot buy back the
@@ -326,7 +371,7 @@ async fn a_crit_header_naming_an_unimplemented_extension_is_refused() {
     let server = server(&key, Some(JarConfig::new()), None).await;
     let header = format!(
         r#"{{"alg":"ES256","kid":"{}","crit":["b64"],"b64":false}}"#,
-        key.public_jwk().kid
+        key.public_jwk().kid().unwrap()
     );
     let object = signed(&key, &header, &live_exp());
 

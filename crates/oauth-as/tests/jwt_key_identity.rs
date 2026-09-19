@@ -46,7 +46,8 @@ fn the_configured_kid_is_the_one_reported_and_the_one_published() {
     let jwks = config.jwks();
     assert_eq!(jwks.keys.len(), 1);
     assert_eq!(
-        jwks.keys[0].kid, "kid-under-test",
+        jwks.keys[0].kid(),
+        Some("kid-under-test"),
         "the JWKS entry must name the key tokens are signed under"
     );
 }

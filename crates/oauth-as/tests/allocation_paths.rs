@@ -569,6 +569,7 @@ fn client_assertion_verification_bound() {
             client_id: ClientId::new("pkjwt"),
             auth: ClientAuth::ConfidentialAssertion {
                 keys: AssertionKeys::PublicKeys {
+                    alg: oauth_as::jwt::JwsAlg::Es256,
                     keys: vec![key.to_public_jwk()],
                 },
             },

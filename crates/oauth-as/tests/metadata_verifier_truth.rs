@@ -11,17 +11,20 @@
 //!
 //! - `client_secret_jwt` is HS256 over the registered secret. It needs no elliptic curve, so it
 //!   is honest in every build that has the `client-assertion` feature.
-//! - `private_key_jwt` is ES256. It needs a verifier, and since the signing seam landed there are
-//!   builds that have `client-assertion` and no verifier at all (`client-assertion = ["jwt"]`,
-//!   which does not pull `jwt-p256`, and no host verifier installed).
+//! - `private_key_jwt` is an asymmetric signature (ES256, RS256 or EdDSA). It needs a verifier, and
+//!   since the signing seam landed there are builds that have `client-assertion` and no verifier at
+//!   all (`client-assertion = ["jwt"]`, which pulls no backend, and no host verifier installed).
 //!
 //! So there are three states and the document has to be right in each:
 //!
 //! | state                                | `client_secret_jwt` | `private_key_jwt` |
 //! |--------------------------------------|---------------------|-------------------|
-//! | `jwt-p256` compiled in               | advertised          | advertised        |
+//! | a built-in backend compiled in       | advertised          | advertised        |
 //! | host verifier installed              | advertised          | advertised        |
 //! | neither                              | advertised          | NOT advertised    |
+//!
+//! "A built-in backend" is any of `jwt-p256`, `jwt-rsa` or `jwt-ed25519`: each installs a default
+//! verifier for its algorithm, so any one of them makes an asymmetric assertion checkable.
 //!
 //! `tests/wire_reachability.rs` is the other half: it proves every value the document DOES name
 //! works over HTTP. This file is what stops the answer to that being "advertise nothing".
@@ -86,21 +89,31 @@ mod without_the_built_in_backend {
 
     use std::sync::Arc;
 
-    use oauth_as::jwt::{Es256Verifier, PublicJwk};
+    use oauth_as::jwt::{Jwk, JwsAlg, JwsVerifier};
 
     /// Says yes to everything, exactly as `tests/verifier_refusal.rs` does and for the same
     /// reason: the question here is whether the SEAM is wired, not whether the arithmetic is
     /// right, which is `signer_conformance`'s job.
     struct AlwaysVerifies;
 
-    impl Es256Verifier for AlwaysVerifies {
-        fn verify(&self, _key: &PublicJwk, _input: &[u8], _signature: &[u8]) -> bool {
+    impl JwsVerifier for AlwaysVerifies {
+        fn alg(&self) -> JwsAlg {
+            JwsAlg::Es256
+        }
+
+        fn verify(&self, _key: &Jwk, _input: &[u8], _signature: &[u8]) -> bool {
             true
         }
     }
 
-    /// State three: no backend of any kind. Every ES256 assertion is refused, so naming the
-    /// method would be an instruction a client cannot follow.
+    /// State three: no backend of ANY kind. The module gate already rules out `jwt-p256`; this
+    /// function's own gate rules out the other two built-in backends, because since 0.10.0
+    /// `jwt-rsa` and `jwt-ed25519` ALSO install a default verifier (RS256 and EdDSA respectively),
+    /// so a build with either of them on has a verifier and DOES advertise `private_key_jwt` -- the
+    /// state this test exists to check simply does not occur there. With none of the three, every
+    /// asymmetric assertion is refused, so naming the method would be an instruction a client
+    /// cannot follow.
+    #[cfg(not(any(feature = "jwt-rsa", feature = "jwt-ed25519")))]
     #[test]
     fn private_key_jwt_is_not_advertised_with_no_verifier() {
         let meta = server().metadata();
@@ -127,7 +140,7 @@ mod without_the_built_in_backend {
     #[test]
     fn private_key_jwt_is_advertised_once_a_verifier_is_installed() {
         let meta = server()
-            .with_es256_verifier(Arc::new(AlwaysVerifies))
+            .with_jws_verifier(Arc::new(AlwaysVerifies))
             .metadata();
         assert!(
             meta.token_endpoint_auth_methods_supported
