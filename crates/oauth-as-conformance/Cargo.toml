@@ -29,7 +29,7 @@ sha2 = "0.10"
 hmac = "0.12"
 # jsonwebtoken verifies the RFC 7515 Appendix A RS256/ES256 vectors and, in black-box mode,
 # verifies RFC 9068 access tokens against the AS's advertised jwks_uri.
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 url = "2"
 
 [dev-dependencies]
