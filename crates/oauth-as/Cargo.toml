@@ -288,7 +288,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 getrandom = "0.3"
 sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
-base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
+base64 = "0.23"            # BASE64URL-without-padding, the exact PKCE challenge encoding
 
 # OPTIONAL, feature `http` only. The HTTP vocabulary, and nothing above it.
 #
@@ -386,7 +386,7 @@ serde_json = "1"
 # — there is no access token in a proof's own signature, so the RS is the only party that can bind
 # the proof to the token. Both crates are already in the library's normal tree (base64 and sha2 back
 # PKCE), so declaring them dev-only adds nothing to a consumer's build.
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
 # IN-TREE CONFORMANCE CHECKS (dev-only; never in any shipped binary):
 #   - `oauth2` is a widely used third-party OAuth 2 CLIENT. tests/third_party_client.rs drives it
