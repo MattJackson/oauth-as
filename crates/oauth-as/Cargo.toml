@@ -422,7 +422,7 @@ url = "2"
 # `tls-rustls` feature, so no `aws-lc-rs` C toolchain is dragged into a dev build: `ring` is already
 # in this workspace's tree, and `p256` (the crate's own signing backend) is pure Rust, so the
 # fixture keeps that property.
-axum-server = { version = "0.7.3", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 # The self-signed certificate the fixture presents. Default features (pem + ring), NOT the optional
 # `aws_lc_rs` backend, for the reason above.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
