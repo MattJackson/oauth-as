@@ -37,10 +37,17 @@ export OAUTH_AS_ADDR="${OAUTH_AS_ADDR:-127.0.0.1:8914}"
 #
 # `jwt-p256` as well, and the BACKEND rather than the seam: the harness verifies the access token
 # as an RFC 9068 `at+jwt` against the advertised jwks_uri, so this fixture has to actually SIGN.
-# Since 0.9.0 `jwt` is the `Es256Signer`/`Es256Verifier` seam and carries no key implementation, so
+# Since 0.9.0 `jwt` is the `JwsSigner`/`JwsVerifier` seam and carries no key implementation, so
 # a build with only `jwt` has nothing to sign with. Neither feature is on by default, so a consumer
 # who enables neither still gets opaque tokens and a metadata document with no jwks_uri.
+#
+# `client-assertion,jwt-rsa,jwt-ed25519` are the example's other required-features: the fixture
+# registers two RFC 7523 `private_key_jwt` clients (RS256 and EdDSA) that the Go second judge
+# (scripts/oauth-interop.sh) authenticates as, and the AS auto-installs the matching
+# RsaVerifier/Ed25519Verifier only when those backends are compiled in. The list here MUST match
+# the example's `required-features` in Cargo.toml, or cargo silently skips building the example and
+# the `exec` below finds no binary.
 cargo build --locked --manifest-path "$CRATE_DIR/Cargo.toml" \
-  --features axum,jwt-p256 --example conformance_server >&2
+  --features axum,jwt-p256,client-assertion,jwt-rsa,jwt-ed25519 --example conformance_server >&2
 
 exec "$ROOT/target/debug/examples/conformance_server"

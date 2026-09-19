@@ -69,7 +69,7 @@ pg-integration = [
 ]
 
 [dependencies]
-oauth-as = { version = "0.9", path = "../oauth-as" }
+oauth-as = { version = "0.10", path = "../oauth-as" }
 # THE DRIVER. See README.md "Why sqlx" for the full reasoning; the short version is that the
 # RUNTIME query API (`sqlx::query`, not `sqlx::query!`) needs no database to COMPILE, and the
 # connection pool and transaction types are in the box. `default-features = false` drops the
@@ -90,7 +90,7 @@ serde_json = "1"
 # `test-util` is the core's exported conformance harness. It is a DEV dependency feature and not a
 # feature of this crate on purpose: it adds no method to the `Storage` trait, so unifying it into
 # the test build cannot change what this crate has to implement.
-oauth-as = { version = "0.9", path = "../oauth-as", features = ["test-util"] }
+oauth-as = { version = "0.10", path = "../oauth-as", features = ["test-util"] }
 # The harness's `with_spawn` mode needs a multi-threaded runtime for the races to be real races
 # rather than an interleaving, and the two-connection test needs a barrier. `time` is for
 # `tests/revocation_races.rs`, which holds a write open while a revocation commits and has to give

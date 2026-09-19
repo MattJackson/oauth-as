@@ -286,7 +286,7 @@ jobs:
       - name: tests (every feature EXCEPT the ES256 backend)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,cimd,test-util
+            axum,jwt,jwt-rsa,jwt-ed25519,jwt-ed25519-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,rar,cimd,test-util
 
       # See dev.yml's copy for the argument. RFC 9396 section 5's refusals are proven by two files
       # gated `not(feature = "rar")`, and no feature set anywhere ran them; one was never compiled.
@@ -294,7 +294,7 @@ jobs:
       - name: tests (every feature EXCEPT rar, so the RFC 9396 s5 refusals actually run)
         run: |
           cargo test -p oauth-as --locked --features \
-            axum,jwt,jwt-p256,jwt-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,cimd,test-util
+            axum,jwt,jwt-p256,jwt-pkcs8,jwt-rsa,jwt-ed25519,jwt-ed25519-pkcs8,mtls,par,jar,client-assertion,dpop,resource-metadata,token-exchange,consent,cimd,test-util
       # THE MUTUALLY-EXCLUSIVE PAIRS, which no other step in any workflow REACHES.
       #
       # Four tests were gated on feature combinations that every running configuration
@@ -386,6 +386,48 @@ jobs:
         run: |
           echo "crates/oauth-as/Cargo.toml is at $VERSION, which is already on crates.io."
           echo "To release: bump the version in crates/oauth-as/Cargo.toml, take it through dev and qa, and promote to main."
+
+  # COVERAGE, measured with cargo-llvm-cov and uploaded to Codecov. A SEPARATE JOB, so it costs the
+  # rest of this gate no wall clock, and on STABLE because coverage instrumentation is a stable-
+  # toolchain concern and not an MSRV one -- the MSRV floor is verified by its own job in qa.yml.
+  #
+  # WHERE IT RUNS: dev.yml's `pull_request` trigger (Codecov's per-line PR annotations) and
+  # publish.yml's push to main (which populates the README badge). It is carried in qa.yml only
+  # because the drift check at the top of `lint-and-test` requires qa to carry every JOB dev carries.
+  #
+  # SCOPED TO `-p oauth-as` WITH `--all-features`, deliberately NOT `--workspace`: oauth-as-postgres
+  # turns a missing OAUTH_AS_POSTGRES_TEST_URL into a PANIC under its integration feature, so a
+  # workspace-wide all-features run would go RED on a runner with no database. oauth-as is also the
+  # only published crate, so it is the one the badge should describe.
+  #
+  # `fail_ci_if_error: true` so a broken upload is RED rather than a badge that silently stops
+  # updating. Token is a repo secret; codecov-action and cargo-llvm-cov are SHA-pinned like every
+  # other third-party action here.
+  coverage:
+    name: coverage (llvm-cov -> Codecov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2, 2026-09-18
+        with:
+          tool: cargo-llvm-cov
+      - name: coverage (llvm-cov, all features)
+        run: cargo llvm-cov --all-features -p oauth-as --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5, 2026-09-18
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
 
 # WHAT THE OWNER MUST CONFIGURE BY HAND (none of this can be done from inside a workflow file):
 #

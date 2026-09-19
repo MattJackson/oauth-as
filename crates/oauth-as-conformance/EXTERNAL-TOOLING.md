@@ -191,6 +191,35 @@ That is a release's worth of work, not a task, and it is honest to say so. It is
 external certification available to a non-OIDC authorization server, and this crate is now close
 enough that the remaining list is finite and written down.
 
+**Update, on the `feat/fapi2-conformance` branch:** the CI wiring and config skeleton around that
+next step now exist, ahead of the fixture itself, so what is real and what is still missing can be
+stated precisely:
+
+- `scripts/fapi2-conformance.sh` exists and runs the sequence above end to end (clone/build/start
+  the suite, build and launch the fixture example, run the plan, collect logs) -- but its very
+  first act is a preflight check for
+  `crates/oauth-as/examples/fapi2_conformance_server.rs`, and it STOPS there with a pointer back
+  to this section, by design, because that file does not exist yet.
+- `.github/workflows/fapi2-conformance.yml` wires that script into a `workflow_dispatch`-only
+  job. It is not on `push`, it is not referenced by `dev.yml` or `qa.yml`, and it carries no
+  `continue-on-error`, so it is expected to fail loudly today for the same preflight reason as the
+  script -- a manual job that could pass without the fixture would be exactly the kind of lying
+  gate `qa.yml`'s own header argues against.
+- `crates/oauth-as-conformance/fapi2/config.json` and its sibling `README.md` give the suite
+  config the right SHAPE (the `client`/`client2`/`resource.resourceUrl`/`browser` fields this
+  section and s2.3 describe) with every value that depends on the fixture marked `PLACEHOLDER`.
+
+None of that is a run, a green, or progress toward certification; it is scaffolding built ahead of
+its own prerequisite so that landing the prerequisite is the only remaining step rather than also
+requiring new CI plumbing at the same time. **The two remaining blockers are still exactly the two
+named in s2.3**: item 1 (the fixture example itself: HTTPS listener, two static
+`private_key_jwt` clients, the DPoP-verifying protected resource, mandatory PAR) and item 7 (a
+switch to turn refresh-token rotation OFF, since FAPI 2.0 s5.3.2.1-9 forbids the rotation this
+crate does by default). Once both land: fill in `fapi2/config.json`'s placeholders from the real
+client ids, public JWKS, resource URL and consent-page selectors the fixture exposes, then run the
+job from **Actions -> FAPI 2.0 conformance -> Run workflow**. Nothing is certified and nothing is
+green yet; this update records CI plumbing, not a result.
+
 ## 3. `authgent`: run, and what it found
 
 See the header of `scripts/oauth-mcp-lint.sh` for the full argument about why standing up an RFC

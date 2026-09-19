@@ -28,14 +28,18 @@ mod harness;
 ))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The crate's built-in ES256 backend. Verification goes through the `Es256Verifier` seam, so a
+/// The crate's built-in ES256 backend. Verification goes through the `JwsVerifier` seam, so a
 /// verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets by
 /// default, which is what keeps these benchmarks measuring what they always measured.
 #[cfg(all(
     feature = "jwt-p256",
     any(feature = "dpop", feature = "client-assertion")
 ))]
-const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
+fn verifiers() -> oauth_as::jwt::JwsVerifiers {
+    let mut verifiers = oauth_as::jwt::JwsVerifiers::new();
+    verifiers.install(std::sync::Arc::new(oauth_as::jwt::P256Verifier));
+    verifiers
+}
 
 #[cfg(all(
     feature = "jwt-p256",
@@ -139,6 +143,12 @@ fn main() {
         // mid-run. A bench whose input expires partway through stops measuring the success path
         // and starts measuring the refusal path, which is a different number wearing the same name.
         let now = SystemTime::now();
+        // Built ONCE, outside every measured loop, and reused. A fresh `JwsVerifiers` per
+        // iteration (a `verifiers()` call inside the closure) allocates an `Arc` and the slot
+        // array on every measured pass, so the row would report that allocation on top of the
+        // ES256 verify it exists to isolate. The installed set does not change between iterations,
+        // so building it once is both faster and what the row is meant to measure.
+        let installed = verifiers();
         let key = EcdsaP256Key::generate("device-key");
         let header = serde_json::json!({
             "typ": "dpop+jwt",
@@ -157,7 +167,7 @@ fn main() {
             |input| key.sign_signing_input(input).unwrap(),
         );
         assert!(
-            verify_proof(VERIFIER, &proof, HTM, HTU, now).is_ok(),
+            verify_proof(&installed, &proof, HTM, HTU, now).is_ok(),
             "the fixture proof must verify, or this row measures a refusal"
         );
 
@@ -166,7 +176,7 @@ fn main() {
         // on every request. That makes this row the single most consequential number in the file
         // for a DPoP deployment.
         b.bench_fast("dpop_verify_proof", || {
-            verify_proof(VERIFIER, &proof, HTM, HTU, now)
+            verify_proof(&installed, &proof, HTM, HTU, now)
         });
 
         // The refusal, driven by an attacker who has no key. TWO of them, because they are not
@@ -200,20 +210,20 @@ fn main() {
         // to measure. These two rows exist precisely to be compared against each other, so the
         // one that must cost a full ES256 verify has to be the one that actually ran one.
         assert_eq!(
-            verify_proof(VERIFIER, malformed, HTM, HTU, now),
+            verify_proof(&installed, malformed, HTM, HTU, now),
             Err(DpopFailure::Malformed),
             "this row must measure the PARSER refusing, before any curve arithmetic"
         );
         assert_eq!(
-            verify_proof(VERIFIER, &wrong_signature, HTM, HTU, now),
+            verify_proof(&installed, &wrong_signature, HTM, HTU, now),
             Err(DpopFailure::BadSignature),
             "this row must measure a COMPLETED ES256 verification that failed, not an earlier              refusal that skipped it"
         );
         b.bench_fast("dpop_verify_proof_malformed", || {
-            verify_proof(VERIFIER, malformed, HTM, HTU, now)
+            verify_proof(&installed, malformed, HTM, HTU, now)
         });
         b.bench_fast("dpop_verify_proof_bad_signature", || {
-            verify_proof(VERIFIER, &wrong_signature, HTM, HTU, now)
+            verify_proof(&installed, &wrong_signature, HTM, HTU, now)
         });
     }
 
@@ -248,11 +258,26 @@ fn main() {
             hmac_sha256(SECRET.as_bytes(), input.as_bytes()).to_vec()
         });
         assert!(
-            verify_assertion(Some(VERIFIER), &hs_keys, &hs, CLIENT, &audiences, now).is_ok(),
+            verify_assertion(
+                Some(&oauth_as::jwt::P256Verifier),
+                &hs_keys,
+                &hs,
+                CLIENT,
+                &audiences,
+                now
+            )
+            .is_ok(),
             "the HS256 fixture must verify"
         );
         b.bench_fast("client_secret_jwt_hs256_verify", || {
-            verify_assertion(Some(VERIFIER), &hs_keys, &hs, CLIENT, &audiences, now)
+            verify_assertion(
+                Some(&oauth_as::jwt::P256Verifier),
+                &hs_keys,
+                &hs,
+                CLIENT,
+                &audiences,
+                now,
+            )
         });
 
         // private_key_jwt: ES256, asymmetric, and the reason a deployment whose policy forbids
@@ -260,17 +285,33 @@ fn main() {
         // price of that policy is a number rather than a feeling.
         let key = EcdsaP256Key::generate("client-key-1");
         let es_keys = AssertionKeys::PublicKeys {
+            alg: oauth_as::jwt::JwsAlg::Es256,
             keys: vec![key.to_public_jwk()],
         };
         let es = compact_jws(br#"{"alg":"ES256","typ":"JWT"}"#, &claims_bytes, |input| {
             key.sign_signing_input(input).unwrap()
         });
         assert!(
-            verify_assertion(Some(VERIFIER), &es_keys, &es, CLIENT, &audiences, now).is_ok(),
+            verify_assertion(
+                Some(&oauth_as::jwt::P256Verifier),
+                &es_keys,
+                &es,
+                CLIENT,
+                &audiences,
+                now
+            )
+            .is_ok(),
             "the ES256 fixture must verify"
         );
         b.bench_fast("private_key_jwt_es256_verify", || {
-            verify_assertion(Some(VERIFIER), &es_keys, &es, CLIENT, &audiences, now)
+            verify_assertion(
+                Some(&oauth_as::jwt::P256Verifier),
+                &es_keys,
+                &es,
+                CLIENT,
+                &audiences,
+                now,
+            )
         });
     }
 

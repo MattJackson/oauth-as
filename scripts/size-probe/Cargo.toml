@@ -82,6 +82,14 @@ f-jwt-pkcs8 = ["lib", "f-jwt-p256", "oauth-as/jwt-pkcs8"]
 # never calling it cost? Under `lto = "fat"` the answer turns out to be nothing, which is not what
 # a reader of the manifest would guess.
 f-jwt-pkcs8-unused = ["lib", "f-jwt-p256", "oauth-as/jwt-pkcs8"]
+# THE BUILT-IN RS256 BACKEND, which is where the `rsa` crate and its tree enter. Hangs off `f-jwt`
+# (the seam), not `f-jwt-p256`: RS256 and ES256 are independent, and a host may want either.
+f-jwt-rsa = ["lib", "f-jwt", "oauth-as/jwt-rsa"]
+# THE BUILT-IN EdDSA (Ed25519) BACKEND, which is where `ed25519-dalek` enters. Also off `f-jwt`.
+f-jwt-ed25519 = ["lib", "f-jwt", "oauth-as/jwt-ed25519"]
+# The Ed25519 PKCS#8 DER codec, which pulls `pkcs8`/`der`/`spki` behind `ed25519-dalek/pkcs8`.
+# Off `f-jwt-ed25519` because the constructor it measures is a method on the ed25519 backend's type.
+f-jwt-ed25519-pkcs8 = ["lib", "f-jwt-ed25519", "oauth-as/jwt-ed25519-pkcs8"]
 f-mtls = ["lib", "oauth-as/mtls"]
 f-par = ["lib", "oauth-as/par"]
 # `f-jwt-p256`, not `f-jwt`: the probe has to PRODUCE the credential it verifies.

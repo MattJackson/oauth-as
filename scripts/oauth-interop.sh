@@ -13,6 +13,13 @@
 # the RFC 6749 s4.4 client credentials grant and the s6 refresh grant with rotation, neither of
 # which the Rust client drive exercises.
 #
+# It also carries the RS256/EdDSA half of the RFC 7523 private_key_jwt story. The Rust conformance
+# drive interops on ES256 client authentication only; here Go's own stdlib crypto/rsa and
+# crypto/ed25519 hand-assemble and sign the client assertion (no third-party JWT library), against
+# this crate's rsa / ed25519-dalek verifiers, over the PINNED RFC 7515 A.2 and RFC 8037 A.4
+# keypairs. Each algorithm is proven twice: a valid assertion is accepted AND a one-byte-tampered
+# signature is rejected as invalid_client, so the check cannot go green if verification were absent.
+#
 # What it is NOT: it is not certification, and it is not a conformance suite. It is two clients
 # agreeing. See the "What is not claimed" section of README.md, which this does not change.
 #
@@ -138,7 +145,8 @@ run_selftest() {
   fi
   # Each named grant must be reported failing individually. Exit status alone would also be
   # satisfied by a crash during discovery, which would prove nothing about the assertions.
-  for want in "FAIL  device flow" "FAIL  authorization code" "FAIL  client credentials"; do
+  for want in "FAIL  device flow" "FAIL  authorization code" "FAIL  client credentials" \
+              "FAIL  private_key_jwt RS256" "FAIL  private_key_jwt EdDSA"; do
     if ! grep -q "$want" "$TMPDIR_INTEROP/red-b.log"; then
       cat "$TMPDIR_INTEROP/red-b.log"
       fail "RED-B: the drive failed, but never reported '$want'; the per-grant assertions are \

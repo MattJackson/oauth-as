@@ -49,9 +49,10 @@
 use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
+use oauth_as::client_assertion::AssertionKeys;
 use oauth_as::grant::GrantType;
 use oauth_as::http::{ApprovalDecision, ServiceBuilder};
-use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
+use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, Jwk, JwsAlg, JwtConfig};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
 use oauth_as::store::MemoryStorage;
@@ -98,6 +99,36 @@ const SEEDED_SIGNING_SCALAR: [u8; 32] = [
 
 /// RFC 7517 s4.5 `kid`: names the key in the JWKS and in every token header this AS signs.
 const SEEDED_KID: &str = "conformance-es256-1";
+
+/// ############################################################################
+/// # CONFORMANCE FIXTURE ONLY. NEVER COPY THIS INTO A PRODUCTION HOST.        #
+/// ############################################################################
+///
+/// The two `private_key_jwt` (RFC 7523) fixture clients that let a SECOND, independent judge —
+/// `interop/go`, driven by `scripts/oauth-interop.sh` — exercise RS256 and EdDSA client
+/// authentication against this AS. The Rust conformance drive interops on ES256 only; these two
+/// clients are the RS256/EdDSA half, verified end to end by Go's own stdlib `crypto/rsa` and
+/// `crypto/ed25519` signing against this crate's `rsa`/`ed25519-dalek` verifiers.
+///
+/// The registered keys are the PUBLIC halves of the RFC key pairs whose private halves the Go
+/// client signs with, so both sides share identical PINNED keys and nothing generated has to be
+/// committed:
+///
+/// * RS256: the RSA public key of RFC 7515 appendix A.2 (`n`, `e`); the Go client holds its
+///   private `d`/`p`/`q`. It is public in an IETF document exactly like [`SEEDED_SIGNING_SCALAR`]
+///   and, for the same reason, must never be copied into a real registration.
+/// * EdDSA: the Ed25519 public key `x` of RFC 8037 appendix A.4; the Go client holds its seed `d`.
+const PKJWT_RS256_CLIENT_ID: &str = "conformance-pkjwt-rs256";
+const PKJWT_EDDSA_CLIENT_ID: &str = "conformance-pkjwt-eddsa";
+
+/// RFC 7515 appendix A.2 RSA public modulus `n` (base64urlUInt), paired with `e` = `AQAB`.
+const PKJWT_RS256_N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
+const PKJWT_RS256_E: &str = "AQAB";
+const PKJWT_RS256_KID: &str = "conformance-rs256-1";
+
+/// RFC 8037 appendix A.4 Ed25519 public key `x` (base64url, 32 bytes).
+const PKJWT_EDDSA_X: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+const PKJWT_EDDSA_KID: &str = "conformance-eddsa-1";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -245,8 +276,65 @@ where
             ],
             redirect_uris: vec![PUBLIC_REDIRECT_URI.to_string()],
             allowed_scopes: scopes.clone(),
-            default_scopes: scopes,
+            default_scopes: scopes.clone(),
             name: Some("Conformance confidential client".to_string()),
+            registration: None,
+        })
+        .await?;
+
+    // ############################################################################
+    // # CONFORMANCE FIXTURE ONLY. NEVER COPY ANY OF THIS INTO A PRODUCTION HOST.  #
+    // ############################################################################
+    //
+    // The two RFC 7523 `private_key_jwt` clients the Go second judge authenticates as. Each is
+    // confidential (an assertion signed by a key only the client holds), speaks the client
+    // credentials grant so the judge can prove a token issues, and is pinned to exactly ONE
+    // algorithm through `AssertionKeys::PublicKeys { alg, .. }`: the registration decides the alg,
+    // never the token header, which is the whole of the defence against JWS algorithm confusion.
+    //
+    // The keys are the PUBLIC halves of the RFC vectors (see PKJWT_* above); the private halves
+    // live in the Go client. The `jwt-rsa` / `jwt-ed25519` backends this example enables are what
+    // let the AS auto-install the matching `RsaVerifier` / `Ed25519Verifier`.
+    server
+        .register_client(Client {
+            client_id: ClientId::new(PKJWT_RS256_CLIENT_ID),
+            auth: ClientAuth::ConfidentialAssertion {
+                keys: AssertionKeys::PublicKeys {
+                    alg: JwsAlg::Rs256,
+                    keys: vec![Jwk::Rsa {
+                        n: PKJWT_RS256_N.to_string(),
+                        e: PKJWT_RS256_E.to_string(),
+                        kid: Some(PKJWT_RS256_KID.to_string()),
+                    }],
+                },
+            },
+            grant_types: vec![GrantType::ClientCredentials],
+            redirect_uris: vec![],
+            allowed_scopes: scopes.clone(),
+            default_scopes: scopes.clone(),
+            name: Some("Conformance private_key_jwt RS256 client".to_string()),
+            registration: None,
+        })
+        .await?;
+
+    server
+        .register_client(Client {
+            client_id: ClientId::new(PKJWT_EDDSA_CLIENT_ID),
+            auth: ClientAuth::ConfidentialAssertion {
+                keys: AssertionKeys::PublicKeys {
+                    alg: JwsAlg::EdDsa,
+                    keys: vec![Jwk::Okp {
+                        crv: oauth_as::jwt::OkpCurve::Ed25519,
+                        x: PKJWT_EDDSA_X.to_string(),
+                        kid: Some(PKJWT_EDDSA_KID.to_string()),
+                    }],
+                },
+            },
+            grant_types: vec![GrantType::ClientCredentials],
+            redirect_uris: vec![],
+            allowed_scopes: scopes.clone(),
+            default_scopes: scopes,
+            name: Some("Conformance private_key_jwt EdDSA client".to_string()),
             registration: None,
         })
         .await?;

@@ -88,7 +88,7 @@ TARGET_ROOT="${SIZE_REPORT_TARGET_ROOT:-$REPO_ROOT/target/size-report}"
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
 # Every oauth-as feature, mirrored in the probe as `f-<name>`. --all-features is this list.
-ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client-assertion,f-consent,f-token-exchange,f-resource-metadata,f-cimd,f-test-util"
+ALL_FEATURES="f-http,f-axum,f-jwt,f-jwt-p256,f-jwt-pkcs8,f-jwt-rsa,f-jwt-ed25519,f-jwt-ed25519-pkcs8,f-mtls,f-par,f-jar,f-rar,f-dpop,f-client-assertion,f-consent,f-token-exchange,f-resource-metadata,f-cimd,f-test-util"
 
 # ---------------------------------------------------------------------------------------------
 # THE ROWS.
@@ -113,6 +113,9 @@ ROWS=(
   "jwt-p256|f-jwt-p256||the above plus the built-in p256 backend, which is what every consumer of jwt had before the seam"
   "jwt-pkcs8 (called)|f-jwt-pkcs8||jwt-p256, plus a PKCS#8 key actually exported and re-imported"
   "jwt-pkcs8 (never called)|f-jwt-pkcs8-unused||jwt-p256, with the jwt-pkcs8 feature ON and its two constructors never reached"
+  "jwt-rsa|f-jwt-rsa||the built-in RS256 backend over the rsa crate: signing and verification (implies jwt)"
+  "jwt-ed25519|f-jwt-ed25519||the built-in EdDSA backend over ed25519-dalek: signing and verification (implies jwt)"
+  "jwt-ed25519-pkcs8|f-jwt-ed25519-pkcs8||jwt-ed25519, plus the PKCS#8 DER loader for the Ed25519 signing key"
   "mtls|f-mtls||RFC 8705 thumbprints, subject matching and certificate-bound tokens"
   "par|f-par||RFC 9126 pushed authorization requests, pushed and redeemed"
   "jar|f-jar||RFC 9101 signed request objects (implies jwt)"
@@ -176,6 +179,23 @@ ROWS=(
 # README.md's Cost section from the same run.
 budget_for() {
   case "$HOST_TRIPLE:$1" in
+    # RE-BASELINED AGAIN 2026-09-18 for 0.10.0, aarch64-apple-darwin, rustc 1.98.0, ONE run of this
+    # script with --remap-path-prefix in force, ONLY for the two rows the 0.10.0 crypto-agility work
+    # moved out of their 0.9.5 band; the other five gated rows still sit inside the 0.9.5 bands below
+    # (measured `default` 238,704, `http` 442,565, `axum` 682,242, `jwt (seam only)` 276,078,
+    # `http,jwt` 483,964 -- all within their recorded budget and floor) and are deliberately left
+    # untouched so a passing gate is not re-tightened for churn.
+    #   * jwt-p256: 309,366 (0.9.5) -> 315,618. `Jwk` became a THREE-VARIANT enum and verification
+    #     now dispatches through a `JwsVerifiers` set rather than one hardcoded ES256 verifier, so the
+    #     built-in-backend row grew ~6.3 KiB past its old 314,368 budget. New budget 315,618 +1.5%
+    #     rounded up = 313 KiB (320,512); new floor 315,618 -1.5% rounded down = 303 KiB (310,272).
+    #   * all-features: 1,420,273 (0.9.5) -> 1,608,733. THREE new backends entered ALL_FEATURES --
+    #     `jwt-rsa` (the `rsa` crate: num-bigint modmul/modpow), `jwt-ed25519` (`ed25519-dalek`) and
+    #     `jwt-ed25519-pkcs8` (the `pkcs8`/`der`/`spki` codec) -- so the everything row rose ~184 KiB,
+    #     nearly all of it the RSA arithmetic. New budget 1,608,733 +1.5% rounded up = 1595 KiB
+    #     (1,633,280); new floor -1.5% rounded down = 1547 KiB (1,584,128). See README.md's Cost
+    #     section, updated from this same run.
+    #
     # RE-BASELINED 2026-09-18 for 0.9.5, aarch64-apple-darwin, rustc 1.98.0, ONE run of this script
     # with --remap-path-prefix in force. WHAT BOUGHT IT: the opt-in `refresh_retry_window` feature
     # (PR #10) adds the bounded atomic-rotation recovery path -- `refresh_retry_response` and
@@ -257,7 +277,7 @@ budget_for() {
     # actually wants.
     # Budget down from 308,224 to 296,960, because 308,224 was 5.4% above a row that moved by 749
     # bytes all release.
-    aarch64-apple-darwin:jwt-p256) echo 314368 ;;
+    aarch64-apple-darwin:jwt-p256) echo 320512 ;;
     # the conformance server's own feature set: the HTTP surface plus the signing seam, with no
     # curve. MEASURED 458,484, down 14,036 from the 472,520 this row was set from, for the same
     # reason as `http`.
@@ -285,7 +305,7 @@ budget_for() {
     #     marginal cost in a binary that already parses JSON for something else is 30,629 bytes.
     #     (The 24 KiB quoted for this before was taken pre-remap and pre-`ScopeSet`; 30,629 is the
     #     figure from this run.)
-    aarch64-apple-darwin:all-features) echo 1441792 ;;
+    aarch64-apple-darwin:all-features) echo 1633280 ;;
     *) echo "" ;;
   esac
 }
@@ -375,13 +395,13 @@ floor_for() {
     aarch64-apple-darwin:"jwt (seam only)") echo 268288 ;;
     # MEASURED 292,418, budget 296,960. Down to 281 KiB. The gap to the seam-only floor is what
     # stops the built-in p256 backend disappearing from the probe unnoticed.
-    aarch64-apple-darwin:jwt-p256) echo 304128 ;;
+    aarch64-apple-darwin:jwt-p256) echo 310272 ;;
     # MEASURED 458,484, budget 465,920. Down to 441 KiB.
     aarch64-apple-darwin:"http,jwt") echo 468992 ;;
     # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
     # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
     # before trusting this one to notice a single feature: it will not.
-    aarch64-apple-darwin:all-features) echo 1398784 ;;
+    aarch64-apple-darwin:all-features) echo 1584128 ;;
     *) echo "" ;;
   esac
 }

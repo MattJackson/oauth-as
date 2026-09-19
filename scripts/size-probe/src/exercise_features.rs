@@ -9,9 +9,11 @@
 //! same code either way, and they are the bulk of it. Where the happy path is reachable without a
 //! counterparty (PAR, RAR, consent, token exchange, resource metadata) it is what runs.
 
-/// The crate's built-in ES256 backend. Verification goes through the `Es256Verifier` seam, so a
-/// verifier is a per-call argument; this is the one a consumer who enables `jwt-p256` gets.
-#[cfg(any(feature = "f-dpop", feature = "f-client-assertion"))]
+/// The crate's built-in ES256 verifier. Verification goes through the `JwsVerifier` seam, so a
+/// verifier is a per-call argument (a `JwsVerifiers` set for DPoP, an `Option<&dyn JwsVerifier>`
+/// for a client assertion); this is the one a consumer who enables `jwt-p256` gets. DPoP builds its
+/// verifier set inline (see `dpop`), so this const serves the client-assertion path only.
+#[cfg(feature = "f-client-assertion")]
 const VERIFIER: &oauth_as::jwt::P256Verifier = &oauth_as::jwt::P256Verifier;
 
 #[cfg(feature = "f-mtls")]
@@ -110,7 +112,7 @@ pub fn jar() -> u64 {
             &x,
             &y,
         ) {
-            acc = acc.wrapping_add(registered.alg().as_str().len() as u64);
+            acc = acc.wrapping_add(registered.alg().jose_name().len() as u64);
         }
     }
     // The verification entry point. No key source is installed, so this refuses, which is the arm
@@ -157,10 +159,14 @@ pub fn dpop() -> u64 {
     use oauth_as::dpop::{htu_of, verify_proof};
 
     let mut acc = htu_of("https://as.probe.example/token?x=1").len() as u64;
+    // The verifier set the seam dispatches through: install the built-in ES256 verifier, exactly as
+    // a consumer of `jwt-p256` gets. `verify_proof` takes the whole set, not one verifier.
+    let mut verifiers = oauth_as::jwt::JwsVerifiers::new();
+    verifiers.install(std::sync::Arc::new(oauth_as::jwt::P256Verifier));
     // No client here to mint a real proof, so this is the refusal arm: it still runs the compact
     // JWS parse, the `typ` and `alg` checks and the failure mapping, which is most of the code.
     match verify_proof(
-        VERIFIER,
+        &verifiers,
         "not.a.proof",
         "POST",
         "https://as.probe.example/token",
@@ -184,7 +190,7 @@ pub fn client_assertion() -> u64 {
         let keys = AssertionKeys::ClientSecret { secret };
         acc = acc.wrapping_add(keys.token_endpoint_auth_method().len() as u64);
         if let Err(failure) = verify_assertion(
-            Some(VERIFIER as &dyn oauth_as::jwt::Es256Verifier),
+            Some(VERIFIER as &dyn oauth_as::jwt::JwsVerifier),
             &keys,
             "not.an.assertion",
             "probe-confidential",
@@ -196,11 +202,14 @@ pub fn client_assertion() -> u64 {
     }
     let key = oauth_as::jwt::EcdsaP256Key::generate("probe-assertion-1");
     if let Ok(value) = serde_json::to_value(key.public_jwk()) {
-        if let Ok(public) = oauth_as::jwt::PublicJwk::from_json(&value) {
-            let keys = AssertionKeys::PublicKeys { keys: vec![public] };
+        if let Ok(public) = oauth_as::jwt::Jwk::from_json(&value) {
+            let keys = AssertionKeys::PublicKeys {
+                alg: oauth_as::jwt::JwsAlg::Es256,
+                keys: vec![public],
+            };
             acc = acc.wrapping_add(keys.signing_alg().len() as u64);
             if let Err(failure) = verify_assertion(
-                Some(VERIFIER as &dyn oauth_as::jwt::Es256Verifier),
+                Some(VERIFIER as &dyn oauth_as::jwt::JwsVerifier),
                 &keys,
                 "not.an.assertion",
                 "probe-confidential",
@@ -270,7 +279,11 @@ pub fn consent() -> u64 {
             .await
         {
             acc = acc.wrapping_add(record.consent_id.len() as u64);
-            acc = acc.wrapping_add(u64::from(record.covers(&scope, &[], RequestedDetails::none())));
+            acc = acc.wrapping_add(u64::from(record.covers(
+                &scope,
+                &[],
+                RequestedDetails::none(),
+            )));
             if let Ok(all) = server.consents_for_subject("probe-subject").await {
                 acc = acc.wrapping_add(all.len() as u64);
             }

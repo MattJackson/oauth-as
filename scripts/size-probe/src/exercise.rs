@@ -71,13 +71,18 @@ pub fn config() -> ServerConfig {
 struct ProbeSigner;
 
 #[cfg(all(feature = "f-jwt", not(feature = "f-jwt-p256")))]
-impl oauth_as::jwt::Es256Signer for ProbeSigner {
+impl oauth_as::jwt::JwsSigner for ProbeSigner {
+    fn alg(&self) -> oauth_as::jwt::JwsAlg {
+        oauth_as::jwt::JwsAlg::Es256
+    }
+
     fn sign(
         &self,
         _signing_input: &[u8],
-    ) -> impl std::future::Future<Output = Result<[u8; 64], oauth_as::jwt::SignerError>> + Send
-    {
-        async { Ok([0x5Au8; 64]) }
+    ) -> impl std::future::Future<
+        Output = Result<oauth_as::jwt::JwsSignature, oauth_as::jwt::SignerError>,
+    > + Send {
+        async { Ok(oauth_as::jwt::JwsSignature::Es256([0x5Au8; 64])) }
     }
 
     fn public_jwk(&self) -> oauth_as::jwt::Jwk {
@@ -85,14 +90,11 @@ impl oauth_as::jwt::Es256Signer for ProbeSigner {
         // coordinate at. All-zero rather than a real point, and spelled out rather than encoded,
         // so the probe takes no `base64` dependency of its own: nothing here verifies anything,
         // and a coordinate that is well FORMED is all the JWKS serialization path reads.
-        oauth_as::jwt::Jwk {
-            kty: "EC",
-            crv: "P-256",
+        oauth_as::jwt::Jwk::Ec {
+            crv: oauth_as::jwt::EcCurve::P256,
             x: "A".repeat(43),
             y: "A".repeat(43),
-            kid: "probe-host-1".to_string(),
-            use_: "sig",
-            alg: "ES256",
+            kid: Some("probe-host-1".to_string()),
         }
     }
 }

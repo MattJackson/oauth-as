@@ -1,0 +1,55 @@
+{
+  "_comment": "Real values, matched to crates/oauth-as/examples/fapi2_conformance_server.rs (EXTERNAL-TOOLING.md s2.3 item 1). The only field that still needs operator attention before a run is the redirect URI implied by `alias`: see crates/oauth-as-conformance/fapi2/README.md's \"Alias and redirect URI\" section.",
+
+  "alias": "oauth-as-fapi2-plain-oauth",
+  "description": "oauth-as FAPI 2.0 Security Profile, plain_oauth, private_key_jwt + DPoP",
+
+  "server": {
+    "discoveryUrl": "https://localhost.emobix.co.uk:8443/.well-known/oauth-authorization-server"
+  },
+
+  "client": {
+    "client_id": "client",
+    "scope": "read write offline_access",
+    "jwks": {
+      "keys": [
+        {
+          "kty": "EC",
+          "crv": "P-256",
+          "kid": "client-pkjwt-1",
+          "x": "-OJFbScoxwN9pnxRv4XXdAOQ0ez_sIZ3MNbjuIHVW6w",
+          "y": "Sp38xgJj5x9xVlXU193jHt3y8bofM3-uD6WaBRfa8Lk",
+          "d": "ESExQVFhcYGRobHB0eHxAhIiMkJSYnKCkqKywtLi8gM",
+          "alg": "ES256",
+          "use": "sig"
+        }
+      ]
+    }
+  },
+
+  "client2": {
+    "client_id": "client2",
+    "scope": "read write offline_access",
+    "jwks": {
+      "keys": [
+        {
+          "kty": "EC",
+          "crv": "P-256",
+          "kid": "client2-pkjwt-1",
+          "x": "ifUGRhCkUHjg4vVhy_0vkDkKuyztHi3XGxrOTbMeAkY",
+          "y": "rwC-B8bA8L34g_klnnJWXxl-PYOZ2k00jE4Fzvwkvjw",
+          "d": "M0RVZneImaq7zN3uDx4tPEtaaXiHlqW0w9Lh8AobLD0",
+          "alg": "ES256",
+          "use": "sig"
+        }
+      ]
+    }
+  },
+
+  "resource": {
+    "resourceUrl": "https://localhost.emobix.co.uk:8443/resource"
+  },
+
+  "_browser_comment": "EMPTY, deliberately. examples/fapi2_conformance_server.rs wires ServiceBuilder::with_subject_resolver to a constant subject and with_approval_resolver to an unconditional ApprovalDecision::Approve -- there is no login form and no consent screen for the suite's headless HtmlUnit browser to fill in or click through; every valid authorization request is approved server-side and the browser only ever needs to follow the redirect chain the AS itself issues. An empty task list is the correct match for that behaviour, not an omission; do not add click/text commands here unless the fixture grows an actual interactive page.",
+  "browser": []
+}

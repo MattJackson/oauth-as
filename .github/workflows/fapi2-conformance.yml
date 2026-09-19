@@ -1,0 +1,121 @@
+# MANUAL, NON-GATING. This job runs ONLY on workflow_dispatch and is not referenced by
+# dev.yml, qa.yml or publish.yml, and it must stay that way: it stands up the OpenID Foundation
+# FAPI 2.0 Security Profile conformance suite in a docker compose stack, which is heavyweight
+# (a Maven build of the suite plus a docker-in-docker run) and, more importantly, this crate is
+# not ready for it yet. See the HONESTY note below before wiring this into anything that runs
+# automatically.
+#
+# HONESTY, matching qa.yml's rule that nothing in this repository is allowed to look green
+# without having earned it:
+#
+#   Running the suite (this job) requires NO OpenID Foundation membership, payment or agreement.
+#   crates/oauth-as-conformance/EXTERNAL-TOOLING.md s2.4 verifies that directly from the OIDF's
+#   own certification pages: only formal CERTIFICATION, a separate manual submission at
+#   https://submissions.openid.net/ with a Declaration of Conformance and (for non-OIDF-member
+#   FAPI 2 deployments) a USD 5000 fee, requires any of that. This workflow does not perform a
+#   certification submission and never will; it produces a local run and, if the suite is asked
+#   to "Publish for certification", a log ZIP that a HUMAN would carry to that separate step.
+#
+#   This job is expected to FAIL, today, and that failure is correct and by design, not a bug in
+#   this file. scripts/fapi2-conformance.sh stops at preflight with a pointer to
+#   crates/oauth-as-conformance/EXTERNAL-TOOLING.md s2.3 because the FAPI 2.0 fixture example
+#   (crates/oauth-as/examples/fapi2_conformance_server.rs: HTTPS listener, two static
+#   private_key_jwt clients, a DPoP-verifying protected resource, mandatory PAR, and a
+#   refresh-rotation-OFF switch) does not exist in the tree yet. See EXTERNAL-TOOLING.md s2.5 for
+#   the exact remaining work. DO NOT add continue-on-error to make this job "pass" before that
+#   fixture lands: a manual job that can go green without the fixture existing is a job that lies,
+#   exactly as qa.yml's header argues for its own jobs. A red run here, today, is the honest
+#   answer.
+#
+#   Once the fixture and the rotation-off switch exist, this job becomes genuinely runnable, and
+#   is invoked by hand from the Actions tab (Actions -> FAPI 2.0 conformance -> Run workflow), not
+#   by a push. Its result is still not a certification; it is evidence to read before anyone
+#   decides whether to spend the money and the DocuSign step on a real submission.
+
+name: FAPI 2.0 conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: >-
+          OIDF test-plan string to run (see EXTERNAL-TOOLING.md s2.1 for how this string was
+          derived, and s2.3 item 7 for why sender_constrain=dpop and not mtls is chosen here).
+        required: false
+        default: >-
+          fapi2-security-profile-final-test-plan[openid=plain_oauth][client_auth_type=private_key_jwt][sender_constrain=dpop][fapi_profile=plain_fapi]
+
+# LEAST PRIVILEGE FOR THE JOB TOKEN, matching qa.yml and dev.yml. This job only checks out,
+# builds, and runs a local suite; it writes nothing back to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fapi2-conformance:
+    name: FAPI 2.0 Security Profile suite (plain_oauth, manual, non-gating)
+    runs-on: ubuntu-latest
+    # No timeout override: the default 360-minute cap is generous enough for a suite build plus a
+    # single plan run, and if this job ever needs longer than that, that is itself worth noticing
+    # rather than silently extending.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        # SAME pin as qa.yml and dev.yml, so a run of this job builds against the exact toolchain
+        # every other gate in this repository builds against, not a moving "latest".
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+
+      - name: Set up JDK (the OIDF suite is a Maven/Spring Boot application)
+        # v6 verified against the actions/setup-java GitHub releases (latest tag v6.0.1, major
+        # tag v6 exists) at the time this pin was written.
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python (the suite's run-test-plan.py runner)
+        # v7 verified against the actions/setup-python GitHub releases (latest tag v7.0.0, major
+        # tag v7 exists) at the time this pin was written.
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Docker is preinstalled on ubuntu-latest runners
+        # Documented rather than actioned: GitHub's ubuntu-latest image ships Docker Engine and
+        # the docker compose v2 plugin already. scripts/fapi2-conformance.sh itself checks for
+        # both (`command -v docker`, `docker compose version`) and dies loudly if either is
+        # missing, so there is no silent fallback if that ever stops being true.
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Run the FAPI 2.0 Security Profile suite
+        # NO continue-on-error. See the HONESTY header above: until the fixture example exists,
+        # this step is SUPPOSED to fail at preflight, and that red is the correct, expected
+        # result, not a flake to swallow. Do not add continue-on-error to "unblock" this job; the
+        # only real unblock is building the fixture (EXTERNAL-TOOLING.md s2.5).
+        env:
+          FAPI2_PLAN: ${{ inputs.plan }}
+        run: scripts/fapi2-conformance.sh
+
+      # Uploaded unconditionally (not `if: failure()`): a failed preflight still writes nothing
+      # under FAPI2_LOG_DIR, so there is nothing to upload in that case, but once the suite
+      # actually runs, the run.log and (if "Publish for certification" was exercised) the
+      # certification package ZIP are the entire point of this job existing, whether the plan
+      # itself passed or failed. `if-no-files-found: warn` so an empty directory (the
+      # preflight-stop case) does not itself fail an otherwise-correct red run twice over.
+      - name: Upload conformance logs and certification package
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fapi2-conformance-logs
+          path: target/fapi2-conformance/
+          if-no-files-found: warn
