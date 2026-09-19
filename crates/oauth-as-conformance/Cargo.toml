@@ -24,7 +24,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
 hmac = "0.12"
 # jsonwebtoken verifies the RFC 7515 Appendix A RS256/ES256 vectors and, in black-box mode,
