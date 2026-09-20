@@ -10,6 +10,84 @@ crates.io at **0.9.0**, not 0.1.0. Versions 0.1.0 through 0.8.0 are built, teste
 through the `dev` -> `qa` -> `main` promotion pipeline, but they are not published; only 0.0.1 and
 whatever version is current at each real crates.io release appear as published on crates.io.
 
+## [Unreleased]
+
+## [0.10.1] - 2026-09-20
+
+The OIDF FAPI 2.0 Security Profile conformance suite now runs **green**. The `plain_oauth` +
+`private_key_jwt` + DPoP plan passes end to end in CI (51 modules, 3095 condition successes). The
+only non-passes are documented, spec-permitted expected failures/skips, each recorded per-condition
+in `crates/oauth-as-conformance/fapi2/expected-failures.json` and `expected-skips.json` with a
+justification: user-rejection and reuse-of-`request_uri`-before-auth-completion (headless flows the
+fixture cannot drive interactively), a code-reuse token-revocation `SHOULD` logged at WARNING (the AS
+revokes the token family correctly; the fixture's resource validates the JWT statelessly and does not
+introspect), and an RS256 client-assertion negative test the ES256 profile skips. This is a green
+suite run, stated plainly: it is **not** a certification, which is a separate OIDF submission and
+review. The library changes below are what closed the conformance findings.
+
+### Added
+
+- `ServerConfig::assertion_audience` / `AssertionAudience::IssuerOnly` — an opt-in, FAPI-2.0-only
+  rule that accepts the authorization server's issuer identifier, as a string, as the sole client
+  authentication assertion `aud` (FAPI 2.0 Security Profile Final s5.3.2.1-8, s5.3.3.1-5;
+  draft-ietf-oauth-rfc7523bis-11 s3). The default, `AssertionAudience::Rfc7523`, is byte-for-byte
+  the existing RFC 7523 s3 (3) behaviour (token endpoint URL or issuer, as a string or an array);
+  the default is expected to move to `IssuerOnly` once rfc7523bis is published.
+- DPoP-bound authorization codes (RFC 9449 s10). A DPoP proof presented at the PAR endpoint — or a
+  `dpop_jkt` authorization-request parameter — binds the issued code to that key's JWK thumbprint;
+  the code is then redeemable only by proving the same key at the token endpoint, closing the
+  authorization-code injection that DPoP is meant to stop. New, non-breaking, `dpop`+`par`-gated
+  surface: `dpop_jkt` on `PushedAuthorizationRequest` / `AuthorizationRequest`, and
+  `AuthorizationServer::pushed_authorization_request_with_credential_and_proof`, which verifies the
+  PAR-endpoint proof (RFC 9449 s5) and enforces the s10.1 rule that a `dpop_jkt` parameter equal
+  the proof's thumbprint. Existing PAR callers are unaffected.
+- **PS256** (RSASSA-PSS with MGF1-SHA-256, salt length 32; RFC 7518 s3.5) as a first-class JWS
+  algorithm for both signing and verifying, alongside ES256/RS256/EdDSA. New `jwt-rsa`-gated
+  `Ps256Signer` / `Ps256Verifier` (no new dependency — `rsa::pss` rides the existing `rsa` crate),
+  new `JwsAlg::Ps256` / `JwsSignature::Ps256`. PS256 and RS256 are the same RSA key with different
+  padding; they are kept apart STRUCTURALLY by occupying distinct verifier slots (PS256 → PSS,
+  RS256 → PKCS#1 v1.5), never by the key kind, so a signature made under one padding cannot verify
+  under the other even with the identical public key. FAPI 2.0 permits PS256 for `private_key_jwt`.
+- `ServerConfig::jws_alg_allow_list` (`AlgAllowList`) — an optional server-level restriction on
+  which asymmetric algorithms the server will VERIFY and ADVERTISE, on top of per-client pinning.
+  `AlgAllowList::fapi()` is the FAPI 2.0 subset (ES256 + PS256, RS256 forbidden). It is enforced at
+  both verifier-resolution chokepoints — the Registered path (client assertions, request objects)
+  and the DPoP `AnyInstalled` path, where a forbidden algorithm's slot is cleared so a self-carried
+  proof key cannot reintroduce it — and in the derived RFC 8414 metadata. Default `all()` allows
+  every wired algorithm, so an existing deployment is unchanged.
+
+### Fixed
+
+- A serving JWKS entry for an RSA key no longer carries a hard-coded `"alg":"RS256"`. An RSA public
+  key is dual-use (it verifies both RS256 and PS256) and RFC 7517 s4.4 makes `alg` OPTIONAL, so the
+  `alg` member is now OMITTED for RSA keys rather than asserting one algorithm — which for a PS256
+  signing key would have mis-advertised it as RS256. EC and OKP keys, whose algorithm their curve
+  fixes unambiguously, are unchanged.
+
+- DPoP `htu` comparison now follows RFC 3986 s6.2.2.1: scheme and host (authority) match
+  case-insensitively while the path stays case-sensitive, in place of the previous exact
+  byte comparison, so a proof with an upper-case scheme or host is no longer spuriously rejected.
+- Refresh-token DPoP rebinding is now gated on client confidentiality (RFC 9449 s5): a public
+  client's rotated refresh token must stay bound to its original key and cannot be re-bound to
+  another, while a confidential client may re-key across a rotation but can neither drop nor add a
+  binding mid-chain.
+
+### Changed
+
+- **BREAKING (direct callers of `client_assertion::verify_assertion`):** the function takes an
+  `AudienceRule` in place of `audiences: &[&str]`. `AudienceRule::AnyOf(&[..])` reproduces the old
+  behaviour; `AudienceRule::Exactly(issuer)` is the FAPI 2.0 rule. Callers going through
+  `AuthorizationServer` (token, PAR, and every other client-authenticating endpoint) are
+  unaffected and select the rule via `ServerConfig::assertion_audience`.
+- **BREAKING (exhaustive matchers on the JWS enums):** `JwsAlg` and `JwsSignature` each gain a
+  `Ps256` variant. Both are closed, deliberately non-`#[non_exhaustive]` enums (a new signature
+  algorithm is meant to compel a review of every `match`), so downstream code that matches all
+  variants without a wildcard must add a `Ps256` arm. Callers going through the crate's own signer
+  and verifier seams are unaffected.
+- Internal, no observable behaviour change: the DPoP `AnyInstalled` verifier set is now built once
+  per `AuthorizationServer` and cached (the configured signers are frozen at construction), instead
+  of being rebuilt on every token/PAR request, removing a per-request allocation on the DPoP path.
+
 ## [0.10.0] - 2026-09-18
 
 Two pieces of work, both pre-1.0 and both stated plainly. **Crypto agility** replaces the

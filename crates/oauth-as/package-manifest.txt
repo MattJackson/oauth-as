@@ -75,6 +75,7 @@ tests/allocation.rs
 tests/allocation_footprint.rs
 tests/allocation_paths.rs
 tests/api_safety.rs
+tests/assertion_audience_policy.rs
 tests/authorization_code.rs
 tests/authorization_details_code.rs
 tests/authorization_details_refusal_with_rar.rs
@@ -100,6 +101,7 @@ tests/device_flow_edges.rs
 tests/device_grant_races.rs
 tests/direct_consent_seam.rs
 tests/dpop.rs
+tests/dpop_authorization_code_binding.rs
 tests/dpop_proof_bounds.rs
 tests/ed25519_rfc8037_vector.rs
 tests/events.rs
@@ -156,6 +158,7 @@ tests/rate_limit_impl.rs
 tests/refresh_retry.rs
 tests/refresh_reuse.rs
 tests/refresh_rotation_policy.rs
+tests/refresh_token_state_machine.rs
 tests/refusal_cost.rs
 tests/registration.rs
 tests/registration_management.rs
