@@ -17,7 +17,7 @@ use crate::authorization::{
 };
 use crate::client::{Client, ClientId};
 #[cfg(feature = "client-assertion")]
-use crate::client_assertion::{verify_assertion, CLIENT_ASSERTION_TYPE};
+use crate::client_assertion::{verify_assertion, AudienceRule, CLIENT_ASSERTION_TYPE};
 use crate::device::{
     normalize_user_code, DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState,
 };
@@ -449,6 +449,15 @@ pub struct ServerConfig {
     /// purpose rather than a default anybody inherits.
     #[cfg(feature = "dpop")]
     pub require_dpop: bool,
+    /// Which `aud` a client-authentication assertion must carry to name this server (see
+    /// [`AssertionAudience`]).
+    ///
+    /// [`AssertionAudience::Rfc7523`] by default — RFC 7523 section 3 (3) as published, unchanged
+    /// from every prior release. [`AssertionAudience::IssuerOnly`] is the opt-in FAPI 2.0
+    /// tightening; see the enum. Read in the private
+    /// `AuthorizationServer::authenticate_by_assertion`.
+    #[cfg(feature = "client-assertion")]
+    pub assertion_audience: AssertionAudience,
     /// User code length in symbols, excluding the display hyphen. Default
     /// [`MIN_USER_CODE_LENGTH`] (about 34 bits over the 20-symbol alphabet, the RFC 8628 section
     /// 6.1 example shape).
@@ -849,6 +858,36 @@ pub enum RefreshRotation {
     Reuse,
 }
 
+/// Which `aud` a client-authentication assertion must carry to name this server, selected by
+/// [`ServerConfig::assertion_audience`].
+///
+/// A SECURITY posture, not a convenience, exactly like [`RefreshRotation`] and
+/// [`ServerConfig::require_dpop`]. The default, [`AssertionAudience::Rfc7523`], is RFC 7523 section
+/// 3 (3) as published and is byte-for-byte the behaviour of every prior release;
+/// [`AssertionAudience::IssuerOnly`] is a deliberate, off-by-default tightening a general-purpose
+/// deployment must not select unless it is being run against the FAPI 2.0 Security Profile. The
+/// default is expected to move to `IssuerOnly` once draft-ietf-oauth-rfc7523bis publishes, at which
+/// point it becomes a one-line, pre-announced change.
+#[cfg(feature = "client-assertion")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionAudience {
+    /// RFC 7523 (the default): the assertion's `aud` names this server when it is a JSON string
+    /// equal to the token endpoint URL or the issuer identifier, or an RFC 7519 section 4.1.3 array
+    /// with one such member. Section 3 (3) explicitly permits the token endpoint URL, RFC 7519
+    /// permits the array form, and OpenID Connect Core section 9 established the issuer identifier;
+    /// widely deployed client software sends each of these. This is the only posture a non-FAPI
+    /// host should run.
+    Rfc7523,
+    /// FAPI 2.0 (off by default): the assertion's `aud` must be a JSON string equal to the issuer
+    /// identifier (RFC 8414) and nothing else — the token endpoint URL is refused, and an array is
+    /// refused even when the issuer is its sole member. FAPI 2.0 Security Profile Final section
+    /// 5.3.2.1 item 8 ("shall only accept its issuer identifier value ... as a string in the `aud`
+    /// claim") and section 5.3.3.1 item 5 ("as a string not as an item in an array") require this;
+    /// draft-ietf-oauth-rfc7523bis-11 section 3 narrows the base protocol the same way. It strictly
+    /// NARROWS [`AssertionAudience::Rfc7523`], so selecting it weakens nothing.
+    IssuerOnly,
+}
+
 impl ServerConfig {
     /// A config with RFC-shaped defaults; `issuer` and `verification_uri` have no sane default and
     /// are required.
@@ -906,6 +945,8 @@ impl ServerConfig {
             refresh_rotation: RefreshRotation::Rotate,
             #[cfg(feature = "dpop")]
             require_dpop: false,
+            #[cfg(feature = "client-assertion")]
+            assertion_audience: AssertionAudience::Rfc7523,
             user_code_length: MIN_USER_CODE_LENGTH,
         }
     }
@@ -919,6 +960,17 @@ impl ServerConfig {
     /// tokens.
     pub fn with_refresh_rotation(mut self, policy: RefreshRotation) -> Self {
         self.refresh_rotation = policy;
+        self
+    }
+
+    /// Set the client-assertion audience rule (see [`AssertionAudience`]).
+    ///
+    /// The default is [`AssertionAudience::Rfc7523`] and a general-purpose deployment must leave it
+    /// there. Passing [`AssertionAudience::IssuerOnly`] is the FAPI-2.0-only tightening documented
+    /// on the enum: the assertion `aud` must then be the issuer identifier as a bare string.
+    #[cfg(feature = "client-assertion")]
+    pub fn with_assertion_audience(mut self, rule: AssertionAudience) -> Self {
+        self.assertion_audience = rule;
         self
     }
 }
@@ -3319,8 +3371,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             _ => return Err(AssertionFailure::WrongPrincipal),
         };
 
-        // RFC 7523 section 3 (3) admits either the token endpoint URL or, by long-established
-        // practice (OpenID Connect Core section 9), the issuer identifier.
+        // RFC 7523 section 3 (3) names this server as the assertion's audience; which values count
+        // is `ServerConfig::assertion_audience`'s to say. The default `Rfc7523` accepts the token
+        // endpoint URL or the issuer identifier (section 3 (3) permits the URL; OpenID Connect Core
+        // section 9 established the issuer), as a string or an RFC 7519 array. `IssuerOnly` accepts
+        // ONLY the issuer identifier as a bare string (FAPI 2.0 SP Final s5.3.2.1-8, s5.3.3.1-5;
+        // draft-ietf-oauth-rfc7523bis-11 s3). The rule is built below and passed to
+        // `verify_assertion`, which reports a miss as `WrongAudience`.
         //
         // The verifier is resolved and PASSED ALONG rather than required here, because only one of
         // the two methods needs one. `private_key_jwt` names one asymmetric algorithm (ES256,
@@ -3340,12 +3397,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `verify_assertion` refuses it on a `None` verifier; `client_secret_jwt` is HS256 over the
         // registered secret and needs none.
         let assertion_verifier = keys.asymmetric_alg().and_then(|alg| self.jws_verifier(alg));
+        // Bound outside the match so the `AnyOf` borrow outlives the call below.
+        let either = [self.token_endpoint(), self.issuer_identifier()];
+        let audience = match self.config.assertion_audience {
+            AssertionAudience::Rfc7523 => AudienceRule::AnyOf(&either),
+            AssertionAudience::IssuerOnly => AudienceRule::Exactly(self.issuer_identifier()),
+        };
         let verified = verify_assertion(
             assertion_verifier,
             keys,
             assertion,
             client.client_id.as_str(),
-            &[self.token_endpoint(), self.issuer_identifier()],
+            audience,
             self.clock.now(),
         )?;
 
@@ -3413,6 +3476,32 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// add a seam whose only possible use is to get it wrong.
     #[cfg(feature = "dpop")]
     async fn verify_dpop(&self, proof: Option<&str>) -> Result<Option<Box<str>>, ErrorResponse> {
+        // The token endpoint is POST-only (RFC 6749 s3.2) and its own URL is the `htu` a conforming
+        // client read from the RFC 8414 document — see `token_endpoint`.
+        self.verify_dpop_inner(proof, "POST", self.token_endpoint())
+            .await
+    }
+
+    /// [`AuthorizationServer::verify_dpop`] with the request line supplied, for endpoints other than
+    /// the token endpoint (the PAR endpoint, RFC 9126 + RFC 9449 s5). Same section 4.3 checks and the
+    /// same single-use `jti` claim; only the `htu`/`htm` the proof must name differ.
+    #[cfg(all(feature = "dpop", feature = "par"))]
+    pub(crate) async fn verify_dpop_at(
+        &self,
+        proof: Option<&str>,
+        htm: &str,
+        htu: &str,
+    ) -> Result<Option<Box<str>>, ErrorResponse> {
+        self.verify_dpop_inner(proof, htm, htu).await
+    }
+
+    #[cfg(feature = "dpop")]
+    async fn verify_dpop_inner(
+        &self,
+        proof: Option<&str>,
+        htm: &str,
+        htu: &str,
+    ) -> Result<Option<Box<str>>, ErrorResponse> {
         let proof = match proof {
             Some(proof) => proof,
             None if self.config.require_dpop => {
@@ -3442,23 +3531,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // anonymous caller could read a deployment misconfiguration off a refusal.
             return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
         }
-        let verified = verify_proof(
-            &verifiers,
-            proof,
-            "POST",
-            self.token_endpoint(),
-            self.clock.now(),
-        )
-        // THE REASON GOES TO THE AUDIT CHANNEL, and until 0.9.1 it went nowhere: this arm was
-        // `map_err(|_| ..)` and no event was emitted at all, against `dpop.rs`'s statement that
-        // "the distinction here is for the host's audit channel, not for the wire". A deployment
-        // could therefore not tell a client with a skewed clock (`StaleProof`) from one whose
-        // proofs are being captured and replayed (`Replayed`), which are a configuration problem
-        // and an incident.
-        .map_err(|failure| {
-            self.hooks.emit(|| Event::DpopProofRefused { failure });
-            ErrorResponse::new(ErrorCode::InvalidDpopProof)
-        })?;
+        let verified = verify_proof(&verifiers, proof, htm, htu, self.clock.now())
+            // THE REASON GOES TO THE AUDIT CHANNEL, and until 0.9.1 it went nowhere: this arm was
+            // `map_err(|_| ..)` and no event was emitted at all, against `dpop.rs`'s statement that
+            // "the distinction here is for the host's audit channel, not for the wire". A deployment
+            // could therefore not tell a client with a skewed clock (`StaleProof`) from one whose
+            // proofs are being captured and replayed (`Replayed`), which are a configuration problem
+            // and an incident.
+            .map_err(|failure| {
+                self.hooks.emit(|| Event::DpopProofRefused { failure });
+                ErrorResponse::new(ErrorCode::InvalidDpopProof)
+            })?;
         // Namespaced by THUMBPRINT rather than by client id: a proof is bound to a key, not to a
         // registration (a public client's proof arrives before anything has authenticated), so the
         // key is the only identity available at this point that an attacker cannot choose freely.
@@ -4545,6 +4628,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         validated.set_authorization_details(details);
         #[cfg(feature = "consent")]
         validated.set_authentication_requirement(requirement);
+        // RFC 9449 section 10: carry the code's DPoP binding through validation so
+        // `issue_authorization_code` records it and the token endpoint enforces it. For a PAR push
+        // this is the value the PAR endpoint resolved and stored; for a plain request it is the
+        // `dpop_jkt` parameter as sent. Validation neither adds nor removes a binding.
+        #[cfg(feature = "dpop")]
+        validated.set_dpop_jkt(request.dpop_jkt.as_deref().map(Into::into));
         Ok(validated)
     }
 
@@ -4746,6 +4835,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // could not ask. See `AuthorizationCodeRecord::authentication`.
             #[cfg(feature = "consent")]
             authentication: authentication.authentication,
+            // RFC 9449 s10: bind the code to the key the authorization request committed to (a DPoP
+            // proof's thumbprint at the PAR endpoint, or the `dpop_jkt` parameter). The token
+            // endpoint refuses a redemption whose proof does not match, which is what stops a stolen
+            // code being redeemed by a client that cannot prove that key.
+            #[cfg(feature = "dpop")]
+            dpop_jkt: request.dpop_jkt.clone(),
         };
         self.store
             .put_authorization_code(record)
@@ -4996,6 +5091,24 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             let _ = self.store.put_authorization_code(record).await;
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant)
                 .with_description("code_verifier does not match the recorded code_challenge"));
+        }
+
+        // RFC 9449 s10: a code bound to a DPoP key at the authorization request (a proof at the PAR
+        // endpoint, or the `dpop_jkt` parameter) may only be redeemed by proving THAT key here. This
+        // is the authorization-code half of DPoP sender-constraining: PKCE above proves the redeemer
+        // is the client that started the flow, and this proves it holds the key the code was minted
+        // for, so a code stolen in transit cannot be redeemed by a thief who can satisfy neither.
+        // The code goes BACK on refusal, as the PKCE and redirect_uri mismatches above do: a
+        // mismatch is a client/setup error, and burning a live code for it is a free denial of
+        // service. Absent binding (`None`) means the request committed to no key and no check runs.
+        #[cfg(feature = "dpop")]
+        if let Some(expected_jkt) = record.dpop_jkt.as_deref() {
+            if bound.jkt != Some(expected_jkt) {
+                let _ = self.store.put_authorization_code(record).await;
+                return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof).with_description(
+                    "the DPoP proof key does not match the key this authorization code is bound to",
+                ));
+            }
         }
 
         // RFC 8707 s2: the token request may narrow the audience the authorization request
@@ -5510,17 +5623,52 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 .with_description("refresh token reuse detected; the grant has been revoked"));
         }
 
-        // RFC 9449 s5: a refresh chain issued to a DPoP-bound grant stays bound to the SAME key,
-        // and a rotation has to prove possession of it. Without this the binding would be
-        // decorative past the first access token: a stolen refresh token could simply be re-bound
+        // RFC 9449 s5: a DPoP-bound refresh chain issued to a PUBLIC client stays bound to the SAME
+        // key, and a rotation has to prove possession of it. For a public client that binding is the
+        // ONLY thing protecting the refresh token: without it a stolen token could simply be re-bound
         // to the thief's key on the next rotation, leaving the attacker holding a token they can
-        // prove possession for while the victim's key is the one refused. The record goes BACK, as
-        // for every other judgement here that is not evidence of compromise.
+        // prove possession for while the victim's key is the one refused.
+        //
+        // A CONFIDENTIAL client is different, and RFC 9449 s5 says so: it does not require refresh
+        // tokens issued to confidential clients to be DPoP-bound, because such a token is already
+        // sender-constrained by the client authentication mechanism (this is a paraphrase, not a
+        // verbatim quote). The refresh token is protected by client authentication (here
+        // private_key_jwt), so a thief without the
+        // client's key cannot present it regardless of DPoP key, and the client MAY rotate onto a new
+        // key. The freshly minted access token binds to the PRESENTED proof (`bound.jkt`) via `issue`
+        // below, so the chain stays sender-constrained to whatever key this rotation proved. Enforcing
+        // equality on a confidential client would wrongly reject a legitimate re-key and is exactly
+        // what FAPI 2.0 SP `refresh-token` exercises. The record goes BACK, as for every other
+        // judgement here that is not evidence of compromise.
         #[cfg(feature = "dpop")]
-        if record.jkt.as_deref() != bound.jkt {
-            self.restore_refresh_token(record).await?;
-            return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                .with_description("this refresh token is bound to a different DPoP key"));
+        {
+            let binding_violation = if client.auth.is_confidential() {
+                // A confidential client's refresh chain is bound to the CLIENT (via authentication),
+                // not to the key, so it MAY rotate onto a DIFFERENT key: a thief cannot present the
+                // chain at all without the client credential, which is the protection the public-key
+                // binding stands in for when there is no credential. What a confidential client must
+                // NOT do is change the chain's sender-constraint STATUS -- a DPoP-bound chain cannot
+                // silently downgrade to bearer by omitting the proof, and a bearer chain cannot
+                // acquire a binding at rotation -- so the PRESENCE of a proof must match the chain
+                // even though the key need not. The freshly minted access token binds to the
+                // presented proof (`bound.jkt`) via `issue` below, keeping the chain sender-
+                // constrained to whatever key this rotation proved.
+                record.jkt.is_some() != bound.jkt.is_some()
+            } else {
+                // A public client has no credential, so the DPoP key is the ONLY thing protecting the
+                // refresh token: a stolen token could otherwise be re-bound to the thief's key on the
+                // next rotation. The key must match exactly (RFC 9449 s5), which also covers both the
+                // no-proof downgrade and the bind-an-unbound-chain cases above.
+                record.jkt.as_deref() != bound.jkt
+            };
+            if binding_violation {
+                self.restore_refresh_token(record).await?;
+                return Err(
+                    ErrorResponse::new(ErrorCode::InvalidDpopProof).with_description(
+                        "this refresh token's DPoP binding does not match the presented proof",
+                    ),
+                );
+            }
         }
 
         // RFC 8705 s3, and word for word the same argument as the DPoP check above: a chain
@@ -5743,8 +5891,23 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         {
             return Err(ErrorResponse::new(ErrorCode::InvalidGrant));
         }
+        // EXACT match for every client type, but against the key the WINNING rotation bound the
+        // cached response to (`retry.jkt`), NOT `record.jkt` (the spent predecessor's key). A
+        // confidential client MAY re-key the chain at rotation (RFC 9449 s5; see the rotation path
+        // above), so the predecessor's key is not the key this coalesced response requires. A retry
+        // is a byte-identical replay, so exact match is correct for confidential and public alike:
+        // the presence-vs-key relaxation belongs to a rotation that MINTS a fresh binding, never to
+        // replaying one already minted — which is why a thief holding the client credential but a
+        // different key still cannot claim the cached response.
+        //
+        // `.or(record.jkt)` is a rolling-upgrade fallback: a retry record persisted by a release
+        // before `RefreshTokenRetry.jkt` existed deserialises it as `None` (serde default), so for
+        // those records fall back to the spent predecessor's key — the pre-0.10.1 behaviour, which is
+        // correct for the common non-re-key retry and preserves the thief refusal, rather than
+        // failing a legitimate lost-response retry for the retry window during a dev->qa->main
+        // upgrade. New records always carry `retry.jkt`, so the fallback never masks the fix.
         #[cfg(feature = "dpop")]
-        if record.jkt.as_deref() != bound.jkt {
+        if retry.jkt.as_deref().or(record.jkt.as_deref()) != bound.jkt {
             return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
         }
         #[cfg(feature = "mtls")]
@@ -6220,6 +6383,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let retry = Box::new(crate::token::RefreshTokenRetry {
             response: response.clone(),
             until,
+            // The key the coalesced response is bound to (this rotation's presented proof), which a
+            // confidential re-key makes different from `expected.jkt`. The retry must prove THIS key.
+            #[cfg(feature = "dpop")]
+            jkt: bound.jkt.map(Box::from),
+            #[cfg(not(feature = "dpop"))]
+            jkt: None,
         });
         let mut spent = expected.clone();
         spent.state = RefreshTokenState::Spent;

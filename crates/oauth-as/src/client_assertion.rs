@@ -290,7 +290,7 @@ pub enum AssertionFailure {
     BadSignature,
     /// `iss` or `sub` is absent, or is not the client this request claims to be.
     WrongPrincipal,
-    /// `aud` names neither this server's token endpoint nor its issuer.
+    /// `aud` does not name this server under the caller's [`AudienceRule`].
     WrongAudience,
     /// `exp` is absent, has passed, or is further out than this server will track a `jti` for.
     Expired,
@@ -338,6 +338,33 @@ impl fmt::Display for AssertionFailure {
 
 impl std::error::Error for AssertionFailure {}
 
+/// Which `aud` values name this server, for [`verify_assertion`] (RFC 7523 section 3 (3)).
+///
+/// A value rather than a second parameter so the acceptance shape cannot drift from the audience it
+/// is checked against. [`crate::server::AssertionAudience`] is the switch a host sets; each arm
+/// cites the specs it implements.
+///
+/// A CLOSED enum, deliberately NOT `#[non_exhaustive]`, matching its selecting posture
+/// [`crate::server::AssertionAudience`] and the other security-posture enums in this crate
+/// ([`crate::server::RefreshRotation`], [`crate::jwt::JwsAlg`]): the set of audience rules the
+/// server implements is a crate-level decision, and a new one would be a deliberate, reviewed
+/// addition rather than something a host or a wire value may introduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudienceRule<'a> {
+    /// RFC 7523 section 3 (3) as published, and the crate default. The `aud` names this server when
+    /// it is a JSON string equal to one of these values, or (RFC 7519 section 4.1.3) an array with
+    /// at least one string member equal to one of them. The caller passes the token endpoint URL
+    /// and the issuer identifier: section 3 (3) explicitly permits the token endpoint URL, and
+    /// OpenID Connect Core section 9 established the issuer identifier.
+    AnyOf(&'a [&'a str]),
+    /// FAPI 2.0 Security Profile Final section 5.3.2.1 item 8 (and draft-ietf-oauth-rfc7523bis-11
+    /// section 3): the `aud` names this server ONLY as a JSON string equal to this value, the AS
+    /// issuer identifier (RFC 8414). An array is refused even when this value is its sole member,
+    /// because section 5.3.3.1 item 5 requires the issuer "as a string not as an item in an array".
+    /// Strictly narrower than [`AudienceRule::AnyOf`].
+    Exactly(&'a str),
+}
+
 /// What a verified assertion leaves the caller holding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedAssertion {
@@ -361,8 +388,10 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 
 /// Verify one RFC 7523 section 3 client assertion.
 ///
-/// `audiences` is what section 3 (3) will accept as naming this server: the caller passes the token
-/// endpoint URL and the issuer identifier. `now` is the server's clock.
+/// `audience` is the [`AudienceRule`] section 3 (3) is evaluated under: [`AudienceRule::AnyOf`] for
+/// RFC 7523 as published (the token endpoint URL or the issuer identifier, in a string or an
+/// array), or [`AudienceRule::Exactly`] for the FAPI 2.0 tightening (the issuer identifier, as a
+/// bare string). `now` is the server's clock.
 ///
 /// The ORDER of the checks below is the security property of this function:
 ///
@@ -398,7 +427,7 @@ pub fn verify_assertion(
     keys: &AssertionKeys,
     assertion: &str,
     client_id: &str,
-    audiences: &[&str],
+    audience: AudienceRule<'_>,
     now: SystemTime,
 ) -> Result<VerifiedAssertion, AssertionFailure> {
     // (0) SIZE, before the parse and therefore before any base64 decoding or JSON parsing happens.
@@ -468,7 +497,7 @@ pub fn verify_assertion(
     // authorization server the client also authenticates to can take the assertion it was handed
     // and present it here as that client. This is the only check standing between a multi-AS client
     // and a credential its other servers can spend.
-    if !audience_matches(&jws, audiences) {
+    if !audience_matches(&jws, audience) {
         return Err(AssertionFailure::WrongAudience);
     }
 
@@ -554,15 +583,20 @@ pub fn unverified_subject(assertion: &str) -> Option<String> {
     jws.claim_str("sub").map(str::to_string)
 }
 
-/// Whether the assertion names one of `audiences`, in either of the two shapes RFC 7519 section
-/// 4.1.3 allows for the claim.
-fn audience_matches(jws: &CompactJws<'_>, audiences: &[&str]) -> bool {
-    match jws.payload.get("aud") {
-        Some(serde_json::Value::String(one)) => audiences.iter().any(|a| a == one),
-        Some(serde_json::Value::Array(many)) => many
+/// Whether the assertion's `aud` names this server under `rule` (RFC 7523 section 3 (3)), in the
+/// shapes each [`AudienceRule`] arm admits (RFC 7519 section 4.1.3 allows a string or an array).
+fn audience_matches(jws: &CompactJws<'_>, rule: AudienceRule<'_>) -> bool {
+    match (rule, jws.payload.get("aud")) {
+        (AudienceRule::AnyOf(audiences), Some(serde_json::Value::String(one))) => {
+            audiences.iter().any(|a| a == one)
+        }
+        (AudienceRule::AnyOf(audiences), Some(serde_json::Value::Array(many))) => many
             .iter()
             .filter_map(|v| v.as_str())
             .any(|one| audiences.contains(&one)),
+        // FAPI 2.0: the issuer identifier ONLY, and ONLY as a bare string — an array is refused
+        // even when it carries the issuer (section 5.3.3.1 item 5).
+        (AudienceRule::Exactly(expected), Some(serde_json::Value::String(one))) => one == expected,
         _ => false,
     }
 }

@@ -18,7 +18,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use oauth_as::client_assertion::{verify_assertion, AssertionFailure, AssertionKeys};
+use oauth_as::client_assertion::{verify_assertion, AssertionFailure, AssertionKeys, AudienceRule};
 use oauth_as::jwt::{compact_jws, EcdsaP256Key, JwsAlg};
 
 /// The crate's built-in ES256 backend. Verification now goes through the [`oauth_as::jwt::Es256Verifier`] seam,
@@ -74,7 +74,7 @@ fn an_exp_of_u64_max_is_refused_rather_than_panicking() {
             &keys(&key),
             &assertion,
             CLIENT_ID,
-            &[TOKEN_ENDPOINT],
+            AudienceRule::AnyOf(&[TOKEN_ENDPOINT]),
             now()
         ),
         Err(AssertionFailure::Expired),
@@ -105,7 +105,7 @@ fn an_nbf_or_iat_of_u64_max_is_refused_rather_than_panicking() {
                 &keys(&key),
                 &assertion,
                 CLIENT_ID,
-                &[TOKEN_ENDPOINT],
+                AudienceRule::AnyOf(&[TOKEN_ENDPOINT]),
                 now()
             ),
             Err(AssertionFailure::NotYetValid),

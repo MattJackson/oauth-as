@@ -36,8 +36,19 @@ const TOKEN_ENDPOINT: &str = "https://as.example/token";
 const ISSUER: &str = "https://as.example";
 const SECRET: &str = "a-high-entropy-registered-client-secret";
 
-fn audiences() -> Vec<&'static str> {
-    vec![TOKEN_ENDPOINT, ISSUER]
+/// The FAPI 2.0 posture: only the issuer identifier, as a bare string, names this server.
+fn verify_issuer_only(
+    keys: &AssertionKeys,
+    assertion: &str,
+) -> Result<VerifiedAssertion, AssertionFailure> {
+    verify_assertion(
+        Some(VERIFIER),
+        keys,
+        assertion,
+        CLIENT,
+        AudienceRule::Exactly(ISSUER),
+        now(),
+    )
 }
 
 /// The claim set RFC 7523 section 3 asks for, before a test spoils one member of it.
@@ -84,7 +95,14 @@ fn key_pair() -> (EcdsaP256Key, AssertionKeys) {
 }
 
 fn verify(keys: &AssertionKeys, assertion: &str) -> Result<VerifiedAssertion, AssertionFailure> {
-    verify_assertion(Some(VERIFIER), keys, assertion, CLIENT, &audiences(), now())
+    verify_assertion(
+        Some(VERIFIER),
+        keys,
+        assertion,
+        CLIENT,
+        AudienceRule::AnyOf(&[TOKEN_ENDPOINT, ISSUER]),
+        now(),
+    )
 }
 
 fn base64_url(bytes: &[u8]) -> String {
@@ -133,10 +151,65 @@ fn the_issuer_is_an_acceptable_audience_as_well_as_the_token_endpoint() {
 #[test]
 fn an_array_valued_audience_is_accepted_when_one_element_matches() {
     // RFC 7519 s4.1.3 admits the array form, and a client talking to several servers sends one.
+    // This pins the RFC 7523 default (`AudienceRule::AnyOf`); the FAPI 2.0 `AudienceRule::Exactly`
+    // refuses it, which the `under_issuer_only_*` tests below pin.
     let mut c = claims();
     c["aud"] = json!(["https://other.example/token", TOKEN_ENDPOINT]);
     let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
     assert!(verify(&secret_keys(), &assertion).is_ok());
+}
+
+// ------------------------------------------- FAPI 2.0 s5.3.2.1-8: exactly the issuer, as a string
+//
+// Under `AudienceRule::Exactly(ISSUER)` the ONLY `aud` that names this server is the issuer
+// identifier as a bare JSON string. The token endpoint URL is refused (RFC 7523 s3 (3) permitted
+// it; FAPI 2.0 s5.3.2.1-8 withdraws it), and an array is refused even when the issuer is a member
+// (s5.3.3.1-5: "as a string not as an item in an array"). Each is RED against the `AnyOf` default
+// the two tests above pin.
+
+#[test]
+fn under_issuer_only_the_token_endpoint_url_is_refused() {
+    // `claims()` addresses the token endpoint URL, which `verify` (the default) accepts; the FAPI
+    // rule does not.
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &claims());
+    assert_eq!(
+        verify_issuer_only(&secret_keys(), &assertion),
+        Err(AssertionFailure::WrongAudience)
+    );
+}
+
+#[test]
+fn under_issuer_only_an_array_carrying_the_issuer_and_another_value_is_refused() {
+    // The suite's exact payload for par-test-array-as-audience-fails: aud = [issuer, token_endpoint].
+    let mut c = claims();
+    c["aud"] = json!([ISSUER, TOKEN_ENDPOINT]);
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+    assert_eq!(
+        verify_issuer_only(&secret_keys(), &assertion),
+        Err(AssertionFailure::WrongAudience)
+    );
+}
+
+#[test]
+fn under_issuer_only_a_single_element_array_holding_the_issuer_is_refused() {
+    // s5.3.3.1-5 is explicit that the issuer is sent "not as an item in an array", so even a
+    // one-element array is refused.
+    let mut c = claims();
+    c["aud"] = json!([ISSUER]);
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+    assert_eq!(
+        verify_issuer_only(&secret_keys(), &assertion),
+        Err(AssertionFailure::WrongAudience)
+    );
+}
+
+#[test]
+fn under_issuer_only_the_issuer_as_a_string_verifies() {
+    // The one accepted shape.
+    let mut c = claims();
+    c["aud"] = json!(ISSUER);
+    let assertion = hs256(SECRET, &json!({"alg": "HS256"}), &c);
+    assert!(verify_issuer_only(&secret_keys(), &assertion).is_ok());
 }
 
 // ---------------------------------------------------------------------------- algorithm attacks

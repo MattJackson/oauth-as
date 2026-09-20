@@ -18,7 +18,7 @@
 //! It validates a PROOF (section 4.3) and produces a thumbprint. It does not speak HTTP: the host
 //! (or the optional `http` feature) reads the `DPoP` request header and hands the string in.
 //!
-//! Three things RFC 9449 defines that are NOT implemented here, called out rather than left to be
+//! Two things RFC 9449 defines that are NOT implemented here, called out rather than left to be
 //! discovered:
 //!
 //! - The `ath` CLAIM (section 4.3 step 11), which binds a proof to the specific access token it is
@@ -37,9 +37,15 @@
 //!   Their purpose is to stop a client pre-generating proofs long in advance; the `iat` window here
 //!   bounds that to [`MAX_PROOF_AGE`] instead, which is the weaker but non-optional half of the
 //!   same defence.
-//! - The `dpop_jkt` AUTHORIZATION REQUEST parameter (section 10), which binds an authorization code
-//!   to a key at the authorization endpoint so a stolen code cannot be redeemed by another client.
-//!   It belongs with the authorization request rather than here.
+//!
+//! The `dpop_jkt` AUTHORIZATION REQUEST parameter (section 10) and its section 10.1 companion, a
+//! `DPoP` header on a pushed authorization request, ARE implemented — outside this module, because
+//! they belong with the authorization request rather than with proof validation. The parameter is
+//! parsed onto `AuthorizationRequest`; the PAR header binding is reconciled at the PAR endpoint in
+//! `par.rs` (`bind_par_dpop`), the proof itself checked by
+//! `AuthorizationServer::verify_dpop_at` against the advertised PAR endpoint; the resulting
+//! thumbprint rides `AuthorizationCodeRecord` to redemption, where the token endpoint (`server.rs`,
+//! `authorization_code_token`) refuses a bound code redeemed with the wrong key or with none.
 //!
 //! # Single use is the point, again
 //!
@@ -237,6 +243,30 @@ pub fn htu_of(url: &str) -> &str {
     &url[..end]
 }
 
+/// Compare a proof's `htu` against the request URI as RFC 9449 section 4.3 (7) requires.
+///
+/// Beyond stripping the query and fragment ([`htu_of`]), the comparison honours RFC 3986
+/// section 6.2.2.1: the scheme and authority (host and port) are case-INSENSITIVE, while the path is
+/// case-sensitive. So `HTTPS://AS.LOCAL:8444/resource` and `https://as.local:8444/resource` are the
+/// same `htu`, but `/resource` and `/RESOURCE` are not. A byte-exact `==` would wrongly reject the
+/// former, which the FAPI 2.0 `dpop-negative-tests` module sends deliberately ("compare scheme and
+/// hostname using case independent mode").
+fn htu_eq(claimed: &str, expected: &str) -> bool {
+    // Split "scheme://authority" (case-insensitive) from the path (case-sensitive).
+    fn split_origin(u: &str) -> (&str, &str) {
+        match u.find("://") {
+            Some(i) => match u[i + 3..].find('/') {
+                Some(j) => (&u[..i + 3 + j], &u[i + 3 + j..]),
+                None => (u, ""),
+            },
+            None => ("", u),
+        }
+    }
+    let (co, cp) = split_origin(htu_of(claimed));
+    let (eo, ep) = split_origin(htu_of(expected));
+    co.eq_ignore_ascii_case(eo) && cp == ep
+}
+
 /// Verify one RFC 9449 section 4.3 DPoP proof.
 ///
 /// `htm` is the request's method and `htu` its URI (the query and fragment are stripped here, so a
@@ -342,7 +372,7 @@ pub fn verify_proof(
         return Err(DpopFailure::WrongMethod);
     }
     match jws.claim_str("htu") {
-        Some(claimed) if htu_of(claimed) == htu_of(htu) => {}
+        Some(claimed) if htu_eq(claimed, htu) => {}
         _ => return Err(DpopFailure::WrongUri),
     }
 

@@ -317,8 +317,8 @@ pub use client::{Client, ClientAuth, ClientId, DynamicRegistration, SecretHash, 
 #[cfg(feature = "client-assertion")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-assertion")))]
 pub use client_assertion::{
-    AssertionFailure, AssertionKeys, VerifiedAssertion, CLIENT_ASSERTION_TYPE, CLIENT_SECRET_JWT,
-    MAX_ASSERTION_LIFETIME, MIN_CLIENT_SECRET_JWT_KEY_LENGTH, PRIVATE_KEY_JWT,
+    AssertionFailure, AssertionKeys, AudienceRule, VerifiedAssertion, CLIENT_ASSERTION_TYPE,
+    CLIENT_SECRET_JWT, MAX_ASSERTION_LIFETIME, MIN_CLIENT_SECRET_JWT_KEY_LENGTH, PRIVATE_KEY_JWT,
 };
 #[cfg(feature = "consent")]
 #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
@@ -423,6 +423,9 @@ pub use scope::{Scope, ScopeSet};
 // `DeviceApprovalError` is re-exported here as of 0.2.0: a host's verification UI has to match on
 // it to tell "unknown code" from "too many attempts", and having to reach into `server::` for the
 // error type of a re-exported method was an oversight rather than a decision.
+#[cfg(feature = "client-assertion")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-assertion")))]
+pub use server::AssertionAudience;
 pub use server::{
     AuthorizationServer, ClientCredential, Clock, DeviceApprovalError, RefreshRotation,
     ResourceServerRegistration, ServerConfig, SystemClock, TokenRequest, TokenRequestContext,

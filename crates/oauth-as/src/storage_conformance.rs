@@ -5654,6 +5654,9 @@ fn sample_pushed_request(request_uri: &str) -> crate::par::PushedAuthorizationRe
         acr_values: Some("urn:acr:phr".to_string()),
         #[cfg(feature = "consent")]
         max_age: Some("300".to_string()),
+        // A distinctive Some so a store dropping the RFC 9449 s10 binding is visible on round-trip.
+        #[cfg(feature = "dpop")]
+        dpop_jkt: Some("pushed-conformance-jkt".to_string()),
         expires_at: at(60),
     }
 }
@@ -5691,6 +5694,10 @@ fn sample_authorization_code(code: &str) -> AuthorizationCodeRecord {
         },
         #[cfg(feature = "consent")]
         authentication: sample_authentication(),
+        // A distinctive Some so a store that drops the RFC 9449 s10 binding column round-trips
+        // visibly, exactly as `redirect_uri_was_explicit` above.
+        #[cfg(feature = "dpop")]
+        dpop_jkt: Some("code-conformance-jkt".into()),
     }
 }
 

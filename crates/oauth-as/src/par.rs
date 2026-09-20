@@ -125,6 +125,18 @@ pub struct ParConfig {
     /// ([`AuthorizationServer::validate_authorization_request`] answers `invalid_request`), which
     /// is the section 4 policy statement that PAR is the only way in.
     pub require_pushed_authorization_requests: bool,
+    /// FAPI 2.0 Security Profile Final section 5.3.2.2 clause 6: "the AS shall require the
+    /// `redirect_uri` parameter in pushed authorization requests." When true, a pushed request
+    /// (either the plain form body or a signed request object) that omits `redirect_uri` is
+    /// refused with `invalid_request`.
+    ///
+    /// This OVERRIDES the RFC 6749 section 3.1.2.3 single-registered-URI omission fallback that
+    /// [`AuthorizationServer::validate_authorization_request`] otherwise applies, and it does so
+    /// FOR THE PAR PUSH PATH ONLY: the FAPI clause is scoped to pushed requests, so the plain
+    /// query authorization path keeps the section 3.1.2.3 behaviour. Default `false`, so a plain
+    /// OAuth 2.1 host is unaffected; a FAPI 2.0 deployment sets it, exactly as it sets
+    /// `require_pushed_authorization_requests` above.
+    pub require_redirect_uri: bool,
 }
 
 #[cfg(feature = "par")]
@@ -143,6 +155,7 @@ impl ParConfig {
             pushed_authorization_request_endpoint: None,
             request_uri_ttl: std::time::Duration::from_secs(60),
             require_pushed_authorization_requests: false,
+            require_redirect_uri: false,
         }
     }
 
@@ -259,6 +272,15 @@ pub struct PushedAuthorizationRequest {
     /// the session it was told to replace.
     #[cfg(feature = "consent")]
     pub max_age: Option<String>,
+    /// RFC 9449 section 10: the RFC 7638 thumbprint the code minted from this request will be bound
+    /// to. Set by the PAR endpoint when the push carried a `dpop_jkt` parameter and/or a DPoP proof
+    /// (see [`crate::authorization::AuthorizationRequest::dpop_jkt`]); carried through `as_request`
+    /// so the authorization endpoint binds the code and the token endpoint enforces it.
+    /// `#[serde(default)]` for the rolling-upgrade reason `pushed_at` gives: a record written before
+    /// this field existed reads back as `None`, i.e. no binding, the fail-safe direction.
+    #[cfg(feature = "dpop")]
+    #[serde(default)]
+    pub dpop_jkt: Option<String>,
     /// The instant this request was PUSHED.
     ///
     /// A pushed request is not yet a grant, but it is a thing a client authored, and a
@@ -358,6 +380,8 @@ impl PushedAuthorizationRequest {
             acr_values: None,
             #[cfg(feature = "consent")]
             max_age: None,
+            #[cfg(feature = "dpop")]
+            dpop_jkt: None,
             expires_at,
         }
     }
@@ -387,6 +411,8 @@ impl PushedAuthorizationRequest {
             acr_values: self.acr_values.as_deref().map(Into::into),
             #[cfg(feature = "consent")]
             max_age: self.max_age.as_deref().map(Into::into),
+            #[cfg(feature = "dpop")]
+            dpop_jkt: self.dpop_jkt.as_deref().map(Into::into),
         }
     }
 }
@@ -691,6 +717,10 @@ struct RequestObjectClaims {
     acr_values: Option<String>,
     #[cfg(feature = "consent")]
     max_age: Option<String>,
+    /// RFC 9449 section 10 `dpop_jkt`, carried in a signed request object (RFC 9101). Threaded so a
+    /// JAR request binds the code to a key exactly as a plain or PAR request does.
+    #[cfg(feature = "dpop")]
+    dpop_jkt: Option<String>,
 }
 
 #[cfg(feature = "jar")]
@@ -717,6 +747,8 @@ impl RequestObjectClaims {
             acr_values: self.acr_values.as_deref().map(Into::into),
             #[cfg(feature = "consent")]
             max_age: self.max_age.as_deref().map(Into::into),
+            #[cfg(feature = "dpop")]
+            dpop_jkt: self.dpop_jkt.as_deref().map(Into::into),
         }
     }
 }
@@ -837,6 +869,37 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         credential: &crate::server::ClientCredential<'_>,
         parameters: &[(&str, &str)],
     ) -> Result<PushedAuthorizationResponse, ErrorResponse> {
+        self.pushed_authorization_request_inner(client_id, credential, parameters, None)
+            .await
+    }
+
+    /// [`AuthorizationServer::pushed_authorization_request_with_credential`] with the request's
+    /// `DPoP` proof header (RFC 9449 s5). When present, the proof's key thumbprint becomes the
+    /// binding the eventual authorization code carries (s10), and a `dpop_jkt` parameter sent
+    /// alongside MUST match it (s10.1). The proof is OPTIONAL here: a client may instead declare the
+    /// key with the `dpop_jkt` parameter alone, so a missing proof is not refused at this endpoint
+    /// even when `require_dpop` is set — the token endpoint is where every token request must carry
+    /// one.
+    #[cfg(all(feature = "par", feature = "dpop"))]
+    pub async fn pushed_authorization_request_with_credential_and_proof(
+        &self,
+        client_id: &ClientId,
+        credential: &crate::server::ClientCredential<'_>,
+        parameters: &[(&str, &str)],
+        dpop_proof: Option<&str>,
+    ) -> Result<PushedAuthorizationResponse, ErrorResponse> {
+        self.pushed_authorization_request_inner(client_id, credential, parameters, dpop_proof)
+            .await
+    }
+
+    #[cfg(feature = "par")]
+    async fn pushed_authorization_request_inner(
+        &self,
+        client_id: &ClientId,
+        credential: &crate::server::ClientCredential<'_>,
+        parameters: &[(&str, &str)],
+        #[cfg_attr(not(feature = "dpop"), allow(unused_variables))] dpop_proof: Option<&str>,
+    ) -> Result<PushedAuthorizationResponse, ErrorResponse> {
         // Read before authenticating: a server that is not offering PAR should say so whatever the
         // credential was, and should not become a client-credential oracle for a feature it does
         // not run.
@@ -879,8 +942,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         #[cfg(feature = "jar")]
         if let Some((_, object)) = parameters.iter().find(|(name, _)| *name == "request") {
             let claims = self.verified_request_object(&client.client_id, object)?;
+            #[cfg_attr(not(feature = "dpop"), allow(unused_mut))]
+            let mut request = claims.as_request();
+            #[cfg(feature = "dpop")]
+            self.bind_par_dpop(&mut request, dpop_proof).await?;
             return self
-                .store_pushed_request(&client.client_id, &claims.as_request(), pushed_at)
+                .store_pushed_request(&client.client_id, &request, pushed_at)
                 .await;
         }
 
@@ -902,9 +969,56 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             ));
         }
 
-        let request = AuthorizationRequest::from_pairs(parameters.iter().copied());
+        #[cfg_attr(not(feature = "dpop"), allow(unused_mut))]
+        let mut request = AuthorizationRequest::from_pairs(parameters.iter().copied());
+        #[cfg(feature = "dpop")]
+        self.bind_par_dpop(&mut request, dpop_proof).await?;
         self.store_pushed_request(&client.client_id, &request, pushed_at)
             .await
+    }
+
+    /// RFC 9449 s10 at the PAR endpoint: resolve the DPoP binding the pushed request establishes.
+    ///
+    /// When the push carried a DPoP proof (RFC 9449 s5), verify it against the PAR endpoint and take
+    /// its key thumbprint as the binding the eventual authorization code will carry. If the request
+    /// ALSO carried a `dpop_jkt` parameter it MUST equal that thumbprint (s10.1), else the push is
+    /// refused. When no proof is present the binding is left as whatever the `dpop_jkt` parameter
+    /// declared (possibly nothing): the proof is optional at this endpoint, and the token endpoint
+    /// is where `require_dpop` makes a proof mandatory.
+    #[cfg(all(feature = "par", feature = "dpop"))]
+    async fn bind_par_dpop(
+        &self,
+        request: &mut AuthorizationRequest<'_>,
+        dpop_proof: Option<&str>,
+    ) -> Result<(), ErrorResponse> {
+        let proof = match dpop_proof {
+            Some(proof) => proof,
+            None => return Ok(()),
+        };
+        let htu = match self.config().par.as_ref() {
+            Some(par) => par.endpoint(self.issuer_identifier()),
+            // Unreachable: this method runs only on the PAR push path, which the router serves only
+            // when PAR is configured. Fail CLOSED if that invariant is ever violated, rather than
+            // silently discard a proof that WAS presented (the no-proof case already returned above),
+            // which would issue an authorization code with no DPoP binding.
+            None => return Err(ErrorResponse::new(ErrorCode::ServerError)),
+        };
+        // A present proof always yields a thumbprint (the `None`/`require_dpop` arms of the verifier
+        // are for an ABSENT proof, handled above), so this is `Some`.
+        let jkt = self
+            .verify_dpop_at(Some(proof), "POST", &htu)
+            .await?
+            .expect("a verified DPoP proof yields a key thumbprint");
+        if let Some(param) = request.dpop_jkt.as_deref() {
+            if param != jkt.as_ref() {
+                return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof).with_description(
+                    "the dpop_jkt parameter does not match the key of the DPoP proof presented at \
+                     the PAR endpoint (RFC 9449 s10.1)",
+                ));
+            }
+        }
+        request.dpop_jkt = Some(std::borrow::Cow::Owned(jkt.into()));
+        Ok(())
     }
 
     /// Validate a pushed request and mint its handle. Split out so that the form-body path and the
@@ -934,6 +1048,22 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                 return Err(ErrorResponse::new(ErrorCode::InvalidRequest)
                     .with_description("client_id is required (RFC 9126 s2.1)"))
             }
+        }
+
+        // FAPI 2.0 SP Final s5.3.2.2 clause 6: "the AS shall require the `redirect_uri` parameter
+        // in pushed authorization requests." When `require_redirect_uri` is set this OVERRIDES the
+        // RFC 6749 s3.1.2.3 single-registered-URI omission that `validate_direct_authorization_request`
+        // below would otherwise apply, and it fires on BOTH push shapes because the form-body path
+        // and the request-object path both reach here. The clause is scoped to pushed requests, so
+        // it lives at this chokepoint rather than in the shared query-path validator. RFC 9126 s2.3
+        // gives this the RFC 6749 s5.2 shape; `invalid_request` (HTTP 400) is the code for an
+        // incomplete pushed request.
+        if matches!(&self.config().par, Some(par) if par.require_redirect_uri)
+            && request.redirect_uri.is_none()
+        {
+            return Err(ErrorResponse::new(ErrorCode::InvalidRequest).with_description(
+                "redirect_uri is required in a pushed authorization request (FAPI 2.0 s5.3.2.2-6)",
+            ));
         }
 
         // Section 2.1 step 3: the same validation the authorization endpoint performs, reused
@@ -1007,6 +1137,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             acr_values: request.acr_values.as_deref().map(str::to_string),
             #[cfg(feature = "consent")]
             max_age: request.max_age.as_deref().map(str::to_string),
+            // RFC 9449 section 10: the binding the PAR endpoint resolved (the DPoP proof's
+            // thumbprint, or the client's `dpop_jkt` parameter confirmed to match it) travels on the
+            // stored request so `as_request` hands it to the authorization endpoint.
+            #[cfg(feature = "dpop")]
+            dpop_jkt: request.dpop_jkt.as_deref().map(str::to_string),
             expires_at,
         };
         // A REFUSAL HERE IS NOT AN ERROR TO REPORT AS ONE. `authenticate_client` succeeded a
@@ -1592,6 +1727,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                         .with_description("the max_age claim must be a JSON string or number"))
                 }
             },
+            #[cfg(feature = "dpop")]
+            dpop_jkt: string_claim(claims, "dpop_jkt")?,
         })
     }
 }

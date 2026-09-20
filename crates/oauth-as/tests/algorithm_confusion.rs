@@ -34,7 +34,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::json;
 
-use oauth_as::client_assertion::{verify_assertion, AssertionKeys};
+use oauth_as::client_assertion::{verify_assertion, AssertionKeys, AudienceRule};
 use oauth_as::dpop::verify_proof;
 use oauth_as::jwt::{
     EcdsaP256Key, Jwk, JwsAlg, JwsSignature, JwsSigner, JwsVerifier, JwsVerifiers,
@@ -241,7 +241,7 @@ async fn client_assertion_accepts(key: &MatrixKey, claimed_alg: &str) -> bool {
         &keys,
         &assertion,
         CLIENT,
-        &[TOKEN_ENDPOINT, ISSUER],
+        AudienceRule::AnyOf(&[TOKEN_ENDPOINT, ISSUER]),
         now(),
     )
     .is_ok()

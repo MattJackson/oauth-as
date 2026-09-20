@@ -993,7 +993,11 @@ fn core_public_types_stay_within_their_size_budget() {
     // the redemption path, which is the hot one and is gated at 39.
     let code_budget = 264
         + if cfg!(feature = "rar") { 24 } else { 0 }
-        + if cfg!(feature = "consent") { 8 } else { 0 };
+        + if cfg!(feature = "consent") { 8 } else { 0 }
+        // RFC 9449 s10 `dpop_jkt`: one `Option<Box<str>>` (16 bytes) binding the code to a DPoP key.
+        // Carried by every code so the token endpoint can enforce the binding; `None` on a code the
+        // request did not bind.
+        + if cfg!(feature = "dpop") { 16 } else { 0 };
     assert!(
         size_of::<oauth_as::AuthorizationCodeRecord>() <= code_budget,
         "AuthorizationCodeRecord grew past its size budget: {}",
@@ -1014,7 +1018,10 @@ fn core_public_types_stay_within_their_size_budget() {
     {
         let pushed_budget = 264
             + if cfg!(feature = "rar") { 24 } else { 0 }
-            + if cfg!(feature = "consent") { 48 } else { 0 };
+            + if cfg!(feature = "consent") { 48 } else { 0 }
+            // RFC 9449 s10 `dpop_jkt`: one `Option<String>` (24 bytes), matching this record's other
+            // owned-`String` parameters, carrying the code's DPoP binding from push to authorization.
+            + if cfg!(feature = "dpop") { 24 } else { 0 };
         assert!(
             size_of::<oauth_as::par::PushedAuthorizationRequest>() <= pushed_budget,
             "PushedAuthorizationRequest grew past its size budget: {}",

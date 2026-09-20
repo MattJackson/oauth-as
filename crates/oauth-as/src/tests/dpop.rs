@@ -103,6 +103,41 @@ fn the_request_uri_is_compared_without_its_query_or_fragment() {
 }
 
 #[test]
+fn the_htu_scheme_and_host_are_compared_case_insensitively_but_the_path_is_not() {
+    // RFC 3986 s6.2.2.1: the scheme and host are case-insensitive, the path is not. The FAPI 2.0
+    // dpop-negative-tests module sends a proof whose `htu` upper-cases the scheme and host and
+    // expects the resource to accept it, so an upper-cased origin must still match.
+    let key = EcdsaP256Key::generate("k");
+    let mut c = claims();
+    c["htu"] = json!("HTTPS://AS.EXAMPLE/token");
+    let proof = proof_with(&key, &header(&key), &c);
+    assert!(
+        verify_proof(&verifiers(), &proof, HTM, HTU, now()).is_ok(),
+        "an upper-cased scheme and host in htu must still match (RFC 3986 s6.2.2.1)"
+    );
+
+    // The path, however, is case-sensitive: an upper-cased path is a different resource and must
+    // NOT match.
+    let mut c = claims();
+    c["htu"] = json!("https://as.example/TOKEN");
+    let proof = proof_with(&key, &header(&key), &c);
+    assert!(
+        verify(&proof).is_err(),
+        "an upper-cased path is a different resource and must not match"
+    );
+
+    // Belt and braces on the private comparator itself.
+    assert!(htu_eq(
+        "HTTPS://AS.EXAMPLE/token",
+        "https://as.example/token"
+    ));
+    assert!(!htu_eq(
+        "https://as.example/TOKEN",
+        "https://as.example/token"
+    ));
+}
+
+#[test]
 fn a_proof_within_the_acceptance_window_verifies() {
     let key = EcdsaP256Key::generate("k");
     let mut c = claims();

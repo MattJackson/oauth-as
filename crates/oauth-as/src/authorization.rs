@@ -134,6 +134,15 @@ pub struct AuthorizationRequest<'a> {
     /// a field here rather than something read off the query.
     #[cfg(feature = "consent")]
     pub max_age: Option<Cow<'a, str>>,
+    /// RFC 9449 section 10 `dpop_jkt`: the RFC 7638 JWK Thumbprint the client asks the issued
+    /// authorization code to be bound to, so the code can only be redeemed by proving possession of
+    /// that key. ON THIS TYPE for the reason [`AuthorizationRequest::acr_values`] gives — every
+    /// intake path (query, PAR push, JAR claim set) funnels through here. RFC 9449 section 10
+    /// imposes no refuse-if-unsupported rule, so a non-DPoP build ignores it (RFC 6749 section 3.1).
+    /// At a PAR endpoint that also receives a DPoP proof, the host sets this to the proof's
+    /// thumbprint after confirming any client-supplied value matches it (section 10.1).
+    #[cfg(feature = "dpop")]
+    pub dpop_jkt: Option<Cow<'a, str>>,
 }
 
 impl<'a> AuthorizationRequest<'a> {
@@ -174,6 +183,8 @@ impl<'a> AuthorizationRequest<'a> {
                 "acr_values" => &mut req.acr_values,
                 #[cfg(feature = "consent")]
                 "max_age" => &mut req.max_age,
+                #[cfg(feature = "dpop")]
+                "dpop_jkt" => &mut req.dpop_jkt,
                 _ => continue,
             };
             if slot.is_none() {
@@ -293,6 +304,13 @@ pub struct ValidatedAuthorizationRequest {
     /// Empty means the client asked for no step-up, which is what an ordinary request carries.
     #[cfg(feature = "consent")]
     pub authentication_requirement: crate::consent::AuthenticationRequirement,
+    /// RFC 9449 section 10: the RFC 7638 thumbprint the authorization request bound the eventual
+    /// code to, if any. On the VALIDATED request for the reason the other members give — every
+    /// intake path (query, PAR record, JAR claim set) funnels through here, so a binding placed here
+    /// survives all three and reaches [`AuthorizationCodeRecord`]. `None` means the request carried
+    /// no binding and the token endpoint applies no `jkt` check to the code.
+    #[cfg(feature = "dpop")]
+    pub dpop_jkt: Option<Box<str>>,
     /// Zero-sized witness, private to this module. Its only purpose is that it cannot be named
     /// (let alone constructed) outside `authorization.rs`, so a struct-literal expression cannot
     /// build a whole `ValidatedAuthorizationRequest` from anywhere else, in this crate or out of
@@ -347,8 +365,18 @@ impl ValidatedAuthorizationRequest {
             authorization_details: crate::rar::AuthorizationDetails::none(),
             #[cfg(feature = "consent")]
             authentication_requirement: crate::consent::AuthenticationRequirement::none(),
+            #[cfg(feature = "dpop")]
+            dpop_jkt: None,
             _sealed: Sealed,
         }
+    }
+
+    /// Record the RFC 9449 section 10 `dpop_jkt` this request bound the code to. `pub(crate)` for
+    /// the reason [`ValidatedAuthorizationRequest::new`] is: only in-crate validation produces a
+    /// validated request, and the token endpoint enforces this value against the redeeming proof.
+    #[cfg(feature = "dpop")]
+    pub(crate) fn set_dpop_jkt(&mut self, jkt: Option<Box<str>>) {
+        self.dpop_jkt = jkt;
     }
 
     /// Record the RFC 9470 step-up requirement this request was validated as carrying.
@@ -760,6 +788,13 @@ pub struct AuthorizationCodeRecord {
     /// only ever be guessed at.
     #[cfg(feature = "consent")]
     pub authentication: Option<Box<crate::consent::Authentication>>,
+    /// RFC 9449 section 10: the RFC 7638 JWK Thumbprint the authorization request bound this code
+    /// to, if any. The token endpoint checks the redeeming DPoP proof against it, so a code minted
+    /// for one key cannot be redeemed by proving another (an authorization-code injection defence).
+    /// `None` means the code carries no binding — the fail-safe direction, and what a code minted
+    /// before this field existed deserializes to (serde defaults a missing `Option` to `None`).
+    #[cfg(feature = "dpop")]
+    pub dpop_jkt: Option<Box<str>>,
 }
 
 impl AuthorizationCodeRecord {
@@ -806,6 +841,8 @@ impl AuthorizationCodeRecord {
             state: AuthorizationCodeState::Issued,
             #[cfg(feature = "consent")]
             authentication: None,
+            #[cfg(feature = "dpop")]
+            dpop_jkt: None,
         }
     }
 }
@@ -837,6 +874,10 @@ impl fmt::Debug for AuthorizationCodeRecord {
             .field("state", &self.state);
         #[cfg(feature = "consent")]
         out.field("authentication", &self.authentication);
+        // A thumbprint is a public-key hash, not a credential, so it prints (as `IssuedToken`'s
+        // Debug prints `jkt`).
+        #[cfg(feature = "dpop")]
+        out.field("dpop_jkt", &self.dpop_jkt);
         out.finish()
     }
 }

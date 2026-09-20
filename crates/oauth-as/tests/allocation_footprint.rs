@@ -486,7 +486,10 @@ const DEVICE_GRANT_BUDGET: usize = 769;
 /// `Option<Box<Authentication>>` (8).
 const AUTHORIZATION_CODE_BUDGET: usize = 850
     + if cfg!(feature = "rar") { 48 } else { 0 }
-    + if cfg!(feature = "consent") { 16 } else { 0 };
+    + if cfg!(feature = "consent") { 16 } else { 0 }
+    // RFC 9449 s10 `dpop_jkt`: the 16-byte `Option<Box<str>>` field is resident by value in the
+    // store even when `None` (no code is bound here, so no string is allocated).
+    + if cfg!(feature = "dpop") { 16 } else { 0 };
 
 /// Observed 432 default, 496 all-features (was 688 / 752). Stored behind an `Arc`, so each optional
 /// field counts once: `rar` 24, `dpop`'s `Option<Box<str>>` 16, `mtls`'s
@@ -529,7 +532,13 @@ const CONSENT_RECORD_BUDGET: usize = 357;
 #[cfg(feature = "par")]
 const PUSHED_REQUEST_BUDGET: usize = 847
     + if cfg!(feature = "rar") { 48 } else { 0 }
-    + if cfg!(feature = "consent") { 96 } else { 0 };
+    + if cfg!(feature = "consent") { 96 } else { 0 }
+    // RFC 9449 s10 `dpop_jkt`: a 24-byte `Option<String>` field, resident by value in the store
+    // (matching this record's other owned-`String` parameters); `None` here, so no string heap.
+    // Observed +32, not +24: adding the field takes this record (already the largest in the store)
+    // across an allocator size class, so the boxed value's resident allocation rounds up by a
+    // further 8. Measured 1023 bytes/record with `--all-features` (mac + the macOS CI runner).
+    + if cfg!(feature = "dpop") { 32 } else { 0 };
 
 /// Observed 134, and it is the cheapest record in the store by a factor of five: a `String` key and
 /// a `SystemTime`, with no value struct at all. It is also the only one an attacker can grow

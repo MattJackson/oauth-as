@@ -262,18 +262,22 @@ fn token_exchange_token_type_refusal_bound() {
 
     let (response, d) = measure(|| rt.block_on(service.handle(request)));
     assert_eq!(response.status(), 400);
-    // Observed 9 allocations / 4523 bytes. It was 11 / 4633 before the description stopped being
-    // formatted, 10 / 4549 after that and before `TokenTypeIdentifier::parse` stopped `FromStr`
-    // copying the caller's value onto the heap to carry it into an error this endpoint discards.
-    // The allocation bound is EXACT (each one removed is the whole of its claim); the byte bound
-    // carries a little room because most of those bytes are the response buffer the `http` crate
-    // hands back, not this crate's.
+    // Observed 9 allocations. It was 11 / 4633 before the description stopped being formatted, 10 /
+    // 4549 after that and before `TokenTypeIdentifier::parse` stopped `FromStr` copying the caller's
+    // value onto the heap to carry it into an error this endpoint discards. The ALLOCATION bound is
+    // EXACT (each one removed is the whole of its claim) and is the real gate; the BYTE bound carries
+    // room because most of those bytes are the response buffer the `http` crate hands back, not this
+    // crate's, and it is sized by the enabled feature set: 4523 at default-ish features, 4843 under
+    // `--all-features` (the same 9 allocations are each larger in the full build — richer request and
+    // response structs — not new heap objects). The bound is set for the largest configuration the
+    // gates run, so the exact alloc count still catches a real regression while the byte figure does
+    // not flake across feature sets.
     //
     // This gate is the one whose fixture was TOO SMALL to see the second of those two: its
     // `urn:example:not-registered` is 27 bytes, so the copy it was buying cost 27 bytes and hid
     // inside the byte bound's slack. `unknown_token_type_refusal_is_not_sized_by_the_caller`
     // below is the gate that can see it.
-    check("token exchange token-type refusal", d, (9, 4800));
+    check("token exchange token-type refusal", d, (9, 4900));
 }
 
 #[cfg(not(all(feature = "http", feature = "token-exchange")))]

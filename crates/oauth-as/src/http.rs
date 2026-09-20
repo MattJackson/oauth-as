@@ -1569,6 +1569,52 @@ fn error_response(err: &ErrorResponse, via_header: bool, challenge: &HeaderValue
     resp
 }
 
+/// Read the single optional `DPoP` proof header, or return the refusal an endpoint must send.
+///
+/// RFC 9449 s4.3: at most ONE `DPoP` header. A header that is not visible ASCII cannot be a compact
+/// JWS, so it is a MALFORMED proof, not an absent one, and must be refused rather than silently
+/// downgraded to no binding — reporting "absent" would hand a client that asked for a
+/// sender-constrained token a bearer one with no way to find out. Both refusals emit
+/// [`crate::events::Event::DpopProofRefused`] so a deployment can tell its failure modes apart.
+///
+/// The token endpoint and the PAR endpoint need EXACTLY this, so it lives here once: two copies were
+/// a standing invitation to drift on what counts as malformed vs absent. `Ok(None)` is an absent
+/// proof, `Ok(Some(..))` the raw header value (borrowed from `headers`), `Err(..)` the ready-to-send
+/// error response the caller returns unchanged.
+// `Box<Response>` for the `Err`: the `Ok` arm is a tiny `Option<&str>`, so an unboxed `Response`
+// there would make every caller's `Result` as large as an HTTP response for the rare refusal path
+// (`clippy::result_large_err`). The caller returns the boxed response with a single deref.
+#[cfg(feature = "dpop")]
+fn dpop_proof_header<'h, S: Storage, C: Clock>(
+    headers: &'h HeaderMap,
+    state: &Inner<S, C>,
+    via_header: bool,
+) -> Result<Option<&'h str>, Box<Response>> {
+    let refuse = |state: &Inner<S, C>, why: &'static str| -> Box<Response> {
+        state
+            .server
+            .hooks()
+            .emit(|| crate::events::Event::DpopProofRefused {
+                failure: crate::dpop::DpopFailure::Malformed,
+            });
+        Box::new(error_response(
+            &ErrorResponse::new(ErrorCode::InvalidDpopProof).with_description(why),
+            via_header,
+            &state.challenge,
+        ))
+    };
+    let mut values = headers.get_all(crate::dpop::DPOP_HEADER).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(refuse(state, "more than one DPoP header (RFC 9449 s4.3)"));
+    }
+    match first.map(|v| v.to_str()) {
+        None => Ok(None),
+        Some(Ok(value)) => Ok(Some(value)),
+        Some(Err(_)) => Err(refuse(state, "the DPoP header is not a compact JWS")),
+    }
+}
+
 /// The RFC 8628 verification page, and the only HTML this server emits.
 ///
 /// It carries more headers than any other response here because it is the only one a BROWSER
@@ -2339,49 +2385,9 @@ async fn token_handler<S: Storage, C: Clock>(
     // all: no duplicate check, no proof verification, and an issued token with no `jkt`. A client
     // that asked for a sender-constrained token got a bearer token and no way to find out.
     #[cfg(feature = "dpop")]
-    let dpop_proof = {
-        let mut values = headers.get_all(crate::dpop::DPOP_HEADER).iter();
-        let first = values.next();
-        if values.next().is_some() {
-            // EMITTED like every other proof refusal. These two are refused HERE rather than in
-            // `verify_proof`, which is the only reason they were silent through 0.9.0: a
-            // deployment reading `DpopProofRefused` to tell its failure modes apart would have
-            // seen nothing whatever for a client sending two headers, which is a client bug the
-            // operator is the only one who can report back.
-            state
-                .server
-                .hooks()
-                .emit(|| crate::events::Event::DpopProofRefused {
-                    failure: crate::dpop::DpopFailure::Malformed,
-                });
-            return error_response(
-                &ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                    .with_description("more than one DPoP header (RFC 9449 s4.3)"),
-                via_header,
-                &state.challenge,
-            );
-        }
-        match first.map(|v| v.to_str()) {
-            None => None,
-            Some(Ok(value)) => Some(value),
-            // A header that is not visible ASCII cannot be a compact JWS, so this is a malformed
-            // proof rather than an absent one, and answering "absent" would silently downgrade a
-            // client that asked for a bound token to a bearer one.
-            Some(Err(_)) => {
-                state
-                    .server
-                    .hooks()
-                    .emit(|| crate::events::Event::DpopProofRefused {
-                        failure: crate::dpop::DpopFailure::Malformed,
-                    });
-                return error_response(
-                    &ErrorResponse::new(ErrorCode::InvalidDpopProof)
-                        .with_description("the DPoP header is not a compact JWS"),
-                    via_header,
-                    &state.challenge,
-                );
-            }
-        }
+    let dpop_proof = match dpop_proof_header(headers, state, via_header) {
+        Ok(proof) => proof,
+        Err(response) => return *response,
     };
 
     let request = match grant {
@@ -2706,11 +2712,32 @@ async fn pushed_authorization_handler<S: Storage, C: Clock>(
     // the parsed form, so passing it costs no allocation per parameter.
     let parameters: Vec<(&str, &str)> =
         form.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
-    match state
+
+    // RFC 9449 s5: a PAR push MAY carry a DPoP proof, which binds the eventual authorization code to
+    // its key (s10). The same "absent vs malformed" distinction as at the token endpoint applies, so
+    // both endpoints read the header through one helper (see `dpop_proof_header`).
+    #[cfg(feature = "dpop")]
+    let dpop_proof = match dpop_proof_header(headers, state, via_header) {
+        Ok(proof) => proof,
+        Err(response) => return *response,
+    };
+
+    #[cfg(feature = "dpop")]
+    let outcome = state
+        .server
+        .pushed_authorization_request_with_credential_and_proof(
+            &client_id,
+            &creds.credential(),
+            &parameters,
+            dpop_proof,
+        )
+        .await;
+    #[cfg(not(feature = "dpop"))]
+    let outcome = state
         .server
         .pushed_authorization_request_with_credential(&client_id, &creds.credential(), &parameters)
-        .await
-    {
+        .await;
+    match outcome {
         Ok(response) => {
             // s2.2: "with a 201 HTTP status code". Taken from the response type rather than
             // written here twice, so the wire status and the type's own answer cannot drift.

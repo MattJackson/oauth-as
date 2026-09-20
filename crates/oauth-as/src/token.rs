@@ -875,6 +875,13 @@ pub enum RefreshTokenState {
 pub struct RefreshTokenRetry {
     pub(crate) response: TokenResponse,
     pub(crate) until: SystemTime,
+    /// The DPoP key thumbprint (RFC 9449) the cached `response` is bound to, if any. A lost-response
+    /// retry must prove THIS key — the one the winning rotation actually bound the coalesced token to
+    /// — not the spent predecessor's key, which for a confidential client that re-keyed the chain at
+    /// rotation (RFC 9449 s5 permits it) is a DIFFERENT key. `None` for a bearer chain. `serde`
+    /// default so a record persisted before this field existed still deserialises (as `None`).
+    #[serde(default)]
+    pub(crate) jkt: Option<Box<str>>,
 }
 
 /// A persisted refresh token. Single use: redemption goes through

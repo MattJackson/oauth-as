@@ -230,7 +230,9 @@ fn main() {
     // ====================================================================== RFC 7523 client assertion
     #[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
     {
-        use oauth_as::client_assertion::{verify_assertion, AssertionKeys, ClientSecretKey};
+        use oauth_as::client_assertion::{
+            verify_assertion, AssertionKeys, AudienceRule, ClientSecretKey,
+        };
         use oauth_as::jwt::{compact_jws, hmac_sha256, EcdsaP256Key};
 
         const CLIENT: &str = "assertion-client";
@@ -263,7 +265,7 @@ fn main() {
                 &hs_keys,
                 &hs,
                 CLIENT,
-                &audiences,
+                AudienceRule::AnyOf(&audiences),
                 now
             )
             .is_ok(),
@@ -275,7 +277,7 @@ fn main() {
                 &hs_keys,
                 &hs,
                 CLIENT,
-                &audiences,
+                AudienceRule::AnyOf(&audiences),
                 now,
             )
         });
@@ -297,7 +299,7 @@ fn main() {
                 &es_keys,
                 &es,
                 CLIENT,
-                &audiences,
+                AudienceRule::AnyOf(&audiences),
                 now
             )
             .is_ok(),
@@ -309,7 +311,7 @@ fn main() {
                 &es_keys,
                 &es,
                 CLIENT,
-                &audiences,
+                AudienceRule::AnyOf(&audiences),
                 now,
             )
         });

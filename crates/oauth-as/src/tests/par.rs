@@ -81,6 +81,8 @@ fn a_stored_handle_is_not_printed_by_debug() {
         #[cfg(feature = "consent")]
         max_age: None,
         resource: vec!["https://rs.example".to_string()],
+        #[cfg(feature = "dpop")]
+        dpop_jkt: None,
         expires_at: std::time::SystemTime::UNIX_EPOCH,
     };
     let rendered = format!("{record:?}");
@@ -122,6 +124,8 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
             "https://rs.example/a".to_string(),
             "https://rs.example/b".to_string(),
         ],
+        #[cfg(feature = "dpop")]
+        dpop_jkt: None,
         expires_at: std::time::SystemTime::UNIX_EPOCH,
     };
     let request = record.as_request();
@@ -163,6 +167,104 @@ fn a_stored_handle_resolves_to_exactly_the_parameters_that_were_pushed() {
             Some("urn:acr:phr urn:acr:mfa")
         );
         assert_eq!(request.max_age.as_deref(), Some("0"));
+    }
+}
+
+// ------------------------------------------------ FAPI 2.0 SP Final s5.3.2.2-6 (redirect_uri)
+
+/// FAPI 2.0 Security Profile Final s5.3.2.2 clause 6: "the AS shall require the `redirect_uri`
+/// parameter in pushed authorization requests." [`ParConfig::require_redirect_uri`] enforces it at
+/// the PAR push chokepoint, OVERRIDING the RFC 6749 s3.1.2.3 single-registered-URI omission for that
+/// path only. Default-off, so a plain OAuth 2.1 host keeps s3.1.2.3. See
+/// `crates/oauth-as-conformance/fapi2/FINDINGS.md` D6.
+#[cfg(feature = "par")]
+mod require_redirect_uri {
+    use super::*;
+
+    use crate::client::{Client, ClientAuth};
+    use crate::grant::GrantType;
+    use crate::scope::ScopeSet;
+    use crate::server::{AuthorizationServer, ServerConfig};
+    use crate::store::MemoryStorage;
+
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    /// A server whose one registered client has EXACTLY ONE redirect URI, so that the RFC 6749
+    /// s3.1.2.3 omission fallback is precisely what would otherwise supply the missing value. This
+    /// is the shape the FAPI2 fixture registers `client` in.
+    async fn server_with(par: ParConfig) -> AuthorizationServer<MemoryStorage> {
+        let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+        cfg.par = Some(Box::new(par));
+        let server = AuthorizationServer::new(cfg, MemoryStorage::new());
+        server
+            .register_client(Client {
+                client_id: ClientId::new("app"),
+                auth: ClientAuth::Public,
+                grant_types: vec![GrantType::AuthorizationCode],
+                redirect_uris: vec!["https://app.example/cb".to_string()],
+                allowed_scopes: ScopeSet::parse("read write").unwrap(),
+                default_scopes: ScopeSet::parse("read").unwrap(),
+                name: None,
+                registration: None,
+            })
+            .await
+            .unwrap();
+        server
+    }
+
+    /// The plain form-body push, minus `redirect_uri`, with the flag ON: refused with
+    /// `invalid_request` (HTTP 400) even though the single registered URI could have been resolved.
+    #[tokio::test]
+    async fn a_pushed_plain_request_omitting_redirect_uri_is_refused_when_required() {
+        let mut par = ParConfig::new();
+        par.require_redirect_uri = true;
+        let server = server_with(par).await;
+        let challenge = crate::pkce::code_challenge_s256(VERIFIER);
+
+        let error = server
+            .pushed_authorization_request(
+                &ClientId::new("app"),
+                None,
+                &[
+                    ("response_type", "code"),
+                    ("client_id", "app"),
+                    ("scope", "read"),
+                    ("code_challenge", challenge.as_str()),
+                    ("code_challenge_method", "S256"),
+                ],
+            )
+            .await
+            .expect_err("FAPI 2.0 s5.3.2.2-6: a push omitting redirect_uri must be refused");
+        assert_eq!(error.error, ErrorCode::InvalidRequest);
+        assert_eq!(
+            error.error.http_status(),
+            400,
+            "RFC 9126 s2.3 / RFC 6749 s5.2: invalid_request is HTTP 400 at the PAR endpoint"
+        );
+    }
+
+    /// The DEFAULT (flag OFF) preserves RFC 6749 s3.1.2.3: the identical push SUCCEEDS, resolving
+    /// the single registered URI. Without this the assertion above could be satisfied by breaking
+    /// every plain OAuth 2.1 host.
+    #[tokio::test]
+    async fn the_same_pushed_plain_request_succeeds_by_default() {
+        let server = server_with(ParConfig::new()).await;
+        let challenge = crate::pkce::code_challenge_s256(VERIFIER);
+
+        server
+            .pushed_authorization_request(
+                &ClientId::new("app"),
+                None,
+                &[
+                    ("response_type", "code"),
+                    ("client_id", "app"),
+                    ("scope", "read"),
+                    ("code_challenge", challenge.as_str()),
+                    ("code_challenge_method", "S256"),
+                ],
+            )
+            .await
+            .expect("with the flag off, s3.1.2.3 supplies the single registered redirect_uri");
     }
 }
 
@@ -645,5 +747,53 @@ mod jar {
         assert_eq!(registered.kid(), Some("k"));
         // The public key is not a secret, but the Debug form is still only what an operator needs.
         assert!(format!("{registered:?}").contains("Es256"));
+    }
+
+    /// FAPI 2.0 SP Final s5.3.2.2-6 on the JAR request-object push path: a signed object that omits
+    /// `redirect_uri` is refused identically when [`ParConfig::require_redirect_uri`] is on, because
+    /// the request-object push funnels through the same `store_pushed_request` guard as the plain
+    /// form body. Gated on `par` too, since it drives the PAR endpoint.
+    #[cfg(feature = "par")]
+    #[tokio::test]
+    async fn a_pushed_request_object_omitting_redirect_uri_is_refused_when_required() {
+        let key = signing_key(7);
+        let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
+        cfg.jar = Some(Box::new(JarConfig::new()));
+        let mut par = ParConfig::new();
+        par.require_redirect_uri = true;
+        cfg.par = Some(Box::new(par));
+        let server = AuthorizationServer::new(cfg, MemoryStorage::new()).with_request_object_keys(
+            Box::new(OneClientsKey {
+                client_id: ClientId::new("app"),
+                key: registered(&key, Some("client-key-1")),
+            }),
+        );
+        server
+            .register_client(Client {
+                client_id: ClientId::new("app"),
+                auth: ClientAuth::Public,
+                grant_types: vec![GrantType::AuthorizationCode],
+                redirect_uris: vec!["https://app.example/cb".to_string()],
+                allowed_scopes: ScopeSet::parse("read write").unwrap(),
+                default_scopes: ScopeSet::parse("read").unwrap(),
+                name: None,
+                registration: None,
+            })
+            .await
+            .unwrap();
+
+        // A genuinely signed, otherwise-valid request object with `redirect_uri` stripped.
+        let mut without = claims();
+        without
+            .as_object_mut()
+            .expect("the fixture claims are a JSON object")
+            .remove("redirect_uri");
+        let object = sign(header(), without, &key);
+
+        let error = server
+            .pushed_authorization_request(&ClientId::new("app"), None, &[("request", &object)])
+            .await
+            .expect_err("FAPI 2.0 s5.3.2.2-6 applies to a pushed signed request object too");
+        assert_eq!(error.error, ErrorCode::InvalidRequest);
     }
 }

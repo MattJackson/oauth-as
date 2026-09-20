@@ -68,6 +68,8 @@ fn c13_authorization_code_record_debug_format_redacts_code_and_tokens() {
         },
         #[cfg(feature = "consent")]
         authentication: None,
+        #[cfg(feature = "dpop")]
+        dpop_jkt: None,
     };
     let printed = format!("{record:?}");
     assert!(!printed.contains("the-secret-code-value"), "{printed}");
@@ -246,6 +248,8 @@ fn a_code_record_missing_redirect_uri_was_explicit_defaults_to_fail_closed_true(
         },
         #[cfg(feature = "consent")]
         authentication: None,
+        #[cfg(feature = "dpop")]
+        dpop_jkt: None,
     };
     let mut value = serde_json::to_value(&record).expect("the record serializes");
     let removed = value

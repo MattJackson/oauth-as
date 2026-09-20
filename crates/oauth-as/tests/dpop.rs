@@ -455,23 +455,128 @@ async fn mint_refresh_token(
     .expect("the authorization code grant issues a refresh token")
 }
 
-#[tokio::test]
-async fn a_bound_refresh_chain_cannot_be_rebound_to_another_key() {
-    // WITHOUT THIS THE BINDING IS DECORATIVE. An attacker who steals a DPoP-bound refresh token
-    // holds a string; the access token it was issued with is useless to them, because they cannot
-    // prove possession of the key. But if a rotation accepted a proof from a DIFFERENT key, the
-    // thief simply presents their own: they get a fresh access token bound to THEIR key, and it is
-    // the victim who is now unable to use the chain. RFC 9449 s5.
-    let victim = EcdsaP256Key::generate("victim");
-    let thief = EcdsaP256Key::generate("thief");
-    let srv = server();
-    let stolen = mint_refresh_token(&srv, Some(&victim), "seed").await;
+/// A PUBLIC client (no credential), so the DPoP key is the only thing that can bind its refresh
+/// chain — the case where RFC 9449 s5's exact-key-match requirement actually applies.
+fn public_refreshing_client() -> Client {
+    Client {
+        client_id: ClientId::new("pub-app"),
+        auth: ClientAuth::Public,
+        grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+        redirect_uris: vec![REDIRECT.to_string()],
+        allowed_scopes: ScopeSet::parse("read write").unwrap(),
+        default_scopes: ScopeSet::parse("read").unwrap(),
+        name: None,
+        registration: None,
+    }
+}
 
-    let refused = srv
+/// The public-client twin of [`mint_refresh_token`]: same PKCE authorization-code flow, but no
+/// client secret at the token endpoint.
+async fn mint_public_refresh_token(
+    srv: &AuthorizationServer<MemoryStorage>,
+    key: Option<&EcdsaP256Key>,
+    jti: &str,
+) -> String {
+    srv.register_client(public_refreshing_client())
+        .await
+        .unwrap();
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = oauth_as::pkce::code_challenge_s256(verifier);
+    let request = {
+        let mut request = oauth_as::AuthorizationRequest::default();
+        request.response_type = Some("code".into());
+        request.client_id = Some("pub-app".into());
+        request.redirect_uri = Some(REDIRECT.into());
+        request.scope = Some("read".into());
+        request.state = Some("s".into());
+        request.code_challenge = Some(challenge.into());
+        request.code_challenge_method = Some("S256".into());
+        request
+    };
+    let validated = srv.validate_authorization_request(&request).await.unwrap();
+    let code = srv
+        .issue_authorization_code(UserApproval::granted(&validated, "user-1"))
+        .await
+        .unwrap()
+        .code;
+
+    let proof = key.map(|k| proof(k, jti));
+    let context = match &proof {
+        Some(proof) => with_proof(proof),
+        None => TokenRequestContext::default(),
+    };
+    srv.token_with_context(
+        TokenRequest::AuthorizationCode {
+            client_id: ClientId::new("pub-app"),
+            client_secret: None,
+            code,
+            redirect_uri: Some(REDIRECT.to_string()),
+            code_verifier: Some(verifier.to_string()),
+        },
+        context,
+    )
+    .await
+    .unwrap()
+    .refresh_token
+    .expect("the authorization code grant issues a refresh token")
+}
+
+#[tokio::test]
+async fn a_confidential_client_may_rotate_a_bound_chain_onto_a_different_key() {
+    // RFC 9449 s5: a CONFIDENTIAL client's refresh chain is bound to the CLIENT through its
+    // credential, not to the DPoP key. A thief who steals only the token string cannot present the
+    // chain at all -- client authentication fails -- so the key binding would protect nothing the
+    // credential does not already, and the RFC lets a confidential client rotate onto a new key.
+    // (A PUBLIC client, which has no credential, IS held to an exact key match; see
+    // `a_public_client_refresh_chain_cannot_be_rebound_to_another_key`.) The rotated access token
+    // must bind to the NEW key, so the chain stays sender-constrained rather than reverting to
+    // bearer. This is exactly what FAPI 2.0 SP `refresh-token` exercises: it rotates with a fresh
+    // key and requires success.
+    let first = EcdsaP256Key::generate("first");
+    let second = EcdsaP256Key::generate("second");
+    let srv = server();
+    let rt = mint_refresh_token(&srv, Some(&first), "seed").await;
+
+    let rotated = srv
         .token_with_context(
             TokenRequest::RefreshToken {
                 client_id: ClientId::new("app"),
                 client_secret: Some(SECRET.to_string()),
+                refresh_token: rt,
+                scope: None,
+            },
+            with_proof(&proof(&second, "second-1")),
+        )
+        .await
+        .expect("a confidential client may present a different key on rotation");
+    assert_eq!(rotated.token_type, TokenType::Dpop);
+    let introspected = srv
+        .introspection_response(&ClientId::new("app"), Some(SECRET), &rotated.access_token)
+        .await
+        .unwrap();
+    assert_eq!(
+        introspected.cnf.unwrap().jkt,
+        Some(second.to_public_jwk().thumbprint()),
+        "the rotated access token must bind to the newly presented key, not the original"
+    );
+}
+
+#[tokio::test]
+async fn a_public_client_refresh_chain_cannot_be_rebound_to_another_key() {
+    // WITHOUT THIS THE BINDING IS DECORATIVE for a public client. It has no credential, so the DPoP
+    // key is the ONLY thing binding the chain: if a rotation accepted a proof from a DIFFERENT key,
+    // a thief who stole the token string simply presents their own key, gets a fresh access token
+    // bound to THEIR key, and the victim is locked out. RFC 9449 s5.
+    let victim = EcdsaP256Key::generate("victim");
+    let thief = EcdsaP256Key::generate("thief");
+    let srv = server();
+    let stolen = mint_public_refresh_token(&srv, Some(&victim), "seed").await;
+
+    let refused = srv
+        .token_with_context(
+            TokenRequest::RefreshToken {
+                client_id: ClientId::new("pub-app"),
+                client_secret: None,
                 refresh_token: stolen.clone(),
                 scope: None,
             },
@@ -485,8 +590,8 @@ async fn a_bound_refresh_chain_cannot_be_rebound_to_another_key() {
     assert!(
         srv.token_with_context(
             TokenRequest::RefreshToken {
-                client_id: ClientId::new("app"),
-                client_secret: Some(SECRET.to_string()),
+                client_id: ClientId::new("pub-app"),
+                client_secret: None,
                 refresh_token: stolen,
                 scope: None,
             },
@@ -753,4 +858,49 @@ async fn refresh_retry_requires_the_original_dpop_key() {
         .unwrap();
     assert_eq!(retried.access_token, rotated.access_token);
     assert_eq!(retried.refresh_token, rotated.refresh_token);
+}
+
+// A CONFIDENTIAL client may rotate a DPoP-bound refresh chain onto a NEW key (RFC 9449 s5: the chain
+// is bound to the client through client authentication, not to the key). If that rotation's response
+// is lost in transit, the lost-response retry — a byte-identical replay carrying the SAME new key —
+// must coalesce to the same tokens, not be refused. The retry-coalescing check must compare the
+// presented key against the key the WINNING rotation bound to, not the spent predecessor's key.
+#[tokio::test]
+async fn a_confidential_client_retry_matches_the_re_keyed_rotations_key_not_the_predecessors() {
+    let original = EcdsaP256Key::generate("original");
+    let rekeyed = EcdsaP256Key::generate("rekeyed");
+    let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
+    config.token_endpoint = Some(TOKEN_ENDPOINT.into());
+    config.refresh_retry_window = Duration::from_secs(30);
+    let srv = AuthorizationServer::new(config, MemoryStorage::new());
+    let token = mint_refresh_token(&srv, Some(&original), "rekey-seed").await;
+    let request = || TokenRequest::RefreshToken {
+        client_id: ClientId::new("app"),
+        client_secret: Some(SECRET.into()),
+        refresh_token: token.clone(),
+        scope: None,
+    };
+    // The rotation re-keys the chain from `original` to `rekeyed`; a confidential client is allowed
+    // to, and the freshly minted token binds to `rekeyed`.
+    let rotated = srv
+        .token_with_context(request(), with_proof(&proof(&rekeyed, "rekey-first")))
+        .await
+        .expect("a confidential client may rotate its DPoP-bound chain onto a new key");
+    // Response lost; the client retries the SAME refresh token with the SAME new key. This must
+    // coalesce to the winning rotation's tokens, not be refused for not matching the OLD key.
+    let retried = srv
+        .token_with_context(request(), with_proof(&proof(&rekeyed, "rekey-retry")))
+        .await
+        .expect("a lost-response retry of a legitimate re-keying rotation must coalesce");
+    assert_eq!(retried.access_token, rotated.access_token);
+    assert_eq!(retried.refresh_token, rotated.refresh_token);
+    // And a thief with the client credential but a THIRD key still cannot claim the cached response.
+    let thief = EcdsaP256Key::generate("thief");
+    assert_eq!(
+        srv.token_with_context(request(), with_proof(&proof(&thief, "rekey-thief")))
+            .await
+            .unwrap_err()
+            .error,
+        ErrorCode::InvalidDpopProof
+    );
 }
