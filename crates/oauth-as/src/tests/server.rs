@@ -818,6 +818,28 @@ fn a_ps256_only_allow_list_forbids_es256_per_slot_and_suppresses_its_static_meta
     }
 }
 
+/// The DPoP `AnyInstalled` verifier set is built ONCE and cached, not rebuilt per request. Proven by
+/// identity: two calls to `resolved_jws_verifiers` return the SAME reference, so the up-to-four `Arc`
+/// fallback installs happen once for the life of the server rather than on every DPoP-bound request.
+/// This is a deterministic gate (pointer identity), not an allocation count — it cannot flake.
+/// Red-before-green: reverting `resolved_jws_verifiers` to build and return an owned set makes the
+/// two references point at different stack temporaries and the `ptr::eq` assertion fails to compile
+/// or fails at runtime.
+#[cfg(feature = "dpop")]
+#[test]
+fn the_dpop_verifier_set_is_resolved_once_and_cached() {
+    let server = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        crate::store::MemoryStorage::new(),
+    );
+    let first = server.resolved_jws_verifiers();
+    let second = server.resolved_jws_verifiers();
+    assert!(
+        std::ptr::eq(first, second),
+        "resolved_jws_verifiers must return the same cached set on every call"
+    );
+}
+
 /// The largest `SystemTime` this platform can represent: the point beyond which `checked_add`
 /// returns `None`. Found rather than hardcoded, because the ceiling differs by platform (a 64-bit
 /// `timespec` on one host, a 128-bit intermediate on another), and the whole subject of the test

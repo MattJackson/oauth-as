@@ -1963,6 +1963,18 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
     /// null until the host installs something: see [`Hooks`] for why the three do not sit here as
     /// three separate fields.
     hooks: Hooks,
+    /// The DPoP `AnyInstalled` verifier set, computed ONCE on first use and cached.
+    ///
+    /// [`AuthorizationServer::resolved_jws_verifiers`] is a pure function of the host's installed
+    /// verifiers and `config.jws_alg_allow_list`, both frozen at construction (`with_jws_verifier`
+    /// consumes `self`, so nothing can install a verifier after the server begins serving). Building
+    /// it per request installed up to four `Arc`s of built-in fallbacks on every DPoP-bound token or
+    /// PAR request — the hot path in a FAPI deployment, where DPoP is mandatory. A `OnceLock`
+    /// (populated on the first request, by which time every builder has run) turns that into one
+    /// build for the life of the server. It is NOT a module `static` (the crate forbids those); it is
+    /// per-server state, and empty until the first DPoP request.
+    #[cfg(feature = "dpop")]
+    dpop_verifiers_cache: std::sync::OnceLock<crate::jwt::JwsVerifiers>,
 }
 
 impl<S: Storage> AuthorizationServer<S, SystemClock> {
@@ -1991,6 +2003,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             #[cfg(any(feature = "client-assertion", feature = "dpop"))]
             token_endpoint,
             hooks: Hooks::new(),
+            #[cfg(feature = "dpop")]
+            dpop_verifiers_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -2135,42 +2149,47 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     }
 
     /// The full set of verifiers this server resolves, HOST-installed plus the built-in `jwt-p256`
-    /// fallback for any algorithm the host did not install one for. Owned, so it can carry the
-    /// static fallback alongside the host's `Arc`s; built once per request that needs it.
+    /// fallback for any algorithm the host did not install one for. Carries the built-in fallback
+    /// alongside the host's `Arc`s; built ONCE and cached (see `dpop_verifiers_cache`), then borrowed
+    /// on every DPoP request rather than rebuilt.
     ///
     /// Used by the DPoP path, which is the one site that reads the algorithm off the proof header
     /// ([`crate::jwt::AlgPolicy::AnyInstalled`], the RFC 9449 self-carried-key exception) and so
     /// needs the whole installed set rather than one algorithm.
     #[cfg(feature = "dpop")]
-    pub(crate) fn resolved_jws_verifiers(&self) -> crate::jwt::JwsVerifiers {
-        // `mut` only matters when a built-in backend is compiled to install a fallback below; a
-        // `dpop`-only build (no jwt-p256/jwt-rsa/jwt-ed25519) returns the host set untouched.
-        #[allow(unused_mut)]
-        let mut verifiers = self.hooks.jws_verifiers().cloned().unwrap_or_default();
-        #[cfg(feature = "jwt-p256")]
-        if verifiers.get(crate::jwt::JwsAlg::Es256).is_none() {
-            verifiers.install(std::sync::Arc::new(crate::jwt::P256Verifier));
-        }
-        #[cfg(feature = "jwt-rsa")]
-        if verifiers.get(crate::jwt::JwsAlg::Rs256).is_none() {
-            verifiers.install(std::sync::Arc::new(crate::backends::rsa::RsaVerifier));
-        }
-        #[cfg(feature = "jwt-rsa")]
-        if verifiers.get(crate::jwt::JwsAlg::Ps256).is_none() {
-            verifiers.install(std::sync::Arc::new(crate::backends::rsa::Ps256Verifier));
-        }
-        #[cfg(feature = "jwt-ed25519")]
-        if verifiers.get(crate::jwt::JwsAlg::EdDsa).is_none() {
-            verifiers.install(std::sync::Arc::new(
-                crate::backends::ed25519::Ed25519Verifier,
-            ));
-        }
-        // The DPoP `AnyInstalled` chokepoint for the server-level allow-list: clear the slot of every
-        // forbidden algorithm AFTER the built-in fallbacks are installed, so a self-carried DPoP proof
-        // key cannot reintroduce a forbidden algorithm. `expect_alg(AnyInstalled)` selects only among
-        // occupied slots, so a cleared slot reads as `NotInstalled`.
-        verifiers.restrict_to(&self.config.jws_alg_allow_list);
-        verifiers
+    pub(crate) fn resolved_jws_verifiers(&self) -> &crate::jwt::JwsVerifiers {
+        // Computed ONCE and cached (see `dpop_verifiers_cache`): the set is a pure function of the
+        // host's installed verifiers and the allow-list, both frozen before the first request.
+        self.dpop_verifiers_cache.get_or_init(|| {
+            // `mut` only matters when a built-in backend is compiled to install a fallback below; a
+            // `dpop`-only build (no jwt-p256/jwt-rsa/jwt-ed25519) returns the host set untouched.
+            #[allow(unused_mut)]
+            let mut verifiers = self.hooks.jws_verifiers().cloned().unwrap_or_default();
+            #[cfg(feature = "jwt-p256")]
+            if verifiers.get(crate::jwt::JwsAlg::Es256).is_none() {
+                verifiers.install(std::sync::Arc::new(crate::jwt::P256Verifier));
+            }
+            #[cfg(feature = "jwt-rsa")]
+            if verifiers.get(crate::jwt::JwsAlg::Rs256).is_none() {
+                verifiers.install(std::sync::Arc::new(crate::backends::rsa::RsaVerifier));
+            }
+            #[cfg(feature = "jwt-rsa")]
+            if verifiers.get(crate::jwt::JwsAlg::Ps256).is_none() {
+                verifiers.install(std::sync::Arc::new(crate::backends::rsa::Ps256Verifier));
+            }
+            #[cfg(feature = "jwt-ed25519")]
+            if verifiers.get(crate::jwt::JwsAlg::EdDsa).is_none() {
+                verifiers.install(std::sync::Arc::new(
+                    crate::backends::ed25519::Ed25519Verifier,
+                ));
+            }
+            // The DPoP `AnyInstalled` chokepoint for the server-level allow-list: clear the slot of every
+            // forbidden algorithm AFTER the built-in fallbacks are installed, so a self-carried DPoP proof
+            // key cannot reintroduce a forbidden algorithm. `expect_alg(AnyInstalled)` selects only among
+            // occupied slots, so a cleared slot reads as `NotInstalled`.
+            verifiers.restrict_to(&self.config.jws_alg_allow_list);
+            verifiers
+        })
     }
 
     /// The installed host seams, for a host that wants to emit its own events onto the same
@@ -3584,7 +3603,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // anonymous caller could read a deployment misconfiguration off a refusal.
             return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
         }
-        let verified = verify_proof(&verifiers, proof, htm, htu, self.clock.now())
+        let verified = verify_proof(verifiers, proof, htm, htu, self.clock.now())
             // THE REASON GOES TO THE AUDIT CHANNEL, and until 0.9.1 it went nowhere: this arm was
             // `map_err(|_| ..)` and no event was emitted at all, against `dpop.rs`'s statement that
             // "the distinction here is for the host's audit channel, not for the wire". A deployment

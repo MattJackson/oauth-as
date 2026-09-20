@@ -859,6 +859,17 @@ fn core_public_types_stay_within_their_size_budget() {
     const JWS_ALG_ALLOW_LIST: usize = 8;
     #[cfg(not(feature = "jwt"))]
     const JWS_ALG_ALLOW_LIST: usize = 0;
+    // `AuthorizationServer::dpop_verifiers_cache`: a `OnceLock<JwsVerifiers>`, gated on `dpop`. The
+    // `JwsVerifiers` is `[Option<Arc<dyn>>; 4]` (64 bytes) plus the `OnceLock`'s own state word: 72
+    // bytes, RESIDENT once per server (not per request). What it buys is one build of the DPoP
+    // `AnyInstalled` verifier set for the life of the server, instead of up to four `Arc` fallback
+    // installs on EVERY DPoP-bound token/PAR request — the hot path in a FAPI deployment. This is a
+    // resident-size-for-per-request-allocation trade, and DPoP is exactly where it pays off.
+    // MEASURED on `--all-features`: AuthorizationServer 1032 -> 1104 bytes.
+    #[cfg(feature = "dpop")]
+    const DPOP_VERIFIERS_CACHE: usize = 72;
+    #[cfg(not(feature = "dpop"))]
+    const DPOP_VERIFIERS_CACHE: usize = 0;
     let server_budget = 832
         + REVOCATION_BARRIERS
         + RESOURCE_SERVERS
@@ -868,7 +879,8 @@ fn core_public_types_stay_within_their_size_budget() {
         + TOKEN_ENDPOINT
         + CIMD
         + REFRESH_RETRY_WINDOW
-        + JWS_ALG_ALLOW_LIST;
+        + JWS_ALG_ALLOW_LIST
+        + DPOP_VERIFIERS_CACHE;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
