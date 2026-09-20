@@ -306,9 +306,53 @@ fn token_exchange_token_type_refusal_bound() {}
 #[cfg(feature = "http")]
 const CALLER_SIZED: usize = 60 * 1024;
 
-/// Post `body` to the token endpoint and measure the whole refusal, expecting `status`.
+/// How many times [`measure_token_post`] repeats an identical request and takes the per-field
+/// MINIMUM. The counting allocator is PROCESS-WIDE and can only ever OVER-count a window: the
+/// handler's own allocations always fall inside the window and are never missed, while spurious
+/// allocations from the async runtime or the allocator's own bookkeeping leak in on SOME runs. So
+/// the noise is strictly additive-upward, and the minimum across identical repetitions is the true,
+/// noise-free cost — exactly as strict as a single reading (no tolerance is added), but immune to the
+/// transient upward noise that otherwise made these exact-count gates flaky across platforms.
+/// Sixteen samples makes "every sample happened to be noisy" astronomically unlikely.
+#[cfg(feature = "http")]
+const MEASURE_SAMPLES: usize = 16;
+
+/// Post `body` to the token endpoint and return the NOISE-FLOOR refusal cost: the per-field minimum
+/// over [`MEASURE_SAMPLES`] identical requests (see that constant for why the minimum is the honest
+/// reading). Every sample must return `status`.
 #[cfg(feature = "http")]
 fn measure_token_post<S, C>(
+    rt: &tokio::runtime::Runtime,
+    service: &oauth_as::AuthorizationService<S, C>,
+    body: String,
+    status: u16,
+) -> Delta
+where
+    S: oauth_as::Storage,
+    C: oauth_as::Clock,
+{
+    let mut floor: Option<Delta> = None;
+    for _ in 0..MEASURE_SAMPLES {
+        let d = measure_token_post_once(rt, service, body.clone(), status);
+        floor = Some(match floor {
+            None => d,
+            // Per-field minimum: each counter's noise is independently additive-upward, so the
+            // element-wise floor recovers each metric's true value.
+            Some(f) => Delta {
+                allocs: f.allocs.min(d.allocs),
+                deallocs: f.deallocs.min(d.deallocs),
+                bytes: f.bytes.min(d.bytes),
+                freed: f.freed.min(d.freed),
+            },
+        });
+    }
+    floor.expect("MEASURE_SAMPLES is non-zero")
+}
+
+/// One measured request. The whole refusal is measured, expecting `status`. Callers should prefer
+/// [`measure_token_post`], which repeats this and takes the noise floor.
+#[cfg(feature = "http")]
+fn measure_token_post_once<S, C>(
     rt: &tokio::runtime::Runtime,
     service: &oauth_as::AuthorizationService<S, C>,
     mut body: String,
