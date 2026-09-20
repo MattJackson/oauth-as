@@ -1,0 +1,82 @@
+# Supply-chain gate: cargo-deny (RustSec advisories, licences, banned/duplicate crates, sources)
+# and cargo-audit (RustSec advisories, second reader). Both read the same RustSec database from two
+# independent tools on purpose: cargo-deny is configured by deny.toml and also gates licences and
+# sources, while cargo-audit is the narrower, widely-recognised advisory scanner that reviewers and
+# OpenSSF Scorecard look for by name.
+#
+# This is a SEPARATE workflow, not a job in dev.yml/qa.yml/publish.yml, for two reasons: it must run
+# on a SCHEDULE (a new advisory lands against an unchanged tree, so a push-only gate would miss it),
+# and it must stay outside the dev<->qa<->publish drift check and the feature-mirror check, which own
+# those three files and would treat an unrelated job as drift.
+#
+# Action pinning follows the repository rule (see dev.yml's header): actions/* stay on major tags
+# (same trust root as the runner), everything else is pinned to a full commit SHA with the readable
+# ref in a trailing comment.
+
+name: supply-chain
+
+on:
+  push:
+    branches: [dev, qa, main]
+  pull_request:
+  schedule:
+    # Weekly, Monday 07:00 UTC. Catches advisories published against a tree nobody has touched.
+    - cron: "0 7 * * 1"
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: this workflow scans, it never writes.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, licences, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+      # Cache the compiled tool binary so we do not rebuild it from source every run. Keyed on the
+      # exact pinned version, so a version bump below is a cache miss and a rebuild, as intended.
+      - name: Cache cargo-deny binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-${{ runner.os }}
+      - name: Install cargo-deny (if not cached)
+        run: command -v cargo-deny >/dev/null 2>&1 || cargo install --locked cargo-deny@0.20.2
+      - name: cargo deny check
+        run: cargo deny check
+
+  cargo-audit:
+    name: cargo-audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+      - name: Cache cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-${{ runner.os }}
+      - name: Install cargo-audit (if not cached)
+        run: command -v cargo-audit >/dev/null 2>&1 || cargo install --locked cargo-audit@0.22.2
+      # RUSTSEC-2023-0071 (rsa "Marvin" timing side-channel) is ignored with the same rationale as
+      # deny.toml: no fixed version exists, it affects RSA SIGNING (not the verification this crate
+      # performs), and in-process RSA signing is an opt-in, documented lower-assurance posture. Keep
+      # this flag and deny.toml's `ignore` list in lock-step.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071

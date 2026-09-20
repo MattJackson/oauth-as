@@ -81,6 +81,17 @@ is):
   `Storage` implementation that satisfies the trait's wording while allowing one, is worth
   reporting.
 
+- **RUSTSEC-2023-0071 (the `rsa` crate's "Marvin" timing side-channel).** The `rsa` crate, pulled in
+  only by the optional `jwt-rsa` feature, carries an unfixed advisory: a timing side-channel in RSA
+  PRIVATE-KEY operations, i.e. SIGNING. There is no released `rsa` version that closes it, so the
+  supply-chain gates (`deny.toml`, the `cargo-audit` job) IGNORE it with this rationale rather than
+  failing on a fix that does not exist. It does not affect public-key VERIFICATION, which is the only
+  RSA operation this crate performs on the DPoP, request-object and client-assertion paths. In-process
+  RSA signing is reachable only through `RsaSigner` / `Ps256Signer`, an opt-in the documentation marks
+  as the lower-assurance posture: the FAPI 2.0 recommendation is ES256, or an asymmetric signer backed
+  by a remote HSM/KMS through the `JwsSigner` seam, neither of which exercises the `rsa` private-key
+  path. The ignore is revisited on every `rsa` release and removed the moment a fixed version ships. A
+  concrete exploit against a deployment that does sign in-process with `jwt-rsa` is still a finding.
 - **The `Storage` trait's `take_*` operations must be genuinely atomic.** A host that implements
   them as read-then-delete on a multi-node deployment reintroduces double-spend. This is documented
   on the trait, and it is a host obligation.

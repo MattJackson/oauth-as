@@ -1,0 +1,67 @@
+# cargo-deny configuration — supply-chain gate for oauth-as.
+#
+# Run locally with `cargo deny check`; CI runs the same in .github/workflows/supply-chain.yml.
+# Four checks: advisories (RustSec), licenses, bans (duplicate/banned crates), and sources.
+
+[graph]
+# Check every target and every feature: the publishable crate's wire surface is almost entirely
+# behind off-by-default features, so a default-only graph would miss most of the dependency tree.
+all-features = true
+
+[advisories]
+# The database is the community RustSec advisory-db. `unmaintained` is scoped to the crates we
+# actually build (workspace + transitive), not every crate that has ever existed.
+version = 2
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in the `rsa` crate's RSA operations.
+    #
+    # WHY IGNORED, not fixed: there is no fixed version to upgrade to — the `rsa` crate has not
+    # published a release that closes it (tracked upstream; `rsa` is at 0.9.x). The advisory is a
+    # TIMING side-channel in RSA/PSS PRIVATE-KEY operations, i.e. SIGNING. It does NOT affect
+    # public-key VERIFICATION, which is the only RSA operation this crate performs in its DPoP,
+    # request-object, and client-assertion verify paths.
+    #
+    # In-process RSA SIGNING is reachable only through the optional `jwt-rsa` `RsaSigner` /
+    # `Ps256Signer`, which a deployment opts into and which is documented (see backends/rsa.rs and
+    # SECURITY.md) as the lower-assurance posture: the FAPI 2.0 recommendation is ES256, or an
+    # asymmetric signer backed by a remote HSM/KMS via the `JwsSigner` seam, neither of which
+    # exercises the `rsa` private-key path. This ignore is revisited on every `rsa` release and
+    # removed the moment a fixed version exists.
+    "RUSTSEC-2023-0071",
+]
+
+[licenses]
+version = 2
+# The crate is MIT OR Apache-2.0. The rest of this list is the licences that appear in the
+# transitive dependency tree (all permissive, all OSI-approved). cargo-deny fails if a dependency
+# introduces a licence not on this list, which is exactly the review trigger we want.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "0BSD",
+]
+confidence-threshold = 0.9
+
+[bans]
+# A duplicate (two major versions of one crate in the tree) is a warning, not a failure: the
+# lockfile pins them deliberately in a few cases and the MSRV comments in Cargo.toml explain the
+# version floors. Elevate to "deny" once the tree is flat.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
