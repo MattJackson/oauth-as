@@ -21,6 +21,17 @@
 //! (a same-KEY, different-PADDING swap, since PS256 and RS256 share `KeyKind::Rsa`) and vice-versa,
 //! and every `none`/`HS256`/foreign spelling are each REFUSED at all three sites, while the
 //! truthfully-labelled one is accepted.
+//!
+//! WHERE THE CROSS-PADDING CHECK ACTUALLY LANDS, since the three sites refuse a lying header by
+//! different mechanisms. At the DPoP site the header itself selects the verifier
+//! (`AlgPolicy::AnyInstalled`), so a PS256-signed proof claiming RS256 is fed to the RS256 verifier
+//! and refused by the cryptographic check — this is the one site whose refusal exercises same-KEY,
+//! different-PADDING rejection inside the RSA backend. At the client-assertion and request-object
+//! sites the REGISTRATION pins the one algorithm, so a lying header is refused by the alg comparison
+//! (`client_assertion.rs`, `par.rs::validate_signed_authorization_request`) BEFORE any signature is
+//! verified: the same refusal, reached one layer earlier and never reaching the backend. All three
+//! outcomes are asserted here; the backend's own cross-padding rejection is additionally pinned at
+//! the seam in `backends/rsa.rs` and `signer_conformance_multi_alg.rs`.
 
 #![cfg(all(
     feature = "jwt-p256",

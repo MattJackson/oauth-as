@@ -3453,7 +3453,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         //
         // The verifier is resolved and PASSED ALONG rather than required here, because only one of
         // the two methods needs one. `private_key_jwt` names one asymmetric algorithm (ES256,
-        // RS256, or EdDSA) and `verify_assertion` refuses it on a `None` (an unchecked credential
+        // RS256, EdDSA, or PS256) and `verify_assertion` refuses it on a `None` (an unchecked credential
         // has authenticated nobody). `client_secret_jwt` is
         // an HS256 HMAC over the registered secret and touches no curve at all, so requiring a
         // backend on that path refused a valid credential for a reason no RFC gives. Which one

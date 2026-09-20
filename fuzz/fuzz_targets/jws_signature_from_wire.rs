@@ -30,7 +30,7 @@ use libfuzzer_sys::fuzz_target;
 use oauth_as::jwt::{JwsAlg, JwsSignature};
 
 /// `JwsAlg` is a closed enum in the crate and does not derive `Arbitrary`, so the choice is made
-/// here over its three variants.
+/// here over its four variants.
 fn arbitrary_alg(u: &mut Unstructured<'_>) -> arbitrary::Result<JwsAlg> {
     Ok(*u.choose(&[JwsAlg::Es256, JwsAlg::Rs256, JwsAlg::EdDsa, JwsAlg::Ps256])?)
 }
