@@ -7,7 +7,10 @@
 [![codecov](https://codecov.io/gh/MattJackson/oauth-as/graph/badge.svg)](https://codecov.io/gh/MattJackson/oauth-as)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![MSRV 1.75](https://img.shields.io/badge/MSRV-1.75-blue.svg)](#minimum-supported-rust-version)
+[![docs.rs](https://img.shields.io/docsrs/oauth-as)](https://docs.rs/oauth-as)
 [![Conformance](https://img.shields.io/badge/independent%20conformance-8%2F8-brightgreen.svg)](#evidence)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/MattJackson/oauth-as/badge)](https://scorecard.dev/viewer/?uri=github.com/MattJackson/oauth-as)
+[![REUSE status](https://api.reuse.software/badge/github.com/MattJackson/oauth-as)](https://api.reuse.software/info/github.com/MattJackson/oauth-as)
 
 An embeddable **OAuth 2.1 Authorization Server** for Rust.
 
