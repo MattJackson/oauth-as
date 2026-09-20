@@ -32,7 +32,7 @@ use oauth_as::jwt::{JwsAlg, JwsSignature};
 /// `JwsAlg` is a closed enum in the crate and does not derive `Arbitrary`, so the choice is made
 /// here over its three variants.
 fn arbitrary_alg(u: &mut Unstructured<'_>) -> arbitrary::Result<JwsAlg> {
-    Ok(*u.choose(&[JwsAlg::Es256, JwsAlg::Rs256, JwsAlg::EdDsa])?)
+    Ok(*u.choose(&[JwsAlg::Es256, JwsAlg::Rs256, JwsAlg::EdDsa, JwsAlg::Ps256])?)
 }
 
 /// The wire octets. A raw byte buffer some of the time; a buffer of a length chosen from the set
@@ -80,10 +80,11 @@ fuzz_target!(|input: Input| {
             "{alg:?} from_wire accepted iff the input is 64 bytes was violated at len {}",
             raw.len()
         ),
-        // 3.
-        JwsAlg::Rs256 => assert!(
+        // 3. RS256 and PS256 (both RSA, modulus-width signatures) are length-lenient by design:
+        // `from_wire` accepts any width and the `length == modulus` check is the verifier's.
+        JwsAlg::Rs256 | JwsAlg::Ps256 => assert!(
             signature.is_some(),
-            "RS256 from_wire refused a {}-byte input; RS256 is length-lenient by design",
+            "{alg:?} from_wire refused a {}-byte input; RSA signatures are length-lenient by design",
             raw.len()
         ),
     }

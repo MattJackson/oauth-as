@@ -133,7 +133,7 @@ impl std::error::Error for WeakClientSecret {}
 /// The built-in `token_endpoint_auth_signing_alg_values_supported` baseline this server advertises
 /// (RFC 8414 section 2): `client_secret_jwt`'s HS256, plus the `jwt-p256` backend's ES256.
 ///
-/// Only the baseline. A [`AssertionKeys::PublicKeys`] registration under RS256 or EdDSA makes
+/// Only the baseline. A [`AssertionKeys::PublicKeys`] registration under RS256, EdDSA or PS256 makes
 /// [`AssertionKeys::signing_alg`] return that algorithm too, and [`crate::metadata`] adds it to the
 /// advertised list where the matching verifier resolves.
 pub const ASSERTION_SIGNING_ALGS: &[&str] = &["HS256", "ES256"];
@@ -209,7 +209,7 @@ pub enum AssertionKeys {
     /// under a key only the client holds. This is the variant to reach for.
     PublicKeys {
         /// The ONE algorithm this registration's assertions may carry — any wired [`JwsAlg`]
-        /// (ES256, RS256, or EdDSA). Singular on purpose (see [`AssertionKeys::signing_alg`]): a
+        /// (ES256, RS256, EdDSA, or PS256). Singular on purpose (see [`AssertionKeys::signing_alg`]): a
         /// registration that accepted a SET would be one where an attacker picks from the set.
         alg: JwsAlg,
         /// The registered public keys. Several are allowed so a client can rotate: it publishes the
@@ -407,7 +407,7 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 ///
 /// `verifier` is the backend for the registration's asymmetric algorithm, the host's to choose
 /// after 0.9.0: enable `jwt-p256`/`jwt-rsa`/`jwt-ed25519` for a built-in [`crate::jwt::JwsVerifier`]
-/// (ES256, RS256, EdDSA), or pass your own.
+/// (ES256, RS256, EdDSA, PS256 — the last two both under `jwt-rsa`), or pass your own.
 ///
 /// It is an `Option`, and unlike [`crate::dpop::verify_proof`]'s it HAS to be, because only ONE of
 /// the two RFC 7523 methods carries an asymmetric signature at all. `private_key_jwt` names one

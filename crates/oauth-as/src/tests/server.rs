@@ -633,7 +633,7 @@ fn the_dummy_assertion_verification_uses_the_presented_algorithms_verifier() {
 }
 
 /// [`AuthorizationServer::presented_assertion_alg`] reads the header's `alg` and routes exactly the
-/// three wired asymmetric algorithms, refusing everything a `JwsVerifier` cannot: an HMAC, `none`,
+/// four wired asymmetric algorithms, refusing everything a `JwsVerifier` cannot: an HMAC, `none`,
 /// an unwired value, and an assertion past the size cap (refused before it is parsed, on the same
 /// terms as `verify_assertion`).
 #[cfg(feature = "client-assertion")]
@@ -655,12 +655,13 @@ fn presented_assertion_alg_reads_the_header_and_refuses_the_unroutable() {
     assert_eq!(alg_of(&assertion_with_alg("ES256")), Some(JwsAlg::Es256));
     assert_eq!(alg_of(&assertion_with_alg("RS256")), Some(JwsAlg::Rs256));
     assert_eq!(alg_of(&assertion_with_alg("EdDSA")), Some(JwsAlg::EdDsa));
+    assert_eq!(alg_of(&assertion_with_alg("PS256")), Some(JwsAlg::Ps256));
 
-    // Unroutable: an HMAC, the unsecured `none`, and an unwired asymmetric alg all fall to None,
-    // which is the HMAC-fallback path in `dummy_assertion_verify`.
+    // Unroutable: an HMAC and the unsecured `none` both fall to None, which is the HMAC-fallback path
+    // in `dummy_assertion_verify`. (`PS256` is a WIRED algorithm now — routable, above.)
     assert_eq!(alg_of(&assertion_with_alg("HS256")), None);
     assert_eq!(alg_of(&assertion_with_alg("none")), None);
-    assert_eq!(alg_of(&assertion_with_alg("PS256")), None);
+    assert_eq!(alg_of(&assertion_with_alg("ES384")), None);
 
     // A garbage string is not a compact JWS: None, never a panic.
     assert_eq!(alg_of("not-a-jws"), None);
@@ -671,6 +672,150 @@ fn presented_assertion_alg_reads_the_header_and_refuses_the_unroutable() {
         assertion_with_alg("ES256") + &"A".repeat(crate::client_assertion::MAX_ASSERTION_BYTES);
     assert!(oversized.len() > crate::client_assertion::MAX_ASSERTION_BYTES);
     assert_eq!(alg_of(&oversized), None);
+}
+
+/// The server-level [`AlgAllowList`] (FAPI subset) forbids RS256 at BOTH verifier-resolution
+/// chokepoints and in the advertised metadata, while leaving ES256 and PS256 fully available. This
+/// is the load-bearing proof of the allow-list: gate #1 (`jws_verifier`, the Registered path) hands
+/// out no RS256 verifier, gate #2 (`resolved_jws_verifiers`, the DPoP `AnyInstalled` path) clears the
+/// RS256 slot so a self-carried proof key cannot reintroduce it, and the RFC 8414 document never
+/// advertises RS256. Red-before-green: dropping the `is_allowed` guard in `jws_verifier` or the
+/// `restrict_to` call in `resolved_jws_verifiers` turns one of the `is_none()` assertions to `Some`.
+// `client-assertion` is in the gate because the test asserts on
+// `token_endpoint_auth_signing_alg_values_supported`, which the metadata document only carries when
+// `client-assertion` is compiled; without it that member is `None` and the assertion would panic.
+#[cfg(all(
+    feature = "dpop",
+    feature = "jwt-rsa",
+    feature = "jwt-p256",
+    feature = "client-assertion"
+))]
+#[test]
+fn the_fapi_alg_allow_list_forbids_rs256_at_both_chokepoints_and_in_metadata() {
+    use crate::jwt::{AlgAllowList, JwsAlg};
+
+    let fapi = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device")
+            .with_jws_alg_allow_list(AlgAllowList::fapi()),
+        crate::store::MemoryStorage::new(),
+    );
+
+    // Gate #1 — Registered path: RS256 resolves to no verifier; ES256 and PS256 both do.
+    assert!(fapi.jws_verifier(JwsAlg::Rs256).is_none());
+    assert!(fapi.jws_verifier(JwsAlg::Es256).is_some());
+    assert!(fapi.jws_verifier(JwsAlg::Ps256).is_some());
+
+    // Gate #2 — DPoP AnyInstalled path: the jwt-rsa fallback would fill the RS256 slot, but
+    // `restrict_to` clears it, so `expect_alg(AnyInstalled)` reads it as NotInstalled.
+    let resolved = fapi.resolved_jws_verifiers();
+    assert!(resolved.get(JwsAlg::Rs256).is_none());
+    assert!(resolved.get(JwsAlg::Es256).is_some());
+    assert!(resolved.get(JwsAlg::Ps256).is_some());
+
+    // Advertising: the metadata omits RS256 from every signing-alg list but keeps ES256 and PS256.
+    let doc = serde_json::to_value(fapi.metadata()).unwrap();
+    for member in [
+        "token_endpoint_auth_signing_alg_values_supported",
+        "dpop_signing_alg_values_supported",
+    ] {
+        let algs = doc[member]
+            .as_array()
+            .unwrap_or_else(|| panic!("{member} is present"));
+        let has = |name: &str| algs.iter().any(|a| a == name);
+        assert!(has("ES256"), "{member} must advertise ES256");
+        assert!(has("PS256"), "{member} must advertise PS256");
+        assert!(
+            !has("RS256"),
+            "{member} must NOT advertise RS256 under fapi()"
+        );
+    }
+
+    // The RFC 9101 request-object member rides the SAME allow-list machinery (metadata's
+    // `baseline_algs` filter plus the per-alg `jws_verifier(alg).is_some()` gate in
+    // `mark_alg_verifiable`), but only exists when JAR is configured. Prove it does not leak RS256.
+    #[cfg(feature = "jar")]
+    {
+        let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device")
+            .with_jws_alg_allow_list(AlgAllowList::fapi());
+        cfg.jar = Some(Box::new(crate::par::JarConfig::new()));
+        let jar_fapi = AuthorizationServer::new(cfg, crate::store::MemoryStorage::new());
+        let doc = serde_json::to_value(jar_fapi.metadata()).unwrap();
+        let algs = doc["request_object_signing_alg_values_supported"]
+            .as_array()
+            .expect("request_object_signing_alg_values_supported is present with JAR configured");
+        let has = |name: &str| algs.iter().any(|a| a == name);
+        assert!(has("ES256"), "request-object member must advertise ES256");
+        assert!(has("PS256"), "request-object member must advertise PS256");
+        assert!(
+            !has("RS256"),
+            "request-object member must NOT advertise RS256 under fapi()"
+        );
+    }
+
+    // Backward compatibility: the default `all()` list keeps RS256 verifiable on both paths.
+    let default = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device"),
+        crate::store::MemoryStorage::new(),
+    );
+    assert!(default.jws_verifier(JwsAlg::Rs256).is_some());
+    assert!(default
+        .resolved_jws_verifiers()
+        .get(JwsAlg::Rs256)
+        .is_some());
+}
+
+/// A PS256-ONLY allow-list (`AlgAllowList::only(&[Ps256])`, which FORBIDS ES256) proves the gate is
+/// genuinely per-slot — each algorithm checked against its OWN slot — rather than a coarse "is this
+/// the FAPI {ES256,PS256} pair" shortcut. It is also the one configuration that exercises the ES256
+/// suppression path (metadata gate #3): ES256 has a STATIC metadata baseline that the other algs do
+/// not, so a PS256-only list is the only way to prove that baseline is filtered too. Red-before-green:
+/// a refactor that keyed the gate off `fapi()` rather than `allowed[alg.slot()]` would still resolve
+/// an ES256 verifier here (ES256 is in the FAPI pair) and this test's `is_none()` would flip to `Some`.
+// `client-assertion` gated for the same reason as the sibling test above: the metadata assertion on
+// `token_endpoint_auth_signing_alg_values_supported` needs that member to be present.
+#[cfg(all(
+    feature = "dpop",
+    feature = "jwt-rsa",
+    feature = "jwt-p256",
+    feature = "client-assertion"
+))]
+#[test]
+fn a_ps256_only_allow_list_forbids_es256_per_slot_and_suppresses_its_static_metadata_baseline() {
+    use crate::jwt::{AlgAllowList, JwsAlg};
+
+    let ps_only = AuthorizationServer::new(
+        ServerConfig::new("https://as.example", "https://as.example/device")
+            .with_jws_alg_allow_list(AlgAllowList::only(&[JwsAlg::Ps256])),
+        crate::store::MemoryStorage::new(),
+    );
+
+    // Per-slot at both chokepoints: PS256 allowed, ES256 AND RS256 forbidden.
+    assert!(ps_only.jws_verifier(JwsAlg::Ps256).is_some());
+    assert!(ps_only.jws_verifier(JwsAlg::Es256).is_none());
+    assert!(ps_only.jws_verifier(JwsAlg::Rs256).is_none());
+    let resolved = ps_only.resolved_jws_verifiers();
+    assert!(resolved.get(JwsAlg::Ps256).is_some());
+    assert!(resolved.get(JwsAlg::Es256).is_none());
+    assert!(resolved.get(JwsAlg::Rs256).is_none());
+
+    // Metadata: ES256's STATIC baseline is suppressed (gate #3), and only PS256 remains — no ES256,
+    // no RS256. This is the assertion the {ES256,PS256}-only tests cannot make.
+    let doc = serde_json::to_value(ps_only.metadata()).unwrap();
+    for member in [
+        "token_endpoint_auth_signing_alg_values_supported",
+        "dpop_signing_alg_values_supported",
+    ] {
+        let algs = doc[member]
+            .as_array()
+            .unwrap_or_else(|| panic!("{member} is present"));
+        let has = |name: &str| algs.iter().any(|a| a == name);
+        assert!(has("PS256"), "{member} must advertise PS256");
+        assert!(
+            !has("ES256"),
+            "{member} must NOT advertise ES256 under a PS256-only list (gate #3)"
+        );
+        assert!(!has("RS256"), "{member} must NOT advertise RS256");
+    }
 }
 
 /// The largest `SystemTime` this platform can represent: the point beyond which `checked_add`

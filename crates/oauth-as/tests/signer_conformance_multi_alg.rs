@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
-//! Proves the exported signer conformance harness is CRYPTO-AGILE: it validates RS256 and EdDSA
-//! backends, not only the ES256 one it was born for.
+//! Proves the exported signer conformance harness is CRYPTO-AGILE: it validates RS256, EdDSA and
+//! PS256 backends, not only the ES256 one it was born for.
 //!
 //! `tests/signer_conformance_selftest.rs` drives the ES256 path red and green. This file is the
-//! other two algorithms. Before the harness was generalised it dispatched nothing on the signer's
-//! algorithm: it demanded a 64-byte `[u8; 64]` signature (RS256 is 256 bytes) and checked the
-//! published key against the ES256 P-256 vector, so a CONFORMANT RS256 or EdDSA signer failed it
-//! SPURIOUSLY. The two green tests here are what make that impossible to regress to; the broken
-//! ones prove the harness still bites once it is looking at the right algorithm.
+//! other three algorithms. Before the harness was generalised it dispatched nothing on the signer's
+//! algorithm: it demanded a 64-byte `[u8; 64]` signature (RS256/PS256 are 256 bytes) and checked the
+//! published key against the ES256 P-256 vector, so a CONFORMANT RS256, EdDSA or PS256 signer failed
+//! it SPURIOUSLY. The green tests here are what make that impossible to regress to; the broken ones
+//! prove the harness still bites once it is looking at the right algorithm.
 
 #![cfg(all(feature = "test-util", feature = "jwt-rsa", feature = "jwt-ed25519"))]
 
@@ -20,7 +20,9 @@ use base64::Engine as _;
 
 use oauth_as::jwt::{Jwk, JwsAlg, JwsSignature, JwsSigner, SignerError};
 use oauth_as::signer_conformance::{SignerConformance, Violation};
-use oauth_as::{Ed25519Signer, Ed25519Verifier, RsaSigner, RsaVerifier};
+use oauth_as::{
+    Ed25519Signer, Ed25519Verifier, Ps256Signer, Ps256Verifier, RsaSigner, RsaVerifier,
+};
 
 const SIGNER_VERIFIES_UNDER_ITS_OWN_JWK: &str = "signer/verifies_under_its_own_public_jwk";
 
@@ -57,6 +59,15 @@ fn rsa_signer() -> RsaSigner {
         .decode(RSA_PKCS8_DER_B64)
         .expect("the embedded PKCS#8 is base64");
     RsaSigner::from_pkcs8_der("rs256-test", &der).expect("a valid 2048-bit RSA key")
+}
+
+/// The SAME distinct RSA key as `rsa_signer`, wrapped as a PS256 (RSASSA-PSS) signer. Distinct from
+/// the RFC 7515 A.2 key so the harness's example-key check does not (correctly) fire.
+fn ps256_signer() -> Ps256Signer {
+    let der = STANDARD
+        .decode(RSA_PKCS8_DER_B64)
+        .expect("the embedded PKCS#8 is base64");
+    Ps256Signer::from_pkcs8_der("ps256-test", &der).expect("a valid 2048-bit RSA key")
 }
 
 /// A one-line executor, so this file needs no async-runtime feature of its own. Every future the
@@ -97,6 +108,16 @@ fn a_conformant_eddsa_backend_passes_every_check() {
     let signer = Ed25519Signer::from_seed_bytes("eddsa-test", &[3u8; 32])
         .expect("a fixed 32-byte seed keeps this test deterministic");
     let violations = block_on(SignerConformance::new(signer, Ed25519Verifier).run());
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// A CONFORMANT PS256 (RSASSA-PSS) backend (`Ps256Signer` + `Ps256Verifier`) passes every check.
+/// This is the one test that exercises the harness's `JwsAlg::Ps256` arm end to end — its pinned
+/// salt-32 known-answer vector and the shared RS256/EdDSA/PS256 generic verifier routine — so the
+/// harness cannot silently stop covering the algorithm FAPI 2.0 actually asks for.
+#[test]
+fn a_conformant_ps256_backend_passes_every_check() {
+    let violations = block_on(SignerConformance::new(ps256_signer(), Ps256Verifier).run());
     assert!(violations.is_empty(), "{violations:#?}");
 }
 

@@ -300,6 +300,18 @@ pub struct ServerConfig {
     /// record is still persisted, so introspection and revocation are unchanged.
     #[cfg(feature = "jwt")]
     pub access_token_format: AccessTokenFormat,
+    /// Which asymmetric [`JwsAlg`](crate::jwt::JwsAlg) this server will VERIFY and ADVERTISE, on top
+    /// of the per-client algorithm pinning every registration already carries. Defaults to
+    /// [`AlgAllowList::all`](crate::jwt::AlgAllowList::all) (every wired algorithm —
+    /// backward-compatible, changes nothing).
+    ///
+    /// Set [`AlgAllowList::fapi`](crate::jwt::AlgAllowList::fapi) to enforce the FAPI 2.0 subset
+    /// (`ES256` + `PS256`, `RS256`
+    /// forbidden) centrally. This gates the two verifier-resolution chokepoints (the Registered path
+    /// and the DPoP `AnyInstalled` path) and the RFC 8414 metadata the server derives; it does not
+    /// filter host-authored free-form fields such as the RFC 9728 resource-metadata alg lists.
+    #[cfg(feature = "jwt")]
+    pub jws_alg_allow_list: crate::jwt::AlgAllowList,
     /// Authorization code lifetime. RFC 6749 section 4.1.2 recommends a maximum of 10 minutes;
     /// the default is 60 seconds, which is ample for a redirect round trip.
     pub authorization_code_ttl: Duration,
@@ -924,6 +936,9 @@ impl ServerConfig {
             protected_resources: None,
             #[cfg(feature = "jwt")]
             access_token_format: AccessTokenFormat::Opaque,
+            // Every wired algorithm allowed: an existing deployment is unchanged.
+            #[cfg(feature = "jwt")]
+            jws_alg_allow_list: crate::jwt::AlgAllowList::all(),
             authorization_code_ttl: Duration::from_secs(60),
             // OFF. RFC 8628 s5.4 remote phishing: see the field's own docs.
             include_verification_uri_complete: false,
@@ -971,6 +986,18 @@ impl ServerConfig {
     #[cfg(feature = "client-assertion")]
     pub fn with_assertion_audience(mut self, rule: AssertionAudience) -> Self {
         self.assertion_audience = rule;
+        self
+    }
+
+    /// Restrict which asymmetric [`JwsAlg`](crate::jwt::JwsAlg) this server will verify and
+    /// advertise (see [`ServerConfig::jws_alg_allow_list`]).
+    ///
+    /// The default is [`AlgAllowList::all`](crate::jwt::AlgAllowList::all), which changes nothing.
+    /// Pass [`AlgAllowList::fapi`](crate::jwt::AlgAllowList::fapi) to enforce the FAPI 2.0 subset
+    /// (`ES256` + `PS256`, `RS256` forbidden) across every verification path and the derived metadata.
+    #[cfg(feature = "jwt")]
+    pub fn with_jws_alg_allow_list(mut self, list: crate::jwt::AlgAllowList) -> Self {
+        self.jws_alg_allow_list = list;
         self
     }
 }
@@ -1551,6 +1578,9 @@ fn dummy_assertion_material(alg: crate::jwt::JwsAlg) -> (crate::jwt::Jwk, Vec<u8
         // `sig.len() == modulus` guard passes; every byte is `0x01`, an integer far below the
         // 2048-bit modulus, so the RSA verify performs the full modular exponentiation.
         JwsAlg::Rs256 => (dummy_rs256_key(), vec![0x01u8; 256]),
+        // PS256 shares the RSA modulus width, so the same 256-byte dummy makes the verifier's
+        // `sig.len() == modulus` guard pass and the full PSS modular exponentiation run.
+        JwsAlg::Ps256 => (dummy_rs256_key(), vec![0x01u8; 256]),
         JwsAlg::EdDsa => (dummy_eddsa_key(), DUMMY_EDDSA_SIGNATURE.to_vec()),
     }
 }
@@ -2068,6 +2098,15 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         &self,
         alg: crate::jwt::JwsAlg,
     ) -> Option<&dyn crate::jwt::JwsVerifier> {
+        // The server-level allow-list is the FIRST thing checked, BEFORE the host-installed lookup
+        // and the built-in fallbacks. This ordering is load-bearing: a forbidden algorithm must have
+        // NO verifier on any path — not the built-in one, and not a verifier a host installed — so
+        // this gate precedes both. It is the single Registered-path chokepoint (RFC 7523 client
+        // assertions, RFC 9101 request objects), and metadata honesty rides on it too: `metadata()`
+        // advertises an algorithm iff `jws_verifier(alg).is_some()`.
+        if !self.config.jws_alg_allow_list.is_allowed(alg) {
+            return None;
+        }
         if let Some(installed) = self.hooks.jws_verifiers().and_then(|vs| vs.get(alg)) {
             return Some(installed);
         }
@@ -2081,6 +2120,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         #[cfg(feature = "jwt-rsa")]
         if alg == crate::jwt::JwsAlg::Rs256 {
             return Some(&crate::backends::rsa::RsaVerifier);
+        }
+        // PS256 rides the same `jwt-rsa` feature as RS256 but its OWN verifier (PSS, not PKCS#1 v1.5).
+        #[cfg(feature = "jwt-rsa")]
+        if alg == crate::jwt::JwsAlg::Ps256 {
+            return Some(&crate::backends::rsa::Ps256Verifier);
         }
         #[cfg(feature = "jwt-ed25519")]
         if alg == crate::jwt::JwsAlg::EdDsa {
@@ -2111,12 +2155,21 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         if verifiers.get(crate::jwt::JwsAlg::Rs256).is_none() {
             verifiers.install(std::sync::Arc::new(crate::backends::rsa::RsaVerifier));
         }
+        #[cfg(feature = "jwt-rsa")]
+        if verifiers.get(crate::jwt::JwsAlg::Ps256).is_none() {
+            verifiers.install(std::sync::Arc::new(crate::backends::rsa::Ps256Verifier));
+        }
         #[cfg(feature = "jwt-ed25519")]
         if verifiers.get(crate::jwt::JwsAlg::EdDsa).is_none() {
             verifiers.install(std::sync::Arc::new(
                 crate::backends::ed25519::Ed25519Verifier,
             ));
         }
+        // The DPoP `AnyInstalled` chokepoint for the server-level allow-list: clear the slot of every
+        // forbidden algorithm AFTER the built-in fallbacks are installed, so a self-carried DPoP proof
+        // key cannot reintroduce a forbidden algorithm. `expect_alg(AnyInstalled)` selects only among
+        // occupied slots, so a cleared slot reads as `NotInstalled`.
+        verifiers.restrict_to(&self.config.jws_alg_allow_list);
         verifiers
     }
 
@@ -2794,8 +2847,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ///
     /// WHICH VERIFICATION, and why it is DRIVEN BY THE PRESENTED HEADER. RFC 7523 has TWO client
     /// authentication methods and this crate implements both, and after crypto agility a
-    /// `private_key_jwt` registration names one of THREE asymmetric algorithms (ES256, RS256,
-    /// EdDSA), three orders of magnitude apart in cost. The KNOWN-id path pays a verification of the
+    /// `private_key_jwt` registration names one of FOUR asymmetric algorithms (ES256, RS256, EdDSA,
+    /// PS256), orders of magnitude apart in cost. The KNOWN-id path pays a verification of the
     /// REGISTRATION's algorithm, and `verify_assertion` reaches that verification only when the
     /// token header's `alg` EQUALS it (a header mismatch is refused before any signature work). So
     /// the cost a known id pays for a given request is the cost of verifying the algorithm the
@@ -2824,8 +2877,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     ///
     /// WHAT IT COSTS, stated rather than left to be found: a probe that could have reached a
     /// verification now buys one of this server's time whether or not its id exists, and — new with
-    /// the per-algorithm dummy — an attacker who sends RS256 assertions for unknown ids forces an
-    /// RSA verification, the most expensive of the three. That is ACCEPTABLE: it is exactly the cost
+    /// the per-algorithm dummy — an attacker who sends RS256 (or PS256) assertions for unknown ids
+    /// forces an RSA verification, the most expensive of the four. That is ACCEPTABLE: it is exactly the cost
     /// a real RS256 `private_key_jwt` client already imposes on every request, it is bounded above
     /// by the [`crate::client_assertion::MAX_ASSERTION_BYTES`] cap (4 KiB, checked before any
     /// parse) and by the [`RateLimiter`], which is charged for the attempt either way, and refusing
@@ -2981,8 +3034,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// beside it.
     ///
     /// SECOND, WHICH RFC 7523 METHOD an id that is known to exist is registered for, in a
-    /// deployment running both. `private_key_jwt` costs an asymmetric verification (ES256, RS256 or
-    /// EdDSA) and `client_secret_jwt` costs an HMAC, and no single dummy on one request can be more
+    /// deployment running both. `private_key_jwt` costs an asymmetric verification (ES256, RS256,
+    /// EdDSA or PS256) and `client_secret_jwt` costs an HMAC, and no single dummy on one request can be more
     /// than one of those; [`AuthorizationServer::dummy_assertion_verify`] picks the algorithm the
     /// request's assertion HEADER presents, which is the one a known id would actually verify under.
     /// This is not an enumeration primitive: it says nothing about whether an id exists, and it is
@@ -3393,7 +3446,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // signature; see the FOURTH residual on `authenticate_client`, and `CredentialCost`.
         paid.assertion = true;
         // The registration's algorithm chooses the verifier, never the token header. A
-        // `private_key_jwt` registration names one asymmetric `JwsAlg` (ES256, RS256, or EdDSA) and
+        // `private_key_jwt` registration names one asymmetric `JwsAlg` (ES256, RS256, EdDSA, or PS256) and
         // `verify_assertion` refuses it on a `None` verifier; `client_secret_jwt` is HS256 over the
         // registered secret and needs none.
         let assertion_verifier = keys.asymmetric_alg().and_then(|alg| self.jws_verifier(alg));

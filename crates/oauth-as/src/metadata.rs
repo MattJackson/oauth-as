@@ -345,6 +345,26 @@ fn advertised_jwks_uri(config: &ServerConfig) -> Option<String> {
     config.jwks_uri.clone()
 }
 
+/// Filter a list of JOSE `alg` names against the server-level [`crate::jwt::AlgAllowList`], for the
+/// STATIC metadata baselines (`ASSERTION_SIGNING_ALGS`, `DPOP_SIGNING_ALG_VALUES_SUPPORTED`,
+/// `REQUEST_OBJECT_SIGNING_ALGS`).
+///
+/// A name that [`crate::jwt::classify_alg`] does not map to a [`crate::jwt::JwsAlg`] — `HS256`, the
+/// symmetric `client_secret_jwt` algorithm — is NOT governed by this allow-list (it is not an
+/// asymmetric `JwsAlg`) and is kept unconditionally; dropping it here would silently under-advertise
+/// a method the endpoint still accepts. Every asymmetric name is kept iff the allow-list permits it.
+/// For the canonical FAPI subset (`ES256` + `PS256`) this is a no-op on these ES256-only baselines —
+/// it is load-bearing only for a deployment that also forbids `ES256`.
+#[cfg(feature = "jwt-p256")]
+#[allow(dead_code)] // Unused in a `jwt-p256` build with no jar/dpop/client-assertion endpoint.
+fn baseline_algs(names: &[&str], allow: &crate::jwt::AlgAllowList) -> Vec<String> {
+    names
+        .iter()
+        .filter(|&&name| crate::jwt::classify_alg(name).map_or(true, |alg| allow.is_allowed(alg)))
+        .map(|&name| name.to_string())
+        .collect()
+}
+
 impl AuthorizationServerMetadata {
     /// Derive the document from the server's configuration.
     ///
@@ -413,10 +433,10 @@ impl AuthorizationServerMetadata {
             // at all, which is what that method keys off.
             #[cfg(all(feature = "jar", feature = "jwt-p256"))]
             request_object_signing_alg_values_supported: config.jar.as_ref().map(|_| {
-                crate::par::REQUEST_OBJECT_SIGNING_ALGS
-                    .iter()
-                    .map(|alg| alg.to_string())
-                    .collect()
+                baseline_algs(
+                    crate::par::REQUEST_OBJECT_SIGNING_ALGS,
+                    &config.jws_alg_allow_list,
+                )
             }),
             #[cfg(all(feature = "jar", not(feature = "jwt-p256")))]
             request_object_signing_alg_values_supported: None,
@@ -470,12 +490,10 @@ impl AuthorizationServerMetadata {
             // The same split, one member along: HS256 is checkable in every build with the
             // feature, ES256 only where there is a backend to check it with.
             #[cfg(all(feature = "client-assertion", feature = "jwt-p256"))]
-            token_endpoint_auth_signing_alg_values_supported: Some(
-                crate::client_assertion::ASSERTION_SIGNING_ALGS
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect(),
-            ),
+            token_endpoint_auth_signing_alg_values_supported: Some(baseline_algs(
+                crate::client_assertion::ASSERTION_SIGNING_ALGS,
+                &config.jws_alg_allow_list,
+            )),
             #[cfg(all(feature = "client-assertion", not(feature = "jwt-p256")))]
             token_endpoint_auth_signing_alg_values_supported: Some(vec!["HS256".to_string()]),
             #[cfg(not(feature = "client-assertion"))]
@@ -483,12 +501,10 @@ impl AuthorizationServerMetadata {
             // RFC 9449 s5.1: a proof is an ES256 JWS this server VERIFIES, so with no backend
             // there is no algorithm a client could send one under.
             #[cfg(all(feature = "dpop", feature = "jwt-p256"))]
-            dpop_signing_alg_values_supported: Some(
-                crate::dpop::DPOP_SIGNING_ALG_VALUES_SUPPORTED
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect(),
-            ),
+            dpop_signing_alg_values_supported: Some(baseline_algs(
+                crate::dpop::DPOP_SIGNING_ALG_VALUES_SUPPORTED,
+                &config.jws_alg_allow_list,
+            )),
             #[cfg(all(feature = "dpop", not(feature = "jwt-p256")))]
             dpop_signing_alg_values_supported: None,
             #[cfg(not(feature = "dpop"))]
@@ -524,7 +540,7 @@ impl AuthorizationServerMetadata {
     ///
     /// Kept as the ES256 spelling for the crate's own tests; it delegates to the per-algorithm
     /// [`AuthorizationServerMetadata::mark_alg_verifiable`], which the server now calls once per
-    /// algorithm whose verifier resolves (ES256, RS256, EdDSA). Test-only: production code reaches
+    /// algorithm whose verifier resolves (ES256, RS256, EdDSA, PS256). Test-only: production code reaches
     /// `mark_alg_verifiable` directly.
     ///
     /// Gated on `client-assertion` alone, its one caller's feature: `mark_alg_verifiable` also
@@ -544,7 +560,7 @@ impl AuthorizationServerMetadata {
     /// calls this once per algorithm it actually resolves a verifier for. Every push is idempotent,
     /// so calling it for an algorithm `from_config` already listed is a no-op.
     ///
-    /// All three wired algorithms are asymmetric SIGNATURES, so each makes `private_key_jwt`
+    /// All four wired algorithms are asymmetric SIGNATURES, so each makes `private_key_jwt`
     /// honest; only HS256 (which never reaches this seam) is the symmetric exception.
     #[cfg(any(feature = "client-assertion", feature = "jar", feature = "dpop"))]
     pub(crate) fn mark_alg_verifiable(&mut self, alg: crate::jwt::JwsAlg) {

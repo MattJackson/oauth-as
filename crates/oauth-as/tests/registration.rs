@@ -731,12 +731,19 @@ fn a_host_that_never_registers_anything_pays_one_pointer() {
     const RESOURCE_SERVERS: usize = 16;
     // Same opt-in Duration accounted for by the core allocation gate.
     const REFRESH_RETRY_WINDOW: usize = 16;
+    // Same `jws_alg_allow_list` (`AlgAllowList`, `#[cfg(jwt)]`) the core allocation gate accounts
+    // for: 8 bytes (4 payload + alignment padding). Named here for the same reason as every term.
+    // The `cimd` term mirrors the canonical formula in `tests/allocation.rs` so the two budgets stay
+    // the same shape: `ServerConfig::client_id_metadata_document_policy` is an `Option<Box<_>>`, one
+    // word, present only under `cimd`.
     assert!(
         std::mem::size_of::<ServerConfig>()
             <= 448
                 + RESOURCE_SERVERS
                 + REFRESH_RETRY_WINDOW
-                + if cfg!(feature = "rar") { 24 } else { 0 },
+                + if cfg!(feature = "rar") { 24 } else { 0 }
+                + if cfg!(feature = "cimd") { 8 } else { 0 }
+                + if cfg!(feature = "jwt") { 8 } else { 0 },
         "ServerConfig grew past its size budget: {}",
         std::mem::size_of::<ServerConfig>()
     );

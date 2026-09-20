@@ -16,9 +16,11 @@
 //! SIGNED under, crossed with every algorithm name a header could CLAIM — the wired ones plus a
 //! fixed set of foreign spellings — and asserts the credential is accepted only when the claimed
 //! algorithm matches the one it was signed under. Under `--all-features` the wired set is the full
-//! ES256 / RS256 / EdDSA, so the matrix is 3×N: an ES256-signed credential claiming RS256, an
-//! RSA-signed credential claiming ES256 (a cross-KIND swap), and every `none`/`HS256`/foreign
-//! spelling are each REFUSED at all three sites, while the truthfully-labelled one is accepted.
+//! ES256 / RS256 / EdDSA / PS256, so the matrix is 4×N: an ES256-signed credential claiming RS256, an
+//! RSA-signed credential claiming ES256 (a cross-KIND swap), a PS256-signed credential claiming RS256
+//! (a same-KEY, different-PADDING swap, since PS256 and RS256 share `KeyKind::Rsa`) and vice-versa,
+//! and every `none`/`HS256`/foreign spelling are each REFUSED at all three sites, while the
+//! truthfully-labelled one is accepted.
 
 #![cfg(all(
     feature = "jwt-p256",
@@ -61,11 +63,15 @@ fn secs(t: SystemTime) -> u64 {
 // ---------------------------------------------------------------------------- the signer per row
 
 /// One signer for each wired algorithm, so the matrix can produce a genuinely-signed credential
-/// under any of them. The RS256 and EdDSA variants exist only when their backend is compiled.
+/// under any of them. The RS256, PS256 and EdDSA variants exist only when their backend is compiled.
 enum MatrixKey {
     Es256(EcdsaP256Key),
     #[cfg(feature = "jwt-rsa")]
     Rs256(Box<oauth_as::RsaSigner>),
+    // PS256 uses the SAME A.2 RSA public key as the RS256 row, so the cross-verify rows are a genuine
+    // same-key/different-padding confusion test rather than merely different keys.
+    #[cfg(feature = "jwt-rsa")]
+    Ps256(Box<oauth_as::Ps256Signer>),
     #[cfg(feature = "jwt-ed25519")]
     EdDsa(oauth_as::Ed25519Signer),
 }
@@ -76,6 +82,8 @@ impl MatrixKey {
             MatrixKey::Es256(k) => JwsSigner::alg(k),
             #[cfg(feature = "jwt-rsa")]
             MatrixKey::Rs256(k) => JwsSigner::alg(k.as_ref()),
+            #[cfg(feature = "jwt-rsa")]
+            MatrixKey::Ps256(k) => JwsSigner::alg(k.as_ref()),
             #[cfg(feature = "jwt-ed25519")]
             MatrixKey::EdDsa(k) => JwsSigner::alg(k),
         }
@@ -86,6 +94,8 @@ impl MatrixKey {
             MatrixKey::Es256(k) => JwsSigner::public_jwk(k),
             #[cfg(feature = "jwt-rsa")]
             MatrixKey::Rs256(k) => JwsSigner::public_jwk(k.as_ref()),
+            #[cfg(feature = "jwt-rsa")]
+            MatrixKey::Ps256(k) => JwsSigner::public_jwk(k.as_ref()),
             #[cfg(feature = "jwt-ed25519")]
             MatrixKey::EdDsa(k) => JwsSigner::public_jwk(k),
         }
@@ -102,6 +112,8 @@ impl MatrixKey {
             MatrixKey::Es256(k) => JwsSigner::sign(k, input).await,
             #[cfg(feature = "jwt-rsa")]
             MatrixKey::Rs256(k) => JwsSigner::sign(k.as_ref(), input).await,
+            #[cfg(feature = "jwt-rsa")]
+            MatrixKey::Ps256(k) => JwsSigner::sign(k.as_ref(), input).await,
             #[cfg(feature = "jwt-ed25519")]
             MatrixKey::EdDsa(k) => JwsSigner::sign(k, input).await,
         }
@@ -137,6 +149,16 @@ fn signer_for(alg: JwsAlg) -> Option<MatrixKey> {
                 None
             }
         }
+        JwsAlg::Ps256 => {
+            #[cfg(feature = "jwt-rsa")]
+            {
+                Some(MatrixKey::Ps256(Box::new(ps256_matrix_signer())))
+            }
+            #[cfg(not(feature = "jwt-rsa"))]
+            {
+                None
+            }
+        }
         JwsAlg::EdDsa => {
             #[cfg(feature = "jwt-ed25519")]
             {
@@ -156,7 +178,7 @@ fn signer_for(alg: JwsAlg) -> Option<MatrixKey> {
 /// The RFC 7515 Appendix A.2 RSA-2048 private key, rebuilt deterministically from its components so
 /// the matrix needs no RNG and no `getrandom` feature on `rsa`, and sits right at the 2048-bit floor.
 #[cfg(feature = "jwt-rsa")]
-fn rsa_matrix_signer() -> oauth_as::RsaSigner {
+fn a2_rsa_private_key() -> rsa::RsaPrivateKey {
     use rsa::{BigUint, RsaPrivateKey};
     const N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
     const E: &str = "AQAB";
@@ -164,9 +186,21 @@ fn rsa_matrix_signer() -> oauth_as::RsaSigner {
     const P: &str = "4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPGBY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUc";
     const Q: &str = "uQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdc";
     let b = |s: &str| BigUint::from_bytes_be(&URL_SAFE_NO_PAD.decode(s).unwrap());
-    let key = RsaPrivateKey::from_components(b(N), b(E), b(D), vec![b(P), b(Q)])
-        .expect("A.2 components are consistent");
-    oauth_as::RsaSigner::from_private_key("matrix-rsa", key).expect("A.2 is a 2048-bit key")
+    RsaPrivateKey::from_components(b(N), b(E), b(D), vec![b(P), b(Q)])
+        .expect("A.2 components are consistent")
+}
+
+#[cfg(feature = "jwt-rsa")]
+fn rsa_matrix_signer() -> oauth_as::RsaSigner {
+    oauth_as::RsaSigner::from_private_key("matrix-rsa", a2_rsa_private_key())
+        .expect("A.2 is a 2048-bit key")
+}
+
+/// PS256 over the SAME A.2 key as `rsa_matrix_signer`: same public modulus, PSS padding.
+#[cfg(feature = "jwt-rsa")]
+fn ps256_matrix_signer() -> oauth_as::Ps256Signer {
+    oauth_as::Ps256Signer::from_private_key("matrix-ps256", a2_rsa_private_key())
+        .expect("A.2 is a 2048-bit key")
 }
 
 /// The verifier for a wired algorithm. Only ever called for an algorithm whose signer exists, which
@@ -176,6 +210,8 @@ fn verifier_for(alg: JwsAlg) -> &'static dyn JwsVerifier {
         JwsAlg::Es256 => &oauth_as::jwt::P256Verifier,
         #[cfg(feature = "jwt-rsa")]
         JwsAlg::Rs256 => &oauth_as::RsaVerifier,
+        #[cfg(feature = "jwt-rsa")]
+        JwsAlg::Ps256 => &oauth_as::Ps256Verifier,
         #[cfg(feature = "jwt-ed25519")]
         JwsAlg::EdDsa => &oauth_as::Ed25519Verifier,
         #[allow(unreachable_patterns)]
@@ -190,6 +226,8 @@ fn all_verifiers() -> JwsVerifiers {
     verifiers.install(Arc::new(oauth_as::jwt::P256Verifier));
     #[cfg(feature = "jwt-rsa")]
     verifiers.install(Arc::new(oauth_as::RsaVerifier));
+    #[cfg(feature = "jwt-rsa")]
+    verifiers.install(Arc::new(oauth_as::Ps256Verifier));
     #[cfg(feature = "jwt-ed25519")]
     verifiers.install(Arc::new(oauth_as::Ed25519Verifier));
     verifiers
@@ -212,7 +250,10 @@ fn claimed_alg_spellings() -> Vec<String> {
         .iter()
         .map(|a| a.jose_name().to_string())
         .collect();
-    for foreign in ["none", "HS256", "PS256", "ES384", "ES512"] {
+    // "PS256" is no longer here: it is a WIRED algorithm now, added by the `JwsAlg::ALL` loop above.
+    // The foreign set stays the confusion classics (`none`, `HS256`) plus asymmetric algs this crate
+    // does not wire.
+    for foreign in ["none", "HS256", "ES384", "ES512"] {
         names.push(foreign.to_string());
     }
     names

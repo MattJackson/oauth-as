@@ -363,9 +363,9 @@ pub use jwt::{classify_alg, consistent, expect_alg};
 #[cfg(feature = "jwt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
 pub use jwt::{
-    AccessTokenFormat, AlgPolicy, AlgRefusal, Audience, EcCurve, Jwk, Jwks, JwsAlg, JwsSignature,
-    JwsSigner, JwsVerifier, JwsVerifiers, JwtConfig, JwtError, KeyError, KeyKind, OkpCurve,
-    SignerError, VerifyError,
+    AccessTokenFormat, AlgAllowList, AlgPolicy, AlgRefusal, Audience, EcCurve, Jwk, Jwks, JwsAlg,
+    JwsSignature, JwsSigner, JwsVerifier, JwsVerifiers, JwtConfig, JwtError, KeyError, KeyKind,
+    OkpCurve, SignerError, VerifyError,
 };
 // NARROWER on purpose: these are the BUILT-IN backends, which `jwt` deliberately does not carry
 // (see the `jwt-p256`/`jwt-rsa`/`jwt-ed25519` notes in Cargo.toml). `KeyError` is with `jwt` above
@@ -375,7 +375,7 @@ pub use jwt::{
 pub use backends::ed25519::{Ed25519Signer, Ed25519Verifier};
 #[cfg(feature = "jwt-rsa")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt-rsa")))]
-pub use backends::rsa::{RsaSigner, RsaVerifier};
+pub use backends::rsa::{Ps256Signer, Ps256Verifier, RsaSigner, RsaVerifier};
 #[cfg(feature = "jwt-p256")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt-p256")))]
 pub use jwt::{EcdsaP256Key, P256Verifier};

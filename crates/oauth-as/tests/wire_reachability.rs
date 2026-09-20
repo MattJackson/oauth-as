@@ -688,7 +688,7 @@ async fn prove_auth_method(fx: &Fixture, method: &str) {
         }
         // No ES256 backend, but crypto agility made `private_key_jwt` an ANY-asymmetric-backend
         // method: `AuthorizationServer::metadata` calls `mark_alg_verifiable` once per verifier it
-        // resolves (ES256, RS256, EdDSA), so a build with the RSA or EdDSA backend advertises the
+        // resolves (ES256, RS256, EdDSA, PS256), so a build with the RSA or EdDSA backend advertises the
         // method honestly and owes the same wire proof the ES256 arm gives. Redeem an assertion
         // signed by whichever backend this build compiled; the fixture registered a matching key.
         #[cfg(all(
@@ -974,10 +974,10 @@ async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
                             );
                         }
                     }
-                    // The RS256/EdDSA backends advertise their algorithm exactly when their verifier
-                    // resolves, the same honesty rule ES256 follows; each therefore owes the same
-                    // wire proof — a credential genuinely signed under it, redeemed for that member's
-                    // own purpose.
+                    // The RS256/EdDSA/PS256 backends advertise their algorithm exactly when their
+                    // verifier resolves, the same honesty rule ES256 follows; each therefore owes the
+                    // same wire proof — a credential genuinely signed under it, redeemed for that
+                    // member's own purpose.
                     "RS256" => {
                         assert!(
                             rs256_is_performed_over_the_wire(&service, member, label).await,
@@ -1002,6 +1002,20 @@ async fn every_advertised_signing_algorithm_can_be_performed_by_this_build() {
                             assert!(
                                 methods.iter().any(|m| m == "private_key_jwt"),
                                 "{label}: EdDSA is advertised for client authentication but \
+                                 private_key_jwt is not among {methods:?}"
+                            );
+                        }
+                    }
+                    "PS256" => {
+                        assert!(
+                            ps256_is_performed_over_the_wire(&service, member, label).await,
+                            "{label}: {member} advertises PS256 and a credential signed PS256 for \
+                             that member's own purpose was REFUSED over the wire"
+                        );
+                        if member == "token_endpoint_auth_signing_alg_values_supported" {
+                            assert!(
+                                methods.iter().any(|m| m == "private_key_jwt"),
+                                "{label}: PS256 is advertised for client authentication but \
                                  private_key_jwt is not among {methods:?}"
                             );
                         }
@@ -1054,11 +1068,11 @@ async fn es256_is_performed_over_the_wire(service: &Service, member: &str, label
     }
 }
 
-// ---------------------------------------------------------------- RS256 / EdDSA wire proofs
+// ---------------------------------------------------------- RS256 / EdDSA / PS256 wire proofs
 //
-// The RS256 and EdDSA backends advertise their algorithm only when their verifier resolves (the
-// built-in one for the feature, here), so each owes the same wire proof ES256 does: a credential
-// genuinely signed under it, redeemed for the advertising member's own purpose.
+// The RS256, EdDSA and PS256 backends advertise their algorithm only when their verifier resolves
+// (the built-in one for the feature, here), so each owes the same wire proof ES256 does: a
+// credential genuinely signed under it, redeemed for the advertising member's own purpose.
 
 /// Sign `header`/`payload` into a compact JWS with `signer`'s real algorithm. The seam's `sign` is
 /// async but ready on the first poll for every in-process backend.
@@ -1081,6 +1095,7 @@ async fn encode_and_sign(
         JwsSignature::Es256(b) => b,
         JwsSignature::Rs256(b) => b,
         JwsSignature::EdDsa(b) => b,
+        JwsSignature::Ps256(b) => b,
     };
     format!("{input}.{}", URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -1113,28 +1128,70 @@ async fn eddsa_is_performed_over_the_wire(service: &Service, member: &str, label
     }
 }
 
-/// The RFC 7515 A.2 RSA-2048 key, rebuilt deterministically (no RNG), shared by the RS256 assertion
-/// registration and every RS256 probe so they agree.
+async fn ps256_is_performed_over_the_wire(service: &Service, member: &str, label: &str) -> bool {
+    // Distinct `ps256-` prefix so the DPoP `jti` (and assertion `jti`) does not collide with the
+    // RS256 probe's, which sweeps the SAME member string and would otherwise trip replay refusal.
+    let nonce = format!("ps256-{label}-{member}");
+    match member {
+        "token_endpoint_auth_signing_alg_values_supported" => {
+            ps256_client_assertion_is_accepted(service, &nonce).await
+        }
+        "dpop_signing_alg_values_supported" => ps256_dpop_proof_is_accepted(service, &nonce).await,
+        other => panic!(
+            "{label}: {other} advertises PS256 and nothing here signs the credential that member \
+             is a promise about."
+        ),
+    }
+}
+
+/// The RFC 7515 A.2 RSA-2048 private key, rebuilt deterministically (no RNG) from its published
+/// components. SHARED by `rsa_signer` and `ps256_signer` so the two signers genuinely hold the SAME
+/// modulus — which is exactly what the RS256 vs PS256 same-key/different-padding cross-verify rows
+/// depend on. One copy of the constants means the two cannot silently diverge.
+#[cfg(all(
+    feature = "jwt-rsa",
+    any(feature = "client-assertion", feature = "dpop")
+))]
+fn a2_rsa_private_key() -> rsa::RsaPrivateKey {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use rsa::{BigUint, RsaPrivateKey};
+    const N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
+    const E: &str = "AQAB";
+    const D: &str = "Eq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyWPEAeP88vLNO97IjlA7_GQ5sLKMgvfTeXZx9SE-7YwVol2NXOoAJe46sui395IW_GO-pWJ1O0BkTGoVEn2bKVRUCgu-GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzjkn439X0M_V51gfpRLI9JYanrC4D4qAdGcopV_0ZHHzQlBjudU2QvXt4ehNYTCBr6XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl_x_jTj3ccPDVZFD9pIuhLhBOneufuBiB4cS98l2SR_RQyGWSeWjnczT0QU91p1DhOVRuOopznQ";
+    const P: &str = "4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPGBY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUc";
+    const Q: &str = "uQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdc";
+    let b = |s: &str| BigUint::from_bytes_be(&URL_SAFE_NO_PAD.decode(s).unwrap());
+    RsaPrivateKey::from_components(b(N), b(E), b(D), vec![b(P), b(Q)])
+        .expect("A.2 components are consistent")
+}
+
+/// The A.2 key as an RS256 (PKCS#1 v1.5) signer, shared by the RS256 assertion registration and
+/// every RS256 probe so they agree.
 #[cfg(all(
     feature = "jwt-rsa",
     any(feature = "client-assertion", feature = "dpop")
 ))]
 fn rsa_signer() -> &'static oauth_as::RsaSigner {
-    use rsa::{BigUint, RsaPrivateKey};
     use std::sync::OnceLock;
     static KEY: OnceLock<oauth_as::RsaSigner> = OnceLock::new();
     KEY.get_or_init(|| {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine as _;
-        const N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
-        const E: &str = "AQAB";
-        const D: &str = "Eq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyWPEAeP88vLNO97IjlA7_GQ5sLKMgvfTeXZx9SE-7YwVol2NXOoAJe46sui395IW_GO-pWJ1O0BkTGoVEn2bKVRUCgu-GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzjkn439X0M_V51gfpRLI9JYanrC4D4qAdGcopV_0ZHHzQlBjudU2QvXt4ehNYTCBr6XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl_x_jTj3ccPDVZFD9pIuhLhBOneufuBiB4cS98l2SR_RQyGWSeWjnczT0QU91p1DhOVRuOopznQ";
-        const P: &str = "4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPGBY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUc";
-        const Q: &str = "uQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdc";
-        let b = |s: &str| BigUint::from_bytes_be(&URL_SAFE_NO_PAD.decode(s).unwrap());
-        let key = RsaPrivateKey::from_components(b(N), b(E), b(D), vec![b(P), b(Q)])
-            .expect("A.2 components are consistent");
-        oauth_as::RsaSigner::from_private_key(PRIVATE_KEY_JWT_RSA_CLIENT, key)
+        oauth_as::RsaSigner::from_private_key(PRIVATE_KEY_JWT_RSA_CLIENT, a2_rsa_private_key())
+            .expect("A.2 is a 2048-bit key")
+    })
+}
+
+/// The SAME A.2 key wrapped as a PS256 (RSASSA-PSS) signer, shared by the PS256 assertion
+/// registration and every PS256 probe. Same modulus as `rsa_signer`, PSS padding.
+#[cfg(all(
+    feature = "jwt-rsa",
+    any(feature = "client-assertion", feature = "dpop")
+))]
+fn ps256_signer() -> &'static oauth_as::Ps256Signer {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<oauth_as::Ps256Signer> = OnceLock::new();
+    KEY.get_or_init(|| {
+        oauth_as::Ps256Signer::from_private_key(PRIVATE_KEY_JWT_PS_CLIENT, a2_rsa_private_key())
             .expect("A.2 is a 2048-bit key")
     })
 }
@@ -1161,6 +1218,14 @@ const PRIVATE_KEY_JWT_RSA_CLIENT: &str = "pkjwt-rsa-app";
     not(feature = "client-assertion")
 ))]
 const PRIVATE_KEY_JWT_RSA_CLIENT: &str = "pkjwt-rsa-app";
+#[cfg(all(feature = "client-assertion", feature = "jwt-rsa"))]
+const PRIVATE_KEY_JWT_PS_CLIENT: &str = "pkjwt-ps-app";
+#[cfg(all(
+    feature = "dpop",
+    feature = "jwt-rsa",
+    not(feature = "client-assertion")
+))]
+const PRIVATE_KEY_JWT_PS_CLIENT: &str = "pkjwt-ps-app";
 #[cfg(all(feature = "client-assertion", feature = "jwt-ed25519"))]
 const PRIVATE_KEY_JWT_ED_CLIENT: &str = "pkjwt-ed-app";
 #[cfg(all(
@@ -1184,6 +1249,23 @@ async fn rs256_client_assertion_is_accepted(service: &Service, nonce: &str) -> b
 }
 #[cfg(not(all(feature = "client-assertion", feature = "jwt-rsa")))]
 async fn rs256_client_assertion_is_accepted(_service: &Service, _nonce: &str) -> bool {
+    false
+}
+
+#[cfg(all(feature = "client-assertion", feature = "jwt-rsa"))]
+async fn ps256_client_assertion_is_accepted(service: &Service, nonce: &str) -> bool {
+    let header = serde_json::json!({ "alg": "PS256", "typ": "JWT" });
+    let assertion = encode_and_sign(
+        &header,
+        &assertion_claims(PRIVATE_KEY_JWT_PS_CLIENT, nonce),
+        ps256_signer(),
+    )
+    .await;
+    let response = assertion_token(service, PRIVATE_KEY_JWT_PS_CLIENT, &assertion).await;
+    response.status == http::StatusCode::OK && response.json().get("access_token").is_some()
+}
+#[cfg(not(all(feature = "client-assertion", feature = "jwt-rsa")))]
+async fn ps256_client_assertion_is_accepted(_service: &Service, _nonce: &str) -> bool {
     false
 }
 
@@ -1222,6 +1304,27 @@ async fn rs256_dpop_proof_is_accepted(service: &Service, nonce: &str) -> bool {
 }
 #[cfg(not(all(feature = "dpop", feature = "jwt-rsa")))]
 async fn rs256_dpop_proof_is_accepted(_service: &Service, _nonce: &str) -> bool {
+    false
+}
+
+#[cfg(all(feature = "dpop", feature = "jwt-rsa"))]
+async fn ps256_dpop_proof_is_accepted(service: &Service, nonce: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let header = serde_json::json!({
+        "typ": oauth_as::dpop::DPOP_PROOF_TYP,
+        "alg": "PS256",
+        "jwk": serde_json::to_value(oauth_as::jwt::JwsSigner::public_jwk(ps256_signer())).unwrap(),
+    });
+    let claims =
+        serde_json::json!({ "jti": nonce, "htm": "POST", "htu": TOKEN_ENDPOINT, "iat": now });
+    let proof = encode_and_sign(&header, &claims, ps256_signer()).await;
+    dpop_bound_token_is_issued(service, proof).await
+}
+#[cfg(not(all(feature = "dpop", feature = "jwt-rsa")))]
+async fn ps256_dpop_proof_is_accepted(_service: &Service, _nonce: &str) -> bool {
     false
 }
 
@@ -1755,9 +1858,9 @@ async fn register_assertion_clients(server: &AuthorizationServer<MemoryStorage, 
             .expect("register the private_key_jwt client");
     }
 
-    // The RS256 and EdDSA `private_key_jwt` clients, one per compiled backend, so the sweep's RS256
-    // and EdDSA arms have a registered key to redeem an assertion against. Same shape as the ES256
-    // one, one algorithm and one key per registration.
+    // The RS256, PS256 and EdDSA `private_key_jwt` clients, one per compiled backend, so the sweep's
+    // RS256, PS256 and EdDSA arms have a registered key to redeem an assertion against. Same shape as
+    // the ES256 one, one algorithm and one key per registration.
     #[cfg(feature = "jwt-rsa")]
     {
         let mut pk = confidential_client();
@@ -1772,6 +1875,19 @@ async fn register_assertion_clients(server: &AuthorizationServer<MemoryStorage, 
             .register_client(pk)
             .await
             .expect("register the RS256 private_key_jwt client");
+
+        let mut ps = confidential_client();
+        ps.client_id = ClientId::new(PRIVATE_KEY_JWT_PS_CLIENT);
+        ps.auth = ClientAuth::ConfidentialAssertion {
+            keys: AssertionKeys::PublicKeys {
+                alg: oauth_as::jwt::JwsAlg::Ps256,
+                keys: vec![oauth_as::jwt::JwsSigner::public_jwk(ps256_signer())],
+            },
+        };
+        server
+            .register_client(ps)
+            .await
+            .expect("register the PS256 private_key_jwt client");
     }
     #[cfg(feature = "jwt-ed25519")]
     {

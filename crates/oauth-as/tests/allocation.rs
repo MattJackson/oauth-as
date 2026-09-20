@@ -849,6 +849,16 @@ fn core_public_types_stay_within_their_size_budget() {
     // One Duration for the opt-in retry policy. It allocates nothing when disabled.
     // Measured with all features: AuthorizationServer 1000 -> 1016 bytes.
     const REFRESH_RETRY_WINDOW: usize = 16;
+    // `ServerConfig::jws_alg_allow_list`: an `AlgAllowList` (`[bool; JwsAlg::ALL.len()]`, one byte
+    // per wired algorithm), `Copy`, no allocation, gated on `jwt`. Costs 8 bytes here — 4 payload
+    // bytes plus alignment padding within `ServerConfig`. What it buys is the server-level FAPI
+    // algorithm allow-list (`ES256`/`PS256` only, `RS256` forbidden) enforced at both verifier
+    // resolution chokepoints, rather than trusting every client registration to pin a safe alg.
+    // MEASURED on `--all-features`: AuthorizationServer 1024 -> 1032 bytes.
+    #[cfg(feature = "jwt")]
+    const JWS_ALG_ALLOW_LIST: usize = 8;
+    #[cfg(not(feature = "jwt"))]
+    const JWS_ALG_ALLOW_LIST: usize = 0;
     let server_budget = 832
         + REVOCATION_BARRIERS
         + RESOURCE_SERVERS
@@ -857,7 +867,8 @@ fn core_public_types_stay_within_their_size_budget() {
         + RAR
         + TOKEN_ENDPOINT
         + CIMD
-        + REFRESH_RETRY_WINDOW;
+        + REFRESH_RETRY_WINDOW
+        + JWS_ALG_ALLOW_LIST;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",
@@ -868,7 +879,8 @@ fn core_public_types_stay_within_their_size_budget() {
     // 0.9.2 the `resource_servers` boxed slice above, whose 16 bytes are attributed there.
     // MEASURED: 464 before that field, 488 as a `Vec`, 480 as a boxed slice.
     assert!(
-        size_of::<ServerConfig>() <= 448 + RESOURCE_SERVERS + RAR + CIMD + REFRESH_RETRY_WINDOW,
+        size_of::<ServerConfig>()
+            <= 448 + RESOURCE_SERVERS + RAR + CIMD + REFRESH_RETRY_WINDOW + JWS_ALG_ALLOW_LIST,
         "ServerConfig grew past its size budget: {}",
         size_of::<ServerConfig>()
     );

@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
-//! RS256 backend (Phase B of crypto agility): RSASSA-PKCS1-v1.5 with SHA-256 (RFC 8017 §8.2, which
-//! RFC 7518 §3.3 names `RS256`), over the pure-Rust RustCrypto [`rsa`] crate.
+//! RS256 + PS256 backends (Phase B of crypto agility): RSASSA-PKCS1-v1.5 (RFC 8017 §8.2, which RFC
+//! 7518 §3.3 names `RS256`) and RSASSA-PSS with MGF1-SHA-256 and salt length 32 (RFC 8017 §8.1, which
+//! RFC 7518 §3.5 names `PS256`), both with SHA-256, over the pure-Rust RustCrypto [`rsa`] crate.
 //!
-//! This is the RSA analogue of the `p256` ES256 backend (`EcdsaP256Key`): a [`RsaSigner`] that
-//! implements [`JwsSigner`] and a [`RsaVerifier`] that implements [`JwsVerifier`]. It is ADDITIVE —
-//! a tree that enables both `jwt-p256` and `jwt-rsa` compiles, and a host that installs its own
-//! signer still wins, because installation beats a feature flag.
+//! These are the RSA analogues of the `p256` ES256 backend (`EcdsaP256Key`): a [`RsaSigner`] /
+//! [`Ps256Signer`] that implement [`JwsSigner`] and a [`RsaVerifier`] / [`Ps256Verifier`] that
+//! implement [`JwsVerifier`]. Both PADDINGS ride the SAME `jwt-rsa` feature and the SAME `rsa` crate
+//! (`rsa::pss` is unconditional there — no extra feature, no extra dependency). It is ADDITIVE — a
+//! tree that enables both `jwt-p256` and `jwt-rsa` compiles, and a host that installs its own signer
+//! still wins, because installation beats a feature flag.
+//!
+//! RS256 and PS256 are the SAME RSA key with DIFFERENT padding. What keeps the two apart is NOT the
+//! key (both are `Jwk::Rsa`, both `KeyKind::Rsa`) but the algorithm's own [`crate::jwt::JwsVerifiers`]
+//! slot: `RS256` routes only to [`RsaVerifier`] (PKCS#1 v1.5) and `PS256` only to [`Ps256Verifier`]
+//! (PSS), so a signature made under one padding fails verification under the other, structurally.
 //!
 //! # The RS256 backend module
 //! This module is WIRED and LIVE: `lib.rs` pulls it in with `mod backends;` behind the `jwt-rsa`
@@ -21,12 +29,13 @@
 //! private-key operation (decryption/**signing**) with no fix available in the 0.9 line. It matters
 //! here for [`RsaSigner`] and ONLY for [`RsaSigner`]:
 //!
-//! - **Signing is affected.** [`RsaSigner`] performs the private-key operation in THIS process, so a
-//!   local attacker able to measure signing time precisely could, in principle, recover the key.
-//! - **Verification is NOT affected.** [`RsaVerifier`] is public-key only (modular exponentiation
-//!   with the public exponent); the advisory does not apply to it. A deployment that only needs to
-//!   verify RS256 (RFC 9449 DPoP, RFC 9101 request objects, RFC 7523 `private_key_jwt` from clients)
-//!   can use this backend with no exposure.
+//! - **Signing is affected.** [`RsaSigner`] and [`Ps256Signer`] perform the private-key operation in
+//!   THIS process, so a local attacker able to measure signing time precisely could, in principle,
+//!   recover the key. (PSS applies no blinding on the plain `rsa::pss::SigningKey`, same posture.)
+//! - **Verification is NOT affected.** [`RsaVerifier`] and [`Ps256Verifier`] are public-key only
+//!   (modular exponentiation with the public exponent); the advisory does not apply to them. A
+//!   deployment that only needs to VERIFY RS256/PS256 (RFC 9449 DPoP, RFC 9101 request objects, RFC
+//!   7523 `private_key_jwt` from clients) can use this backend with no exposure.
 //!
 //! **Recommendation for production RSA signing:** do the private-key operation OUT OF PROCESS. The
 //! whole point of the `JwsSigner` seam being async is that a host can implement it against a cloud
@@ -45,7 +54,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
 use rsa::pkcs8::DecodePrivateKey as _;
-use rsa::signature::{SignatureEncoding as _, Signer as _, Verifier as _};
+use rsa::pss::{
+    Signature as PssSignature, SigningKey as PssSigningKey, VerifyingKey as PssVerifyingKey,
+};
+use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _, Signer as _, Verifier as _};
 use rsa::traits::PublicKeyParts as _;
 use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
 use sha2::Sha256;
@@ -259,6 +271,225 @@ pub fn rsa_public_jwk(public: &RsaPublicKey, kid: Option<String>) -> Jwk {
         n: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
         e: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
         kid,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PS256 (RSASSA-PSS) — the SAME RSA key material, DIFFERENT padding.
+// ---------------------------------------------------------------------------------------------
+
+/// The OS CSPRNG as a `rand_core` 0.6 RNG, for the one randomized signer in the crate.
+///
+/// PSS signing draws a fresh 32-byte salt per signature (RFC 8017 §9.1), so unlike deterministic
+/// PKCS#1 v1.5 it needs randomness. Zero-state: it holds nothing and reaches the OS synchronously per
+/// call through [`getrandom::fill`] — the SAME source [`crate::jwt::EcdsaP256Key::generate`] uses —
+/// so there is no hidden global, no background thread, and no new dependency. It exists to feed
+/// `RandomizedSigner::try_sign_with_rng`, which lets this backend avoid `rsa`'s `getrandom` feature
+/// (whose blanket `Signer::sign` would drag a second `getrandom`/`rand_core` major into the tree).
+///
+/// `RngCore::fill_bytes` is infallible, so an OS randomness failure PANICS here rather than surfacing
+/// as a `SignerError` — the same house style as `EcdsaP256Key::generate`'s `.expect(...)`. An AS that
+/// cannot draw randomness cannot safely mint artifacts; failing loudly is correct.
+struct OsFillRng;
+
+impl rsa::rand_core::RngCore for OsFillRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::fill(dest).expect("OS CSPRNG must be available to sign OAuth artifacts");
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rsa::rand_core::CryptoRng for OsFillRng {}
+
+/// An in-process PS256 signing key: RSASSA-PSS (MGF1-SHA-256, salt length 32) + SHA-256 over a
+/// `rsa::RsaPrivateKey`.
+///
+/// SECURITY: read the module-level RUSTSEC-2023-0071 note before using this to sign in production —
+/// the private-key operation (and no PSS blinding on the plain signing key) runs in this process; a
+/// KMS/HSM async [`JwsSigner`] is the production posture for RSA. Verification has no such caveat —
+/// see [`Ps256Verifier`]. PS256 shares the [`MIN_RSA_MODULUS_BITS`] 2048-bit floor with RS256.
+pub struct Ps256Signer {
+    kid: String,
+    signing: PssSigningKey<Sha256>,
+    public: RsaPublicKey,
+}
+
+impl Ps256Signer {
+    /// Load from a `rsa::RsaPrivateKey`, rejecting a modulus below [`MIN_RSA_MODULUS_BITS`]. The one
+    /// primitive every other constructor funnels through, so the 2048-bit floor lives in one place.
+    ///
+    /// `PssSigningKey::<Sha256>::new` fixes the salt length at the SHA-256 output size, 32 octets
+    /// (RFC 7518 §3.5); there is no `new_with_salt_len` on this path, so a non-standard salt length
+    /// cannot be configured by accident.
+    pub fn from_private_key(
+        kid: impl Into<String>,
+        private_key: RsaPrivateKey,
+    ) -> Result<Self, KeyError> {
+        let bits = private_key.n().bits();
+        if bits < MIN_RSA_MODULUS_BITS {
+            return Err(KeyError::new(format!(
+                "RSA modulus is {bits} bits; PS256 requires at least {MIN_RSA_MODULUS_BITS}"
+            )));
+        }
+        let public = private_key.to_public_key();
+        Ok(Ps256Signer {
+            kid: kid.into(),
+            signing: PssSigningKey::<Sha256>::new(private_key),
+            public,
+        })
+    }
+
+    /// Load from a PKCS#8 (RFC 5208) `PrivateKeyInfo` DER document. Funnels through
+    /// [`Ps256Signer::from_private_key`], so the [`MIN_RSA_MODULUS_BITS`] floor is enforced here too.
+    /// The key material is padding-agnostic: an RSA private key is a PS256 or an RS256 key depending
+    /// only on which signer wraps it.
+    pub fn from_pkcs8_der(kid: impl Into<String>, der: &[u8]) -> Result<Self, KeyError> {
+        let private_key = RsaPrivateKey::from_pkcs8_der(der)
+            .map_err(|_| KeyError::new("not a valid PKCS#8 RSA private key"))?;
+        Self::from_private_key(kid, private_key)
+    }
+
+    /// A freshly generated key of `bits` bits, for TESTS and a host's own provisioning step. Refuses
+    /// anything below the 2048-bit floor before spending time generating it. The RNG is INJECTED, for
+    /// the same reason [`RsaSigner::generate`] injects one.
+    pub fn generate<R: rsa::rand_core::CryptoRngCore>(
+        kid: impl Into<String>,
+        bits: usize,
+        rng: &mut R,
+    ) -> Result<Self, KeyError> {
+        if bits < MIN_RSA_MODULUS_BITS {
+            return Err(KeyError::new(format!(
+                "refusing to generate a {bits}-bit RSA key; PS256 requires at least {MIN_RSA_MODULUS_BITS}"
+            )));
+        }
+        let private_key = RsaPrivateKey::new(rng, bits)
+            .map_err(|_| KeyError::new("RSA key generation failed"))?;
+        Self::from_private_key(kid, private_key)
+    }
+
+    /// The key identifier published in the JWKS and in every token header signed with this key.
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    /// The PUBLIC half as an RFC 7517 RSA JWK. Never carries the private members.
+    pub fn public_jwk(&self) -> Jwk {
+        rsa_public_jwk(&self.public, Some(self.kid.clone()))
+    }
+
+    /// Sign a JWS Signing Input with PS256. RANDOMIZED (a fresh salt per call), so — unlike RS256 —
+    /// the output is not a pure function of key and input; verification stays deterministic.
+    fn sign_ps256(&self, message: &[u8]) -> Result<Box<[u8]>, SignerError> {
+        let signature: PssSignature = self
+            .signing
+            .try_sign_with_rng(&mut OsFillRng, message)
+            .map_err(|_| SignerError::new("RSA-PSS signing failed"))?;
+        // `to_bytes` yields exactly `k` octets (the modulus size), which `JwsSignature::Ps256`'s
+        // `Box<[u8]>` carries for any 2048/3072/4096-bit key.
+        Ok(signature.to_bytes())
+    }
+}
+
+impl JwsSigner for Ps256Signer {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Ps256
+    }
+
+    fn sign(&self, input: &[u8]) -> impl Future<Output = Result<JwsSignature, SignerError>> + Send {
+        // The salt is drawn and the signature computed BEFORE the future is created (synchronous
+        // `try_sign_with_rng`), so it is ready on first poll, matching the other in-process backends.
+        let result = self.sign_ps256(input).map(JwsSignature::Ps256);
+        async move { result }
+    }
+
+    fn public_jwk(&self) -> Jwk {
+        Ps256Signer::public_jwk(self)
+    }
+}
+
+impl fmt::Debug for Ps256Signer {
+    /// Redacted on purpose: a host that logs its config must not thereby log its signing key.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ps256Signer")
+            .field("kid", &self.kid)
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The PS256 verifier. Public-key only, so it is NOT subject to RUSTSEC-2023-0071 (see the module
+/// note). Stateless: it verifies against whatever `Jwk` the caller — never the token — chose.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ps256Verifier;
+
+impl JwsVerifier for Ps256Verifier {
+    fn alg(&self) -> JwsAlg {
+        JwsAlg::Ps256
+    }
+
+    /// Verify a PS256 signature. Returns `false` — NEVER panics — on any failure: a non-RSA `Jwk`, a
+    /// PKCS#1 v1.5 (RS256) signature over the same key, a signature made with any salt length other
+    /// than 32, malformed `n`/`e`, a sub-2048-bit modulus, a wrong-length signature, or an arithmetic
+    /// failure. The key is the caller's; this routes on neither the token's `alg` nor any lookup.
+    fn verify(&self, key: &Jwk, input: &[u8], sig: &[u8]) -> bool {
+        // Reject any key that is not an RSA JWK — an EC/OKP key reaching a PS256 verifier is an
+        // algorithm-confusion attempt. (RS256↔PS256 confusion is handled a layer up, by the slot: an
+        // RS256 header never reaches this verifier at all.)
+        let Jwk::Rsa { n, e, .. } = key else {
+            return false;
+        };
+
+        let (Ok(n_bytes), Ok(e_bytes)) = (URL_SAFE_NO_PAD.decode(n), URL_SAFE_NO_PAD.decode(e))
+        else {
+            return false;
+        };
+        if n_bytes.is_empty() || e_bytes.is_empty() {
+            return false;
+        }
+        let n_int = BigUint::from_bytes_be(&n_bytes);
+        let e_int = BigUint::from_bytes_be(&e_bytes);
+
+        let Ok(public) = RsaPublicKey::new(n_int, e_int) else {
+            return false;
+        };
+
+        // Same 2048-bit floor as RS256, enforced at verification time.
+        if public.n().bits() < MIN_RSA_MODULUS_BITS {
+            return false;
+        }
+
+        // A PS256 signature is exactly `k` octets (`k` == modulus size). `rsa`'s own PSS verify also
+        // rejects a wrong-length signature internally, so this explicit guard is defense-in-depth
+        // (matching `RsaVerifier`), not the sole gate.
+        if sig.len() != public.size() {
+            return false;
+        }
+        let Ok(signature) = PssSignature::try_from(sig) else {
+            return false;
+        };
+
+        // `PssVerifyingKey::<Sha256>::new` fixes the expected salt length at 32 (the SHA-256 output
+        // size) and MGF1-SHA-256; `verify` enforces that salt length exactly — a signature made with
+        // any other salt length is rejected. There is no salt-length-autodetect path.
+        PssVerifyingKey::<Sha256>::new(public)
+            .verify(input, &signature)
+            .is_ok()
     }
 }
 
@@ -498,6 +729,174 @@ mod seam_tests {
     fn from_pkcs8_der_rejects_malformed_der() {
         assert!(RsaSigner::from_pkcs8_der("k", b"not pkcs8 der").is_err());
         assert!(RsaSigner::from_pkcs8_der("k", &[]).is_err());
+    }
+
+    // A PS256 (RSASSA-PSS, salt length 32) signature over `SIGNING_INPUT` under the RFC 7515 A.2 RSA
+    // key. PSS is randomized, so there is no RFC known-answer vector; this one was produced once by
+    // this crate's `Ps256Signer` (equivalently `openssl dgst -sha256 -sigopt rsa_padding_mode:pss
+    // -sigopt rsa_pss_saltlen:32`) and PINNED. VERIFICATION is deterministic — the salt is carried in
+    // the signature — so any conforming PSS verifier that enforces salt length 32 accepts these exact
+    // bytes, which is what makes a pinned, externally-checkable vector meaningful here.
+    const PS256_A2_SIG: &str = "VPsxqpmiWCZjFcc9Oid-KEUsg3LR7ewNlohr2ZUUkpc63KZW4yJrYHZzSQn2jpMZRLrGB-A-SUU5R3_wzfH6upgpN3RorvmZc91E8aZWJqj0hu151XRTxvIO4Cnma8Qi1cFP6cftLOPs49aXP9OEzzZvmpBXWE0FTWIHLA0gKF9kZNX3xavVfR6owwN1-n6ZcC6SUwgthYdbTlME71p6IvtfBKS4JltoPYJKOQgEls44RomWn-RbpKEkD3Y1okxFZajveVNR7oXLQ_6WBPtY__L2Pfd365OVzcurpvXIcJs1EbeSorecaaIVHyeBBmWej2Gfi-2P-NNvCot3aUhdKA";
+
+    fn a2_signer_ps256() -> Ps256Signer {
+        let private_key = RsaPrivateKey::from_components(
+            BigUint::from_bytes_be(&b64u(N_B64URL)),
+            BigUint::from_bytes_be(&b64u(E_B64URL)),
+            BigUint::from_bytes_be(&b64u(D_B64URL)),
+            vec![
+                BigUint::from_bytes_be(&b64u(P_B64URL)),
+                BigUint::from_bytes_be(&b64u(Q_B64URL)),
+            ],
+        )
+        .unwrap();
+        Ps256Signer::from_private_key("test-rsa", private_key).unwrap()
+    }
+
+    /// `Ps256Verifier` ACCEPTS the pinned salt-32 PSS vector under the A.2 key, and `public_jwk`
+    /// round-trips the same `n`/`e`. A round-trip through the async signer also verifies.
+    #[tokio::test]
+    async fn ps256_verifier_accepts_pinned_vector_and_roundtrips() {
+        let sig = URL_SAFE_NO_PAD.decode(PS256_A2_SIG).unwrap();
+        assert!(
+            Ps256Verifier.verify(&rsa_jwk(), SIGNING_INPUT, &sig),
+            "the pinned salt-32 PSS vector must verify"
+        );
+
+        let signer = a2_signer_ps256();
+        assert_eq!(
+            JwsSigner::public_jwk(&signer),
+            rsa_jwk(),
+            "public_jwk must publish the A.2 n/e"
+        );
+        let JwsSignature::Ps256(fresh) = JwsSigner::sign(&signer, SIGNING_INPUT).await.unwrap()
+        else {
+            panic!("Ps256Signer must produce a Ps256 signature");
+        };
+        assert!(
+            Ps256Verifier.verify(&signer.public_jwk(), SIGNING_INPUT, &fresh),
+            "a freshly signed PS256 signature verifies under its own JWK"
+        );
+    }
+
+    /// THE HEADLINE CONFUSION TEST: under the IDENTICAL RSA public key, an RS256 (PKCS#1 v1.5)
+    /// signature must NOT verify through `Ps256Verifier`, and a PS256 (PSS) signature must NOT verify
+    /// through `RsaVerifier`. This is what makes RS256↔PS256 a genuine algorithm distinction rather
+    /// than two names for the same check. Red-before-green: pointing either verifier at the other's
+    /// padding (or giving `Ps256`/`Rs256` the same `JwsAlg::slot`) flips one of these to `true`.
+    #[test]
+    fn rs256_and_ps256_signatures_do_not_cross_verify() {
+        let rs256_sig = URL_SAFE_NO_PAD.decode(EXPECTED_SIG_B64URL).unwrap();
+        let ps256_sig = URL_SAFE_NO_PAD.decode(PS256_A2_SIG).unwrap();
+
+        // Sanity: each verifies under its OWN padding.
+        assert!(RsaVerifier.verify(&rsa_jwk(), SIGNING_INPUT, &rs256_sig));
+        assert!(Ps256Verifier.verify(&rsa_jwk(), SIGNING_INPUT, &ps256_sig));
+
+        // The confusion each direction: same key, wrong padding → false.
+        assert!(
+            !Ps256Verifier.verify(&rsa_jwk(), SIGNING_INPUT, &rs256_sig),
+            "an RS256 (PKCS#1 v1.5) signature must not verify as PS256"
+        );
+        assert!(
+            !RsaVerifier.verify(&rsa_jwk(), SIGNING_INPUT, &ps256_sig),
+            "a PS256 (PSS) signature must not verify as RS256"
+        );
+    }
+
+    /// A PSS signature made with a salt length OTHER than 32 is rejected: `Ps256Verifier` pins salt
+    /// length 32 (the SHA-256 output size) via `PssVerifyingKey::<Sha256>::new`. Red-before-green:
+    /// the verifier using `new_with_salt_len(_, 48)` would accept this.
+    #[test]
+    fn ps256_rejects_non_standard_salt_length() {
+        use rsa::pss::SigningKey as PssSigningKey;
+        use rsa::signature::RandomizedSigner as _;
+
+        let private_key = RsaPrivateKey::from_components(
+            BigUint::from_bytes_be(&b64u(N_B64URL)),
+            BigUint::from_bytes_be(&b64u(E_B64URL)),
+            BigUint::from_bytes_be(&b64u(D_B64URL)),
+            vec![
+                BigUint::from_bytes_be(&b64u(P_B64URL)),
+                BigUint::from_bytes_be(&b64u(Q_B64URL)),
+            ],
+        )
+        .unwrap();
+        let salt48 = PssSigningKey::<Sha256>::new_with_salt_len(private_key, 48);
+        let sig = salt48
+            .sign_with_rng(&mut OsFillRng, SIGNING_INPUT)
+            .to_bytes();
+        assert!(
+            !Ps256Verifier.verify(&rsa_jwk(), SIGNING_INPUT, &sig),
+            "a salt-48 PSS signature must be rejected by the salt-32 verifier"
+        );
+    }
+
+    /// The 2048-bit floor and the non-RSA guard port to PS256 exactly as for RS256: a genuine
+    /// 1024-bit PSS signature is refused by the modulus floor, an EC key is refused, and malformed
+    /// inputs (zero-length, truncated) return `false` without panicking.
+    #[test]
+    fn ps256_enforces_floor_and_guards() {
+        use rsa::pss::SigningKey as PssSigningKey;
+        use rsa::signature::RandomizedSigner as _;
+
+        // 1024-bit key: constructor refuses, and a genuine 1024-bit PSS signature (128 bytes, its own
+        // modulus width, so the length guard passes) is refused by the 2048-bit floor.
+        let small = small_private_key();
+        assert!(Ps256Signer::from_private_key("small", small.clone()).is_err());
+        let salt = PssSigningKey::<Sha256>::new(small);
+        let small_sig = salt.sign_with_rng(&mut OsFillRng, SIGNING_INPUT).to_bytes();
+        assert_eq!(
+            small_sig.len(),
+            128,
+            "a 1024-bit PSS signature is 128 bytes"
+        );
+        let small_pub = Jwk::Rsa {
+            n: SMALL_N.to_string(),
+            e: SMALL_E.to_string(),
+            kid: None,
+        };
+        assert!(
+            !Ps256Verifier.verify(&small_pub, SIGNING_INPUT, &small_sig),
+            "the PS256 verifier must reject a sub-2048-bit key"
+        );
+
+        // Non-RSA key.
+        let ec_key = Jwk::Ec {
+            crv: crate::jwt::EcCurve::P256,
+            x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU".to_string(),
+            y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0".to_string(),
+            kid: None,
+        };
+        let good = URL_SAFE_NO_PAD.decode(PS256_A2_SIG).unwrap();
+        assert!(!Ps256Verifier.verify(&ec_key, SIGNING_INPUT, &good));
+
+        // Truncated / empty signatures.
+        assert!(!Ps256Verifier.verify(&rsa_jwk(), SIGNING_INPUT, &good[..good.len() - 1]));
+        assert!(!Ps256Verifier.verify(&rsa_jwk(), SIGNING_INPUT, &[]));
+    }
+
+    /// `from_pkcs8_der` round-trips a PS256 signer: the A.2 key encodes to PKCS#8 DER, loads back, and
+    /// signs a signature its own published JWK verifies. Padding is a property of the SIGNER, not the
+    /// key bytes, so the same DER that loads an `RsaSigner` loads a `Ps256Signer`.
+    #[test]
+    fn ps256_from_pkcs8_der_roundtrips() {
+        use rsa::pkcs8::EncodePrivateKey as _;
+
+        let private_key = RsaPrivateKey::from_components(
+            BigUint::from_bytes_be(&b64u(N_B64URL)),
+            BigUint::from_bytes_be(&b64u(E_B64URL)),
+            BigUint::from_bytes_be(&b64u(D_B64URL)),
+            vec![
+                BigUint::from_bytes_be(&b64u(P_B64URL)),
+                BigUint::from_bytes_be(&b64u(Q_B64URL)),
+            ],
+        )
+        .unwrap();
+        let der = private_key.to_pkcs8_der().unwrap();
+        let signer = Ps256Signer::from_pkcs8_der("test-rsa", der.as_bytes()).unwrap();
+        let sig = signer.sign_ps256(SIGNING_INPUT).unwrap();
+        assert!(Ps256Verifier.verify(&signer.public_jwk(), SIGNING_INPUT, &sig));
     }
 
     /// The canonical `Jwk::thumbprint` produces the EXACT RFC 7638 §3.2 thumbprint of the RFC 7515

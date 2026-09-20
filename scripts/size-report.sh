@@ -196,6 +196,17 @@ budget_for() {
     #     (1,633,280); new floor -1.5% rounded down = 1547 KiB (1,584,128). See README.md's Cost
     #     section, updated from this same run.
     #
+    # RE-BASELINED 2026-09-20 for 0.10.1, aarch64-apple-darwin, ONE run of this script with
+    # --remap-path-prefix in force. WHAT BOUGHT IT: PS256 (RSASSA-PSS), a new JWS algorithm added
+    # under the existing `jwt-rsa` feature. It pulls in `rsa::pss` (MGF1 + the salt-encoded EMSA-PSS
+    # verify/sign paths) on top of the PKCS#1 v1.5 arithmetic RS256 already links, so ONLY the rows
+    # that carry `jwt-rsa` move; the `all-features` row measured 1,636,659 here (1598.3 KiB; CI's
+    # aarch64 runner 1596.6 KiB), 3.3 KiB past the old 1595 KiB ceiling. The band is recentred on that
+    # measurement per this file's own rule: new budget 1,636,659 +1.5% rounded up = 1623 KiB
+    # (1,661,952); new floor -1.5% rounded down = 1574 KiB (1,611,776). This is genuine, called
+    # feature code (the PSS verifier runs on a well-formed key in the probe), worth its bytes: FAPI
+    # 2.0 requires PS256 for private_key_jwt. No other row's `jwt-rsa`-free measurement changed.
+    #
     # RE-BASELINED 2026-09-18 for 0.9.5, aarch64-apple-darwin, rustc 1.98.0, ONE run of this script
     # with --remap-path-prefix in force. WHAT BOUGHT IT: the opt-in `refresh_retry_window` feature
     # (PR #10) adds the bounded atomic-rotation recovery path -- `refresh_retry_response` and
@@ -305,7 +316,7 @@ budget_for() {
     #     marginal cost in a binary that already parses JSON for something else is 30,629 bytes.
     #     (The 24 KiB quoted for this before was taken pre-remap and pre-`ScopeSet`; 30,629 is the
     #     figure from this run.)
-    aarch64-apple-darwin:all-features) echo 1633280 ;;
+    aarch64-apple-darwin:all-features) echo 1661952 ;;
     *) echo "" ;;
   esac
 }
@@ -401,7 +412,7 @@ floor_for() {
     # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
     # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
     # before trusting this one to notice a single feature: it will not.
-    aarch64-apple-darwin:all-features) echo 1584128 ;;
+    aarch64-apple-darwin:all-features) echo 1611776 ;;
     *) echo "" ;;
   esac
 }

@@ -102,7 +102,7 @@ use sha2::{Digest as _, Sha256};
 // THE ALGORITHM-TAGGED SEAM.
 //
 // The algorithm-tagged JWS seam of crypto agility, generalized off the ES256-hardcoded shape it
-// had through 0.9.x; the wired algorithms are ES256, RS256 and EdDSA. `JwsAlg` is a CLOSED enum on
+// had through 0.9.x; the wired algorithms are ES256, RS256, EdDSA and PS256. `JwsAlg` is a CLOSED enum on
 // purpose (see the module note): a new algorithm is a crate release with a new variant and new
 // match arms, which is where an algorithm belongs to be vetted, not a registry a deployment can extend.
 // =============================================================================================
@@ -177,11 +177,22 @@ pub enum JwsAlg {
     Rs256,
     /// EdDSA using Ed25519 (RFC 8037 section 3.1). `EdDSA` on the wire; Ed25519 only.
     EdDsa,
+    /// RSASSA-PSS using SHA-256 and MGF1 with SHA-256, salt length 32 (RFC 7518 section 3.5).
+    ///
+    /// Shares [`KeyKind::Rsa`] with [`JwsAlg::Rs256`] on purpose: the two are the SAME RSA key with
+    /// DIFFERENT padding, so [`consistent`] cannot and must not tell them apart. What keeps a PS256
+    /// signature from ever being checked with PKCS#1 v1.5 padding (or an RS256 one with PSS) is the
+    /// SLOT: `Ps256` occupies its own [`JwsVerifiers`] slot behind its own PSS verifier, and
+    /// [`expect_alg`] pins the algorithm before any key is read, so `alg → slot → verifier` routes an
+    /// `RS256` header only to the PKCS#1 v1.5 verifier and a `PS256` header only to the PSS one. FAPI
+    /// 2.0 permits `PS256` and `ES256` for `private_key_jwt` and FORBIDS `RS256`; see [`AlgAllowList`].
+    Ps256,
 }
 
 impl JwsAlg {
     /// Every wired algorithm, in a stable order.
-    pub const ALL: &'static [JwsAlg] = &[JwsAlg::Es256, JwsAlg::Rs256, JwsAlg::EdDsa];
+    pub const ALL: &'static [JwsAlg] =
+        &[JwsAlg::Es256, JwsAlg::Rs256, JwsAlg::EdDsa, JwsAlg::Ps256];
 
     /// The RFC 7515 section 4.1.1 `alg` spelling.
     pub fn jose_name(self) -> &'static str {
@@ -189,6 +200,7 @@ impl JwsAlg {
             JwsAlg::Es256 => "ES256",
             JwsAlg::Rs256 => "RS256",
             JwsAlg::EdDsa => "EdDSA",
+            JwsAlg::Ps256 => "PS256",
         }
     }
 
@@ -196,17 +208,26 @@ impl JwsAlg {
     pub fn key_kind(self) -> KeyKind {
         match self {
             JwsAlg::Es256 => KeyKind::Ec(EcCurve::P256),
-            JwsAlg::Rs256 => KeyKind::Rsa,
+            // RS256 and PS256 are the same RSA key with different padding: SAME kind, on purpose.
+            // The padding is separated by the slot/verifier, never by `key_kind` (see `JwsAlg::Ps256`).
+            JwsAlg::Rs256 | JwsAlg::Ps256 => KeyKind::Rsa,
             JwsAlg::EdDsa => KeyKind::Okp(OkpCurve::Ed25519),
         }
     }
 
     /// The slot this algorithm occupies in a [`JwsVerifiers`], one per variant.
+    ///
+    /// SECURITY: `Ps256` and `Rs256` MUST hold DISTINCT slots. The whole RS256↔PS256 confusion
+    /// defense reduces to this: the slot selects the padding-specific verifier, so a one-character
+    /// typo giving them the same slot would silently route one algorithm's signature through the
+    /// other's padding. The `algorithm_confusion` integration test pins it (RS256 sig → false via
+    /// the PSS verifier and vice-versa, under the identical RSA key).
     const fn slot(self) -> usize {
         match self {
             JwsAlg::Es256 => 0,
             JwsAlg::Rs256 => 1,
             JwsAlg::EdDsa => 2,
+            JwsAlg::Ps256 => 3,
         }
     }
 }
@@ -225,7 +246,8 @@ pub fn classify_alg(name: &str) -> Option<JwsAlg> {
         // RFC 8037 s3.1: `EdDSA` is the JOSE name shared by Ed25519 and Ed448. This crate wires
         // Ed25519 ONLY, and the verifier refuses any OKP key on another curve.
         "EdDSA" => Some(JwsAlg::EdDsa),
-        // "none", "HS256", "PS256", "ES384", and everything not wired: refused, not routed.
+        "PS256" => Some(JwsAlg::Ps256),
+        // "none", "HS256", "ES384", and everything not wired: refused, not routed.
         _ => None,
     }
 }
@@ -319,6 +341,12 @@ pub enum JwsSignature {
     Rs256(Box<[u8]>),
     /// A 64-byte fixed-width Ed25519 signature (RFC 8032 section 5.1; RFC 8037 section 3.1).
     EdDsa([u8; 64]),
+    /// A PS256 (RSASSA-PSS) signature (RFC 7518 section 3.5). Its width is the modulus size `k`, the
+    /// same as [`JwsSignature::Rs256`], so it is boxed octets. A SEPARATE variant from `Rs256`, not a
+    /// reuse: the variant IS the algorithm tag ([`JwsSignature::alg`]), so RS256 and PS256 must tag
+    /// distinctly even though both are RSA. The `length == modulus` check is the verifier's; `rsa`'s
+    /// PSS parse is length-lenient (see [`crate::backends::rsa::Ps256Verifier`]).
+    Ps256(Box<[u8]>),
 }
 
 impl JwsSignature {
@@ -328,6 +356,7 @@ impl JwsSignature {
             JwsSignature::Es256(_) => JwsAlg::Es256,
             JwsSignature::Rs256(_) => JwsAlg::Rs256,
             JwsSignature::EdDsa(_) => JwsAlg::EdDsa,
+            JwsSignature::Ps256(_) => JwsAlg::Ps256,
         }
     }
 
@@ -337,20 +366,22 @@ impl JwsSignature {
             JwsSignature::Es256(bytes) => bytes,
             JwsSignature::Rs256(bytes) => bytes,
             JwsSignature::EdDsa(bytes) => bytes,
+            JwsSignature::Ps256(bytes) => bytes,
         }
     }
 
     /// Build a signature of `alg` from wire octets, returning `None` when the width is wrong for the
     /// algorithm. This is the width check the fixed-size arrays make impossible to skip.
     ///
-    /// The fixed-width curves (ES256, EdDSA) require EXACTLY 64 bytes. RS256 accepts the decoded
-    /// octets as-is: an RS256 signature's width is the signer's modulus size, which is not known
-    /// here, so the `length == modulus` check is the verifier's (see [`JwsSignature::Rs256`]).
+    /// The fixed-width curves (ES256, EdDSA) require EXACTLY 64 bytes. RS256 and PS256 accept the
+    /// decoded octets as-is: an RSA signature's width is the signer's modulus size, which is not
+    /// known here, so the `length == modulus` check is the verifier's (see [`JwsSignature::Rs256`]).
     pub fn from_wire(alg: JwsAlg, raw: &[u8]) -> Option<Self> {
         match alg {
             JwsAlg::Es256 => raw.try_into().ok().map(JwsSignature::Es256),
             JwsAlg::EdDsa => raw.try_into().ok().map(JwsSignature::EdDsa),
             JwsAlg::Rs256 => Some(JwsSignature::Rs256(raw.into())),
+            JwsAlg::Ps256 => Some(JwsSignature::Ps256(raw.into())),
         }
     }
 }
@@ -390,6 +421,82 @@ impl JwsVerifiers {
             .iter()
             .copied()
             .filter(move |alg| self.slots[alg.slot()].is_some())
+    }
+
+    /// Clear the verifier slot of every algorithm `allow` forbids. Idempotent.
+    ///
+    /// This is the DPoP half of the server-level [`AlgAllowList`]. The `AnyInstalled` policy
+    /// ([`expect_alg`]) selects among the algorithms with an occupied slot, so emptying a forbidden
+    /// algorithm's slot here makes it `NotInstalled` no matter what key a self-carried DPoP proof
+    /// brings — the allow-list cannot be reintroduced by the proof.
+    ///
+    /// Gated on `dpop`, its only caller ([`crate::AuthorizationServer::resolved_jws_verifiers`]): the
+    /// `AnyInstalled` set exists only for DPoP, so a build without it has no whole-set to restrict.
+    #[cfg(feature = "dpop")]
+    pub(crate) fn restrict_to(&mut self, allow: &AlgAllowList) {
+        for alg in JwsAlg::ALL {
+            if !allow.is_allowed(*alg) {
+                self.slots[alg.slot()] = None;
+            }
+        }
+    }
+}
+
+/// A server-level restriction on which asymmetric [`JwsAlg`] this authorization server will VERIFY
+/// and ADVERTISE, on top of the per-registration algorithm pinning every client already carries.
+///
+/// The motivating case is FAPI 2.0, which permits `PS256` and `ES256` for `private_key_jwt` and
+/// FORBIDS `RS256`: a deployment must be able to enforce that centrally rather than trusting every
+/// registration. [`AlgAllowList::fapi`] is exactly that subset.
+///
+/// The default ([`AlgAllowList::all`]) allows every wired algorithm, so an existing deployment that
+/// never sets one is unchanged. Representation mirrors [`JwsVerifiers`]: a fixed `[bool; ALL.len()]`
+/// indexed by [`JwsAlg`]'s own slot, `Copy`, no allocation, and `is_allowed` is a slot read.
+///
+/// SCOPE: this governs the algorithms the server ACCEPTS and DERIVES its RFC 8414 metadata from. It
+/// does not rewrite host-authored free-form fields such as the RFC 9728 resource-metadata alg lists
+/// (those are the host's declaration about a protected resource), and it does not reach a host that
+/// calls a low-level verify entry point (e.g. [`crate::dpop::verify_proof`]) with its own verifier
+/// set — that is the host operating its own crypto, outside this server's mediation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
+pub struct AlgAllowList {
+    allowed: [bool; JwsAlg::ALL.len()],
+}
+
+impl AlgAllowList {
+    /// Every wired algorithm is allowed. The DEFAULT, and byte-for-byte the behaviour of a server
+    /// with no allow-list: an all-true filter changes nothing.
+    pub const fn all() -> Self {
+        AlgAllowList {
+            allowed: [true; JwsAlg::ALL.len()],
+        }
+    }
+
+    /// Only the listed algorithms; every other is refused at verification and never advertised.
+    pub fn only(algs: &[JwsAlg]) -> Self {
+        let mut allowed = [false; JwsAlg::ALL.len()];
+        for alg in algs {
+            allowed[alg.slot()] = true;
+        }
+        AlgAllowList { allowed }
+    }
+
+    /// The FAPI 2.0 Security Profile subset: `ES256` and `PS256`, with `RS256` (and everything else)
+    /// forbidden (FAPI 2.0 §5.3.2, RFC 8725).
+    pub fn fapi() -> Self {
+        AlgAllowList::only(&[JwsAlg::Es256, JwsAlg::Ps256])
+    }
+
+    /// Whether `alg` is permitted by this list.
+    pub fn is_allowed(&self, alg: JwsAlg) -> bool {
+        self.allowed[alg.slot()]
+    }
+}
+
+impl Default for AlgAllowList {
+    fn default() -> Self {
+        AlgAllowList::all()
     }
 }
 
@@ -524,8 +631,9 @@ impl std::error::Error for SignerError {}
 /// # Before you deploy one
 ///
 /// Run [`crate::signer_conformance`] against it, behind the `test-util` feature. It validates
-/// ES256, RS256 and EdDSA signers, dispatching on this trait's [`JwsSigner::alg`] to select the
-/// matching published RFC known-answer vector. A broken signer fails SILENTLY: a wrong signature is
+/// ES256, RS256, EdDSA and PS256 signers, dispatching on this trait's [`JwsSigner::alg`] to select
+/// the matching known-answer vector (a published RFC one where it exists; a pinned salt-32 signature
+/// for randomised PS256). A broken signer fails SILENTLY: a wrong signature is
 /// indistinguishable, at a resource server, from a tampered token. For ES256, emitting ASN.1 DER
 /// instead of the fixed-width form below is the obvious way to be wrong, and it is wrong in a way
 /// only a real client notices.
@@ -675,10 +783,12 @@ impl<T: JwsSigner + ?Sized> JwsSigner for Arc<T> {
 ///
 /// # Before you deploy one
 ///
-/// Run [`crate::signer_conformance`] against it. It carries a published RFC known-answer vector per
-/// algorithm (RFC 7515 appendix A.3 for ES256, appendix A.2 for RS256, RFC 8037 appendix A.4 for
-/// EdDSA), which neither side of your deployment produced, and it is the only thing that can tell a
-/// verifier that is right from one that agrees with your signer.
+/// Run [`crate::signer_conformance`] against it. It carries a known-answer vector per algorithm — a
+/// published RFC one where it exists (RFC 7515 appendix A.3 for ES256, appendix A.2 for RS256, RFC
+/// 8037 appendix A.4 for EdDSA) and, for randomised PS256 (which has none), a pinned salt-32
+/// signature over the A.2 key whose verification is deterministic — which neither side of your
+/// deployment produced, and it is the only thing that can tell a verifier that is right from one
+/// that agrees with your signer.
 #[cfg(feature = "jwt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
 pub trait JwsVerifier: Send + Sync {
@@ -1094,7 +1204,14 @@ enum JwksEntry<'a> {
         kid: Option<&'a str>,
         #[serde(rename = "use")]
         use_: &'static str,
-        alg: &'static str,
+        // OPTIONAL and, for RSA, OMITTED. Unlike an EC or OKP key whose `alg` is fixed by its curve,
+        // a bare RSA public key is dual-use: it verifies BOTH `RS256` (PKCS#1 v1.5) and `PS256`
+        // (RSASSA-PSS), and `Jwk::Rsa` carries nothing to say which. RFC 7517 section 4.4 makes `alg`
+        // OPTIONAL, so publishing NONE is honest where publishing one would be an over-specification
+        // (and, for a PS256 signing key, an outright lie of `"RS256"`). A relying party selects by
+        // `kid` and reads the algorithm from the token header it is verifying, never from this hint.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        alg: Option<&'static str>,
     },
     #[serde(rename = "OKP")]
     Okp {
@@ -1127,7 +1244,9 @@ impl<'a> JwksEntry<'a> {
                 e,
                 kid: kid.as_deref(),
                 use_: "sig",
-                alg: "RS256",
+                // Omitted: an RSA key serves both RS256 and PS256 and this document cannot know
+                // which. See the `alg` field on `JwksEntry::Rsa`.
+                alg: None,
             },
             Jwk::Okp { crv, x, kid } => JwksEntry::Okp {
                 crv: crv.jose_name(),
@@ -1395,7 +1514,7 @@ impl AccessTokenClaims {
 /// would make two configurations over one KMS key unequal for no reason a host could act on.
 #[derive(Clone)]
 pub struct JwtConfig {
-    /// The host's signing backend (ES256, RS256, or EdDSA), which may be a key in this process or a
+    /// The host's signing backend (ES256, RS256, EdDSA, or PS256), which may be a key in this process or a
     /// handle to one in a KMS.
     ///
     /// `Arc<dyn _>` and not a generic parameter. Making [`JwtConfig`] generic would put a THIRD
@@ -1763,7 +1882,7 @@ pub enum AccessTokenFormat {
     #[default]
     Opaque,
     /// RFC 9068 `at+jwt` access tokens, signed with the [`JwtConfig`]'s configured algorithm
-    /// (ES256, RS256, or EdDSA). The record is still persisted, so introspection and revocation
+    /// (ES256, RS256, EdDSA, or PS256). The record is still persisted, so introspection and revocation
     /// continue to work on the exact string the client presents.
     ///
     /// BOXED deliberately. [`JwtConfig`] carries a signing key, an audience and a `jwks_uri`, and

@@ -11,7 +11,7 @@
 //!
 //! - `client_secret_jwt` is HS256 over the registered secret. It needs no elliptic curve, so it
 //!   is honest in every build that has the `client-assertion` feature.
-//! - `private_key_jwt` is an asymmetric signature (ES256, RS256 or EdDSA). It needs a verifier, and
+//! - `private_key_jwt` is an asymmetric signature (ES256, RS256, EdDSA or PS256). It needs a verifier, and
 //!   since the signing seam landed there are builds that have `client-assertion` and no verifier at
 //!   all (`client-assertion = ["jwt"]`, which pulls no backend, and no host verifier installed).
 //!
@@ -108,7 +108,8 @@ mod without_the_built_in_backend {
 
     /// State three: no backend of ANY kind. The module gate already rules out `jwt-p256`; this
     /// function's own gate rules out the other two built-in backends, because since 0.10.0
-    /// `jwt-rsa` and `jwt-ed25519` ALSO install a default verifier (RS256 and EdDSA respectively),
+    /// `jwt-rsa` and `jwt-ed25519` ALSO install default verifiers (RS256 and PS256 for `jwt-rsa`,
+    /// EdDSA for `jwt-ed25519`),
     /// so a build with either of them on has a verifier and DOES advertise `private_key_jwt` -- the
     /// state this test exists to check simply does not occur there. With none of the three, every
     /// asymmetric assertion is refused, so naming the method would be an instruction a client

@@ -77,8 +77,8 @@ pub const DPOP_HEADER: &str = "DPoP";
 /// The list must stay honest: RFC 9449 section 4.2 requires an ASYMMETRIC algorithm, and
 /// advertising one the verifier will refuse is worse than advertising fewer, because a client that
 /// picks it has no way to find out except by failing. This constant is only the `jwt-p256`
-/// backend's entry (see `Cargo.toml` on why `p256` and not a JOSE framework); the RS256 and EdDSA
-/// backends, where their verifiers resolve, are added to the advertised list by
+/// backend's entry (see `Cargo.toml` on why `p256` and not a JOSE framework); the RS256, EdDSA and
+/// PS256 backends, where their verifiers resolve, are added to the advertised list by
 /// [`crate::metadata`], and `verify_proof` accepts a proof under ANY installed algorithm
 /// ([`crate::jwt::AlgPolicy::AnyInstalled`], the RFC 9449 self-carried-key path).
 pub const DPOP_SIGNING_ALG_VALUES_SUPPORTED: &[&str] = &["ES256"];
@@ -283,7 +283,7 @@ fn htu_eq(claimed: &str, expected: &str) -> bool {
 ///
 /// `verifiers` is the installed verifier SET, not a single backend: a DPoP proof carries its own
 /// key and names its own algorithm (RFC 9449 self-carried key), so it is checked under whichever of
-/// ES256/RS256/EdDSA the set has a verifier installed for
+/// ES256/RS256/EdDSA/PS256 the set has a verifier installed for
 /// ([`crate::jwt::AlgPolicy::AnyInstalled`]); the built-in backends come from
 /// `jwt-p256`/`jwt-rsa`/`jwt-ed25519`, or a host installs its own. It is a PARAMETER rather than
 /// something this function reaches for, because there is no "none" that could be safe here: a
@@ -303,6 +303,11 @@ fn htu_eq(claimed: &str, expected: &str) -> bool {
 /// verified here. Checking it is the caller's obligation, exactly as claiming the `jti` is, and
 /// skipping it leaves a proof bound to a key and a request line but not to a token. See the
 /// module docs.
+///
+/// The `verifiers` set is the caller's: the server-level
+/// [`AlgAllowList`](crate::jwt::AlgAllowList) is applied by `AuthorizationServer` when it BUILDS the
+/// set it passes here (it clears forbidden slots), so a host that hand-builds a `JwsVerifiers` and
+/// calls this directly is responsible for the algorithm policy of the set it supplies.
 pub fn verify_proof(
     verifiers: &JwsVerifiers,
     proof: &str,

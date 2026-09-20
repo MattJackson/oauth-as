@@ -5,12 +5,15 @@
 //! the `test-util` cargo feature (off by default), for a HOST to run from its OWN test suite
 //! against the backend it is about to deploy.
 //!
-//! It validates ES256, RS256 and EdDSA (Ed25519) backends: [`SignerConformance::run`] dispatches on
-//! the signer's own [`JwsSigner::alg`] and selects the matching published RFC known-answer vector
-//! (RFC 7515 appendix A.3 for ES256, appendix A.2 for RS256, RFC 8037 appendix A.4 for EdDSA),
-//! signature width, and public-JWK key kind. The ES256-only encoding hazards — the ASN.1 DER
-//! versus fixed-width `r || s` ambiguity of RFC 7518 section 3.4, and the off-curve public key —
-//! are checked for an ES256 signer and skipped for RS256/EdDSA, which have neither.
+//! It validates ES256, RS256, EdDSA (Ed25519) and PS256 backends: [`SignerConformance::run`]
+//! dispatches on the signer's own [`JwsSigner::alg`] and selects the matching known-answer vector,
+//! signature width, and public-JWK key kind. The vectors are published RFC ones where they exist
+//! (RFC 7515 appendix A.3 for ES256, appendix A.2 for RS256, RFC 8037 appendix A.4 for EdDSA); PS256
+//! (RSASSA-PSS) is randomised and so has no RFC known-answer vector, so it uses a pinned,
+//! externally-checkable salt-32 signature over the A.2 key whose VERIFICATION is deterministic. The
+//! ES256-only encoding hazards — the ASN.1 DER versus fixed-width `r || s` ambiguity of RFC 7518
+//! section 3.4, and the off-curve public key — are checked for an ES256 signer and skipped for
+//! RS256/EdDSA/PS256, which have neither.
 //!
 //! # Why this exists
 //!
@@ -270,6 +273,11 @@ const A2_N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHm
 const RSA_E: &str = "AQAB";
 /// The RFC 7515 appendix A.2 signature (256 bytes / 2048-bit modulus, base64url).
 const A2_SIGNATURE: &str = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+/// A PS256 (RSASSA-PSS, MGF1-SHA-256, salt length 32) signature over `A2_SIGNING_INPUT` under the
+/// A.2 RSA key. PSS is randomized, so there is no RFC known-answer vector; this was produced once
+/// (salt length 32, RFC 7518 §3.5) and PINNED. Verification is deterministic — the salt travels in
+/// the signature — so any conforming PSS verifier accepts these exact bytes.
+const PS256_A2_SIGNATURE: &str = "VPsxqpmiWCZjFcc9Oid-KEUsg3LR7ewNlohr2ZUUkpc63KZW4yJrYHZzSQn2jpMZRLrGB-A-SUU5R3_wzfH6upgpN3RorvmZc91E8aZWJqj0hu151XRTxvIO4Cnma8Qi1cFP6cftLOPs49aXP9OEzzZvmpBXWE0FTWIHLA0gKF9kZNX3xavVfR6owwN1-n6ZcC6SUwgthYdbTlME71p6IvtfBKS4JltoPYJKOQgEls44RomWn-RbpKEkD3Y1okxFZajveVNR7oXLQ_6WBPtY__L2Pfd365OVzcurpvXIcJs1EbeSorecaaIVHyeBBmWej2Gfi-2P-NNvCot3aUhdKA";
 /// A second, well-formed 2048-bit RSA public key, used as the key an A.2 signature must NOT verify
 /// under. Generated offline; its private half is not this crate's, so it can only ever reject. The
 /// A.2 key is not reused for this job (that would pass the foreign-key check for the worst reason:
@@ -290,9 +298,10 @@ const A4_SIGNATURE: &str =
 /// for the same reason the A.4 key is not reused for it.
 const OTHER_OKP_X: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 
-/// The published RFC known-answer vector for one algorithm, plus a same-KIND foreign key the
-/// signature must not verify under. [`SignerConformance::run`] selects one of these on the signer's
-/// own [`JwsSigner::alg`], so an RS256 or EdDSA backend is held to its own RFC vector rather than to
+/// The known-answer vector for one algorithm (a published RFC one for ES256/RS256/EdDSA, a pinned
+/// salt-32 signature for randomised PS256), plus a same-KIND foreign key the signature must not
+/// verify under. [`SignerConformance::run`] selects one of these on the signer's own
+/// [`JwsSigner::alg`], so an RS256, EdDSA or PS256 backend is held to its own vector rather than to
 /// the ES256 one.
 struct AlgProfile {
     /// The JWS Signing Input the vector signs.
@@ -343,6 +352,15 @@ fn alg_profile(alg: JwsAlg) -> AlgProfile {
             vector_signature: decode(A4_SIGNATURE),
             foreign_key: okp_jwk(OTHER_OKP_X),
         },
+        // PS256 shares the A.2 RSA key with RS256 (same key, PSS padding); the pinned salt-32 PSS
+        // vector is what a host's PSS verifier is checked against, and the foreign key is the same
+        // second RSA key RS256 uses.
+        JwsAlg::Ps256 => AlgProfile {
+            signing_input: A2_SIGNING_INPUT.as_bytes(),
+            vector_key: rsa_jwk(A2_N),
+            vector_signature: decode(PS256_A2_SIGNATURE),
+            foreign_key: rsa_jwk(OTHER_RSA_N),
+        },
     }
 }
 
@@ -368,12 +386,15 @@ impl<S: JwsSigner, V: JwsVerifier> SignerConformance<S, V> {
     pub async fn run(&self) -> Vec<Violation> {
         let mut out = Vec::new();
         match self.signer.alg() {
-            // ES256 carries encoding hazards RS256 and EdDSA do not: the ASN.1 DER versus
+            // ES256 carries encoding hazards RS256, EdDSA and PS256 do not: the ASN.1 DER versus
             // fixed-width `r || s` ambiguity of RFC 7518 s3.4, and an off-curve public key. Its
-            // verifier checks are their own routine (below); RS256 and EdDSA share the
+            // verifier checks are their own routine (below); RS256, EdDSA and PS256 share the
             // algorithm-independent core, selected by the signer's own algorithm.
             JwsAlg::Es256 => self.check_verifier(&mut out),
-            JwsAlg::Rs256 | JwsAlg::EdDsa => {
+            // RS256, PS256 and EdDSA share the algorithm-independent core: no DER/off-curve hazard,
+            // and PS256's randomized signer is fine because this harness never compares signature
+            // bytes (it round-trips and checks two-different-inputs binding).
+            JwsAlg::Rs256 | JwsAlg::EdDsa | JwsAlg::Ps256 => {
                 let profile = alg_profile(self.signer.alg());
                 self.check_verifier_generic(&profile, &mut out);
             }
@@ -661,13 +682,14 @@ impl<S: JwsSigner, V: JwsVerifier> SignerConformance<S, V> {
         }
     }
 
-    /// The RS256/EdDSA verifier routine: the algorithm-independent core of [`check_verifier`], run
-    /// against the profile's published RFC vector. It presents the known-answer test, the same
-    /// three rejections (a foreign key, a tampered signing input, a tampered signature), the empty
-    /// signing input, and three wrong LENGTHS (zero, one short, one long). It omits the two checks
-    /// that are meaningful only for ES256: the DER re-encoding (RS256 and EdDSA have a single
-    /// canonical signature form, no DER-versus-raw ambiguity) and the off-curve key (RSA has no
-    /// curve, and an Ed25519 point is validated by the verifier's own decode).
+    /// The RS256/EdDSA/PS256 verifier routine: the algorithm-independent core of [`check_verifier`],
+    /// run against the profile's known-answer vector (a published RFC one for RS256/EdDSA; a pinned
+    /// salt-32 signature for randomised PS256). It presents the known-answer test, the same three
+    /// rejections (a foreign key, a tampered signing input, a tampered signature), the empty signing
+    /// input, and three wrong LENGTHS (zero, one short, one long). It omits the two checks that are
+    /// meaningful only for ES256: the DER re-encoding (RS256, EdDSA and PS256 have no DER-versus-raw
+    /// ambiguity — a PSS signature is octets carrying its salt, not a re-encodable structure) and the
+    /// off-curve key (RSA has no curve, and an Ed25519 point is validated by the verifier's own decode).
     fn check_verifier_generic(&self, profile: &AlgProfile, out: &mut Vec<Violation>) {
         let key = &profile.vector_key;
         let signature = &profile.vector_signature;
@@ -889,7 +911,8 @@ impl<S: JwsSigner, V: JwsVerifier> SignerConformance<S, V> {
         // example is RFC 7515 A.3, RS256 is RFC 7515 A.2, EdDSA is RFC 8037 A.4.
         let is_published_example_key = match self.signer.alg() {
             JwsAlg::Es256 => published.x() == A3_X && published.y() == A3_Y,
-            JwsAlg::Rs256 => {
+            // RS256 and PS256 are the same A.2 RSA key; either padding using it is the example key.
+            JwsAlg::Rs256 | JwsAlg::Ps256 => {
                 matches!(&published, Jwk::Rsa { n, e, .. } if n.as_str() == A2_N && e.as_str() == RSA_E)
             }
             JwsAlg::EdDsa => matches!(&published, Jwk::Okp { x, .. } if x.as_str() == A4_X),
@@ -931,9 +954,9 @@ impl<S: JwsSigner, V: JwsVerifier> SignerConformance<S, V> {
         // two million of a false accusation against a random R || S, and the check is advisory
         // anyway: `signer/verifies_under_its_own_public_jwk` catches this too, less legibly.
         //
-        // ES256 ONLY: the DER-versus-raw ambiguity is specific to ECDSA's `r || s`. RS256 and EdDSA
-        // each have a single canonical signature form, so there is nothing here for them to get
-        // wrong, and their signatures are not the 64 bytes this heuristic reads.
+        // ES256 ONLY: the DER-versus-raw ambiguity is specific to ECDSA's `r || s`. RS256, EdDSA and
+        // PS256 have no DER-versus-raw ambiguity, so there is nothing here for them to get wrong, and
+        // their signatures are not the 64 bytes this heuristic reads.
         if self.signer.alg() == JwsAlg::Es256
             && signature.len() >= 3
             && signature[0] == 0x30
@@ -1071,7 +1094,8 @@ impl<S: JwsSigner, V: JwsVerifier> SignerConformance<S, V> {
                 }
             }
             JwsAlg::EdDsa => check_32_byte_coordinate("x", published.x(), &mut wrong),
-            JwsAlg::Rs256 => {
+            // RS256 and PS256 both publish an RSA `n`/`e`; only the encoding is checked here.
+            JwsAlg::Rs256 | JwsAlg::Ps256 => {
                 if let Jwk::Rsa { n, e, .. } = published {
                     for (name, value) in [("n", n.as_str()), ("e", e.as_str())] {
                         match URL_SAFE_NO_PAD.decode(value) {

@@ -106,6 +106,29 @@ pub fn plane() -> u64 {
             b"probe.rs256",
             &rsa_sig,
         )));
+
+        // PS256 (RSASSA-PSS) rides the SAME `jwt-rsa` feature but pulls in `rsa::pss`, so the probe
+        // measures the extra PSS signing/verification arithmetic a host that enables PS256 pays for.
+        // Same black-box discipline as the RS256 half: built and measured, never run on a real key.
+        use oauth_as::{Ps256Signer, Ps256Verifier};
+        let ps_der = std::hint::black_box([0u8; 16]);
+        if let Ok(signer) = Ps256Signer::from_pkcs8_der("probe-ps256", &ps_der) {
+            acc = acc.wrapping_add(signer.kid().len() as u64);
+            if let Ok(sig) = crate::blockon::block_on(JwsSigner::sign(&signer, b"probe.ps256")) {
+                acc = acc.wrapping_add(sig.as_bytes().len() as u64);
+            }
+        }
+        let ps_jwk = Jwk::Rsa {
+            n: std::hint::black_box("A".repeat(342)),
+            e: "AQAB".to_string(),
+            kid: Some("probe-ps256".to_string()),
+        };
+        let ps_sig = std::hint::black_box(vec![0u8; 256]);
+        acc = acc.wrapping_add(u64::from(Ps256Verifier.verify(
+            &ps_jwk,
+            b"probe.ps256",
+            &ps_sig,
+        )));
     }
 
     // THE BUILT-IN EdDSA (Ed25519) BACKEND (`jwt-ed25519`). `from_seed_bytes` takes a raw 32-byte
