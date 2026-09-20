@@ -106,6 +106,18 @@ impl Delta {
     pub fn resident(&self) -> usize {
         self.bytes.saturating_sub(self.freed)
     }
+
+    /// The element-wise minimum of two deltas. Each counter's noise is independently
+    /// additive-upward (see [`measure_min`]), so the per-field minimum across identical repetitions
+    /// recovers the true, noise-free cost of each counter separately.
+    pub fn min_fields(self, other: Delta) -> Delta {
+        Delta {
+            allocs: self.allocs.min(other.allocs),
+            deallocs: self.deallocs.min(other.deallocs),
+            bytes: self.bytes.min(other.bytes),
+            freed: self.freed.min(other.freed),
+        }
+    }
 }
 
 /// Read the counters now.
@@ -141,4 +153,31 @@ where
     let result = f();
     let after = snapshot();
     (result, before.delta_to(after))
+}
+
+/// Run `f` `samples` times and return the LAST result together with the per-field NOISE-FLOOR
+/// (minimum) delta.
+///
+/// The counters are process-wide, so a measured window can only ever be OVER-counted: allocations
+/// from another thread in the test process leak into the window on some runs and never leak out.
+/// The noise is therefore strictly additive-upward, and the minimum across identical repetitions is
+/// the true, noise-free cost — exactly as strict as a single reading (no tolerance is added), but
+/// immune to the transient upward noise that otherwise makes an exact allocation gate flaky under a
+/// loaded `cargo test --workspace` run.
+///
+/// Only for a REPEATABLE `f`: one whose allocation SHAPE is identical each call, even if it mutates
+/// monotonically (registering a fresh client, say). Do NOT use it for a one-shot consuming operation
+/// (a `take_*`, a revoke) whose second call would measure a different, cheaper path.
+pub fn measure_min<F, R>(samples: usize, mut f: F) -> (R, Delta)
+where
+    F: FnMut() -> R,
+{
+    assert!(samples >= 1, "measure_min needs at least one sample");
+    let (mut last, mut floor) = measure(&mut f);
+    for _ in 1..samples {
+        let (result, delta) = measure(&mut f);
+        floor = floor.min_fields(delta);
+        last = result;
+    }
+    (last, floor)
 }

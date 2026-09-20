@@ -47,10 +47,15 @@ use oauth_as::{
     AuthorizationRequest, AuthorizationServer, Client, ClientAuth, ClientId, GrantType,
     MemoryStorage, ScopeSet, ServerConfig, TokenRequest,
 };
-use support::alloc::{measure, CountingAllocator, Delta, TEST_LOCK};
+use support::alloc::{measure, measure_min, CountingAllocator, Delta, TEST_LOCK};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
+
+/// How many identical repetitions a noise-floor gate takes the per-field minimum over. Sixteen is
+/// the same figure the refusal-cost gate uses: comfortably more than enough for at least one sample
+/// to land in a quiet window, while adding no measurable time to a test that runs in milliseconds.
+const MEASURE_SAMPLES: usize = 16;
 
 #[test]
 fn ungated_path_allocation_gates() {
@@ -349,7 +354,15 @@ fn dynamic_registration_bound() {
     rt.block_on(srv.register_dynamic_client(&metadata, None))
         .unwrap();
 
-    let (info, d) = measure(|| rt.block_on(srv.register_dynamic_client(&metadata, None)));
+    // NOISE FLOOR, not a single reading. This gate measures the widest byte shape in the file
+    // (~1120 B) and runs under `cargo test --workspace`, where allocations from elsewhere in the
+    // process leak into the window on some samples and inflate the byte count without touching the
+    // path itself (observed 34/2020 in CI against a rock-steady 30/1120 local floor). Each call
+    // registers a FRESH client, so the closure is safely repeatable; the per-field minimum over
+    // MEASURE_SAMPLES recovers the true cost and cannot be fooled by the additive-upward noise.
+    let (info, d) = measure_min(MEASURE_SAMPLES, || {
+        rt.block_on(srv.register_dynamic_client(&metadata, None))
+    });
     assert!(info.unwrap().client_secret.is_some());
     check("dynamic registration", d, REGISTRATION);
 }
