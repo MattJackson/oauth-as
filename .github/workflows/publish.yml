@@ -215,7 +215,9 @@ jobs:
     if: needs.decide.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # to push the release tag after a successful publish
+      contents: write # to push the release tag and create the GitHub Release with signed artifacts
+      id-token: write # keyless OIDC, for the SLSA build-provenance attestation and cosign signing
+      attestations: write # to record the build-provenance attestation against the packaged crate
     # GitHub AUTO-CREATES this environment on first use with no protection rules. Until the owner
     # adds required reviewers in repository settings, this line does not gate anything. See the
     # notes at the end of this file.
@@ -372,6 +374,65 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$tag" -m "oauth-as $tag (published to crates.io by $WORKFLOW run $RUN_ID)"
           git push origin "$tag"
+
+      # ---- Signed, attested release artifacts ------------------------------------------------
+      #
+      # Everything below runs AFTER the irreversible `cargo publish`. It packages the exact crate
+      # that was published, records a SLSA build-provenance attestation for it, cosign-signs it
+      # keylessly (OIDC, no long-lived key), and attaches the crate plus its signature bundle to a
+      # GitHub Release on the tag pushed above. A consumer can then verify origin two independent
+      # ways: `gh attestation verify oauth-as-<v>.crate --repo MattJackson/oauth-as` and
+      # `cosign verify-blob --bundle oauth-as-<v>.crate.cosign.bundle ... oauth-as-<v>.crate`.
+      #
+      # RETRY CAVEAT: because these steps follow the publish, a failure here goes RED with the crate
+      # already on crates.io. A plain re-run via workflow_dispatch will find the version present and
+      # take the `no_release`/skip path, so it will NOT re-attempt signing. Recovery is to run the
+      # package/attest/sign/release steps by hand against the same commit (the tag already exists);
+      # the crates.io artifact is immutable, so re-attesting the identical bytes is sound.
+      - name: Package the published crate
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo package --locked -p oauth-as
+          crate="target/package/oauth-as-${VERSION}.crate"
+          test -f "$crate" || { echo "::error::expected $crate to exist after cargo package"; exit 1; }
+          echo "CRATE_PATH=$crate" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.CRATE_PATH }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Cosign-sign the crate (keyless)
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle "oauth-as-${VERSION}.crate.cosign.bundle" \
+            "$CRATE_PATH"
+          echo "BUNDLE_PATH=oauth-as-${VERSION}.crate.cosign.bundle" >> "$GITHUB_ENV"
+
+      - name: Create the GitHub Release with signed artifacts
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists, uploading assets to it"
+            gh release upload "$tag" "$CRATE_PATH" "$BUNDLE_PATH" --clobber
+          else
+            gh release create "$tag" \
+              --title "oauth-as $tag" \
+              --generate-notes \
+              "$CRATE_PATH" "$BUNDLE_PATH"
+          fi
 
   # Runs when the push to main carried no version bump. Exists so the reason is visible in the
   # Actions tab: a green "nothing to publish" is a different fact from a workflow that never ran.
