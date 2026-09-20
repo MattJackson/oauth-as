@@ -1,9 +1,9 @@
-# MANUAL, NON-GATING. This job runs ONLY on workflow_dispatch and is not referenced by
-# dev.yml, qa.yml or publish.yml, and it must stay that way: it stands up the OpenID Foundation
-# FAPI 2.0 Security Profile conformance suite in a docker compose stack, which is heavyweight
-# (a Maven build of the suite plus a docker-in-docker run) and, more importantly, this crate is
-# not ready for it yet. See the HONESTY note below before wiring this into anything that runs
-# automatically.
+# GATES qa, plus manual dispatch. This job stands up the OpenID Foundation FAPI 2.0 Security
+# Profile conformance suite in a docker compose stack (a Maven build of the suite plus a docker
+# compose run) and drives this crate's FAPI 2.0 fixture through it. It is heavyweight and
+# environment-sensitive, which is precisely qa.yml's charter ("everything too slow or too
+# environment-sensitive to run on every push"), so it runs on push to the qa branch and NOT on
+# dev's every-push path. It stays available by hand from the Actions tab.
 #
 # HONESTY, matching qa.yml's rule that nothing in this repository is allowed to look green
 # without having earned it:
@@ -12,29 +12,29 @@
 #   crates/oauth-as-conformance/EXTERNAL-TOOLING.md s2.4 verifies that directly from the OIDF's
 #   own certification pages: only formal CERTIFICATION, a separate manual submission at
 #   https://submissions.openid.net/ with a Declaration of Conformance and (for non-OIDF-member
-#   FAPI 2 deployments) a USD 5000 fee, requires any of that. This workflow does not perform a
-#   certification submission and never will; it produces a local run and, if the suite is asked
-#   to "Publish for certification", a log ZIP that a HUMAN would carry to that separate step.
+#   FAPI 2 deployments that do not qualify for the open-source fee waiver) a fee, requires any of
+#   that. This workflow does not perform a certification submission; it produces a run and, via
+#   the suite's "Publish for certification", the log ZIP that a HUMAN carries to that separate
+#   step.
 #
-#   This job is expected to FAIL, today, and that failure is correct and by design, not a bug in
-#   this file. scripts/fapi2-conformance.sh stops at preflight with a pointer to
-#   crates/oauth-as-conformance/EXTERNAL-TOOLING.md s2.3 because the FAPI 2.0 fixture example
+#   The FAPI 2.0 fixture this job needs now EXISTS
 #   (crates/oauth-as/examples/fapi2_conformance_server.rs: HTTPS listener, two static
-#   private_key_jwt clients, a DPoP-verifying protected resource, mandatory PAR, and a
-#   refresh-rotation-OFF switch) does not exist in the tree yet. See EXTERNAL-TOOLING.md s2.5 for
-#   the exact remaining work. DO NOT add continue-on-error to make this job "pass" before that
-#   fixture lands: a manual job that can go green without the fixture existing is a job that lies,
-#   exactly as qa.yml's header argues for its own jobs. A red run here, today, is the honest
-#   answer.
-#
-#   Once the fixture and the rotation-off switch exist, this job becomes genuinely runnable, and
-#   is invoked by hand from the Actions tab (Actions -> FAPI 2.0 conformance -> Run workflow), not
-#   by a push. Its result is still not a certification; it is evidence to read before anyone
-#   decides whether to spend the money and the DocuSign step on a real submission.
+#   private_key_jwt clients, a DPoP-verifying protected resource, mandatory PAR, and the
+#   refresh-rotation-OFF switch RefreshRotation::Reuse), so this job is a genuine pass/fail gate
+#   rather than a placeholder. DO NOT add continue-on-error: a green here must mean the suite
+#   actually passed, and a red when this crate is nonconformant is the honest answer, exactly as
+#   qa.yml's header argues for its own jobs. A green run is still not a certification; it is the
+#   evidence a human reads before the DocuSign submission step.
 
 name: FAPI 2.0 conformance
 
 on:
+  # Runs on promotion to the qa branch (qa.yml's charter: "everything too slow or too
+  # environment-sensitive to run on every push", proven before main is considered). This job --
+  # a Maven build of the OIDF suite plus a docker compose run -- is exactly that, so it belongs on
+  # qa and NOT on dev's every-push path. Still available by hand from the Actions tab.
+  push:
+    branches: [qa]
   workflow_dispatch:
     inputs:
       plan:
@@ -52,14 +52,21 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The plan runs under the script's default 1500s (25 min) cap (scripts/fapi2-conformance.sh),
+  # which the 40-minute job cap is sized around: suite build (~8 min) + fixture build (~2 min) +
+  # 25-min plan leaves headroom. The earlier "480" here was a temporary diagnostic cap to capture
+  # early module logs fast; it was removed once the flow no longer hangs (a single browser-flow
+  # module that never settles must not be able to starve the rest of the plan of its budget).
 
 jobs:
   fapi2-conformance:
-    name: FAPI 2.0 Security Profile suite (plain_oauth, manual, non-gating)
+    name: FAPI 2.0 Security Profile suite (plain_oauth, gates qa)
     runs-on: ubuntu-latest
-    # No timeout override: the default 360-minute cap is generous enough for a suite build plus a
-    # single plan run, and if this job ever needs longer than that, that is itself worth noticing
-    # rather than silently extending.
+    # Suite build (~8 min) + fixture build (~2 min) + the plan (capped at 25 min inside the
+    # script). 40 minutes is comfortable headroom; anything past it is a hang, and the default
+    # 360-minute cap would just burn runner time silently. The script also dumps the suite server
+    # log on exit so a timeout here is still diagnosable from the uploaded artifact.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -79,7 +86,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Python (the suite's run-test-plan.py runner)
         # v7 verified against the actions/setup-python GitHub releases (latest tag v7.0.0, major

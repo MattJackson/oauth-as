@@ -74,7 +74,8 @@ scripts/fapi2-conformance.sh
 ```
 
 or, from the Actions tab: **Actions -> FAPI 2.0 conformance -> Run workflow**
-(`.github/workflows/fapi2-conformance.yml`, `workflow_dispatch` only, never on push).
+(`.github/workflows/fapi2-conformance.yml`, which also runs on every push to `qa` and gates
+it; see its header).
 
 Both read this file via the `FAPI2_CONFIG` environment variable
 (default: `crates/oauth-as-conformance/fapi2/config.json`, i.e. this file), and the plan string
@@ -86,3 +87,58 @@ Running the suite itself requires no OpenID Foundation membership or payment
 (EXTERNAL-TOOLING.md s2.4). Only formal CERTIFICATION -- a separate manual submission at
 https://submissions.openid.net/ -- does, and neither this script nor this workflow performs that
 submission.
+
+## `expected-failures.json`: recorded gaps, not passes
+
+`expected-failures.json` in this directory is the OIDF runner's own
+`--expected-failures-file` (`scripts/run-test-plan.py` at the pinned suite commit), which
+`scripts/fapi2-conformance.sh` always passes (`FAPI2_EXPECTED_FAILURES`; a missing file is a
+hard stop at preflight, not an empty list). It records, one entry per failing CONDITION, the
+two D2 modules from `FINDINGS.md`:
+
+* `user-rejects-authentication` (six entries: two blocks, first client and second client,
+  times three conditions, two of which the suite logs at WARNING level) -- the fixture has no
+  consent page to cancel; the AS `access_denied` path itself is conformant. Category fixture.
+* `par-ensure-reused-request-uri-prior-to-auth-completion-succeeds` (one entry; its
+  `condition` is the module id, because the module throws a raw `RuntimeException` rather than
+  failing a condition class) -- the fixture authenticates on the first visit AND the crate
+  consumes the `request_uri` when the page loads rather than at authorization (FAPI 2.0 SP
+  Final s5.3.2.2 NOTE 3, RFC 9126 s4). Category fixture and core.
+
+An entry is a documented gap the gate keeps in front of us, with its justification in the
+`comment` field and the evidence in `FINDINGS.md` D2. It is NOT a pass and it does not make the
+job green (D1, D3, D4, D5 and D7 still fail). The runner's accounting cuts both ways: an
+unlisted FAILURE or WARNING exits 1, and a listed condition that STOPS failing also exits 1
+(`EXPECTED_FAILURES_NOT_HAPPEN` / `EXPECTED_WARNINGS_NOT_HAPPEN`), so landing a fix REQUIRES
+deleting its entries, and an entry can never hide a regression elsewhere.
+
+Rules for editing it, read from the runner's matching code:
+
+* Every entry MUST carry all six keys: `test-name`, `variant`, `configuration-filename`,
+  `condition`, `current-block`, `expected-result` (`comment` is free text the runner never
+  reads). A missing key is not "ignored": the runner indexes them directly and raises at
+  analysis time, AFTER the whole plan has run. The script checks the shape at preflight so that
+  cannot happen thirty minutes in.
+* `expected-result` must be the level the suite logs, `failure` for a FAILURE entry and
+  `warning` for a WARNING entry. There is no cross-match; a mismatch counts BOTH as an
+  unexpected result and as an expected one that did not happen.
+* `test-name`, `condition` and `current-block` are pinned EXACTLY, and `variant` is an object.
+  `"*"` is FORBIDDEN in this repository even where the runner would accept it (`test-name`,
+  `current-block`, `variant`): one wildcard can swallow an unrelated regression. The preflight
+  refuses it.
+* `configuration-filename` is `fnmatch`ed against the config path EXACTLY as passed on the
+  runner's command line, with no basename step. The script passes an absolute path
+  (`$repo_root/crates/oauth-as-conformance/fapi2/config.json`; in CI that is
+  `/home/runner/work/oauth-as/oauth-as/...`), so the value is the glob `*/fapi2/config.json`
+  (`fnmatch`'s `*` spans `/`). A bare `config.json` never matches an absolute path; the entries
+  would then be reported as "not found in any test module" and the runner exits 1 -- loudly, not
+  silently.
+* `variant` is subset-matched: the four plan dimensions from `FAPI2_PLAN` are listed; the
+  module's extra baseline dimensions (`fapi_request_method`, `fapi_response_mode`,
+  `authorization_request_type`) are left unlisted, which the runner treats as "any".
+* To capture the strings for a new entry, do not guess. Run the plan, then either read the
+  `--verbose` output in `target/fapi2-conformance/run.log` (it prints a ready-to-paste entry
+  template per unexpected result) or read `target/fapi2-conformance/modules/<test id>.json`:
+  every element with `result` FAILURE or WARNING is one entry, its `src` is the `condition`,
+  and its `blockId` maps to the `msg` of the `-START-BLOCK-` element with that id, which is
+  the `current-block` (empty when the element has no `blockId`).

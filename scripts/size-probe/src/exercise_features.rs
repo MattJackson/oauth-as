@@ -194,7 +194,7 @@ pub fn client_assertion() -> u64 {
             &keys,
             "not.an.assertion",
             "probe-confidential",
-            &["https://as.probe.example/token"],
+            oauth_as::AudienceRule::AnyOf(&["https://as.probe.example/token"]),
             std::time::SystemTime::now(),
         ) {
             acc = acc.wrapping_add(failure.to_string().len() as u64);
@@ -213,7 +213,7 @@ pub fn client_assertion() -> u64 {
                 &keys,
                 "not.an.assertion",
                 "probe-confidential",
-                &["https://as.probe.example/token"],
+                oauth_as::AudienceRule::AnyOf(&["https://as.probe.example/token"]),
                 std::time::SystemTime::now(),
             ) {
                 acc = acc.wrapping_add(failure.to_string().len() as u64);

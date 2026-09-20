@@ -5,7 +5,7 @@
   "description": "oauth-as FAPI 2.0 Security Profile, plain_oauth, private_key_jwt + DPoP",
 
   "server": {
-    "discoveryUrl": "https://localhost.emobix.co.uk:8443/.well-known/oauth-authorization-server"
+    "discoveryUrl": "https://as.local:8444/.well-known/oauth-authorization-server"
   },
 
   "client": {
@@ -47,9 +47,31 @@
   },
 
   "resource": {
-    "resourceUrl": "https://localhost.emobix.co.uk:8443/resource"
+    "resourceUrl": "https://as.local:8444/resource"
   },
 
-  "_browser_comment": "EMPTY, deliberately. examples/fapi2_conformance_server.rs wires ServiceBuilder::with_subject_resolver to a constant subject and with_approval_resolver to an unconditional ApprovalDecision::Approve -- there is no login form and no consent screen for the suite's headless HtmlUnit browser to fill in or click through; every valid authorization request is approved server-side and the browser only ever needs to follow the redirect chain the AS itself issues. An empty task list is the correct match for that behaviour, not an omission; do not add click/text commands here unless the fixture grows an actual interactive page.",
-  "browser": []
+  "_browser_comment": "The fixture auto-approves (no login form, no consent screen), so there is nothing to click or type -- but an EMPTY browser array is NOT correct. conformance-suite BrowserControl.goToUrl (verified at the pinned commit) only drives the suite's internal headless HtmlUnit browser for URLs that match an entry here; for an unmatched URL it adds the URL to a list and waits for an EXTERNAL browser to visit it. In headless CI there is no external browser, so with an empty array every authorization leg hangs in WAITING until timeout (PAR succeeds, then 'Redirecting to authorization endpoint' and silence). One entry matching the authorization endpoint is the minimum that makes the internal browser visit it. WebRunner follows the AS's response automatically, so by the time its tasks are evaluated the current URL is EITHER the suite callback (the AS approved and redirected) OR an as.local error page (the AS correctly refused an invalid authorization request -- FINDINGS.md D1: reused/expired/wrong-client request_uri, or no PAR). Both outcomes are legitimate, so BOTH tasks are marked optional and matched against the settled URL: the happy-path task waits for the id 'submission_complete' the suite's implicitCallback page adds once its inline JS has POSTed the authorization response back to the test (a 5s self-timeout fallback is baked into that page; without this wait WebRunner would close the browser before that JS runs and the response would never be captured), and the rejection-path task waits for the fixture's HTML error page and fills the module's ExpectXxxErrorPage placeholder from it with update-image-placeholder. Filling the last outstanding placeholder is what fires AbstractTestModule.fireTestFinishedInternal, so a rejection module finishes instead of hanging in WAITING until the plan timeout; a bare checkpoint (no command) exits WebRunner cleanly but never clears the placeholder, which was FINDINGS.md D1's original hang. Both tasks are optional because exactly one outcome (callback OR error page) occurs per module and the other's match must be skipped, not throw.",
+  "browser": [
+    {
+      "match": "https://as.local:8444/authorize*",
+      "tasks": [
+        {
+          "task": "Happy path: the fixture auto-approves and the AS redirects to the suite callback; wait for the suite's implicitCallback page to POST the response back (id 'submission_complete', 5s self-timeout fallback)",
+          "match": "https://localhost.emobix.co.uk*",
+          "optional": true,
+          "commands": [
+            ["wait", "id", "submission_complete", 15]
+          ]
+        },
+        {
+          "task": "Rejection path: the AS correctly refused the authorization request (a reused / expired / wrong-client request_uri, or a request not sent via PAR) and the fixture served an HTML error page at its own origin with no callback to follow. Wait for that page and fill the module's ExpectXxxErrorPage placeholder from it (update-image-placeholder) so the WAITING test finishes instead of hanging until the plan timeout. The literal 'Authorization error' is the <h1> the fixture's authorization_errors_as_html renders on every 4xx at /authorize; command[1] MUST be a real selector (xpath), never match/contains, or BrowserControl never enters the placeholder-fill branch (BrowserControl.java doCommand @6b8b809).",
+          "match": "https://as.local:8444/authorize*",
+          "optional": true,
+          "commands": [
+            ["wait", "xpath", "//*", 10, "Authorization error", "update-image-placeholder"]
+          ]
+        }
+      ]
+    }
+  ]
 }

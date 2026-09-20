@@ -39,6 +39,10 @@
 //! 7. **Auto-login / auto-consent** (§2.3, headless): every request is the same signed-in user and
 //!    every valid authorization request is approved without a consent screen, because the suite's
 //!    HtmlUnit browser completes the redirect from a scripted task list and cannot click anything.
+//! 8. **Client-assertion `aud` = the issuer, as a string** (FAPI 2.0 s5.3.2.1-8, s5.3.3.1-5;
+//!    FINDINGS.md D4). `AssertionAudience::IssuerOnly` refuses the token endpoint URL and any array
+//!    `aud` on `private_key_jwt` client authentication assertions, at PAR and the token endpoint
+//!    alike.
 //!
 //! # Environment
 //!
@@ -48,17 +52,21 @@
 //!   MUST equal the URL the metadata document is fetched from (RFC 8414 s3.3), so for the default
 //!   suite deployment leave it at the default; override it only if you moved the suite's base URL.
 //! * `OAUTH_AS_FAPI_REDIRECT_URIS` (default `https://localhost.emobix.co.uk:8443/test/a/oauth-as/callback`):
-//!   comma-separated redirect URIs registered for BOTH clients. FAPI 2.0 requires exact redirect
-//!   URI matching, so this must equal `client.redirect_uri` in the suite configuration; the
-//!   config side and this side are matched together, exactly as the client keys are.
+//!   comma-separated redirect URIs for `client`. FAPI 2.0 requires exact redirect URI matching, so
+//!   this must equal `client.redirect_uri` in the suite configuration. `client2` is registered with
+//!   these same URIs plus a `?dummy1=lorem&dummy2=ipsum` query component, because the happy-flow's
+//!   second-client leg exercises exact matching on a query-carrying redirect URI and requires the
+//!   AS to accept it; the config side and this side are matched together, exactly as the keys are.
 //! * `OAUTH_AS_RESOURCE` (default `{issuer}/resource`): the `resource.resourceUrl` the suite calls
 //!   with a DPoP-bound token. It is a route on THIS listener, so its DPoP `htu` is this URL.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::body::{to_bytes, Body};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -75,7 +83,7 @@ use oauth_as::jwt::{
 };
 use oauth_as::par::ParConfig;
 use oauth_as::scope::ScopeSet;
-use oauth_as::server::{AuthorizationServer, RefreshRotation, ServerConfig};
+use oauth_as::server::{AssertionAudience, AuthorizationServer, RefreshRotation, ServerConfig};
 use oauth_as::store::MemoryStorage;
 use sha2::{Digest, Sha256};
 
@@ -209,6 +217,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `validate_authorization_request` answers `invalid_request` for a query-parameter request.
     let mut par = ParConfig::new();
     par.require_pushed_authorization_requests = true;
+    // (FINDINGS.md D6 / FAPI2-SP-FINAL-5.3.2.2 clause 6) the AS shall require `redirect_uri` in
+    // pushed authorization requests. `require_redirect_uri` overrides the RFC 6749 s3.1.2.3
+    // single-registered-URI fallback for the PAR push path, so a push omitting `redirect_uri` is
+    // rejected `invalid_request` rather than silently defaulted. This is what flips
+    // `ensure-request-object-without-redirect-uri-fails` to PASS.
+    par.require_redirect_uri = true;
     // (§2.3 item 6) the `request_uri` handle expiry, 90s < 600s (s5.3.2.2-12).
     par.request_uri_ttl = std::time::Duration::from_secs(REQUEST_URI_TTL_SECS);
     config.par = Some(Box::new(par));
@@ -221,6 +235,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a DELIBERATE downgrade of this crate's default reuse detection (OAuth 2.1 s6.1 / RFC 9700
     // s4.14.2), and is only sound here because tokens are DPoP sender-constrained above.
     config = config.with_refresh_rotation(RefreshRotation::Reuse);
+
+    // (§2.3 item 8 / FAPI2-SP-FINAL-5.3.2.1-8) FAPI 2.0 s5.3.2.1-8 and s5.3.3.1-5: a client
+    // authentication assertion's `aud` must be the issuer identifier AS A STRING — the token
+    // endpoint URL is refused and an array is refused even when it carries the issuer.
+    // `AssertionAudience::IssuerOnly` is that tightening of RFC 7523 s3 (3); it is what flips the
+    // FINDINGS.md D4 modules (par-test-token-endpoint-url-as-audience-fails,
+    // par-test-array-as-audience-fails) to PASS.
+    config = config.with_assertion_audience(AssertionAudience::IssuerOnly);
 
     // (§2.3 item 1) RFC 9068 `at+jwt` access tokens, signed with the fixture key, so the protected
     // resource can verify them offline against the advertised JWKS. `with_jwks_uri` is what makes
@@ -236,6 +258,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
 
     // (§2.3 item 3) the two static `private_key_jwt` clients, each with its own public key.
+    // FAPI 2.0 mandates EXACT redirect-URI matching, and the suite tests that on a URI that carries
+    // a query component: the happy-flow's second-client leg registers/uses client2 with client's
+    // redirect URI plus `?dummy1=lorem&dummy2=ipsum` and requires the AS to accept it (PAR -> 201).
+    // So client2 must be registered with exactly that query-carrying variant, or its PAR is
+    // (correctly) rejected with `invalid_request: redirect_uri does not exactly match`.
+    let client2_redirect_uris: Vec<String> = redirect_uris
+        .iter()
+        .map(|u| format!("{u}?dummy1=lorem&dummy2=ipsum"))
+        .collect();
     register_client(
         &server,
         CLIENT_ID,
@@ -247,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_client(
         &server,
         CLIENT2_ID,
-        &redirect_uris,
+        &client2_redirect_uris,
         &scope_names,
         client2_keys(),
     )
@@ -288,14 +319,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resource_router = Router::new()
         .route(&resource_path, get(protected_resource))
         .with_state(rs_state);
-    let router = axum::Router::from(builder.build()?).merge(resource_router);
+    let router = axum::Router::from(builder.build()?)
+        .merge(resource_router)
+        // CONFORMANCE FIXTURE ONLY: render a rejected authorization request as an HTML error page
+        // so the suite's headless browser can screenshot it. See `authorization_errors_as_html`.
+        .layer(axum::middleware::from_fn(authorization_errors_as_html));
 
     print_boot_banner(&issuer, &resource_url, &redirect_uris);
 
-    // (§2.2 / §2.3 item 2) HTTPS under a self-signed certificate generated at boot. The suite
-    // trusts all certificates and skips hostname verification, so this needs no CA and no public
-    // hostname.
-    let tls = self_signed_tls(&issuer).await?;
+    // (§2.2 / §2.3 item 2) HTTPS. The suite's *condition* HTTP client trusts all certificates, but
+    // its HtmlUnit BROWSER does NOT (it uses the JVM default trust store), so the browser-driven
+    // authorization leg needs a certificate the suite's JVM trusts. When OAUTH_AS_TLS_CERT and
+    // OAUTH_AS_TLS_KEY are set (the conformance harness generates a private CA, signs this leaf with
+    // it, and imports the CA into the suite container's trust store), serve that CA-signed pair;
+    // otherwise fall back to a boot self-signed certificate for ad-hoc / condition-only use.
+    let tls = match (
+        std::env::var("OAUTH_AS_TLS_CERT").ok(),
+        std::env::var("OAUTH_AS_TLS_KEY").ok(),
+    ) {
+        (Some(cert_path), Some(key_path)) => {
+            println!("FAPI 2.0 fixture: serving CA-signed TLS from {cert_path} / {key_path}");
+            RustlsConfig::from_pem_file(cert_path, key_path).await?
+        }
+        _ => self_signed_tls(&issuer).await?,
+    };
     let socket = addr.parse()?;
     println!("FAPI 2.0 fixture listening on https://{addr} (issuer {issuer})");
     axum_server::bind_rustls(socket, tls)
@@ -402,8 +449,13 @@ fn verify_dpop_bound(state: &ResourceState, headers: &HeaderMap) -> Result<Strin
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .ok_or("missing Authorization header")?;
+    // The scheme is case-INSENSITIVE (RFC 9110 s11.1), so `DPoP`, `dpop` and `DPOP` are the same
+    // credential; matching only the exact casing is what `access-token-type-header-case-sensitivity`
+    // catches. Split off the scheme token and compare it without regard to case.
     let token = authz
-        .strip_prefix("DPoP ")
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("DPoP"))
+        .map(|(_, rest)| rest)
         .ok_or("Authorization is not a DPoP-bound credential (RFC 9449 s7.1)")?
         .trim();
 
@@ -507,6 +559,96 @@ fn path_of(url: &str, issuer: &str) -> String {
         .filter(|p| p.starts_with('/'))
         .unwrap_or("/resource")
         .to_string()
+}
+
+/// CONFORMANCE FIXTURE ONLY. Re-render a rejected authorization request as an HTML error page.
+///
+/// The library answers a rejected authorization request (a reused / expired / wrong-client
+/// `request_uri`, or a request not sent via PAR) with a DIRECT `application/json` error body. That
+/// is the correct machine-readable answer and RFC 6749 s4.1.2.1 forbids redirecting it to a
+/// `redirect_uri` the server has not validated, so the library keeps it a direct response and this
+/// fixture does NOT change that decision. But the suite drives `/authorize` with a headless HtmlUnit
+/// browser, and HtmlUnit renders a JSON response as a non-HTML `TextPage` on which the suite's
+/// `["wait","xpath","//*", …]` browser command finds no DOM, so the module's `ExpectXxxErrorPage`
+/// placeholder never clears and the test hangs in WAITING until the plan timeout (FINDINGS.md D1). A
+/// real browser-facing authorization endpoint shows an HTML error page; this fixture does the same,
+/// but ONLY for a 4xx at `/authorize`, so the token, PAR, resource, and metadata endpoints keep the
+/// exact JSON bytes the suite's HTTP client parses. The page carries the fixed literal "Authorization
+/// error" that `crates/oauth-as-conformance/fapi2/config.json` waits for to fill the placeholder.
+async fn authorization_errors_as_html(req: Request, next: Next) -> Response {
+    let is_authorize = req.method() == Method::GET && req.uri().path() == "/authorize";
+    let resp = next.run(req).await;
+    if !is_authorize || !resp.status().is_client_error() {
+        return resp;
+    }
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !is_json {
+        return resp;
+    }
+
+    let (mut parts, body) = resp.into_parts();
+    let status = parts.status;
+    // Buffer the library's JSON error body and report it FAITHFULLY: never invent an error code the
+    // AS did not return, so a certification screenshot/log cannot misrepresent which check failed.
+    // If the body cannot be read (oversized past the cap, or a stream error) or is not the expected
+    // JSON, show what actually happened (the status, or the raw body) rather than a fabricated code.
+    let (error, description) = match to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => match value.get("error").and_then(|v| v.as_str()) {
+                Some(error) => (
+                    error.to_string(),
+                    value
+                        .get("error_description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                // Valid JSON but not the `{"error":..}` shape: show it verbatim rather than a blank
+                // code, so the page never misreports which check failed.
+                None => (
+                    format!("HTTP {}", status.as_u16()),
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ),
+            },
+            Err(_) => (
+                format!("HTTP {}", status.as_u16()),
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ),
+        },
+        Err(_) => (
+            format!("HTTP {}", status.as_u16()),
+            "the authorization endpoint error body could not be read".to_string(),
+        ),
+    };
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let (error, description) = (esc(&error), esc(&description));
+    // "Authorization error" is the literal fapi2/config.json's browser task waits for; the error
+    // code and description follow it so a certification reviewer's screenshot shows both.
+    let html = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Authorization error</title></head><body>\
+         <h1>Authorization error</h1>\
+         <p>The authorization request was rejected.</p>\
+         <p>error: {error}</p><p>{description}</p></body></html>"
+    );
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, html_content_type());
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(html))
+}
+
+/// The `Content-Type` for the fixture's HTML error page (mirrors the library's own value).
+fn html_content_type() -> HeaderValue {
+    HeaderValue::from_static("text/html;charset=UTF-8")
 }
 
 /// Generate a self-signed certificate at boot and build the rustls server config from its PEM.

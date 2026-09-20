@@ -1,0 +1,13 @@
+[
+  {
+    "test-name": "fapi2-security-profile-final-ensure-signed-client-assertion-with-RS256-fails",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "comment": "The module verifies an AS rejects an RS256-signed client-authentication assertion, but it SKIPS itself when the server offers no RSA/PS256-capable client key to build that negative input from: it logs 'This test requires RSA keys ... If your server does not support PS256 then this will not prevent you certifying' and the OIDF runner reports result SKIPPED (run 35487826596, head c51be96, module log 9U7sARV67FntIVB). This fixture authenticates its client with ES256 (private_key_jwt over EC P-256) and oauth-as does not implement PS256 at all (its wired JWS algorithms are ES256, RS256, EdDSA; JwsAlg has no PS256 variant), so the suite has no PS256/RSA key to sign the RS256 test assertion with and skips the module. This is the suite acknowledging the profile does not exercise RS256 here, not an AS defect and not a masked failure. How oauth-as would in fact reject a wrong-algorithm assertion (stated precisely, since this SKIP means the suite does not demonstrate it): the algorithm is pinned per client registration -- AssertionKeys::PublicKeys carries exactly ONE alg (client_assertion.rs; 'The ONE algorithm this registration's assertions may carry'), and verify_assertion accepts only that alg, so this fixture's ES256-registered client rejects an RS256 (or any non-ES256) assertion as an algorithm mismatch. It is NOT a global RS256 ban: a deployment that registered a client with alg=RS256 would accept RS256 for that client, so a FAPI deployment must register its clients with ES256 (or, once supported, PS256), which this fixture does. An expected SKIP is a documented gap the gate keeps in front of us, not a pass: the runner exits 1 if this test STOPS being skipped (expected_skip_did_not_happen), so if a future PS256/RSA-capable fixture makes it run, this entry must be deleted."
+  }
+]

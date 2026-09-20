@@ -1,0 +1,114 @@
+[
+  {
+    "test-name": "fapi2-security-profile-final-user-rejects-authentication",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Verify authorization endpoint response",
+    "condition": "EnsureErrorFromAuthorizationEndpointResponse",
+    "expected-result": "failure",
+    "comment": "FINDINGS.md D2 module A (category: fixture). The module needs the user to press cancel so the AS returns access_denied; the fixture (fapi2_conformance_server.rs) auto-approves with a constant subject and renders no consent page, so the suite's headless browser has nothing to cancel and the AS issues a code instead of an error. The AS deny path itself is conformant: ApprovalDecision::Deny -> access_denied at the validated redirect URI (http.rs authorize_handler, RFC 6749 s4.1.2.1), covered in-crate by tests/http_surface.rs c4_the_consent_seam_decides_what_the_authorization_endpoint_does and tests/http_par_jar_routing.rs a_pushed_authorization_detail_reaches_the_approval_screen. Strings captured from run 35477787404 (head 2e37ff9), module log pFrvMBesALwNuke.json. A recorded gap, NOT a pass: if this stops failing the runner exits 1 and this entry must be deleted."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-user-rejects-authentication",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Verify authorization endpoint response",
+    "condition": "CheckForUnexpectedParametersInErrorResponseFromAuthorizationEndpoint",
+    "expected-result": "warning",
+    "comment": "FINDINGS.md D2 module A, same cause as the entry above; this condition is logged at WARNING level by the module (callAndContinueOnFailure(..., ConditionResult.WARNING)), so expected-result is 'warning'. It only runs because no error response arrived, which is the fixture's auto-approve, not an AS defect."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-user-rejects-authentication",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Verify authorization endpoint response",
+    "condition": "ExpectAccessDeniedErrorFromAuthorizationEndpointDueToUserRejectingRequest",
+    "expected-result": "failure",
+    "comment": "FINDINGS.md D2 module A, same cause: 'error parameter not found. When running this test, the tester MUST press cancel on the login screen or deny consent'. The suite DOES offer a per-module hook (a top-level config 'override' keyed by test name, merged at plan creation in info/DBTestPlanService.java:171 @6b8b809), so this becomes headlessly certifiable once the fixture can serve a consent page on the PAR path; today the crate consumes the request_uri before the approval resolver runs, so a Respond-rendered page cannot resume issuance (see D2 module B, core half). Keying Deny off this module's incidental 128-character state was rejected as a fake signal."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-user-rejects-authentication",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Second client: Verify authorization endpoint response",
+    "condition": "EnsureErrorFromAuthorizationEndpointResponse",
+    "expected-result": "failure",
+    "comment": "FINDINGS.md D2 module A, second-client leg (AbstractFAPI2SPFinalMultipleClient repeats the flow with client2). Same cause as the first-client block; a distinct block name, so a distinct entry: the runner matches an entry by exact block name and this repository forbids '*' blocks."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-user-rejects-authentication",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Second client: Verify authorization endpoint response",
+    "condition": "CheckForUnexpectedParametersInErrorResponseFromAuthorizationEndpoint",
+    "expected-result": "warning",
+    "comment": "FINDINGS.md D2 module A, second-client leg, WARNING-level condition; same cause as above."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-user-rejects-authentication",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Second client: Verify authorization endpoint response",
+    "condition": "ExpectAccessDeniedErrorFromAuthorizationEndpointDueToUserRejectingRequest",
+    "expected-result": "failure",
+    "comment": "FINDINGS.md D2 module A, second-client leg; same cause as above."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Make request to authorization endpoint",
+    "condition": "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+    "expected-result": "failure",
+    "comment": "FINDINGS.md D2 module B (category: fixture AND core). The condition is the module's own id because processCallback() throws a raw RuntimeException ('The user was authenticated on the initial visit to login page. This must not be attempted until the second visit') and AbstractTestModule.handleException logs it under getName(); there is no condition class to cite. Observed cause (fixture): auto-approve issues a code on the FIRST /authorize visit. Latent cause (core): resolve_authorization_request (http.rs) -> validate_pushed_authorization_request (par.rs) -> Storage::take_pushed_authorization_request consumes the request_uri at READ time, before the subject and approval steps, so a second pre-completion visit gets a direct 400 invalid_request_uri even with a deferred-auth fixture. Spec: FAPI 2.0 SP Final s5.3.2.2 NOTE 3 recommends enforcing one-time use 'at the point of authorization, not at the point of loading an authorization page'; RFC 9126 s4 makes one-time use a SHOULD with a MAY for reload duplicates; s7.3 (Request Object Replay) is a SHOULD. Consume-at-read is a deliberate, spec-permitted stricter posture, not a security downgrade and not the suite being wrong. Certification needs BOTH deferring consumption to code issuance AND a first visit that does not authenticate (human-driven per the module's own summary). Strings captured from run 35477787404 (head 2e37ff9), module log F6DDe0FNM9WGshn.json. A recorded gap, NOT a pass."
+  },
+  {
+    "test-name": "fapi2-security-profile-final-attempt-reuse-authorization-code-after-one-second",
+    "variant": {
+      "openid": "plain_oauth",
+      "client_auth_type": "private_key_jwt",
+      "sender_constrain": "dpop",
+      "fapi_profile": "plain_fapi"
+    },
+    "configuration-filename": "*/fapi2/config.json",
+    "current-block": "Testing if access token was revoked after authorization code reuse (the AS 'should' have revoked the access token)",
+    "condition": "EnsureHttpStatusCodeIs4xx",
+    "expected-result": "warning",
+    "comment": "FINDINGS.md D3 (category: fixture). The module redeems an authorization code, REUSES it, then calls the protected resource with the access token minted on the first redemption and expects a 4xx because the AS 'should' have revoked that token on code reuse. oauth-as DOES revoke it: authorization_code_token (server.rs ~4933) detects the replay and calls Storage::revoke_token_family on the family the code minted (RFC 6749 s4.1.2, RFC 9700 s4.1.1), covered in-crate. The WARNING is logged ONLY because the fixture's protected resource (fapi2_conformance_server.rs protected_resource) validates the access token STATELESSLY -- RFC 9068 JWT signature plus RFC 9449 DPoP binding, no RFC 7662 introspection -- so a token that is still signature-valid and unexpired is accepted until expiry even though its family is revoked at the AS. A self-contained-JWT resource that does not introspect is a legitimate, spec-permitted design; revocation on code reuse is a SHOULD, and the suite logs the missing 4xx at WARNING (callAndContinueOnFailure(..., ConditionResult.WARNING)) and templates it as an expected warning, not a failure. This records the resource's stateless design honestly; it does NOT mask an AS defect. Strings captured from run 35487826596 (head c51be96), module log IYLjk64U3xLG4Zr. A recorded gap, NOT a pass: if this stops warning the runner exits 1 and this entry must be deleted."
+  }
+]
