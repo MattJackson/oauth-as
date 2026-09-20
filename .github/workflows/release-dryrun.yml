@@ -1,0 +1,83 @@
+# Release signing DRY RUN — exercises the exact package -> attest -> cosign path that publish.yml
+# runs after a real crates.io publish, but WITHOUT publishing anything: no cargo publish, no tag, no
+# GitHub Release. It packages the crate, records a SLSA build-provenance attestation, cosign-signs it
+# keylessly, and then VERIFIES both back — so the OIDC / keyless / attestation machinery is proven to
+# work in this repository's Actions environment before it is ever depended on by an irreversible
+# release.
+#
+# Manual only (workflow_dispatch). Run it from any branch. It is a smoke test; keep it in step with
+# the signing block in publish.yml.
+#
+# Pinning follows the repo rule (see dev.yml's header): actions/* on major tags, everything else on a
+# full commit SHA with the readable ref in a trailing comment.
+
+name: release-dryrun
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # keyless OIDC for attestation + cosign
+  attestations: write # to record the build-provenance attestation
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sign-dryrun:
+    name: package, attest, cosign — then verify (no publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+
+      - name: Package the crate (same artifact publish.yml signs)
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="oauth-as"))')"
+          cargo package --locked -p oauth-as
+          crate="target/package/oauth-as-${version}.crate"
+          test -f "$crate" || { echo "::error::expected $crate after cargo package"; exit 1; }
+          echo "CRATE_PATH=$crate" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.CRATE_PATH }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Cosign-sign the crate (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle "oauth-as-${VERSION}.crate.cosign.bundle" \
+            "$CRATE_PATH"
+          echo "BUNDLE_PATH=oauth-as-${VERSION}.crate.cosign.bundle" >> "$GITHUB_ENV"
+
+      - name: Verify the cosign signature (keyless)
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --bundle "$BUNDLE_PATH" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-dryrun.yml@" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$CRATE_PATH"
+          echo "cosign signature verified"
+
+      - name: Verify the build-provenance attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "$CRATE_PATH" --repo "$GITHUB_REPOSITORY"
+          echo "build-provenance attestation verified"
