@@ -171,3 +171,52 @@ fn success_response_shape_is_rfc6749_5_1() {
         "absent optionals must be omitted, not null"
     );
 }
+
+/// A `RefreshTokenRetry` record a PRIOR release persisted WITHOUT the `jkt` field (the winning
+/// rotation's DPoP key thumbprint, added in 0.10.1) still deserialises — as `jkt: None` — instead of
+/// failing the whole record, and a round-trip preserves the value when present. This pins the
+/// rolling-upgrade migration `refresh_retry_response` depends on: across a dev -> qa -> main upgrade,
+/// an in-flight retry record written by the old binary must still load.
+///
+/// The migration holds because `jkt` is an `Option`: serde reads a MISSING `Option<T>` field as
+/// `None` on its own, so this behaviour does NOT depend on the `#[serde(default)]` on the field
+/// (which is explicit reinforcement — it would carry the same guarantee to a future non-`Option`
+/// field). This test therefore pins the observable migration contract, not that one attribute.
+#[test]
+fn refresh_token_retry_from_a_prior_release_without_jkt_migrates_to_none() {
+    let response = TokenResponse {
+        access_token: "at".into(),
+        token_type: TokenType::Bearer,
+        expires_in: 3600,
+        refresh_token: Some("rt".into()),
+        scope: Some("read".into()),
+        #[cfg(feature = "rar")]
+        authorization_details: Default::default(),
+    };
+    let retry = RefreshTokenRetry {
+        response,
+        until: UNIX_EPOCH + Duration::from_secs(1_000),
+        jkt: Some("winning-key-thumbprint".into()),
+    };
+
+    // A present jkt round-trips unchanged.
+    let json = serde_json::to_value(&retry).unwrap();
+    let round_tripped: RefreshTokenRetry = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(round_tripped, retry);
+    assert_eq!(round_tripped.jkt.as_deref(), Some("winning-key-thumbprint"));
+
+    // A record written before the field existed carries no `jkt` key at all. Removing it must
+    // deserialise to `None` (not error), and every other field must survive intact.
+    let mut without = json;
+    assert!(
+        without.as_object_mut().unwrap().remove("jkt").is_some(),
+        "the serialised form should have contained a jkt to remove"
+    );
+    let migrated: RefreshTokenRetry = serde_json::from_value(without).unwrap();
+    assert!(
+        migrated.jkt.is_none(),
+        "a record written before jkt existed must migrate to None, not fail to load"
+    );
+    assert_eq!(migrated.response, retry.response);
+    assert_eq!(migrated.until, retry.until);
+}

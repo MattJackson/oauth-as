@@ -878,8 +878,10 @@ pub struct RefreshTokenRetry {
     /// The DPoP key thumbprint (RFC 9449) the cached `response` is bound to, if any. A lost-response
     /// retry must prove THIS key — the one the winning rotation actually bound the coalesced token to
     /// — not the spent predecessor's key, which for a confidential client that re-keyed the chain at
-    /// rotation (RFC 9449 s5 permits it) is a DIFFERENT key. `None` for a bearer chain. `serde`
-    /// default so a record persisted before this field existed still deserialises (as `None`).
+    /// rotation (RFC 9449 s5 permits it) is a DIFFERENT key. `None` for a bearer chain. A record
+    /// persisted before this field existed still deserialises (as `None`) because a missing `Option`
+    /// field reads as `None` in serde; `#[serde(default)]` is explicit reinforcement of that
+    /// rolling-upgrade contract, not what creates it.
     #[serde(default)]
     pub(crate) jkt: Option<Box<str>>,
 }
