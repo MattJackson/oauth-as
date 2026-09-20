@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 //! `invalid_authorization_details` has to EXIST in a build without `rar`, because that is the
 //! build with the most to refuse.
 //!

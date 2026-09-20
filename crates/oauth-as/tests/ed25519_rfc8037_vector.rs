@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 //! STANDALONE Ed25519 crypto proof for the Phase C (`jwt-ed25519`) backend, driving
 //! `ed25519-dalek` DIRECTLY against the official RFC 8037 Appendix A.4 vector.
 //!

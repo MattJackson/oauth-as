@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 //! Bounded refresh retries use the real issuance and storage seams.
 mod support;
 use oauth_as::{AuthorizationServer, ErrorCode, MemoryStorage, Storage};

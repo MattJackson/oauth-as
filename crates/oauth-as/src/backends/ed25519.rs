@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 //! THE BUILT-IN EdDSA (Ed25519) BACKEND, behind `jwt-ed25519`. Phase C of the crypto-agility
 //! work, the EdDSA sibling of the `jwt-p256` ES256 backend in `crate::jwt`.
 //!

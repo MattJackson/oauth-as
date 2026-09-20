@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 use super::{mint_code_token, public_client, ManualClock, PUBLIC_REDIRECT};
 use oauth_as::{
     AuthorizationServer, ClientId, ErrorCode, ScopeSet, ServerConfig, Storage, TokenRequest,

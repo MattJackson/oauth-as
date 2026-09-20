@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 #![cfg(feature = "pg-integration")]
 #[path = "../../oauth-as/tests/support/mod.rs"]
 mod oauth_support;

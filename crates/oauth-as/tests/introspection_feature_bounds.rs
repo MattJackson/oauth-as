@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+
 //! What an introspection response MEANS must not depend on the flag set of the build that reads
 //! it.
 //!

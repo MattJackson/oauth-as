@@ -1,0 +1,55 @@
+version = 1
+
+# REUSE (https://reuse.software) bulk annotations.
+#
+# Every Rust source file in this repository carries an inline
+#   // SPDX-License-Identifier: MIT OR Apache-2.0
+#   // Copyright (C) 2026 Matthew Jackson
+# header, and an inline header always takes precedence over the entries below.
+# This file supplies the same licensing to the files that cannot (or should not)
+# carry an inline comment: manifests, lockfiles, docs, workflows, shell/python
+# helpers, and the black-box test fixtures and fuzz corpora — which are DATA and
+# must stay byte-for-byte as captured, so a comment cannot be prepended to them.
+#
+# The whole repository is the author's own work under the same dual licence as the
+# crate (MIT OR Apache-2.0); there is no third-party vendored source here. The Go
+# interop harness under crates/oauth-as-conformance/interop/go is first-party glue
+# for the independent conformance judge and is licensed the same way.
+
+[[annotations]]
+path = [
+    "**/*.toml",
+    "**/*.lock",
+    "**/*.md",
+    "**/*.json",
+    "**/*.yml",
+    "**/*.yaml",
+    "**/*.sh",
+    "**/*.py",
+    "**/*.txt",
+    "**/*.sum",
+    "**/*.mod",
+    "**/.gitignore",
+    ".gitignore",
+    "CODEOWNERS",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "crates/oauth-as/LICENSE-MIT",
+    "crates/oauth-as/LICENSE-APACHE",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Matthew Jackson"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Black-box test fixtures and fuzz corpora: captured wire bytes, test vectors, and
+# generated inputs. They are DATA, kept verbatim, so licensing lives here rather
+# than in a header that would change the bytes under test.
+[[annotations]]
+path = [
+    "fuzz/corpus/**",
+    "crates/**/tests/**",
+    "crates/oauth-as-conformance/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Matthew Jackson"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
