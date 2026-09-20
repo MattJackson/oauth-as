@@ -453,11 +453,16 @@ impl JwsVerifiers {
 /// never sets one is unchanged. Representation mirrors [`JwsVerifiers`]: a fixed `[bool; ALL.len()]`
 /// indexed by [`JwsAlg`]'s own slot, `Copy`, no allocation, and `is_allowed` is a slot read.
 ///
-/// SCOPE: this governs the algorithms the server ACCEPTS and DERIVES its RFC 8414 metadata from. It
-/// does not rewrite host-authored free-form fields such as the RFC 9728 resource-metadata alg lists
-/// (those are the host's declaration about a protected resource), and it does not reach a host that
-/// calls a low-level verify entry point (e.g. [`crate::dpop::verify_proof`]) with its own verifier
-/// set — that is the host operating its own crypto, outside this server's mediation.
+/// SCOPE: this governs the ASYMMETRIC [`JwsAlg`] algorithms the server ACCEPTS and DERIVES its RFC
+/// 8414 metadata from. It is NOT:
+/// - a filter on `HS256`/`client_secret_jwt`, which is a SYMMETRIC method (a shared secret, not a
+///   `JwsAlg`) and is out of this list's scope; a FAPI 2.0 deployment — which forbids
+///   `client_secret_jwt` outright — closes that door by not registering such clients;
+/// - a rewrite of host-authored free-form fields such as the RFC 9728 resource-metadata alg lists
+///   (those are the host's declaration about a protected resource, not the AS's client-auth policy);
+/// - reachable by a host that calls a low-level verify entry point (e.g. [`crate::dpop::verify_proof`])
+///   with its own verifier set — that is the host operating its own crypto, outside this server's
+///   mediation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
 pub struct AlgAllowList {
