@@ -400,9 +400,20 @@ jobs:
           echo "CRATE_PATH=$crate" >> "$GITHUB_ENV"
 
       - name: Attest build provenance (SLSA)
+        id: attest
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ env.CRATE_PATH }}
+
+      - name: Stage the SLSA provenance as a release asset
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          # An `.intoto.jsonl` asset on the release is what OpenSSF Scorecard's Signed-Releases check
+          # recognises as provenance (the attestation store alone is invisible to it).
+          cp "${{ steps.attest.outputs.bundle-path }}" "oauth-as-${VERSION}.crate.intoto.jsonl"
+          echo "PROVENANCE_PATH=oauth-as-${VERSION}.crate.intoto.jsonl" >> "$GITHUB_ENV"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -412,10 +423,16 @@ jobs:
           VERSION: ${{ needs.decide.outputs.version }}
         run: |
           set -euo pipefail
+          # Produce a detached `.sig` + `.pem` (which Scorecard recognises as a signature) alongside
+          # the self-contained cosign bundle (which `cosign verify-blob --bundle` consumes).
           cosign sign-blob --yes \
             --bundle "oauth-as-${VERSION}.crate.cosign.bundle" \
+            --output-signature "oauth-as-${VERSION}.crate.sig" \
+            --output-certificate "oauth-as-${VERSION}.crate.pem" \
             "$CRATE_PATH"
           echo "BUNDLE_PATH=oauth-as-${VERSION}.crate.cosign.bundle" >> "$GITHUB_ENV"
+          echo "SIG_PATH=oauth-as-${VERSION}.crate.sig" >> "$GITHUB_ENV"
+          echo "CERT_PATH=oauth-as-${VERSION}.crate.pem" >> "$GITHUB_ENV"
 
       - name: Create the GitHub Release with signed artifacts
         env:
@@ -426,12 +443,12 @@ jobs:
           tag="v$VERSION"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag already exists, uploading assets to it"
-            gh release upload "$tag" "$CRATE_PATH" "$BUNDLE_PATH" --clobber
+            gh release upload "$tag" "$CRATE_PATH" "$BUNDLE_PATH" "$SIG_PATH" "$CERT_PATH" "$PROVENANCE_PATH" --clobber
           else
             gh release create "$tag" \
               --title "oauth-as $tag" \
               --generate-notes \
-              "$CRATE_PATH" "$BUNDLE_PATH"
+              "$CRATE_PATH" "$BUNDLE_PATH" "$SIG_PATH" "$CERT_PATH" "$PROVENANCE_PATH"
           fi
 
   # Runs when the push to main carried no version bump. Exists so the reason is visible in the
