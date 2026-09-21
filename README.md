@@ -85,6 +85,38 @@ submission and **nothing is certified**. See "What is not claimed", below.
 What is missing today is in "What is not claimed", below. It is written down rather than left to be
 discovered.
 
+## Quickstart
+
+Add the crate. The default feature set is empty (see [Features](#features)); pick the wire surface
+you need — for an HTTP server with ES256 JWT access tokens:
+
+```console
+cargo add oauth-as --features http,axum,jwt,jwt-p256
+```
+
+Construct an embeddable authorization server over your storage:
+
+```rust
+use oauth_as::server::{AuthorizationServer, ServerConfig};
+use oauth_as::store::MemoryStorage;
+
+// The issuer identifier and the RFC 8628 device verification URI (both `impl Into<String>`).
+let config = ServerConfig::new(
+    "https://as.example.com",
+    "https://as.example.com/device",
+);
+
+// `MemoryStorage` is fine for a demo; a real deployment implements the `Storage`
+// trait over its own database (atomically — see the trait docs). Add the seams a
+// deployment needs with the builder: `.with_event_sink(...)`, `.with_rate_limiter(...)`, etc.
+let server = AuthorizationServer::new(config, MemoryStorage::new());
+```
+
+A complete, runnable server — the HTTP wiring, JWT keys, consent, and rate limiting — is in
+[`examples/production_server.rs`](crates/oauth-as/examples/production_server.rs); a FAPI 2.0 fixture
+is in [`examples/fapi2_conformance_server.rs`](crates/oauth-as/examples/fapi2_conformance_server.rs).
+The full API reference is on [docs.rs](https://docs.rs/oauth-as).
+
 ## Features
 
 Eighteen features. The default set is **empty**, and stays that way.

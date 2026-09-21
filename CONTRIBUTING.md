@@ -151,6 +151,34 @@ contributor's PR triggers by merging to `dev`.
 `oauth-as` is dual licensed under MIT OR Apache-2.0. By submitting a contribution, you agree it is
 licensed under both, matching the notice in `README.md`.
 
+## Developer Certificate of Origin (DCO)
+
+Contributions are accepted under the [Developer Certificate of Origin](https://developercertificate.org)
+1.1: by signing off you certify that you wrote the change, or have the right to submit it under the
+project's MIT OR Apache-2.0 license. Sign off every commit by adding a `Signed-off-by` trailer with
+your real name and email:
+
+```
+git commit -s -m "your message"
+```
+
+which appends:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+This is a lightweight alternative to a CLA: it keeps the provenance of every contribution on the
+record without assigning any rights. A pull request whose commits are not signed off will be asked
+to add the trailer (`git rebase --signoff` on the branch) before merge.
+
+## Code review
+
+Every change — external or the maintainer's own — is reviewed against the project's
+[code review standards](docs/CODE_REVIEW.md) before it is merged, and a release additionally goes
+through the manual pre-release audit described above. Governance and maintainer roles are in
+[`GOVERNANCE.md`](GOVERNANCE.md).
+
 ## Opening a pull request
 
 - Keep the change scoped to one coherent thing. A PR that mixes a protocol fix with an unrelated
