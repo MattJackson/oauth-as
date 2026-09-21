@@ -423,16 +423,36 @@ jobs:
           VERSION: ${{ needs.decide.outputs.version }}
         run: |
           set -euo pipefail
-          # Produce a detached `.sig` + `.pem` (which Scorecard recognises as a signature) alongside
-          # the self-contained cosign bundle (which `cosign verify-blob --bundle` consumes).
-          cosign sign-blob --yes \
-            --bundle "oauth-as-${VERSION}.crate.cosign.bundle" \
-            --output-signature "oauth-as-${VERSION}.crate.sig" \
-            --output-certificate "oauth-as-${VERSION}.crate.pem" \
+          bundle="oauth-as-${VERSION}.crate.cosign.bundle"
+          sig="oauth-as-${VERSION}.crate.sig"
+          cert="oauth-as-${VERSION}.crate.pem"
+
+          # Sign the crate to a self-contained cosign bundle (which `cosign verify-blob --bundle`
+          # consumes). cosign v4 defaults to the new bundle format, under which the deprecated
+          # `--output-signature` / `--output-certificate` flags are SILENTLY IGNORED -- so the `.sig`
+          # and `.pem` are DERIVED from the bundle below rather than asked for on the command line.
+          cosign sign-blob --yes --bundle "$bundle" "$CRATE_PATH"
+
+          # Extract the detached `.sig` + `.pem` Scorecard recognises from the bundle. The new-format
+          # bundle carries the raw signature over the crate at `.messageSignature.signature` (base64)
+          # and the signing certificate at `.verificationMaterial.certificate.rawBytes` (base64 DER);
+          # both are exactly what `cosign verify-blob --signature <sig> --certificate <cert>` expects,
+          # so these files genuinely verify the crate rather than merely being present.
+          jq -r '.messageSignature.signature' "$bundle" > "$sig"
+          jq -r '.verificationMaterial.certificate.rawBytes' "$bundle" \
+            | base64 -d | openssl x509 -inform DER -out "$cert"
+
+          # Fail loudly if the derived signature does not actually verify the crate: a `.sig` nobody
+          # watched verify is exactly the unexercised-signing-path bug this step exists to have ended.
+          cosign verify-blob \
+            --signature "$sig" --certificate "$cert" \
+            --certificate-identity-regexp '^https://github.com/MattJackson/oauth-as/' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             "$CRATE_PATH"
-          echo "BUNDLE_PATH=oauth-as-${VERSION}.crate.cosign.bundle" >> "$GITHUB_ENV"
-          echo "SIG_PATH=oauth-as-${VERSION}.crate.sig" >> "$GITHUB_ENV"
-          echo "CERT_PATH=oauth-as-${VERSION}.crate.pem" >> "$GITHUB_ENV"
+
+          echo "BUNDLE_PATH=$bundle" >> "$GITHUB_ENV"
+          echo "SIG_PATH=$sig" >> "$GITHUB_ENV"
+          echo "CERT_PATH=$cert" >> "$GITHUB_ENV"
 
       - name: Create the GitHub Release with signed artifacts
         env:
