@@ -193,6 +193,51 @@ fn from_wire_accepts_the_right_width_and_round_trips() {
     let rs = JwsSignature::from_wire(JwsAlg::Rs256, &[1u8; 256]).expect("RS256 takes octets as-is");
     assert_eq!(rs.alg(), JwsAlg::Rs256);
     assert_eq!(rs.as_bytes(), &[1u8; 256]);
+
+    // PS256: same RSA rule as RS256 (octets as-is, width is the verifier's per-key concern), and a
+    // 384-byte (RSA-3072) width is taken verbatim to prove the arm is not hardcoded to 256.
+    let ps = JwsSignature::from_wire(JwsAlg::Ps256, &[2u8; 384]).expect("PS256 takes octets as-is");
+    assert_eq!(ps.alg(), JwsAlg::Ps256);
+    assert_eq!(ps.as_bytes(), &[2u8; 384]);
+}
+
+/// `encoded_jose_header` hand-escapes the `kid` per RFC 8259 section 7: the quote and backslash, the
+/// named short escapes (`\n \r \t \b \f`), and any other control byte as `\u00xx`; everything else
+/// (including non-ASCII) passes through. This is the one place a `kid` reaches the wire, and a
+/// missed escape would emit a header that is not valid JSON. The precomputed base64url decodes back
+/// to the exact bytes asserted here.
+#[test]
+fn encoded_jose_header_escapes_the_kid_per_rfc8259() {
+    // A kid exercising every escape arm plus a passthrough (ASCII and non-ASCII) character.
+    let kid = "a\"b\\c\nd\re\tf\u{8}g\u{c}h\u{1}i\u{7f}\u{e9}";
+    let encoded = encoded_jose_header(JwsAlg::Es256, kid);
+    let json = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded.as_bytes()).unwrap()).unwrap();
+
+    assert!(json.starts_with(r#"{"alg":"ES256","typ":"at+jwt","kid":""#));
+    assert!(json.ends_with(r#""}"#));
+    assert!(json.contains(r#"a\"b"#), "quote escaped");
+    assert!(json.contains(r"b\\c"), "backslash escaped");
+    assert!(json.contains(r"c\nd"), "newline escaped");
+    assert!(json.contains(r"d\re"), "carriage return escaped");
+    assert!(json.contains("e\\tf"), "tab escaped");
+    assert!(json.contains(r"f\bg"), "backspace escaped");
+    assert!(json.contains(r"g\fh"), "form feed escaped");
+    assert!(
+        json.contains("\\u0001"),
+        "control byte U+0001 escaped as \\u00xx: json={json:?}"
+    );
+    assert!(
+        json.contains('\u{7f}'),
+        "0x7f is not below 0x20, so it passes through"
+    );
+    assert!(
+        json.contains('\u{e9}'),
+        "a non-ASCII char passes through unescaped"
+    );
+
+    // The whole header parses as JSON (the escaping produced a valid document).
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["kid"], serde_json::Value::String(kid.to_string()));
 }
 
 /// The ES256 PKCS#8 round-trip, pinned BY VALUE: [`super::EcdsaP256Key::to_pkcs8_der`] must emit

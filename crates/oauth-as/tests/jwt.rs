@@ -723,3 +723,138 @@ fn compact_jws_debug_redacts_the_signing_input_and_signature() {
     // The decoded header and payload DO print: they are what a host debugging a refusal needs.
     assert!(printed.contains("issuer-is-visible"), "{printed:?}");
 }
+
+/// The `Jwk` accessors report each variant's shape without panicking: `kty`/`key_kind`/`crv`/`x`/
+/// `y`/`kid` return the RFC 7517 members for EC, RSA and OKP keys, and the RSA/OKP arms of the
+/// coordinate accessors return the documented empty string rather than reaching for a member the
+/// key does not have. `with_kid` relabels every variant and leaves the key material untouched.
+#[test]
+fn jwk_accessors_report_every_variant_shape() {
+    use oauth_as::jwt::{EcCurve, Jwk, KeyKind, OkpCurve};
+
+    // A 32-byte Ed25519 x and a small RSA n/e, both syntactically valid base64urlUInt/base64url.
+    let ed_x = URL_SAFE_NO_PAD.encode([3u8; 32]);
+    let rsa = Jwk::Rsa {
+        n: "sXchDaQ".to_string(),
+        e: "AQAB".to_string(),
+        kid: Some("rsa-kid".to_string()),
+    };
+    let okp = Jwk::Okp {
+        crv: OkpCurve::Ed25519,
+        x: ed_x.clone(),
+        kid: None,
+    };
+
+    // kty / key_kind.
+    assert_eq!(rsa.kty(), "RSA");
+    assert_eq!(rsa.key_kind(), KeyKind::Rsa);
+    assert_eq!(okp.kty(), "OKP");
+    assert_eq!(okp.key_kind(), KeyKind::Okp(OkpCurve::Ed25519));
+
+    // crv: RSA has none, OKP is not an EC curve so `crv()` (an EC-curve accessor) is None too.
+    assert_eq!(rsa.crv(), None);
+    assert_eq!(okp.crv(), None);
+
+    // x / y: RSA has neither (documented empty string), OKP carries x but no y.
+    assert_eq!(rsa.x(), "");
+    assert_eq!(rsa.y(), "");
+    assert_eq!(okp.x(), ed_x);
+    assert_eq!(okp.y(), "");
+
+    // kid presence and absence.
+    assert_eq!(rsa.kid(), Some("rsa-kid"));
+    assert_eq!(okp.kid(), None);
+
+    // with_kid relabels without disturbing the key material.
+    let relabelled = rsa.clone().with_kid("new-rsa-kid");
+    assert_eq!(relabelled.kid(), Some("new-rsa-kid"));
+    assert_eq!(relabelled.kty(), "RSA");
+    let Jwk::Rsa { n, e, .. } = &relabelled else {
+        panic!("with_kid must not change the variant");
+    };
+    assert_eq!((n.as_str(), e.as_str()), ("sXchDaQ", "AQAB"));
+
+    let okp_relabelled = okp.clone().with_kid("okp-kid");
+    assert_eq!(okp_relabelled.kid(), Some("okp-kid"));
+    assert_eq!(okp_relabelled.x(), ed_x);
+
+    // An EC key relabels through the third arm of with_kid.
+    let ec = Jwk::Ec {
+        crv: EcCurve::P256,
+        x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU".to_string(),
+        y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0".to_string(),
+        kid: None,
+    };
+    assert_eq!(ec.with_kid("ec-kid").kid(), Some("ec-kid"));
+}
+
+/// `Jwk::from_json` reads the RSA and OKP branches of RFC 7517, not only the EC one: a well-formed
+/// RSA or Ed25519 public JWK round-trips to the matching variant, and each branch's own refusal
+/// (malformed RSA `n`/`e`, wrong OKP curve, wrong Ed25519 key length, unknown `kty`) is an `Err`
+/// rather than a panic.
+#[test]
+fn from_json_reads_rsa_and_okp_and_refuses_malformed_ones() {
+    use oauth_as::jwt::Jwk;
+    use serde_json::json;
+
+    // RSA: the public pair, both required, base64urlUInt.
+    let rsa = Jwk::from_json(&json!({"kty": "RSA", "n": "sXchDaQ", "e": "AQAB", "kid": "r"}))
+        .expect("a well-formed RSA JWK reads");
+    assert_eq!(rsa.kty(), "RSA");
+    assert_eq!(rsa.kid(), Some("r"));
+
+    // RSA with a non-base64url n is refused by the RSA branch's own decode check.
+    assert!(
+        Jwk::from_json(&json!({"kty": "RSA", "n": "not base64url!!", "e": "AQAB"})).is_err(),
+        "a malformed RSA n must be refused"
+    );
+
+    // OKP Ed25519: exactly 32 base64url-encoded bytes.
+    let x = URL_SAFE_NO_PAD.encode([5u8; 32]);
+    let okp = Jwk::from_json(&json!({"kty": "OKP", "crv": "Ed25519", "x": x}))
+        .expect("a well-formed Ed25519 JWK reads");
+    assert_eq!(okp.kty(), "OKP");
+
+    // OKP with the wrong curve, and OKP with a wrong-length key, are each refused.
+    assert!(
+        Jwk::from_json(&json!({"kty": "OKP", "crv": "Ed448", "x": x})).is_err(),
+        "only Ed25519 is wired"
+    );
+    let short = URL_SAFE_NO_PAD.encode([5u8; 31]);
+    assert!(
+        Jwk::from_json(&json!({"kty": "OKP", "crv": "Ed25519", "x": short})).is_err(),
+        "an Ed25519 key that is not 32 bytes must be refused"
+    );
+
+    // An unknown key type is refused by the final arm.
+    assert!(
+        Jwk::from_json(&json!({"kty": "oct", "k": "AQAB"})).is_err(),
+        "only EC, RSA and OKP keys are supported"
+    );
+}
+
+/// `verify_hs256` accepts exactly the HMAC-SHA-256 tag `hmac_sha256` produces over the same input
+/// and key, and refuses a wrong tag, a wrong key, and — before any comparison — a signature whose
+/// length is not the fixed 32 bytes SHA-256 emits.
+#[test]
+fn verify_hs256_accepts_the_matching_tag_and_refuses_the_rest() {
+    use oauth_as::jwt::{hmac_sha256, verify_hs256};
+
+    let secret = b"a shared HS256 secret";
+    let input = b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJqb2UifQ";
+    let tag = hmac_sha256(secret, input);
+
+    assert!(
+        verify_hs256(secret, input, &tag),
+        "the tag hmac_sha256 produced must verify"
+    );
+    // Wrong key.
+    assert!(!verify_hs256(b"a different secret", input, &tag));
+    // Wrong tag (flip one byte).
+    let mut bad = tag;
+    bad[0] ^= 0x01;
+    assert!(!verify_hs256(secret, input, &bad));
+    // Wrong length: the fixed-width guard returns false before any comparison.
+    assert!(!verify_hs256(secret, input, &tag[..31]));
+    assert!(!verify_hs256(secret, input, &[]));
+}

@@ -1127,3 +1127,115 @@ fn the_v6_range_guards_are_pinned_at_their_boundaries() {
         );
     }
 }
+
+/// Every `CimdError` variant renders a non-empty, distinct human-readable reason through `Display`.
+/// A host surfaces these to an operator, so a blank or duplicated reason is a real defect; this
+/// pins that every arm of the `Display` match is reached and says something specific. The variants
+/// are listed explicitly (not derived) so adding one without a message breaks compilation here.
+#[test]
+fn every_cimd_error_variant_displays_a_distinct_reason() {
+    use oauth_as::{RegistrationErrorCode, RegistrationErrorResponse};
+    use std::collections::HashSet;
+
+    let variants = [
+        CimdError::NotHttps,
+        CimdError::NoHost,
+        CimdError::NotAscii,
+        CimdError::NoPath,
+        CimdError::DotSegment,
+        CimdError::Fragment,
+        CimdError::Userinfo,
+        CimdError::QueryString,
+        CimdError::SpecialUseAddress,
+        CimdError::UrlTooLong,
+        CimdError::DocumentTooLarge,
+        CimdError::NotJson,
+        CimdError::MissingClientId,
+        CimdError::ClientIdMismatch,
+        CimdError::ClientSecretPresent,
+        CimdError::SharedSecretAuthMethod,
+        CimdError::KeyMaterialPresent,
+        CimdError::RedirectUriNotSameOrigin,
+        CimdError::Metadata(RegistrationErrorResponse::new(
+            RegistrationErrorCode::InvalidClientMetadata,
+            "a wrapped registration refusal",
+        )),
+    ];
+
+    let mut seen = HashSet::new();
+    for v in &variants {
+        let rendered = v.to_string();
+        assert!(!rendered.is_empty(), "{v:?} must render a non-empty reason");
+        assert!(
+            seen.insert(rendered.clone()),
+            "two CimdError variants render the identical reason {rendered:?}"
+        );
+    }
+
+    // The `Metadata` arm delegates to the wrapped response's own Display (its description shows).
+    let wrapped = CimdError::Metadata(RegistrationErrorResponse::new(
+        RegistrationErrorCode::InvalidClientMetadata,
+        "a wrapped registration refusal",
+    ))
+    .to_string();
+    assert!(
+        wrapped.contains("a wrapped registration refusal"),
+        "the Metadata arm must surface the wrapped registration reason, got {wrapped:?}"
+    );
+}
+
+/// The same-origin redirect policy (Section 6.1, the one POLICY rule) refuses a document whose
+/// `redirect_uris` name a different origin than the client identifier, and accepts one whose
+/// redirects are same-origin. This drives the `redirect_uris_same_origin` loop both ways, including
+/// the `ClientIdUrl::origin()` extraction the comparison depends on.
+#[test]
+fn same_origin_redirect_policy_refuses_a_cross_origin_redirect() {
+    // Same-origin: the document validates and reports the URL it was fetched from.
+    let ok_body = document(&format!(
+        r#"{{"client_id": "{URL}", "token_endpoint_auth_method": "none",
+             "redirect_uris": ["https://client.example/callback", "https://client.example/other"]}}"#
+    ));
+    let validated = ValidatedClientIdDocument::validate(&url(URL), &ok_body, &strict())
+        .expect("a same-origin document validates");
+    assert_eq!(validated.client_id_url().as_str(), URL);
+
+    // Cross-origin: one redirect points at a different origin and the same-origin policy refuses it.
+    let cross_body = document(&format!(
+        r#"{{"client_id": "{URL}", "token_endpoint_auth_method": "none",
+             "redirect_uris": ["https://client.example/callback", "https://evil.example/callback"]}}"#
+    ));
+    assert_eq!(
+        ValidatedClientIdDocument::validate(&url(URL), &cross_body, &strict()).err(),
+        Some(CimdError::RedirectUriNotSameOrigin),
+        "a redirect on a different origin than the client identifier must be refused"
+    );
+}
+
+/// The IPv6 special-use guard covers the NAT64 translation prefix (64:ff9b::/96, RFC 6052): a
+/// client identifier on such a literal is refused, because a client that fetches it would reach an
+/// embedded IPv4 address rather than the name this server reasoned about.
+#[test]
+fn nat64_translation_literal_is_special_use() {
+    assert_eq!(
+        ClientIdUrl::parse("https://[64:ff9b::1]/app", &strict()).err(),
+        Some(CimdError::SpecialUseAddress),
+        "a NAT64 translation literal is a special-use address"
+    );
+}
+
+/// `CimdPolicy::default()` is the strict policy (`CimdPolicy::new()`): the same URL the strict
+/// constructor accepts is accepted through the `Default` impl, so a host reaching for `Default`
+/// gets the fail-closed policy rather than a permissive one.
+#[test]
+fn cimd_policy_default_is_the_strict_policy() {
+    let via_default = CimdPolicy::default();
+    assert!(
+        ClientIdUrl::parse(URL, &via_default).is_ok(),
+        "the default policy accepts a well-formed client identifier"
+    );
+    assert_eq!(
+        ClientIdUrl::parse("http://client.example/app", &via_default).err(),
+        Some(CimdError::NotHttps),
+        "the default policy is strict: it refuses a non-https identifier"
+    );
+}

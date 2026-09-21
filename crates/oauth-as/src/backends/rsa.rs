@@ -914,4 +914,95 @@ mod seam_tests {
         };
         assert_eq!(jwk.thumbprint(), A2_RSA_THUMBPRINT);
     }
+
+    /// Both `generate` constructors refuse a sub-2048-bit request BEFORE spending any time on key
+    /// generation (the `if bits < MIN_RSA_MODULUS_BITS` guard returns first). This is the cheap half
+    /// of the floor proof: no RNG work happens, so it costs nothing to assert on every run.
+    /// Red-before-green: deleting either guard turns these into a (slow) `Ok`.
+    #[test]
+    fn generate_refuses_sub_2048_before_generating() {
+        assert!(
+            RsaSigner::generate("k", 1024, &mut OsFillRng).is_err(),
+            "RsaSigner::generate must refuse a 1024-bit request"
+        );
+        assert!(
+            Ps256Signer::generate("k", 1024, &mut OsFillRng).is_err(),
+            "Ps256Signer::generate must refuse a 1024-bit request"
+        );
+    }
+
+    /// `generate` actually produces a WORKING 2048-bit key: the RS256 and PS256 signers it builds sign
+    /// the A.2 input and their own published JWKs verify those signatures. This exercises the
+    /// `RsaPrivateKey::new` + `from_private_key` success path (not just the refusal guard) end to end.
+    /// Slower than the pinned-key tests because it draws a real 2048-bit key from the OS CSPRNG, but it
+    /// is the only proof the generation path yields a floor-passing, sign/verify-round-tripping key.
+    #[tokio::test]
+    async fn generate_produces_a_working_2048_bit_key() {
+        let rs = RsaSigner::generate("gen-rs", 2048, &mut OsFillRng)
+            .expect("a 2048-bit RS256 key generates and passes the floor");
+        let JwsSignature::Rs256(sig) = JwsSigner::sign(&rs, SIGNING_INPUT).await.unwrap() else {
+            panic!("RsaSigner must produce an Rs256 signature");
+        };
+        assert!(
+            RsaVerifier.verify(&JwsSigner::public_jwk(&rs), SIGNING_INPUT, &sig),
+            "a freshly generated RS256 key's signature verifies under its own JWK"
+        );
+
+        let ps = Ps256Signer::generate("gen-ps", 2048, &mut OsFillRng)
+            .expect("a 2048-bit PS256 key generates and passes the floor");
+        let JwsSignature::Ps256(psig) = JwsSigner::sign(&ps, SIGNING_INPUT).await.unwrap() else {
+            panic!("Ps256Signer must produce a Ps256 signature");
+        };
+        assert!(
+            Ps256Verifier.verify(&JwsSigner::public_jwk(&ps), SIGNING_INPUT, &psig),
+            "a freshly generated PS256 key's signature verifies under its own JWK"
+        );
+    }
+
+    /// The `Debug` impls REDACT the private key: a host that logs its config must not thereby log its
+    /// signing key. The rendered form carries the `kid` and the literal `<redacted>`, and never any
+    /// private component. Red-before-green: a derived `Debug` (or one that prints `self.signing`)
+    /// would leak key material and fail the `!contains` assertions.
+    #[test]
+    fn debug_redacts_the_private_key() {
+        let rs = a2_signer();
+        let rendered = format!("{rs:?}");
+        assert!(rendered.contains("test-rsa"), "Debug carries the kid");
+        assert!(rendered.contains("<redacted>"), "Debug redacts the key");
+        assert!(
+            !rendered.contains(&D_B64URL[..16]),
+            "Debug must not leak the private exponent"
+        );
+
+        let ps = a2_signer_ps256();
+        let rendered = format!("{ps:?}");
+        assert!(rendered.contains("test-rsa"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(
+            !rendered.contains(&D_B64URL[..16]),
+            "PS256 Debug must not leak the private exponent"
+        );
+    }
+
+    /// `OsFillRng`'s `RngCore` word methods return varied output (not stuck at zero) and
+    /// `try_fill_bytes` is the infallible sibling of `fill_bytes`. `fill_bytes` is covered by every
+    /// PSS signing test; this covers the `next_u32`/`next_u64`/`try_fill_bytes` seam that PSS does not
+    /// happen to call, so the whole RNG adapter is exercised rather than only its hot path.
+    #[test]
+    fn os_fill_rng_word_methods_work() {
+        use rsa::rand_core::RngCore as _;
+
+        // Astronomically unlikely to be all-zero across this many draws unless the RNG is broken.
+        let mut nonzero = false;
+        for _ in 0..8 {
+            nonzero |= OsFillRng.next_u32() != 0;
+            nonzero |= OsFillRng.next_u64() != 0;
+        }
+        assert!(nonzero, "the OS CSPRNG must not return only zero words");
+
+        let mut buf = [0u8; 16];
+        OsFillRng
+            .try_fill_bytes(&mut buf)
+            .expect("try_fill_bytes is infallible over the OS CSPRNG");
+    }
 }

@@ -796,4 +796,345 @@ mod jar {
             .expect_err("FAPI 2.0 s5.3.2.2-6 applies to a pushed signed request object too");
         assert_eq!(error.error, ErrorCode::InvalidRequest);
     }
+
+    /// A header segment that base64url-decodes but is not JSON is refused BEFORE any signature work
+    /// (the header is parsed to pick the algorithm). Distinct from the base64url refusal, which a
+    /// non-decodable segment would take instead.
+    #[tokio::test]
+    async fn a_header_that_is_not_json_is_refused() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+        let bad_header = URL_SAFE_NO_PAD.encode(b"not json at all");
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims()).unwrap());
+        let object = format!("{bad_header}.{payload}.c2ln");
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a non-JSON header must be refused");
+        assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("header"));
+    }
+
+    /// RFC 7515 s4.1.11: a `crit` header is refused in every shape it can arrive in through this
+    /// hand-staged parser -- an empty array (which the section forbids), a non-empty array naming an
+    /// extension this server does not implement, and a `crit` that is not an array at all. All three
+    /// are checked BEFORE the algorithm and before any signature work.
+    #[tokio::test]
+    async fn a_crit_header_is_refused_in_every_shape() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+
+        for (crit, needle) in [
+            (json!([]), "empty crit"),
+            (
+                json!(["urn:example:unknown"]),
+                "extension this server does not implement",
+            ),
+            (json!("not-an-array"), "crit is not an array"),
+        ] {
+            let object = sign(
+                json!({"alg": "ES256", "typ": REQUEST_OBJECT_TYP, "kid": "client-key-1", "crit": crit}),
+                claims(),
+                &key,
+            );
+            let error = server
+                .verified_request_object(&ClientId::new("app"), &object)
+                .expect_err("a crit header must be refused");
+            assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+            assert!(
+                error.error_description.as_deref().unwrap().contains(needle),
+                "crit {crit} should mention {needle:?}, got {:?}",
+                error.error_description
+            );
+        }
+    }
+
+    /// A header with no `alg` member at all is refused: the algorithm the registration pins has to
+    /// have something to be compared against, and a missing `alg` is not "any algorithm".
+    #[tokio::test]
+    async fn a_header_with_no_alg_is_refused() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+        let object = sign(
+            json!({"typ": REQUEST_OBJECT_TYP, "kid": "client-key-1"}),
+            claims(),
+            &key,
+        );
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a header without alg must be refused");
+        assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("no alg"));
+    }
+
+    /// After the signature verifies, a payload that is not JSON, or is JSON but not an object, is
+    /// refused rather than read. Both are signed GENUINELY over the exact segment text, so they
+    /// reach the payload stage rather than failing as a signature mismatch -- which is the point of
+    /// decoding the payload only after the signature holds.
+    #[tokio::test]
+    async fn a_signed_payload_that_is_not_a_json_object_is_refused() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header()).unwrap());
+
+        // (1) Signed over bytes that are not JSON at all.
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"this is not json");
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+        let object = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a non-JSON payload is refused after the signature holds");
+        assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("not JSON"));
+
+        // (2) Valid JSON, but an array rather than the required object.
+        let object = sign(header(), json!([1, 2, 3]), &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a JSON array is not a claim set");
+        assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("not a JSON object"));
+    }
+
+    /// `aud` may be a string (covered elsewhere) or an ARRAY that names this server, and anything
+    /// else -- a number, say -- names no audience this server can be part of, so it is refused. The
+    /// array that DOES contain the issuer is accepted.
+    #[tokio::test]
+    async fn aud_as_an_array_and_as_a_non_string_are_each_handled() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+
+        // An array containing the issuer is accepted.
+        let mut multi = claims();
+        multi["aud"] = json!(["https://elsewhere.example", "https://as.example"]);
+        let object = sign(header(), multi, &key);
+        server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect("an aud array naming this issuer is accepted");
+
+        // An array NOT containing the issuer is refused.
+        let mut wrong = claims();
+        wrong["aud"] = json!(["https://elsewhere.example"]);
+        let object = sign(header(), wrong, &key);
+        server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("an aud array that omits this issuer is refused");
+
+        // A non-string, non-array aud (a number) names no audience and is refused.
+        let mut number = claims();
+        number["aud"] = json!(42);
+        let object = sign(header(), number, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a numeric aud names no audience");
+        assert_eq!(error.error, ErrorCode::InvalidRequestObject);
+    }
+
+    /// `exp`/`nbf` are NumericDates (RFC 7519 s2): a non-number `exp` is malformed and refused (it
+    /// must never read as "no expiry"), an object whose remaining life exceeds the server ceiling is
+    /// refused, and an `nbf` in the future (beyond the crate's clock skew) is not yet valid.
+    #[tokio::test]
+    async fn malformed_or_out_of_range_dates_are_refused() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+        let now = crate::server::unix_seconds(std::time::SystemTime::now()).unwrap();
+
+        // A string exp is not a NumericDate.
+        let mut string_exp = claims();
+        string_exp["exp"] = json!("soon");
+        let object = sign(header(), string_exp, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a non-numeric exp is malformed");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("NumericDate"));
+
+        // An exp years out exceeds the server's max_request_object_lifetime ceiling.
+        let mut immortal = claims();
+        immortal["exp"] = json!(now + 60 * 60 * 24 * 365);
+        let object = sign(header(), immortal, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("an object may not name its own year-long replay window");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("remaining lifetime"));
+
+        // An nbf comfortably in the future makes the object not yet valid.
+        let mut future = claims();
+        future["nbf"] = json!(now + 3600);
+        let object = sign(header(), future, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("an nbf in the future is not yet valid");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("not yet valid"));
+
+        // A malformed nbf (a string) is refused the same way exp is.
+        let mut bad_nbf = claims();
+        bad_nbf["nbf"] = json!("later");
+        let object = sign(header(), bad_nbf, &key);
+        server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a non-numeric nbf is malformed");
+    }
+
+    /// RFC 8707 `resource` is a string OR an array of strings. An array of strings is carried
+    /// through, an array with a non-string entry is refused, and a `resource` that is neither a
+    /// string nor an array (a number) is refused.
+    #[tokio::test]
+    async fn resource_claim_shapes_are_validated() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+
+        // An array of strings is accepted and both indicators are carried through.
+        let mut many = claims();
+        many["resource"] = json!(["https://rs1.example", "https://rs2.example"]);
+        let object = sign(header(), many, &key);
+        let validated = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect("an array of resource strings is accepted");
+        assert_eq!(
+            validated.resource,
+            vec![
+                "https://rs1.example".to_string(),
+                "https://rs2.example".to_string()
+            ]
+        );
+
+        // An array with a non-string entry is refused.
+        let mut mixed = claims();
+        mixed["resource"] = json!(["https://rs1.example", 7]);
+        let object = sign(header(), mixed, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a non-string resource entry is refused");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("must be a JSON string"));
+
+        // A number is neither a string nor an array.
+        let mut number = claims();
+        number["resource"] = json!(42);
+        let object = sign(header(), number, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a numeric resource is refused");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("string or an array"));
+    }
+
+    /// Inside a request object, `authorization_details` stays a JSON ARRAY (RFC 9101 s4 exempts
+    /// values that are themselves JSON); a non-array is refused.
+    #[cfg(feature = "rar")]
+    #[tokio::test]
+    async fn authorization_details_must_be_a_json_array() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+
+        // An array is carried through, re-serialized to the text the rest of the crate parses.
+        let mut ok = claims();
+        ok["authorization_details"] = json!([{"type": "example"}]);
+        let object = sign(header(), ok, &key);
+        let validated = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect("a JSON array of authorization details is accepted");
+        assert!(validated.authorization_details.is_some());
+
+        // A non-array (an object) is refused.
+        let mut bad = claims();
+        bad["authorization_details"] = json!({"type": "example"});
+        let object = sign(header(), bad, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("authorization_details that is not an array is refused");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("must be a JSON array"));
+    }
+
+    /// OpenID Connect Core s6.1 shows `max_age` as a JSON NUMBER inside a request object, so a
+    /// non-negative integer is accepted and normalised to decimal text; a string is accepted as-is;
+    /// a fractional/negative number, and any other type, are refused.
+    #[cfg(feature = "consent")]
+    #[tokio::test]
+    async fn max_age_accepts_a_string_or_non_negative_integer_and_refuses_the_rest() {
+        let key = signing_key(7);
+        let server = server(&key).await;
+
+        // A JSON number is normalised to decimal text.
+        let mut number = claims();
+        number["max_age"] = json!(86400);
+        let object = sign(header(), number, &key);
+        let validated = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect("a non-negative integer max_age is accepted");
+        assert_eq!(validated.max_age.as_deref(), Some("86400"));
+
+        // A string passes through unchanged.
+        let mut string = claims();
+        string["max_age"] = json!("3600");
+        let object = sign(header(), string, &key);
+        let validated = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect("a string max_age is accepted");
+        assert_eq!(validated.max_age.as_deref(), Some("3600"));
+
+        // A fractional number is not a whole number of seconds.
+        let mut fractional = claims();
+        fractional["max_age"] = json!(1.5);
+        let object = sign(header(), fractional, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a fractional max_age is refused");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("non-negative number of seconds"));
+
+        // A boolean is neither a string nor a number.
+        let mut wrong = claims();
+        wrong["max_age"] = json!(true);
+        let object = sign(header(), wrong, &key);
+        let error = server
+            .verified_request_object(&ClientId::new("app"), &object)
+            .expect_err("a boolean max_age is refused");
+        assert!(error
+            .error_description
+            .as_deref()
+            .unwrap()
+            .contains("JSON string or number"));
+    }
 }
