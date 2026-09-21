@@ -11,6 +11,7 @@
 [![Conformance](https://img.shields.io/badge/independent%20conformance-8%2F8-brightgreen.svg)](#evidence)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/MattJackson/oauth-as/badge)](https://scorecard.dev/viewer/?uri=github.com/MattJackson/oauth-as)
 [![REUSE status](https://api.reuse.software/badge/github.com/MattJackson/oauth-as)](https://api.reuse.software/info/github.com/MattJackson/oauth-as)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14738/badge)](https://www.bestpractices.dev/projects/14738)
 
 An embeddable **OAuth 2.1 Authorization Server** for Rust.
 
@@ -21,18 +22,20 @@ the consent experience; the library owns the protocol.
 
 ```toml
 [dependencies]
-oauth-as = "0.10"
+oauth-as = "0.11"
 ```
 
 ## Status
 
-**Beta, and pre-1.0.** The API is not yet frozen. Every release in the `0.9` line is meant to be
+**Beta, and pre-1.0.** The API is not yet frozen. Every release across the 0.x line is meant to be
 tested in earnest, and each one exists because auditing the release before it found something worth
 fixing — an independent mutation sweep, real SSRF and revocation defects caught and closed, a
-concurrent-refresh race hardened. What each version changed, and how to migrate across the one
-breaking `Storage` change (0.9.1), is in [`CHANGELOG.md`](CHANGELOG.md).
+concurrent-refresh race hardened, and in 0.11.0 FAPI 2.0 Security Profile support with PS256 and a
+FAPI-safe algorithm allow-list. What each version changed, and how to migrate across the breaking
+points (the `Storage` change in 0.9.1 and the JWS enum / assertion-audience changes in 0.11.0), is
+in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Upgrades within `0.9` are drop-in.** New capabilities land opt-in and off by default: leave the
+**Patch upgrades are drop-in; a minor bump signals a breaking change.** New capabilities land opt-in and off by default: leave the
 new configuration alone and the server compiles and behaves exactly as the previous version did. A
 store that passes `oauth_as::storage_conformance` keeps passing it, and persisted records decode
 unchanged across the upgrade.
