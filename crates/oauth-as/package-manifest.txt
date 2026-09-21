@@ -189,6 +189,7 @@ tests/storage_client_id_contract.rs
 tests/storage_conformance_gaps.rs
 tests/storage_conformance_selftest.rs
 tests/storage_contract.rs
+tests/storage_fault_endpoints.rs
 tests/storage_sweep.rs
 tests/support/alloc.rs
 tests/support/mod.rs
