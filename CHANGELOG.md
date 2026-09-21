@@ -12,7 +12,13 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
-## [0.10.1] - 2026-09-20
+## [0.11.0] - 2026-09-20
+
+Published as **0.11.0**, not 0.10.1: this release carries breaking changes (the `JwsAlg` /
+`JwsSignature` enum variants and the `client_assertion::verify_assertion` signature; see
+**Changed**), and SemVer requires a minor bump for a breaking change in the 0.x series. The 0.10.1
+line was built and taken through `qa` but never published to crates.io, so its notes are folded in
+here.
 
 The OIDF FAPI 2.0 Security Profile conformance suite now runs **green**. The `plain_oauth` +
 `private_key_jwt` + DPoP plan passes end to end in CI (51 modules, 3095 condition successes). The
