@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "oauth-as"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "axum",
  "axum-server",

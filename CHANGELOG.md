@@ -12,6 +12,28 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-21
+
+A test-only patch release: no library code, public API, or wire behaviour changes. It raises unit
+and integration test coverage over the paths a release build already shipped but that no test had
+yet exercised, so a future refactor cannot silently break them.
+
+### Added
+
+- Tests for the `jwt-rsa` backend's `RsaSigner::generate` / `Ps256Signer::generate` (the sub-2048
+  refusal and a real 2048-bit round trip), the `Debug` key redaction on both signers, and the
+  `OsFillRng` word methods.
+- Tests for every `CimdError` `Display` arm, `CimdPolicy::default`, the NAT64 (`64:ff9b::/96`)
+  special-use guard, and the same-origin `redirect_uri` policy (both directions).
+- Tests for the `Jwk` accessors (`kty` / `key_kind` / `crv` / `x` / `y` / `with_kid`) across all
+  three key kinds, `Jwk::from_json` on the RSA and OKP branches and their refusals, `verify_hs256`
+  (matching tag, wrong key, wrong tag, wrong length), `JwsSignature::from_wire` for PS256, and the
+  RFC 8259 `kid` escaping in the precomputed JOSE header.
+- Tests for the RFC 9101 request-object verification refusals that were previously unexercised: a
+  non-JSON header, every `crit` shape, a missing `alg`, a signed-but-non-object payload, `aud` as an
+  array and as a non-string, malformed / out-of-range `exp` and `nbf`, the `resource` claim shapes,
+  a non-array `authorization_details`, and the `max_age` string / integer / refusal cases.
+
 ## [0.11.0] - 2026-09-20
 
 Published as **0.11.0**, not 0.10.1: this release carries breaking changes (the `JwsAlg` /
