@@ -318,6 +318,30 @@ pub struct FaultStorage {
     /// which is what the ordering suites need: they are about what survives in the store when the
     /// minting half of a redemption dies half way through.
     pub fail_put_token: AtomicBool,
+    /// When set, `get_client` FAILS. Every client-authenticated endpoint resolves the client first,
+    /// so this is the store being unable to answer "who is this client" -- which must fail closed,
+    /// never fall through as an unauthenticated or unknown client.
+    pub fail_get_client: AtomicBool,
+    /// When set, `get_token` FAILS: the read behind introspection and behind the access-token leg of
+    /// revocation. "The store could not say whether this token exists" is a 5xx, not "not found".
+    pub fail_get_token: AtomicBool,
+    /// When set, `take_refresh_token` FAILS: the consuming read on the refresh-grant and revocation
+    /// paths. Distinct from `get_refresh_token` (a non-consuming lookup) which has its own switches.
+    pub fail_take_refresh_token: AtomicBool,
+    /// When set, `take_authorization_code` FAILS: the consuming read that redeems a code. A store
+    /// that cannot burn the code must not let the redemption proceed.
+    pub fail_take_authorization_code: AtomicBool,
+    /// When set, `get_device_grant` FAILS: the read behind a device-token poll.
+    pub fail_get_device_grant: AtomicBool,
+    /// When set, `put_device_grant` FAILS: the write that records a freshly minted device grant.
+    pub fail_put_device_grant: AtomicBool,
+    /// When set, `take_device_grant` FAILS: the consuming read that finalises a device grant.
+    pub fail_take_device_grant: AtomicBool,
+    /// When set, `compare_and_swap_device_grant` FAILS: the state transition on a device poll.
+    pub fail_compare_and_swap_device_grant: AtomicBool,
+    /// When set, `find_device_grant_by_user_code` FAILS (an error, not the `collide` hit above): the
+    /// store could not answer whether a user code is taken, which the generator must not read as free.
+    pub error_find_device_grant: AtomicBool,
     /// The ORDER in which the server consulted the two token lookups.
     ///
     /// RFC 7009 section 2.1 makes `token_type_hint` an optimisation: the server SHOULD look in the
@@ -353,6 +377,9 @@ impl Storage for FaultStorage {
         &self,
         client_id: &ClientId,
     ) -> Result<Option<std::sync::Arc<Client>>, StorageError> {
+        if self.fail_get_client.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected get_client failure"));
+        }
         self.inner.get_client(client_id).await
     }
 
@@ -377,6 +404,9 @@ impl Storage for FaultStorage {
     }
 
     async fn put_device_grant(&self, grant: DeviceGrant) -> Result<(), StorageError> {
+        if self.fail_put_device_grant.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected put_device_grant failure"));
+        }
         self.inner.put_device_grant(grant).await
     }
 
@@ -384,6 +414,9 @@ impl Storage for FaultStorage {
         &self,
         device_code: &str,
     ) -> Result<Option<DeviceGrant>, StorageError> {
+        if self.fail_get_device_grant.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected get_device_grant failure"));
+        }
         self.inner.get_device_grant(device_code).await
     }
 
@@ -391,6 +424,9 @@ impl Storage for FaultStorage {
         &self,
         normalized_user_code: &str,
     ) -> Result<Option<DeviceGrant>, StorageError> {
+        if self.error_find_device_grant.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected user-code lookup failure"));
+        }
         if self.collide_user_codes.load(Ordering::SeqCst) {
             // Any non-None answer is a collision as far as the generator is concerned; reusing a
             // real stored grant keeps the value well formed.
@@ -405,6 +441,9 @@ impl Storage for FaultStorage {
         &self,
         device_code: &str,
     ) -> Result<Option<DeviceGrant>, StorageError> {
+        if self.fail_take_device_grant.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected take_device_grant failure"));
+        }
         self.inner.take_device_grant(device_code).await
     }
 
@@ -413,6 +452,12 @@ impl Storage for FaultStorage {
         expected: &DeviceGrantState,
         updated: DeviceGrant,
     ) -> Result<bool, StorageError> {
+        if self
+            .fail_compare_and_swap_device_grant
+            .load(Ordering::SeqCst)
+        {
+            return Err(StorageError::new("injected device-grant CAS failure"));
+        }
         self.inner
             .compare_and_swap_device_grant(expected, updated)
             .await
@@ -442,6 +487,11 @@ impl Storage for FaultStorage {
         &self,
         code: &str,
     ) -> Result<Option<AuthorizationCodeRecord>, StorageError> {
+        if self.fail_take_authorization_code.load(Ordering::SeqCst) {
+            return Err(StorageError::new(
+                "injected take_authorization_code failure",
+            ));
+        }
         self.inner.take_authorization_code(code).await
     }
 
@@ -481,6 +531,9 @@ impl Storage for FaultStorage {
         access_token: &str,
     ) -> Result<Option<std::sync::Arc<IssuedToken>>, StorageError> {
         self.record("get_token");
+        if self.fail_get_token.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected get_token failure"));
+        }
         self.inner.get_token(access_token).await
     }
 
@@ -519,6 +572,9 @@ impl Storage for FaultStorage {
         &self,
         refresh_token: &str,
     ) -> Result<Option<RefreshTokenRecord>, StorageError> {
+        if self.fail_take_refresh_token.load(Ordering::SeqCst) {
+            return Err(StorageError::new("injected take_refresh_token failure"));
+        }
         self.inner.take_refresh_token(refresh_token).await
     }
 

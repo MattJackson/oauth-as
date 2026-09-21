@@ -15,10 +15,14 @@
 # full-length commit SHA, with the human-readable ref in a trailing comment so the next person can
 # see what it was meant to be and diff it.
 #
-# `actions/*` stay on major tags. They are published by GitHub itself, from the same trust root
-# that runs the workflow at all: if that account is compromised, a pinned SHA in this file buys
-# nothing, because the runner, the token service and the tag are all downstream of it. Pinning
-# them would cost a dependency-bump treadmill for no threat it removes.
+# `actions/*` ARE ALSO PINNED TO A FULL SHA, with the readable `# vN` in a trailing comment. The
+# argument that they need not be -- they are published by GitHub from the same trust root that runs
+# the workflow, so a pinned SHA buys nothing against a compromise of that account -- still holds
+# against THAT threat. But a SHA also pins against a moved tag (a narrower, non-account-compromise
+# failure), removes the "which commit did v7 mean last week" ambiguity, and is what OpenSSF
+# Scorecard's Pinned-Dependencies check scores. The cost is a dependency-bump treadmill; the
+# trailing `# vN` keeps it readable and `gh api repos/<owner>/<repo>/commits/<ref> --jq .sha`
+# refreshes a pin, so the treadmill is one command.
 #
 # dtolnay/rust-toolchain NEEDS `toolchain:` spelled out once it is pinned by SHA: the action reads
 # the wanted toolchain from the REF it was invoked by, so `@<sha>` alone silently installs its
@@ -59,7 +63,7 @@ jobs:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # THE FEATURE LIST HAS FOUR HAND-MAINTAINED MIRRORS, and this is what stops them drifting.
       # The rule stated in the comment on the no-backend step below (anything added to [features]
       # in crates/oauth-as/Cargo.toml belongs there too, unless it pulls an ES256 backend in) was
@@ -247,7 +251,7 @@ jobs:
     name: independent conformance harness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
@@ -280,7 +284,7 @@ jobs:
     name: linked size budgets
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
@@ -328,7 +332,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:

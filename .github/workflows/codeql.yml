@@ -1,0 +1,55 @@
+# CodeQL static analysis (SAST). Satisfies the OpenSSF Scorecard SAST check and surfaces findings
+# in the code-scanning dashboard. CodeQL's Rust extractor is SOURCE-BASED: it reads the crate's
+# source and Cargo metadata directly and does NOT compile the code, so the analysis runs with
+# `build-mode: none` and there is no autobuild/compile step. The Rust toolchain is still installed
+# so the extractor can resolve the dependency graph via cargo.
+#
+# Runs on push to the default branch, on pull requests, and weekly. Also on `dev` so a change is
+# validated before it is promoted, rather than first running against `main`.
+#
+# Pinning: every action is pinned to a full commit SHA with a readable `# vN` comment (see dev.yml's
+# header); github/codeql-action is outside the actions/* org and is pinned the same way.
+
+name: codeql
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * 2" # weekly, Tuesday 07:00 UTC
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload SARIF to code-scanning
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3
+        with:
+          languages: rust
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3
+        with:
+          category: "/language:rust"

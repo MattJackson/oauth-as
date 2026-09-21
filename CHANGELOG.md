@@ -12,6 +12,31 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-09-21
+
+A CI, supply-chain, and test-only patch release: no library code, public API, or wire behaviour
+changes. It hardens the OpenSSF Scorecard posture, fixes the release-signing path, and adds
+fail-closed coverage for the storage-error branches.
+
+### Changed
+
+- `ci(publish)`: the cosign step now derives the Scorecard-recognised detached `.sig` and `.pem`
+  from the sign-blob bundle (via `jq` + `openssl`) and proves they verify the crate with
+  `cosign verify-blob` before cutting the GitHub Release. cosign v4 silently ignores
+  `--output-signature` / `--output-certificate` under its default new bundle format, which is why
+  the 0.11.1 release step could not find the `.sig` it expected.
+- `ci`: every `actions/*` workflow reference is pinned to a full commit SHA with a readable `# vN`
+  comment (previously they rode major tags), satisfying Scorecard's Pinned-Dependencies check.
+
+### Added
+
+- CodeQL (Rust) static analysis workflow, so Scorecard's SAST check has a tool to run.
+- `SECURITY.md` now carries the direct private-vulnerability-reporting URL for Scorecard's
+  security-policy link check.
+- Fail-closed test coverage: `FaultStorage` gains a fault switch per remaining storage operation,
+  and `tests/storage_fault_endpoints.rs` drives each public endpoint under the matching fault,
+  asserting `server_error` rather than a success the store could not support.
+
 ## [0.11.1] - 2026-09-21
 
 A test-only patch release: no library code, public API, or wire behaviour changes. It raises unit

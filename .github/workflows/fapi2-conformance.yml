@@ -68,7 +68,7 @@ jobs:
     # log on exit so a timeout here is still diagnosable from the uploaded artifact.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
         # SAME pin as qa.yml and dev.yml, so a run of this job builds against the exact toolchain
@@ -83,7 +83,7 @@ jobs:
       - name: Set up JDK (the OIDF suite is a Maven/Spring Boot application)
         # v6 verified against the actions/setup-java GitHub releases (latest tag v6.0.1, major
         # tag v6 exists) at the time this pin was written.
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
         with:
           distribution: temurin
           java-version: "21"
@@ -91,7 +91,7 @@ jobs:
       - name: Set up Python (the suite's run-test-plan.py runner)
         # v7 verified against the actions/setup-python GitHub releases (latest tag v7.0.0, major
         # tag v7 exists) at the time this pin was written.
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
@@ -121,7 +121,7 @@ jobs:
       # preflight-stop case) does not itself fail an otherwise-correct red run twice over.
       - name: Upload conformance logs and certification package
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: fapi2-conformance-logs
           path: target/fapi2-conformance/

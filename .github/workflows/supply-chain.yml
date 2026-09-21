@@ -9,8 +9,8 @@
 # and it must stay outside the dev<->qa<->publish drift check and the feature-mirror check, which own
 # those three files and would treat an unrelated job as drift.
 #
-# Action pinning follows the repository rule (see dev.yml's header): actions/* stay on major tags
-# (same trust root as the runner), everything else is pinned to a full commit SHA with the readable
+# Action pinning follows the repository rule (see dev.yml's header): every action, actions/* included,
+# is pinned to a full commit SHA with the readable
 # ref in a trailing comment.
 
 name: supply-chain
@@ -39,7 +39,7 @@ jobs:
     name: cargo-deny (advisories, licences, bans, sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
@@ -48,7 +48,7 @@ jobs:
       # Cache the compiled tool binary so we do not rebuild it from source every run. Keyed on the
       # exact pinned version, so a version bump below is a cache miss and a rebuild, as intended.
       - name: Cache cargo-deny binary
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cargo/bin/cargo-deny
           key: cargo-deny-0.20.2-${{ runner.os }}
@@ -61,14 +61,14 @@ jobs:
     name: cargo-audit (RustSec advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, 2026-08-06
       - name: Cache cargo-audit binary
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-0.22.2-${{ runner.os }}

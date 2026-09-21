@@ -5,7 +5,7 @@
 # backs the Scorecard README badge. It reads repository configuration and history; it changes
 # nothing.
 #
-# Pinning: actions/* stay on major tags (same trust root as the runner; see dev.yml's header).
+# Pinning: every action is pinned to a full commit SHA with a readable `# vN` comment (see dev.yml's header).
 # ossf/scorecard-action and github/codeql-action are outside that org and are pinned to a full
 # commit SHA with the readable ref in a trailing comment. Refresh a pin with
 #   gh api repos/<owner>/<repo>/commits/<ref> --jq .sha
@@ -34,7 +34,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -48,7 +48,7 @@ jobs:
 
       # Keep the raw SARIF as a build artifact for 5 days, independent of the dashboard upload.
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SARIF file
           path: results.sarif

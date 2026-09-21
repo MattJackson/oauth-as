@@ -8,9 +8,9 @@ seriously.
 
 **Do not open a public issue for a security problem.**
 
-Report privately through GitHub's private vulnerability reporting on this repository
-(Security tab, "Report a vulnerability"). That creates a private advisory only the maintainers can
-see.
+Report privately through GitHub's private vulnerability reporting on this repository, at
+https://github.com/MattJackson/oauth-as/security/advisories/new (equivalently: the Security tab,
+"Report a vulnerability"). That creates a private advisory only the maintainers can see.
 
 Please include, as far as you can:
 
