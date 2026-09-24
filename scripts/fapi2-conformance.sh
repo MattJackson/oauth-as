@@ -32,8 +32,9 @@
 #                          Default: the private_key_jwt + DPoP plain_oauth profile.
 #   CONFORMANCE_SUITE_DIR  checkout of gitlab.com/openid/conformance-suite.
 #                          Default: .fapi2/conformance-suite (cloned + built if absent).
-#   CONFORMANCE_SUITE_REF  git ref of the suite to pin. Default: the commit cited in
-#                          EXTERNAL-TOOLING.md s2 so a green is reproducible.
+#   CONFORMANCE_SUITE_REF  git ref of the suite to pin. Default: the commit tagged
+#                          release-v5.3.1, so a green is reproducible and the certification
+#                          ZIP names a released suite version.
 #   FAPI2_CONFIG           the suite config.json (two clients, resource.resourceUrl, browser task
 #                          list). Default: crates/oauth-as-conformance/fapi2/config.json
 #   FAPI2_LOG_DIR          where to write the certification log ZIP + run logs.
@@ -46,7 +47,7 @@ cd "$repo_root"
 FAPI2_FIXTURE_EXAMPLE="${FAPI2_FIXTURE_EXAMPLE:-fapi2_conformance_server}"
 FAPI2_PLAN="${FAPI2_PLAN:-fapi2-security-profile-final-test-plan[openid=plain_oauth][client_auth_type=private_key_jwt][sender_constrain=dpop][fapi_profile=plain_fapi]}"
 CONFORMANCE_SUITE_DIR="${CONFORMANCE_SUITE_DIR:-$repo_root/.fapi2/conformance-suite}"
-CONFORMANCE_SUITE_REF="${CONFORMANCE_SUITE_REF:-6b8b809dd07df6ca8b4481a9e921bf48b9ffbffe}"
+CONFORMANCE_SUITE_REF="${CONFORMANCE_SUITE_REF:-440eec8bac7b12b7389d7ca9cbc459b53507a443}" # release-v5.3.1
 FAPI2_CONFIG="${FAPI2_CONFIG:-$repo_root/crates/oauth-as-conformance/fapi2/config.json}"
 FAPI2_EXPECTED_FAILURES="${FAPI2_EXPECTED_FAILURES:-$repo_root/crates/oauth-as-conformance/fapi2/expected-failures.json}"
 FAPI2_EXPECTED_SKIPS="${FAPI2_EXPECTED_SKIPS:-$repo_root/crates/oauth-as-conformance/fapi2/expected-skips.json}"

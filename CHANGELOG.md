@@ -12,6 +12,12 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+### Changed
+
+- `ci(fapi2)`: the OIDF conformance suite is pinned to `release-v5.3.1`
+  (`440eec8bac7b12b7389d7ca9cbc459b53507a443`) instead of an untagged master commit, so the
+  certification ZIP it produces names a released suite version.
+
 ## [1.0.0] - 2026-09-23
 
 First stable release. No library code, public API, or wire behaviour changes vs 0.11.2: the 0.11
