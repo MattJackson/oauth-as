@@ -36,14 +36,16 @@ line has been API-frozen for two consecutive releases (0.11.1 and 0.11.2 were bo
 CI-only), and 1.0.0 is the SemVer commitment that comes with that — a patch upgrade is drop-in, a
 minor bump adds capability without breaking existing callers, and only a major bump breaks the API.
 
-The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan continues to
-pass end to end on the hosted conformance suite (51 modules; the non-passes are the same
-spec-permitted expected failures/skips documented in the 0.11.0 entry: user-rejection and
-reuse-of-`request_uri`-before-auth-completion which a headless run cannot drive, a code-reuse
-token-revocation `SHOULD` logged at WARNING inherent to a stateless-JWT resource server, and an
-RS256 client-assertion negative test the ES256 profile skips). Formal OpenID Foundation FAPI 2.0
-certification is being submitted against this release under the "FAPI2SP OP private key + DPoP"
-profile.
+The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes on
+the OpenID Foundation's hosted suite against this release's library code: 51 modules, 0 failures,
+two WARNINGs (the fixture's stateless resource server does not observe revocation after
+authorization-code reuse, a SHOULD; DPoP `htu` default-port normalization, fixed in 1.0.1) and the
+RS256 client-assertion test SKIPPED under the ES256 profile. Getting there needed fixture changes
+only (see [Unreleased]). An earlier version of this entry called the user-rejection and
+reuse-of-`request_uri`-before-auth-completion non-passes "spec-permitted expected failures"; that
+was wrong. They were fixture gaps, the certification package refuses any failed module, and both
+now pass. Submitted for OpenID Foundation certification as OCS-3058 under the "FAPI2SP OP private
+key + DPoP" profile.
 
 ### Changed
 

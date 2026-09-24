@@ -81,12 +81,11 @@ Plus the seams a real deployment needs: an audit **event sink**, a **rate limiti
 secret verifier** so hosts store a hash rather than a secret, a **consent** seam, and **CSRF**
 protection on the device verification form.
 
-The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes end
-to end against the fixture at `examples/fapi2_conformance_server.rs`; CI runs it on every push to
-`qa` and on `workflow_dispatch` (`.github/workflows/fapi2-conformance.yml`) at no OIDF cost. Formal
-OpenID Foundation certification against this release is being submitted through
-`https://submissions.openid.net/`; the listing is not yet issued and is not claimed as issued. See
-"What is not claimed", below.
+The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes on
+the OpenID Foundation's hosted suite with 0 failures (51 modules), against the fixture at
+`examples/fapi2_conformance_server.rs`; CI also runs it on every push to `qa`. oauth-as 1.0.0 has been
+submitted for OpenID Foundation certification (OCS-3058); the listing is not yet issued and is not
+claimed as issued. See "What is not claimed", below.
 
 What is missing today is in "What is not claimed", below. It is written down rather than left to be
 discovered.
@@ -426,17 +425,17 @@ What IS now claimable, and was not before:
   the gate is on anything NEW rather than on zero.
 
 - **The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes
-  end to end** against this crate (51 modules; the non-passes are the same spec-permitted expected
-  failures/skips recorded in `crates/oauth-as-conformance/fapi2/expected-failures.json` and
-  `expected-skips.json` — user-rejection and reuse-of-`request_uri`-before-auth-completion which a
-  headless run cannot drive, a code-reuse token-revocation `SHOULD` logged at WARNING inherent to a
-  stateless-JWT resource server, and an RS256 client-assertion negative test the ES256 profile
-  skips). CI runs the plan on every push to `qa` and on `workflow_dispatch`
-  (`.github/workflows/fapi2-conformance.yml`) at no OIDF cost. Formal OpenID Foundation FAPI 2.0
-  certification against this release is being submitted through `https://submissions.openid.net/`
-  (OIDF has granted a fee-waiver coupon for oauth-as as an open-source implementation); the listing
-  is not yet issued and is not claimed as issued. Certification is a separate, manual step from
-  running the suite, per `crates/oauth-as-conformance/EXTERNAL-TOOLING.md` section 2.4.
+  on the OpenID Foundation's hosted suite** (`www.certification.openid.net`, plan `ADGRXePBZaLpa`):
+  51 modules, 0 failures. Two WARNINGs, neither a failure: the fixture's resource server validates
+  access tokens statelessly and does not introspect, so it does not observe the token revocation
+  the AS performs on authorization-code reuse (a SHOULD); and the DPoP `htu` comparison does not
+  apply RFC 3986 default-port normalization (`https://host:443/x` vs `https://host/x`), a library
+  fix scheduled for 1.0.1. The RS256 client-assertion negative test is SKIPPED by the suite because
+  the profile's clients use ES256. CI runs the same plan on every push to `qa`
+  (`.github/workflows/fapi2-conformance.yml`) against a self-hosted suite, which can gate but cannot
+  certify: a self-hosted suite signs its logs with a key the OpenID Foundation does not hold.
+  oauth-as 1.0.0 has been submitted for OpenID Foundation FAPI 2.0 certification (OCS-3058, fee
+  waived for open source); the listing is not yet issued and is not claimed as issued.
 
 Still not claimable, and stated so it stays that way: any OAuth 2.1 certification (none exists),
 any OpenID Connect claim (this crate is not an OP), and any MCP conformance claim. A headless OAuch
