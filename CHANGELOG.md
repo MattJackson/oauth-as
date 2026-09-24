@@ -17,6 +17,17 @@ whatever version is current at each real crates.io release appear as published o
 - `ci(fapi2)`: the OIDF conformance suite is pinned to `release-v5.3.1`
   (`440eec8bac7b12b7389d7ca9cbc459b53507a443`) instead of an untagged master commit, so the
   certification ZIP it produces names a released suite version.
+- `ci(fapi2)`: the conformance job now requests the suite's real certification package
+  (`POST /api/plan/{id}/certificationpackage`, what "Publish for certification" calls) instead of
+  shipping the plain `--export-dir` log export, which OIDF's submission form rejects. The endpoint
+  refuses any plan with a failed or unfinished module, so the job now fails if the run is not
+  certifiable.
+- FAPI 2.0 fixture (`examples/fapi2_conformance_server.rs`, not the library): an Approve / Deny
+  sign-in page now sits in front of `/authorize` instead of auto-approving. The first visit never
+  reaches the library, so a PAR `request_uri` survives page loads and is consumed at authorization
+  (FAPI 2.0 SP Final s5.3.2.2 NOTE 3), and the suite's per-module browser `override` presses Deny
+  for `user-rejects-authentication`. Both modules previously listed as expected failures now have
+  to pass.
 
 ## [1.0.0] - 2026-09-23
 

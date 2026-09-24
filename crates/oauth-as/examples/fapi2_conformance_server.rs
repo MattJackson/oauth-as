@@ -36,9 +36,15 @@
 //! 6. **Refresh rotation OFF** (§2.3 item 7): `RefreshRotation::Reuse`, which FAPI 2.0 s5.3.2.1-9
 //!    requires and which is a deliberate downgrade of this crate's default reuse detection, safe
 //!    here ONLY because every token is DPoP sender-constrained.
-//! 7. **Auto-login / auto-consent** (§2.3, headless): every request is the same signed-in user and
-//!    every valid authorization request is approved without a consent screen, because the suite's
-//!    HtmlUnit browser completes the redirect from a scripted task list and cannot click anything.
+//! 7. **A sign-in page IN FRONT of `/authorize`, with Approve and Deny** (§2.3; FINDINGS.md D2).
+//!    Every request is the same user, but no authorization request is decided until someone presses
+//!    a button: the first `GET /authorize` of a request is answered with this fixture's own page and
+//!    never reaches the library, so a PAR `request_uri` is not consumed by merely loading the page
+//!    (FAPI 2.0 SP Final s5.3.2.2 NOTE 3: one-time use is enforced "at the point of authorization").
+//!    The button's answer rides a one-shot cookie back to `/authorize`, where the approval resolver
+//!    turns it into `Approve` or `Deny` (RFC 6749 s4.1.2.1 `access_denied`). The suite's headless
+//!    browser presses the buttons from `crates/oauth-as-conformance/fapi2/config.json`, including a
+//!    per-module `override` that presses Deny for the user-rejects module.
 //! 8. **Client-assertion `aud` = the issuer, as a string** (FAPI 2.0 s5.3.2.1-8, s5.3.3.1-5;
 //!    FINDINGS.md D4). `AssertionAudience::IssuerOnly` refuses the token endpoint URL and any array
 //!    `aud` on `private_key_jwt` client authentication assertions, at PAR and the token endpoint
@@ -68,7 +74,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -96,9 +102,13 @@ use sha2::{Digest, Sha256};
 const CLIENT_ID: &str = "client";
 const CLIENT2_ID: &str = "client2";
 
-/// The subject every seeded approval acts as. There is one user, because the suite is not a browser
-/// and there is no login form for it to fill in.
+/// The subject every approval acts as. There is one user and the sign-in page asks for no
+/// password: the suite tests the authorization server, not a login system.
 const SEEDED_SUBJECT: &str = "fapi-conformance-user";
+
+/// The one-shot cookie that carries the sign-in page's answer (`approve` or `deny`) back to
+/// `/authorize`. See `login_gate`.
+const DECISION_COOKIE: &str = "fixture_decision";
 
 /// The kid of the AS access-token signing key, published in the JWKS and in every token header.
 const AS_SIGNING_KID: &str = "fapi-as-es256-1";
@@ -289,19 +299,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ############################################################################
     //
     // The suite drives this AS with an HTTP client and a headless HtmlUnit browser that follows a
-    // scripted task list; it has no session and cannot click a consent button. So, exactly as
-    // `conformance_server.rs` does under its seed flag, this fixture opts IN BY NAME to two
-    // behaviours a real AS must NEVER have:
+    // scripted task list. This fixture opts IN BY NAME to shortcuts a real AS must NEVER take:
     //
-    // * `with_subject_resolver` returning a constant: every request is the same user. A real host
-    //   reads its own authenticated session.
-    // * `with_approval_resolver` returning `Approve`: RFC 6749 s10.12 consent, DELETED. Any
-    //   cross-site navigation would silently issue a code for the logged-in user. A real host
-    //   returns `ApprovalDecision::Respond` with a consent screen and approves only after the user
-    //   has answered it.
+    // * `with_subject_resolver` returning a constant: every request is the same user, and the
+    //   sign-in page has no password. A real host reads its own authenticated session.
+    // * The approval answer rides a bare cookie set by `/fixture/login`, with no CSRF token and no
+    //   binding to the request it answers beyond being one-shot. A real host binds the answer to
+    //   the user's session and to this exact request, and protects the form against CSRF.
+    //
+    // The approval itself is NOT automatic any more: `login_gate` answers the first visit with a
+    // sign-in page, and only a request carrying that page's answer reaches the library. The
+    // resolver reads the answer; anything but an explicit `approve` is a refusal.
     let builder = ServiceBuilder::new(Arc::clone(&server))
         .with_subject_resolver(|_headers| Some(SEEDED_SUBJECT.to_string()))
-        .with_approval_resolver(|_request| ApprovalDecision::Approve);
+        .with_approval_resolver(|request| match decision_cookie(request.headers) {
+            Some("approve") => ApprovalDecision::Approve,
+            _ => ApprovalDecision::Deny,
+        });
 
     // The library hands back a framework-free service; the adapter puts it on axum. The protected
     // resource is one more route on the SAME origin, so its DPoP `htu` is under the issuer.
@@ -321,9 +335,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(rs_state);
     let router = axum::Router::from(builder.build()?)
         .merge(resource_router)
+        .route("/fixture/login", post(fixture_login))
         // CONFORMANCE FIXTURE ONLY: render a rejected authorization request as an HTML error page
         // so the suite's headless browser can screenshot it. See `authorization_errors_as_html`.
-        .layer(axum::middleware::from_fn(authorization_errors_as_html));
+        .layer(axum::middleware::from_fn(authorization_errors_as_html))
+        // Outermost, so an undecided `GET /authorize` never reaches the library. See `login_gate`.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(LoginGate::default()),
+            login_gate,
+        ));
 
     print_boot_banner(&issuer, &resource_url, &redirect_uris);
 
@@ -644,6 +664,140 @@ async fn authorization_errors_as_html(req: Request, next: Next) -> Response {
         .insert(header::CONTENT_TYPE, html_content_type());
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(html))
+}
+
+/// CONFORMANCE FIXTURE ONLY. The `/authorize` URLs (path and query) the sign-in page has already
+/// been shown for, so a second showing of the SAME request can say so.
+///
+/// This exists for one suite module and is test-automation scaffolding, not AS behaviour:
+/// `par-ensure-reused-request-uri-prior-to-auth-completion-succeeds` visits the authorization
+/// endpoint twice with one `request_uri` and requires that nobody signs in on the first visit
+/// ("On the first visit no login should be attempted"). A person running it simply does nothing the
+/// first time. The headless browser cannot tell the visits apart, so the page marks a repeat with
+/// `id="revisit"` and that module's browser override presses Approve only when the marker is there.
+/// The AS treats both visits identically; what the module actually verifies -- that loading the page
+/// did not consume the `request_uri` -- is decided by the library and by this gate keeping the
+/// first visit away from it.
+#[derive(Default)]
+struct LoginGate {
+    shown: Mutex<HashSet<String>>,
+}
+
+/// The answer the sign-in page recorded, if the request carries one.
+fn decision_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|c| c.trim().strip_prefix(DECISION_COOKIE)?.strip_prefix('='))
+        .find(|v| matches!(*v, "approve" | "deny"))
+}
+
+/// CONFORMANCE FIXTURE ONLY. Answer an undecided `GET /authorize` with a sign-in page, and let a
+/// decided one through to the library exactly once.
+///
+/// A real host does the same thing with its own login and consent UI: the library's docs on
+/// `ApprovalDecision::Respond` say a host that sends a visitor to its login page "does it in front
+/// of this service, where its session already lives". Keeping the first visit away from the library
+/// is what keeps a PAR `request_uri` alive until the user has actually answered.
+async fn login_gate(State(gate): State<Arc<LoginGate>>, req: Request, next: Next) -> Response {
+    if req.method() != Method::GET || req.uri().path() != "/authorize" {
+        return next.run(req).await;
+    }
+    if decision_cookie(req.headers()).is_some() {
+        let mut resp = next.run(req).await;
+        // One shot: the answer applies to this authorization request and no other.
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(
+                "fixture_decision=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+            ),
+        );
+        return resp;
+    }
+    let target = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/authorize".to_string(), |pq| pq.as_str().to_string());
+    let revisit = gate
+        .shown
+        .lock()
+        .map(|mut shown| !shown.insert(target.clone()))
+        .unwrap_or(false);
+    sign_in_page(&target, revisit)
+}
+
+/// The sign-in page: one user, two buttons. `id="approve"` / `id="deny"` are what
+/// `fapi2/config.json` presses.
+fn sign_in_page(target: &str, revisit: bool) -> Response {
+    let attr = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    };
+    let marker = if revisit {
+        "<p id=\"revisit\">This authorization request has been shown before.</p>"
+    } else {
+        ""
+    };
+    let html = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Sign in</title></head><body>\
+         <h1>oauth-as FAPI 2.0 fixture: sign in</h1>{marker}\
+         <p>Signed in as {SEEDED_SUBJECT}. Approve or deny this authorization request.</p>\
+         <form method=\"post\" action=\"/fixture/login\">\
+         <input type=\"hidden\" name=\"return_to\" value=\"{target}\">\
+         <button type=\"submit\" id=\"approve\" name=\"decision\" value=\"approve\">Approve</button> \
+         <button type=\"submit\" id=\"deny\" name=\"decision\" value=\"deny\">Deny</button>\
+         </form></body></html>",
+        target = attr(target),
+    );
+    let mut resp = Response::new(Body::from(html));
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, html_content_type());
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// CONFORMANCE FIXTURE ONLY. The sign-in page's form target: record the answer in the one-shot
+/// cookie and send the browser back to the same authorization request.
+async fn fixture_login(body: axum::body::Bytes) -> Response {
+    let (mut decision, mut return_to) = (None, None);
+    for (k, v) in url::form_urlencoded::parse(&body) {
+        match k.as_ref() {
+            "decision" => decision = Some(v.into_owned()),
+            "return_to" => return_to = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    let decision = match decision.as_deref() {
+        Some("approve") => "approve",
+        Some("deny") => "deny",
+        _ => return (StatusCode::BAD_REQUEST, "decision must be approve or deny").into_response(),
+    };
+    // Only ever back to this server's own authorization endpoint: never an open redirect.
+    let location = match return_to
+        .filter(|r| r.starts_with("/authorize?"))
+        .and_then(|r| HeaderValue::from_str(&r).ok())
+    {
+        Some(location) => location,
+        None => {
+            return (StatusCode::BAD_REQUEST, "return_to must be /authorize?...").into_response()
+        }
+    };
+    let cookie = HeaderValue::from_str(&format!(
+        "{DECISION_COOKIE}={decision}; Path=/; Secure; HttpOnly; SameSite=Lax"
+    ))
+    .expect("a fixed ASCII cookie is a valid header value");
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    resp.headers_mut().insert(header::LOCATION, location);
+    resp.headers_mut().insert(header::SET_COOKIE, cookie);
+    resp
 }
 
 /// The `Content-Type` for the fixture's HTML error page (mirrors the library's own value).

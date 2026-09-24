@@ -300,12 +300,36 @@ echo "  $FAPI2_PLAN"
 # passed as the second argument). --verbose makes it print, for every unexpected result, the
 # exact block/condition strings as a ready-to-paste entry template, so a new finding is recorded
 # from the run rather than guessed.
+# --export-dir is the suite's plain per-module log export, kept for diagnosis. It is NOT a
+# certification package and OIDF's submission form rejects it; see the certificationpackage step.
+mkdir -p "$FAPI2_LOG_DIR/plan-export"
 timeout "${FAPI2_PLAN_TIMEOUT:-1500}" python3 "$CONFORMANCE_SUITE_DIR/scripts/run-test-plan.py" \
-  "$FAPI2_PLAN" "$FAPI2_CONFIG" --export-dir "$FAPI2_LOG_DIR" \
+  "$FAPI2_PLAN" "$FAPI2_CONFIG" --export-dir "$FAPI2_LOG_DIR/plan-export" \
   --expected-failures-file "$FAPI2_EXPECTED_FAILURES" \
   --expected-skips-file "$FAPI2_EXPECTED_SKIPS" --verbose \
   | tee "$FAPI2_LOG_DIR/run.log"
 
-echo "fapi2-conformance: done. Logs + certification package under $FAPI2_LOG_DIR"
-echo "For a formal certification submission, use the suite's 'Publish for certification' to"
-echo "produce the log ZIP, then submit at https://submissions.openid.net/ (EXTERNAL-TOOLING.md s2.4)."
+# --- Certification package: what the suite UI's "Publish for certification" button produces. ----
+# POST /api/plan/{id}/certificationpackage (LogApi.prepareCertificationPackageForTestPlan) refuses
+# with 422 unless EVERY module finished without FAILED/UNKNOWN (its only exemption is
+# oidcc-server-rotate-keys), then publishes the plan, marks it immutable and streams the ZIP the
+# OIDF submission form accepts. An OP plan sends an empty clientSideData part, exactly as the
+# suite's own scripts/conformance.py create_certification_package does.
+plan_id="$(sed -nE 's/.*Created test plan, new id: ([A-Za-z0-9]+).*/\1/p' "$FAPI2_LOG_DIR/run.log" | tail -1)"
+[[ -n "$plan_id" ]] || die "no plan id in run.log; cannot request the certification package"
+pkg_dir="$FAPI2_LOG_DIR/certification-package"
+mkdir -p "$pkg_dir"
+echo "fapi2-conformance: requesting the certification package for plan $plan_id"
+pkg_status="$(curl -ksS -X POST -F "clientSideData=@/dev/null;filename=empty" \
+  -D "$pkg_dir/headers.txt" -o "$pkg_dir/package.bin" -w '%{http_code}' \
+  "https://localhost.emobix.co.uk:8443/api/plan/$plan_id/certificationpackage")"
+if [[ "$pkg_status" != "200" ]]; then
+  cat "$pkg_dir/package.bin" || true
+  die "certificationpackage refused (HTTP $pkg_status): the plan is not certifiable as run"
+fi
+pkg_name="$(sed -nE 's/.*[Ff]ilename="([^"]+)".*/\1/p' "$pkg_dir/headers.txt" | tr -d '\r' | tail -1)"
+mv "$pkg_dir/package.bin" "$pkg_dir/${pkg_name:-certification-package-$plan_id.zip}"
+rm -f "$pkg_dir/headers.txt"
+
+echo "fapi2-conformance: done. Certification package: $pkg_dir/${pkg_name:-certification-package-$plan_id.zip}"
+echo "Submit it at https://submissions.openid.net/ (EXTERNAL-TOOLING.md s2.4)."
