@@ -22,23 +22,24 @@ the consent experience; the library owns the protocol.
 
 ```toml
 [dependencies]
-oauth-as = "0.11"
+oauth-as = "1"
 ```
 
 ## Status
 
-**Beta, and pre-1.0.** The API is not yet frozen. Every release across the 0.x line is meant to be
-tested in earnest, and each one exists because auditing the release before it found something worth
-fixing — an independent mutation sweep, real SSRF and revocation defects caught and closed, a
+**Stable, 1.0.** The public API is frozen; breaking changes go to 2.0. The 0.x line reached 1.0 by
+being tested in earnest at every step, and each release existed because auditing it found something
+worth fixing — an independent mutation sweep, real SSRF and revocation defects caught and closed, a
 concurrent-refresh race hardened, and in 0.11.0 FAPI 2.0 Security Profile support with PS256 and a
-FAPI-safe algorithm allow-list. What each version changed, and how to migrate across the breaking
-points (the `Storage` change in 0.9.1 and the JWS enum / assertion-audience changes in 0.11.0), is
-in [`CHANGELOG.md`](CHANGELOG.md).
+FAPI-safe algorithm allow-list. What each version changed, and how to migrate across the pre-1.0
+breaking points (the `Storage` change in 0.9.1 and the JWS enum / assertion-audience changes in
+0.11.0), is in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Patch upgrades are drop-in; a minor bump signals a breaking change.** New capabilities land opt-in and off by default: leave the
-new configuration alone and the server compiles and behaves exactly as the previous version did. A
-store that passes `oauth_as::storage_conformance` keeps passing it, and persisted records decode
-unchanged across the upgrade.
+**SemVer, strictly.** Patch upgrades are drop-in, a minor bump adds capability without breaking
+existing callers, and only a major bump breaks the API. New capabilities land opt-in and off by
+default: leave the new configuration alone and the server compiles and behaves exactly as the
+previous version did. A store that passes `oauth_as::storage_conformance` keeps passing it, and
+persisted records decode unchanged across the upgrade.
 
 ## What it does
 

@@ -12,6 +12,29 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-23
+
+First stable release. No library code, public API, or wire behaviour changes vs 0.11.2: the 0.11
+line has been API-frozen for two consecutive releases (0.11.1 and 0.11.2 were both test-only /
+CI-only), and 1.0.0 is the SemVer commitment that comes with that — a patch upgrade is drop-in, a
+minor bump adds capability without breaking existing callers, and only a major bump breaks the API.
+
+The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan continues to
+pass end to end on the hosted conformance suite (51 modules; the non-passes are the same
+spec-permitted expected failures/skips documented in the 0.11.0 entry: user-rejection and
+reuse-of-`request_uri`-before-auth-completion which a headless run cannot drive, a code-reuse
+token-revocation `SHOULD` logged at WARNING inherent to a stateless-JWT resource server, and an
+RS256 client-assertion negative test the ES256 profile skips). Formal OpenID Foundation FAPI 2.0
+certification is being submitted against this release under the "FAPI2SP OP private key + DPoP"
+profile.
+
+### Changed
+
+- Version bumped to 1.0.0. No functional changes.
+- README: install snippet uses `oauth-as = "1"`; Status section rewritten around the stable API
+  commitment.
+- Workspace: `crates/oauth-as-postgres` path dependency pinned to `oauth-as = "1"`.
+
 ## [0.11.2] - 2026-09-21
 
 A CI, supply-chain, and test-only patch release: no library code, public API, or wire behaviour
