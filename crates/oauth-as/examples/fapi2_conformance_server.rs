@@ -673,8 +673,10 @@ async fn authorization_errors_as_html(req: Request, next: Next) -> Response {
 /// `par-ensure-reused-request-uri-prior-to-auth-completion-succeeds` visits the authorization
 /// endpoint twice with one `request_uri` and requires that nobody signs in on the first visit
 /// ("On the first visit no login should be attempted"). A person running it simply does nothing the
-/// first time. The headless browser cannot tell the visits apart, so the page marks a repeat with
-/// `id="revisit"` and that module's browser override presses Approve only when the marker is there.
+/// first time. The headless browser cannot tell the visits apart (the suite drives each visit from
+/// its own browser thread), so a repeat showing adds a second approve button, `id="approve-revisit"`,
+/// which that module's browser override clicks with the runner's `"optional"` flag: absent on the
+/// first visit, so nothing is pressed; present on the second, so the user approves.
 /// The AS treats both visits identically; what the module actually verifies -- that loading the page
 /// did not consume the `request_uri` -- is decided by the library and by this gate keeping the
 /// first visit away from it.
@@ -738,20 +740,24 @@ fn sign_in_page(target: &str, revisit: bool) -> Response {
             .replace('"', "&quot;")
             .replace('\'', "&#39;")
     };
-    let marker = if revisit {
-        "<p id=\"revisit\">This authorization request has been shown before.</p>"
+    // A repeat showing carries a SECOND approve button with its own id. It submits exactly what
+    // `id="approve"` does; it exists only so one suite module's browser override can press Approve
+    // on the second visit and do nothing on the first (see `LoginGate`).
+    let revisit_button = if revisit {
+        " <button type=\"submit\" id=\"approve-revisit\" name=\"decision\" value=\"approve\">\
+         Approve (this request was shown before)</button>"
     } else {
         ""
     };
     let html = format!(
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <title>Sign in</title></head><body>\
-         <h1>oauth-as FAPI 2.0 fixture: sign in</h1>{marker}\
+         <h1>oauth-as FAPI 2.0 fixture: sign in</h1>\
          <p>Signed in as {SEEDED_SUBJECT}. Approve or deny this authorization request.</p>\
          <form method=\"post\" action=\"/fixture/login\">\
          <input type=\"hidden\" name=\"return_to\" value=\"{target}\">\
          <button type=\"submit\" id=\"approve\" name=\"decision\" value=\"approve\">Approve</button> \
-         <button type=\"submit\" id=\"deny\" name=\"decision\" value=\"deny\">Deny</button>\
+         <button type=\"submit\" id=\"deny\" name=\"decision\" value=\"deny\">Deny</button>{revisit_button}\
          </form></body></html>",
         target = attr(target),
     );

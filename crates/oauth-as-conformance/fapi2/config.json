@@ -44,7 +44,7 @@
   "resource": {
     "resourceUrl": "https://as.local:8444/resource"
   },
-  "_browser_comment": "Every authorization request first lands on the fixture's own sign-in page (fapi2_conformance_server.rs login_gate), which never reaches the library until a button is pressed. Default flow: press Approve, then EITHER the AS redirects to the suite callback (wait for the implicitCallback page's id 'submission_complete') OR the AS refuses the request and the fixture renders its HTML 'Authorization error' page (fill the module's ExpectXxxErrorPage placeholder with update-image-placeholder). Both outcome tasks are optional because exactly one occurs per authorization. The 'override' block below replaces 'browser' for two modules whose summaries require a different human action: user-rejects-authentication presses Deny, and par-ensure-reused-request-uri-prior-to-auth-completion-succeeds takes no action on the first visit and presses Approve only on the second (the page marks a repeat showing with id 'revisit'). Per-module 'override' is the suite's own mechanism: info/DBTestPlanService.java merges override.<testName> into that module's config.",
+  "_browser_comment": "Every authorization request first lands on the fixture's own sign-in page (fapi2_conformance_server.rs login_gate), which never reaches the library until a button is pressed. Default flow: press Approve, then EITHER the AS redirects to the suite callback (wait for the implicitCallback page's id 'submission_complete') OR the AS refuses the request and the fixture renders its HTML 'Authorization error' page (fill the module's ExpectXxxErrorPage placeholder with update-image-placeholder). Both outcome tasks are optional because exactly one occurs per authorization. The 'override' block below replaces 'browser' for two modules whose summaries require a different human action: user-rejects-authentication presses Deny, and par-ensure-reused-request-uri-prior-to-auth-completion-succeeds takes no action on the first visit and presses Approve only on the second (a repeat showing adds a button with id 'approve-revisit', clicked with the runner's 'optional' flag). Per-module 'override' is the suite's own mechanism: info/DBTestPlanService.java merges override.<testName> into that module's config.",
   "browser": [
     {
       "match": "https://as.local:8444/authorize*",
@@ -132,20 +132,15 @@
           "match": "https://as.local:8444/authorize*",
           "tasks": [
             {
-              "task": "Sign-in page: take NO action on the first visit (module summary: 'On the first visit no login should be attempted'); press Approve only when the page marks this request as already shown (id 'revisit'), i.e. on the second visit.",
+              "task": "Sign-in page: take NO action on the first visit (module summary: 'On the first visit no login should be attempted'); a repeat showing adds an approve button with id 'approve-revisit', which this task presses. The runner's 'optional' click flag skips it when absent, so the first visit is a no-op rather than an error. The suite drives each visit from its own browser thread.",
               "match": "https://as.local:8444/authorize*",
               "optional": true,
               "commands": [
                 [
-                  "wait",
-                  "id",
-                  "revisit",
-                  3
-                ],
-                [
                   "click",
                   "id",
-                  "approve"
+                  "approve-revisit",
+                  "optional"
                 ]
               ]
             },
@@ -159,21 +154,6 @@
                   "id",
                   "submission_complete",
                   15
-                ]
-              ]
-            },
-            {
-              "task": "Rejection path: the AS correctly refused the authorization request (a reused / expired / wrong-client request_uri, or a request not sent via PAR) and the fixture served an HTML error page at its own origin with no callback to follow. Wait for that page and fill the module's ExpectXxxErrorPage placeholder from it (update-image-placeholder) so the WAITING test finishes instead of hanging until the plan timeout. The literal 'Authorization error' is the <h1> the fixture's authorization_errors_as_html renders on every 4xx at /authorize; command[1] MUST be a real selector (xpath), never match/contains, or BrowserControl never enters the placeholder-fill branch (BrowserControl.java doCommand @6b8b809).",
-              "match": "https://as.local:8444/authorize*",
-              "optional": true,
-              "commands": [
-                [
-                  "wait",
-                  "xpath",
-                  "//*",
-                  10,
-                  "Authorization error",
-                  "update-image-placeholder"
                 ]
               ]
             }
