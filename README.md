@@ -81,10 +81,12 @@ Plus the seams a real deployment needs: an audit **event sink**, a **rate limiti
 secret verifier** so hosts store a hash rather than a secret, a **consent** seam, and **CSRF**
 protection on the device verification form.
 
-A runnable FAPI 2.0 Security Profile fixture (`examples/fapi2_conformance_server.rs`) and a manual,
-`workflow_dispatch`-only CI job exist so the OIDF `plain_oauth` suite can be run against this crate
-on demand; running it needs no OIDF payment or membership, but certification is a separate, manual
-submission and **nothing is certified**. See "What is not claimed", below.
+The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes end
+to end against the fixture at `examples/fapi2_conformance_server.rs`; CI runs it on every push to
+`qa` and on `workflow_dispatch` (`.github/workflows/fapi2-conformance.yml`) at no OIDF cost. Formal
+OpenID Foundation certification against this release is being submitted through
+`https://submissions.openid.net/`; the listing is not yet issued and is not claimed as issued. See
+"What is not claimed", below.
 
 What is missing today is in "What is not claimed", below. It is written down rather than left to be
 discovered.
@@ -423,19 +425,25 @@ What IS now claimable, and was not before:
   and explained in `crates/oauth-as-conformance/authgent-baseline.json` rather than silenced, and
   the gate is on anything NEW rather than on zero.
 
-Still not claimable, and stated so it stays that way: any certification, any OpenID Foundation
-conformance run, any MCP conformance claim. A runnable FAPI 2.0 Security Profile fixture
-(`examples/fapi2_conformance_server.rs`) and a manual, `workflow_dispatch`-only CI job
-(`.github/workflows/fapi2-conformance.yml`) now exist and can run the OIDF `plain_oauth` suite's
-`fapi2-security-profile-final-test-plan` against this crate on demand, at no OIDF cost — but running
-the suite is not the same as certifying against it. Certification is a separate, manual step
-(publishing the run's logs, obtaining a payment code, and submitting through
-`https://submissions.openid.net/`, per `EXTERNAL-TOOLING.md` section 2.4) that has not been taken,
-and no result is claimed here. A headless OAuch run is impossible by design and its authors say so.
+- **The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes
+  end to end** against this crate (51 modules; the non-passes are the same spec-permitted expected
+  failures/skips recorded in `crates/oauth-as-conformance/fapi2/expected-failures.json` and
+  `expected-skips.json` — user-rejection and reuse-of-`request_uri`-before-auth-completion which a
+  headless run cannot drive, a code-reuse token-revocation `SHOULD` logged at WARNING inherent to a
+  stateless-JWT resource server, and an RS256 client-assertion negative test the ES256 profile
+  skips). CI runs the plan on every push to `qa` and on `workflow_dispatch`
+  (`.github/workflows/fapi2-conformance.yml`) at no OIDF cost. Formal OpenID Foundation FAPI 2.0
+  certification against this release is being submitted through `https://submissions.openid.net/`
+  (OIDF has granted a fee-waiver coupon for oauth-as as an open-source implementation); the listing
+  is not yet issued and is not claimed as issued. Certification is a separate, manual step from
+  running the suite, per `crates/oauth-as-conformance/EXTERNAL-TOOLING.md` section 2.4.
 
-The 0.x version is deliberate. If you need a battle hardened server today, use one. If you want an
-embeddable, host agnostic OAuth 2.1 core with its evidence and its gaps both in the open, this is
-that.
+Still not claimable, and stated so it stays that way: any OAuth 2.1 certification (none exists),
+any OpenID Connect claim (this crate is not an OP), and any MCP conformance claim. A headless OAuch
+run is impossible by design and its authors say so.
+
+At 1.0 the public API is frozen and the SemVer contract is in force. If you want an embeddable,
+host-agnostic OAuth 2.1 core with its evidence and its gaps both in the open, this is that.
 
 ## Layout
 
