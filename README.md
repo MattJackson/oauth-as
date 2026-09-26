@@ -13,6 +13,13 @@
 [![REUSE status](https://api.reuse.software/badge/github.com/MattJackson/oauth-as)](https://api.reuse.software/info/github.com/MattJackson/oauth-as)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14738/badge)](https://www.bestpractices.dev/projects/14738)
 
+<a href="https://openid.net/certification/"><img src="https://openid.net/wordpress-content/uploads/2016/04/oid-l-certification-mark-l-rgb-150dpi-90mm.png" alt="OpenID Certified" height="60"></a>
+
+**oauth-as 1.0.0 is OpenID® Certified™.** Matthew Jackson has certified that oauth-as 1.0.0 conforms
+to the FAPI2SP OP private key + DPoP profile of the OpenID FAPI 2.0 Security Profile
+([certification listing](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/), [test results](https://www.certification.openid.net/plan-detail.html?public=true&plan=ADGRXePBZaLpa)). OpenID and OpenID Certified are
+trademarks of the OpenID Foundation.
+
 An embeddable **OAuth 2.1 Authorization Server** for Rust.
 
 This is the authorization server half of OAuth: it registers clients, runs the grant state
@@ -83,9 +90,11 @@ protection on the device verification form.
 
 The OIDF FAPI 2.0 Security Profile Final `plain_oauth` + `private_key_jwt` + DPoP plan passes on
 the OpenID Foundation's hosted suite with 0 failures (51 modules), against the fixture at
-`examples/fapi2_conformance_server.rs`; CI also runs it on every push to `qa`. oauth-as 1.0.0 has been
-submitted for OpenID Foundation certification (OCS-3058); the listing is not yet issued and is not
-claimed as issued. See "What is not claimed", below.
+`examples/fapi2_conformance_server.rs`; CI also runs it on every push to `qa`. oauth-as 1.0.0 is
+OpenID® Certified™ to the FAPI2SP OP private key + DPoP profile, listed by the OpenID Foundation on
+24 September 2026 ([listing](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)). The certification covers 1.0.0 specifically; later releases
+run the same plan in CI but are not themselves certified until resubmitted. See "What is not
+claimed", below.
 
 What is missing today is in "What is not claimed", below. It is written down rather than left to be
 discovered.
@@ -434,8 +443,10 @@ What IS now claimable, and was not before:
   the profile's clients use ES256. CI runs the same plan on every push to `qa`
   (`.github/workflows/fapi2-conformance.yml`) against a self-hosted suite, which can gate but cannot
   certify: a self-hosted suite signs its logs with a key the OpenID Foundation does not hold.
-  oauth-as 1.0.0 has been submitted for OpenID Foundation FAPI 2.0 certification (OCS-3058, fee
-  waived for open source); the listing is not yet issued and is not claimed as issued.
+  oauth-as 1.0.0 is OpenID® Certified™ to the FAPI2SP OP private key + DPoP profile: the OpenID
+  Foundation published the certification on 24 September 2026 ([listing](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)). It is a
+  self-certification under the OpenID Foundation's program, covering version 1.0.0 only; the
+  OpenID Foundation does not independently verify conformance claims.
 
 Still not claimable, and stated so it stays that way: any OAuth 2.1 certification (none exists),
 any OpenID Connect claim (this crate is not an OP), and any MCP conformance claim. A headless OAuch

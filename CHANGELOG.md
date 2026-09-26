@@ -14,6 +14,11 @@ whatever version is current at each real crates.io release appear as published o
 
 ### Changed
 
+- `docs`: oauth-as 1.0.0 is OpenID Certified to the FAPI2SP OP private key + DPoP profile (OpenID
+  Foundation listing published 24 September 2026). The README carries the official OpenID Certified
+  mark, linked to https://openid.net/certification/ and identifying the certified version, per the
+  OpenID Foundation Trademark Usage Policy.
+
 - `ci(fapi2)`: the OIDF conformance suite is pinned to `release-v5.3.1`
   (`440eec8bac7b12b7389d7ca9cbc459b53507a443`) instead of an untagged master commit, so the
   certification ZIP it produces names a released suite version.
