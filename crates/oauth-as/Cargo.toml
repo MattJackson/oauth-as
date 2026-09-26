@@ -365,7 +365,7 @@ rsa = { version = "0.9", default-features = false, features = ["std", "sha2"], o
 # it is only for `SigningKey::generate` (key generation); RFC 8032 signing is deterministic and
 # consumes no randomness. No `*-sys` crate and no C/asm toolchain is pulled (curve25519-dalek is
 # pure Rust with default features), so `#![forbid(unsafe_code)]` in this crate stays satisfiable.
-ed25519-dalek = { version = "~2.1", default-features = false, features = ["std"], optional = true }
+ed25519-dalek = { version = "~2.2", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # DEV-ONLY, for the RS256 standalone vector test (tests/rsa_rfc7515_a2.rs). An integration-test
@@ -376,7 +376,7 @@ ed25519-dalek = { version = "~2.1", default-features = false, features = ["std"]
 rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 # DEV-ONLY, for the EdDSA test vector (tests/ed25519_rfc8037_vector.rs), which drives
 # `ed25519-dalek` DIRECTLY. Same `~2.1` pin and reasoning as the runtime entry above.
-ed25519-dalek = { version = "~2.1", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "~2.2", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 # A DEV dependency now that the runtime one is optional: the test suite and the examples build JSON
 # fixtures by hand on paths where the library itself does not need a JSON crate at all.
