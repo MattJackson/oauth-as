@@ -268,7 +268,9 @@ impl PostgresStorage {
         // The table names are this crate's own literals, not caller data, so the join cannot be
         // an injection point; `TRUNCATE` takes no bind parameters, so there is no alternative.
         let stmt = format!("TRUNCATE {}", tables.join(", "));
-        sqlx::raw_sql(&stmt).execute(&self.pool).await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

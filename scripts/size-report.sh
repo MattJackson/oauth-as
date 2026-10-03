@@ -179,6 +179,18 @@ ROWS=(
 # README.md's Cost section from the same run.
 budget_for() {
   case "$HOST_TRIPLE:$1" in
+    # RE-BASELINED 2026-10-02, aarch64-apple-darwin, rustc 1.98.1, ONE run of this script with
+    # --remap-path-prefix in force, ONLY for the two rows that carry the built-in p256 backend; the
+    # other five gated rows stayed inside their bands and are left untouched. WHAT BOUGHT IT: the
+    # dependency bump to p256 0.14 (PR #23), which brings ecdsa 0.17, elliptic-curve 0.14,
+    # crypto-bigint 0.7 and its OWN sha2 0.11 -- a second SHA-256 alongside the sha2 0.10 the crate
+    # keeps for PKCE and rsa 0.9. No oauth-as code changed; this is the upstream crypto stack's cost.
+    # The two sha2s unify again once rsa moves to the sha2 0.11 line, at which point re-measure.
+    #   * jwt-p256: 315,618 -> 344,070. New budget +1.5% rounded up = 342 KiB (350,208); new floor
+    #     -1.5% rounded down = 330 KiB (337,920).
+    #   * all-features: 1,636,659 -> 1,689,790. New budget +1.5% rounded up = 1675 KiB (1,715,200);
+    #     new floor -1.5% rounded down = 1625 KiB (1,664,000).
+    #
     # RE-BASELINED AGAIN 2026-09-18 for 0.10.0, aarch64-apple-darwin, rustc 1.98.0, ONE run of this
     # script with --remap-path-prefix in force, ONLY for the two rows the 0.10.0 crypto-agility work
     # moved out of their 0.9.5 band; the other five gated rows still sit inside the 0.9.5 bands below
@@ -288,7 +300,7 @@ budget_for() {
     # actually wants.
     # Budget down from 308,224 to 296,960, because 308,224 was 5.4% above a row that moved by 749
     # bytes all release.
-    aarch64-apple-darwin:jwt-p256) echo 320512 ;;
+    aarch64-apple-darwin:jwt-p256) echo 350208 ;;
     # the conformance server's own feature set: the HTTP surface plus the signing seam, with no
     # curve. MEASURED 458,484, down 14,036 from the 472,520 this row was set from, for the same
     # reason as `http`.
@@ -316,7 +328,7 @@ budget_for() {
     #     marginal cost in a binary that already parses JSON for something else is 30,629 bytes.
     #     (The 24 KiB quoted for this before was taken pre-remap and pre-`ScopeSet`; 30,629 is the
     #     figure from this run.)
-    aarch64-apple-darwin:all-features) echo 1661952 ;;
+    aarch64-apple-darwin:all-features) echo 1715200 ;;
     *) echo "" ;;
   esac
 }
@@ -384,6 +396,8 @@ budget_for() {
 # carry against run-to-run variation.
 floor_for() {
   case "$HOST_TRIPLE:$1" in
+    # jwt-p256 and all-features RE-BASELINED 2026-10-02 for p256 0.14; see the note in `budget_for`.
+    #
     # RE-BASELINED 2026-09-18 for 0.9.5 alongside the budgets above (see the note in `budget_for`
     # for what bought the growth: the opt-in `refresh_retry_window` feature, PR #10). Each floor is
     # the same 0.9.5 measurement minus 1.5%, rounded DOWN to the previous KiB. The per-row MEASURED
@@ -406,13 +420,13 @@ floor_for() {
     aarch64-apple-darwin:"jwt (seam only)") echo 268288 ;;
     # MEASURED 292,418, budget 296,960. Down to 281 KiB. The gap to the seam-only floor is what
     # stops the built-in p256 backend disappearing from the probe unnoticed.
-    aarch64-apple-darwin:jwt-p256) echo 310272 ;;
+    aarch64-apple-darwin:jwt-p256) echo 337920 ;;
     # MEASURED 458,484, budget 465,920. Down to 441 KiB.
     aarch64-apple-darwin:"http,jwt") echo 468992 ;;
     # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
     # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
     # before trusting this one to notice a single feature: it will not.
-    aarch64-apple-darwin:all-features) echo 1611776 ;;
+    aarch64-apple-darwin:all-features) echo 1664000 ;;
     *) echo "" ;;
   esac
 }

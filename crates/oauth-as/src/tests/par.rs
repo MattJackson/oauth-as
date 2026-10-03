@@ -307,7 +307,7 @@ mod jar {
     }
 
     fn registered(key: &SigningKey, kid: Option<&str>) -> RegisteredRequestObjectKey {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         RegisteredRequestObjectKey::es256_from_sec1(kid.map(str::to_string), point.as_bytes())
             .expect("a freshly generated P-256 public key is a point on P-256")
     }
@@ -737,7 +737,7 @@ mod jar {
         );
 
         let key = signing_key(7);
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
         let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
         let registered =
