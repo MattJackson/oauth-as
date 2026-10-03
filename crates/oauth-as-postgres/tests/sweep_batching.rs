@@ -88,7 +88,7 @@ fn nanos(at: SystemTime) -> i64 {
 
 async fn count(store: &PostgresStorage, table: &str) -> i64 {
     // Every table name here is this file's own literal, never caller data.
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
         .fetch_one(store.pool())
         .await
         .unwrap_or_else(|e| panic!("count {table}: {e}"))
@@ -105,7 +105,7 @@ async fn a_backlog_of_several_batches_is_swept_whole_and_counted_truthfully() {
     let rows = backlog();
 
     for (table, sql) in PLANTS {
-        sqlx::query(sql)
+        sqlx::query(*sql)
             .bind(dead_ns)
             .bind(rows)
             .execute(store.pool())

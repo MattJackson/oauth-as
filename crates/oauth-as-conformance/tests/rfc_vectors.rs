@@ -26,7 +26,7 @@
 //! `pkce`, `jws-hs256`, `jws-rs256`, `jws-es256`, `rfc9068`, `rfc8414`, `error-shape`,
 //! `token-response`, `device-auth`. [`SELFTEST_FAULTS`] is the same list, in code.
 
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use oauth_as_conformance as conf;
 use serde_json::{json, Value};
 use sha2::Sha256;

@@ -128,7 +128,7 @@ fn refresh_record(
 /// the primary key of the record the test is about to write.
 async fn blocker<'a>(
     pool: &'a sqlx::Pool<Postgres>,
-    statement: &str,
+    statement: &'static str,
     binds: &[&str],
 ) -> Transaction<'a, Postgres> {
     let mut tx = pool.begin().await.expect("begin the blocking transaction");

@@ -363,7 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => self_signed_tls(&issuer).await?,
     };
-    let socket = addr.parse()?;
+    let socket: std::net::SocketAddr = addr.parse()?;
     println!("FAPI 2.0 fixture listening on https://{addr} (issuer {issuer})");
     axum_server::bind_rustls(socket, tls)
         .serve(router.into_make_service())

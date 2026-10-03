@@ -58,10 +58,12 @@ pub async fn fresh_schema(schema: &str) {
         .expect("connect to the test database");
     // The schema names are this file's own literals, never caller data; `CREATE SCHEMA` takes no
     // bind parameters, so there is no alternative to formatting them in.
-    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop the test schema");
-    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .await
+    .expect("drop the test schema");
+    pool.execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .await
         .expect("create the test schema");
     pool.close().await;
