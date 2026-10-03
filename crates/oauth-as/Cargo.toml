@@ -286,9 +286,9 @@ serde = { version = "1", features = ["derive"] }
 # packages. Four fewer, not three, because serde_json itself counts alongside itoa, ryu and
 # memchr.
 serde_json = { version = "1", optional = true }
-getrandom = "0.3"
-sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
-base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
+getrandom = "0.4"
+sha2 = "0.11"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
+base64 = "0.23"            # BASE64URL-without-padding, the exact PKCE challenge encoding
 
 # OPTIONAL, feature `http` only. The HTTP vocabulary, and nothing above it.
 #
@@ -326,7 +326,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # for the measurement, and in particular for what it does NOT buy: a host that never calls the two
 # PKCS#8 constructors pays zero bytes for them either way, because LTO deletes them. The split is
 # for the dependency tree.
-p256 = { version = "0.13", default-features = false, features = [
+p256 = { version = "0.14", default-features = false, features = [
     "ecdsa",  # ECDSA/P-256/SHA-256 signing, which is ES256 (RFC 7518 s3.4)
     "std",    # this crate is std anyway; adds no crate to the tree, only alloc/error impls
 ], optional = true }
@@ -365,7 +365,7 @@ rsa = { version = "0.9", default-features = false, features = ["std", "sha2"], o
 # it is only for `SigningKey::generate` (key generation); RFC 8032 signing is deterministic and
 # consumes no randomness. No `*-sys` crate and no C/asm toolchain is pulled (curve25519-dalek is
 # pure Rust with default features), so `#![forbid(unsafe_code)]` in this crate stays satisfiable.
-ed25519-dalek = { version = "~2.1", default-features = false, features = ["std"], optional = true }
+ed25519-dalek = { version = "~2.2", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # DEV-ONLY, for the RS256 standalone vector test (tests/rsa_rfc7515_a2.rs). An integration-test
@@ -376,7 +376,7 @@ ed25519-dalek = { version = "~2.1", default-features = false, features = ["std"]
 rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 # DEV-ONLY, for the EdDSA test vector (tests/ed25519_rfc8037_vector.rs), which drives
 # `ed25519-dalek` DIRECTLY. Same `~2.1` pin and reasoning as the runtime entry above.
-ed25519-dalek = { version = "~2.1", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "~2.2", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 # A DEV dependency now that the runtime one is optional: the test suite and the examples build JSON
 # fixtures by hand on paths where the library itself does not need a JSON crate at all.
@@ -386,8 +386,8 @@ serde_json = "1"
 # — there is no access token in a proof's own signature, so the RS is the only party that can bind
 # the proof to the token. Both crates are already in the library's normal tree (base64 and sha2 back
 # PKCE), so declaring them dev-only adds nothing to a consumer's build.
-base64 = "0.22"
-sha2 = "0.10"
+base64 = "0.23"
+sha2 = "0.11"
 # IN-TREE CONFORMANCE CHECKS (dev-only; never in any shipped binary):
 #   - `oauth2` is a widely used third-party OAuth 2 CLIENT. tests/third_party_client.rs drives it
 #     against this AS as a black box through its pluggable HTTP-client seam, so the CLIENT library
@@ -422,7 +422,7 @@ url = "2"
 # `tls-rustls` feature, so no `aws-lc-rs` C toolchain is dragged into a dev build: `ring` is already
 # in this workspace's tree, and `p256` (the crate's own signing backend) is pure Rust, so the
 # fixture keeps that property.
-axum-server = { version = "0.7.3", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 # The self-signed certificate the fixture presents. Default features (pem + ring), NOT the optional
 # `aws_lc_rs` backend, for the reason above.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
