@@ -73,7 +73,7 @@ jobs:
       - name: Install Rust toolchain
         # SAME pin as qa.yml and dev.yml, so a run of this job builds against the exact toolchain
         # every other gate in this repository builds against, not a moving "latest".
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-05
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-08-05
         with:
           toolchain: stable
           components: rustfmt, clippy
