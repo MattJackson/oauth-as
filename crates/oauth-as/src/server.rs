@@ -15,7 +15,7 @@ use crate::authorization::{
     AuthorizationErrorRedirect, AuthorizationRequest, AuthorizationResponse, CodeChallengeMethod,
     ValidatedAuthorizationRequest,
 };
-use crate::client::{Client, ClientId};
+use crate::client::{Client, ClientAuth, ClientId};
 #[cfg(feature = "client-assertion")]
 use crate::client_assertion::{verify_assertion, AudienceRule, CLIENT_ASSERTION_TYPE};
 use crate::device::{
@@ -41,6 +41,34 @@ use crate::token::{
     IntrospectionResponse, IssuedToken, RefreshTokenRecord, RefreshTokenState, TokenResponse,
     TokenType, TokenTypeHint,
 };
+
+/// RFC 8252 section 7.3 changes only the port of a public client's HTTP loopback-IP
+/// redirect. Both URIs must use the same literal IP, and every byte after the port must
+/// match. In particular, `localhost`, remote hosts, userinfo, fragments, paths and queries
+/// cannot use this exception.
+fn loopback_redirect_matches(registered: &str, requested: &str) -> bool {
+    fn parts(uri: &str) -> Option<(&str, &str)> {
+        let (host, rest) = if let Some(rest) = uri.strip_prefix("http://127.0.0.1:") {
+            ("127.0.0.1", rest)
+        } else {
+            let rest = uri.strip_prefix("http://[::1]:")?;
+            ("[::1]", rest)
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let port = rest.get(..digits)?.parse::<u16>().ok()?;
+        if port == 0 {
+            return None;
+        }
+        let suffix = rest.get(digits..)?;
+        if !(suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with('?'))
+            || suffix.contains('#')
+        {
+            return None;
+        }
+        Some((host, suffix))
+    }
+    matches!((parts(registered), parts(requested)), (Some(a), Some(b)) if a == b)
+}
 
 /// Seconds since the Unix epoch, for the RFC 7519 `exp` / `iat` style claims RFC 7662 reuses.
 /// A pre-epoch instant is not representable in that encoding, so it is reported as absent rather
@@ -4467,9 +4495,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             .map_err(|_| direct(ErrorCode::ServerError, "storage unavailable"))?
             .ok_or_else(|| direct(ErrorCode::InvalidRequest, "unknown client_id"))?;
 
-        // 2. The redirect URI. OAuth 2.1 section 4.1.3 requires exact string comparison: no
-        //    prefix matching, no ignoring a trailing slash, no normalising case. Every relaxation
-        //    of this rule has a published attack behind it.
+        // 2. The redirect URI. OAuth 2.1 section 4.1.3 requires exact string comparison,
+        //    except that RFC 8252 section 7.3 requires an arbitrary request-time port for a
+        //    public native client's HTTP loopback IP redirect. The scheme, literal host, path
+        //    and query still match exactly; the requested URI is retained for code redemption.
         //
         //    WHETHER IT WAS SENT is recorded as well as what it resolved to, because RFC 6749
         //    section 4.1.3 makes the token endpoint's copy of this parameter conditional on the
@@ -4481,8 +4510,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             Some(requested) => client
                 .redirect_uris
                 .iter()
-                .find(|registered| registered.as_str() == requested)
-                .cloned()
+                .find(|registered| {
+                    registered.as_str() == requested
+                        || (matches!(&client.auth, ClientAuth::Public)
+                            && loopback_redirect_matches(registered, requested))
+                })
+                .map(|_| requested.to_owned())
                 .ok_or_else(|| {
                     direct(
                         ErrorCode::InvalidRequest,
