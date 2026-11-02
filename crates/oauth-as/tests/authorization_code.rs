@@ -15,7 +15,7 @@ use oauth_as::server::UserApproval;
 use std::time::Duration;
 
 use oauth_as::{
-    AuthorizationError, AuthorizationRequest, ClientId, CodeChallengeMethod, ErrorCode,
+    AuthorizationError, AuthorizationRequest, ClientAuth, ClientId, CodeChallengeMethod, ErrorCode,
     TokenRequest,
 };
 use support::{
@@ -206,6 +206,73 @@ async fn redirect_uri_matching_is_exact() {
             "{near_miss} must not match the registered URI"
         );
     }
+}
+
+/// RFC 8252 section 7.3 permits an ephemeral port on a public native client's
+/// numeric loopback redirect, and the request URI must be retained for redemption.
+#[tokio::test]
+async fn public_loopback_redirect_allows_only_the_port_to_change() {
+    for (registered, requested) in [
+        (
+            "http://127.0.0.1:49152/callback?x=1",
+            "http://127.0.0.1:52731/callback?x=1",
+        ),
+        ("http://[::1]:49152/callback", "http://[::1]:52731/callback"),
+    ] {
+        let mut client = public_client();
+        client.redirect_uris = vec![registered.to_owned()];
+        let srv = server_with(ManualClock::at_epoch(), vec![client]).await;
+        let c = challenge();
+        let mut req = good_request(&c);
+        req.redirect_uri = Some(requested.into());
+        let validated = srv.validate_authorization_request(&req).await.unwrap();
+        assert_eq!(validated.redirect_uri, requested);
+    }
+}
+
+#[tokio::test]
+async fn loopback_redirect_port_exception_keeps_every_other_byte_exact() {
+    let mut client = public_client();
+    client.redirect_uris = vec!["http://127.0.0.1:49152/callback?x=1".into()];
+    let srv = server_with(ManualClock::at_epoch(), vec![client]).await;
+    let c = challenge();
+    for requested in [
+        "http://127.0.0.2:52731/callback?x=1",
+        "http://localhost:52731/callback?x=1",
+        "http://[::1]:52731/callback?x=1",
+        "https://127.0.0.1:52731/callback?x=1",
+        "http://127.0.0.1:52731/other?x=1",
+        "http://127.0.0.1:52731/callback?x=2",
+        "http://127.0.0.1:52731/callback?x=1#fragment",
+        "http://127.0.0.1:0/callback?x=1",
+    ] {
+        let mut req = good_request(&c);
+        req.redirect_uri = Some(requested.into());
+        assert!(
+            matches!(
+                srv.validate_authorization_request(&req).await,
+                Err(AuthorizationError::Direct(_))
+            ),
+            "{requested}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn confidential_client_does_not_get_the_native_loopback_port_exception() {
+    let mut client = public_client();
+    client.auth = ClientAuth::ConfidentialSecret {
+        secret: "test-only-client-secret".into(),
+    };
+    client.redirect_uris = vec!["http://127.0.0.1:49152/callback".into()];
+    let srv = server_with(ManualClock::at_epoch(), vec![client]).await;
+    let c = challenge();
+    let mut req = good_request(&c);
+    req.redirect_uri = Some("http://127.0.0.1:52731/callback".into());
+    assert!(matches!(
+        srv.validate_authorization_request(&req).await,
+        Err(AuthorizationError::Direct(_))
+    ));
 }
 
 /// With exactly one registered URI the request may omit it (RFC 6749 s3.1.2.3).

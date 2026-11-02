@@ -179,6 +179,11 @@ ROWS=(
 # README.md's Cost section from the same run.
 budget_for() {
   case "$HOST_TRIPLE:$1" in
+    # RE-BASELINED 2026-11-02 for 1.0.1 on CI aarch64-apple-darwin, rustc 1.98.0.
+    # The patched p256 0.14 / crypto-bigint 0.7.10 arithmetic adds called code to
+    # the ES256 backend. CI measured jwt-p256 347,772 bytes and all-features
+    # 1,699,680 bytes. Per the established +/-1.5%, KiB-rounded rule the new
+    # ceilings are 345 KiB and 1685 KiB; only these two affected rows move.
     # RE-BASELINED AGAIN 2026-09-18 for 0.10.0, aarch64-apple-darwin, rustc 1.98.0, ONE run of this
     # script with --remap-path-prefix in force, ONLY for the two rows the 0.10.0 crypto-agility work
     # moved out of their 0.9.5 band; the other five gated rows still sit inside the 0.9.5 bands below
@@ -288,7 +293,7 @@ budget_for() {
     # actually wants.
     # Budget down from 308,224 to 296,960, because 308,224 was 5.4% above a row that moved by 749
     # bytes all release.
-    aarch64-apple-darwin:jwt-p256) echo 320512 ;;
+    aarch64-apple-darwin:jwt-p256) echo 353280 ;;
     # the conformance server's own feature set: the HTTP surface plus the signing seam, with no
     # curve. MEASURED 458,484, down 14,036 from the 472,520 this row was set from, for the same
     # reason as `http`.
@@ -316,7 +321,7 @@ budget_for() {
     #     marginal cost in a binary that already parses JSON for something else is 30,629 bytes.
     #     (The 24 KiB quoted for this before was taken pre-remap and pre-`ScopeSet`; 30,629 is the
     #     figure from this run.)
-    aarch64-apple-darwin:all-features) echo 1661952 ;;
+    aarch64-apple-darwin:all-features) echo 1725440 ;;
     *) echo "" ;;
   esac
 }
@@ -406,13 +411,15 @@ floor_for() {
     aarch64-apple-darwin:"jwt (seam only)") echo 268288 ;;
     # MEASURED 292,418, budget 296,960. Down to 281 KiB. The gap to the seam-only floor is what
     # stops the built-in p256 backend disappearing from the probe unnoticed.
-    aarch64-apple-darwin:jwt-p256) echo 310272 ;;
+    # 1.0.1 CI measurement 347,772 -1.5%, rounded down to 334 KiB.
+    aarch64-apple-darwin:jwt-p256) echo 342016 ;;
     # MEASURED 458,484, budget 465,920. Down to 441 KiB.
     aarch64-apple-darwin:"http,jwt") echo 468992 ;;
     # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
     # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
     # before trusting this one to notice a single feature: it will not.
-    aarch64-apple-darwin:all-features) echo 1611776 ;;
+    # 1.0.1 CI measurement 1,699,680 -1.5%, rounded down to 1634 KiB.
+    aarch64-apple-darwin:all-features) echo 1673216 ;;
     *) echo "" ;;
   esac
 }
