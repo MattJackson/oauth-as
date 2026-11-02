@@ -14,6 +14,12 @@ whatever version is current at each real crates.io release appear as published o
 
 ### Changed
 
+- Security: upgrade the optional ES256 backend to `p256` 0.14 and patched `crypto-bigint`
+  0.7.10 (RUSTSEC-2026-0387), and update rustls/webpki to 0.23.46/0.103.16.
+  `jwt-p256` and `jwt-pkcs8` now require Rust 1.88 because of the patched dependency
+  graph. The default protocol core and backend-neutral `jwt` retain Rust 1.75.
+  CI checks the ES256 backend and all features at the new floor.
+
 - `docs`: oauth-as 1.0.0 is OpenID Certified to the FAPI2SP OP private key + DPoP profile (OpenID
   Foundation listing published 24 September 2026). The README carries the official OpenID Certified
   mark, linked to https://openid.net/certification/ and identifying the certified version, per the

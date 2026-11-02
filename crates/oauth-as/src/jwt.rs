@@ -949,7 +949,7 @@ impl EcdsaP256Key {
     /// The PUBLIC half as an RFC 7517 JWK. There is no method that produces a JWK containing `d`,
     /// which is the point: the private parameter cannot be published by accident.
     pub fn public_jwk(&self) -> Jwk {
-        let point = self.signing.verifying_key().to_encoded_point(false);
+        let point = self.signing.verifying_key().to_sec1_point(false);
         // Uncompressed SEC 1 form guarantees both affine coordinates are present and each is the
         // FIXED 32 byte width RFC 7518 section 6.2.1.2 requires (left-padded, never trimmed: a
         // trimmed coordinate is the classic JWK interoperability bug).
@@ -995,15 +995,11 @@ impl PartialEq for EcdsaP256Key {
     /// compare equal without any comparison touching the secret scalar.
     fn eq(&self, other: &Self) -> bool {
         self.kid == other.kid
-            && self
-                .signing
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
+            && self.signing.verifying_key().to_sec1_point(false).as_bytes()
                 == other
                     .signing
                     .verifying_key()
-                    .to_encoded_point(false)
+                    .to_sec1_point(false)
                     .as_bytes()
     }
 }

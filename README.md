@@ -334,58 +334,27 @@ available terms.
 
 ## Minimum supported Rust version
 
-Measured per feature, because there is not one number. The last column is what CI actually builds
-with `--locked`, and it is a separate column because for one row it is NOT the same as the floor:
+The protocol core keeps Rust 1.75 support. Enabling the built-in ES256 backend now
+requires Rust 1.88: the security update to `p256` 0.14 removes the vulnerable
+`crypto-bigint` 0.5 tree (RUSTSEC-2026-0387), and its current patched dependency
+graph includes `sha2` 0.11.1, which requires 1.88. This is a security-driven
+increase for `jwt-p256` and `jwt-pkcs8` in the 1.0.x patch release.
 
-| Feature set | Floor | Set by | Built in CI at |
-| ----------- | ----- | ------ | -------------- |
-| default | **1.75** | this crate (RPITIT in `Storage`) | 1.75 |
-| `jwt` | **1.75** | this crate; `jwt` adds only `serde_json`, which declares 1.71 | 1.75, and `jwt-p256` at 1.75 too |
-| `http` | **1.75** | this crate; `http`, `http-body` and `bytes` are all lower | **1.80 only, never 1.75** |
-| `axum` | **1.80** | `axum` 0.8 declares it | 1.80, via `--features http` and `--all-features` |
+| Feature set | Supported Rust version | Built in CI at |
+| ----------- | ---------------------- | -------------- |
+| default, `jwt` | **1.75** | 1.75, derived from the manifest |
+| `http` | **1.75** locally measured | 1.80 |
+| `axum` | **1.80** | stable; its HTTP dependencies also build at 1.80 |
+| `jwt-p256`, `jwt-pkcs8`, all features | **1.88** | 1.88 |
 
-The `jwt` row's REASON changed with the ES256 seam split, and the table said the old one until
-2026-08-09: it gave `p256` as what set that floor, which stopped being true the moment `jwt`
-became `["dep:serde_json"]` and the backend moved to `jwt-p256 = ["jwt", "dep:p256"]`. The floor
-NUMBER was correct and still is; only the cause was stale. `jwt` pulls no `p256` at all now, so
-nothing it adds sets a floor above this crate's own, and `p256`'s 1.65 belongs to the `jwt-p256`
-row instead.
+The `jwt` signing and verification traits carry no ES256 arithmetic dependency.
+Hosts using their own `JwsSigner` and `JwsVerifier` keep the core floor without
+enabling `jwt-p256`. The RSA and Ed25519 backends retain their existing dependency
+versions; their Rust 1.75 support is based on dependency declarations rather than
+a dedicated CI build.
 
-The `http` row is the one to read carefully. `cargo +1.75 build -p oauth-as --locked --features
-http` does succeed, and that was re-measured for this release, but it was measured on a
-workstation: no job in `.github/workflows/qa.yml` builds `http` on 1.75. The
-`MSRV build (toolchain from rust-version)` job — named that because it reads the floor out of
-`crates/oauth-as/Cargo.toml` rather than hardcoding it, so the number in the manifest is the number
-CI installs — builds default, `jwt`, `jwt-p256` and `jwt-pkcs8` only, and `http` is built by the
-separate `MSRV (1.80) http feature` job. So 1.80 is the number for `http` that a stranger can verify from
-CI logs alone, and 1.75 is a local measurement that nothing re-checks on every push.
-
-Every MSRV job BUILDS and none of them TEST, and that is deliberate rather than an omission. An
-MSRV is a promise to a consumer that their toolchain can compile this library, and a consumer
-never compiles our dev-dependencies. Ours cannot run at 1.75: `cargo +1.75 test -p oauth-as
---locked --no-run` fails with `package litemap v0.7.5 cannot be built because it requires rustc
-1.81 or newer`, reached through `url -> idna -> idna_adapter -> icu_normalizer ->
-icu_properties -> icu_locid`, and both `url` and `oauth2` need it. Behaviour is verified by the
-full test suite on stable instead. So what is checked at the floor is "it compiles"; what is not
-checked at the floor, and cannot be without dragging every dev-dependency back, is "it passes its
-tests".
-
-`axum` is the only feature that raises the floor, and it raises it because a dependency it pulls
-in says so, not because of anything in this crate. Of the other eighteen, five add no crate at all
-(`par`, `consent`, `token-exchange`, `resource-metadata`, `test-util`) and so add no floor, and the
-rest add only crates whose own declared floor is below this one: `serde_json` 1.71 for `jwt` (and
-so for `client-assertion`, `dpop` and `jar`, which turn it on), for `mtls`, for `rar` and for
-`cimd`, `http` 1.57 / `http-body` 1.61 / `bytes` 1.57 for `http`, `p256` 1.65 for `jwt-p256`, and
-`pkcs8` 1.65 for `jwt-pkcs8`.
-
-The three built-in backends that landed in 0.10.0 declare floors below this one too: `rsa` 1.65
-(with `num-bigint-dig` 1.56 and `pkcs1` 1.60) for `jwt-rsa`, `ed25519-dalek` 1.60 (with `ed25519`,
-`curve25519-dalek` and `signature`, all 1.60) for `jwt-ed25519`, and the `pkcs8`/`der`/`spki` 1.65
-tree already counted above for `jwt-ed25519-pkcs8`. These floors are the crates' DECLARED
-`rust-version`s, not a CI measurement: the `MSRV build` job builds `default`, `jwt`, `jwt-p256` and
-`jwt-pkcs8` only, so `jwt-rsa` and `jwt-ed25519` are not compiled at 1.75 on every push the way the
-first four are. If a future bump to either backend raises its own floor past this crate's, that is
-where the number would move, and the job would need a row to catch it.
+MSRV jobs build the library with `--locked`; behavioral tests run on stable.
+Dev-dependencies are outside the consumer's build and require newer toolchains.
 
 1.74 fails on exactly one thing: return position `impl Trait` in the `Storage` trait. Going lower
 would mean `Box<dyn Future>` there, a heap allocation on every storage call, paid forever by every
