@@ -282,7 +282,9 @@ is its measurement plus 1.5% rounded up to the next KiB (and each floor its meas
 rounded down) — so a budget also comes DOWN when a row does, which is the only way it stays a gate
 on that row. For 0.10.0 the two rows the crypto-agility work actually moved past their band,
 `jwt-p256` and `--all-features`, were re-derived from this run; the other five gated rows still sit
-inside their 0.9.5 bands and were left untouched rather than re-tightened for churn.
+inside their 0.9.5 bands and were left untouched rather than re-tightened for churn. The 1.0.1
+security update to p256 0.14 / crypto-bigint 0.7.10 moved the same two rows: CI measured 347,772
+and 1,699,680 bytes. Their bands follow the same 1.5% rule; all other row limits remain fixed.
 
 ### Allocations
 
