@@ -12,6 +12,14 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-02
+
+### Fixed
+
+- RFC 8252 native-app redirects now accept any valid ephemeral port for a public client's
+  registered HTTP loopback IP URI. The requested URI is retained for authorization-code
+  redemption; host, path, query, scheme and confidential-client matching stay exact.
+
 ### Changed
 
 - Security: upgrade the optional ES256 backend to `p256` 0.14 and patched `crypto-bigint`

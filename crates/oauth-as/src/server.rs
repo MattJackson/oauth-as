@@ -50,10 +50,9 @@ fn loopback_redirect_matches(registered: &str, requested: &str) -> bool {
     fn parts(uri: &str) -> Option<(&str, &str)> {
         let (host, rest) = if let Some(rest) = uri.strip_prefix("http://127.0.0.1:") {
             ("127.0.0.1", rest)
-        } else if let Some(rest) = uri.strip_prefix("http://[::1]:") {
-            ("[::1]", rest)
         } else {
-            return None;
+            let rest = uri.strip_prefix("http://[::1]:")?;
+            ("[::1]", rest)
         };
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
         let port = rest.get(..digits)?.parse::<u16>().ok()?;
