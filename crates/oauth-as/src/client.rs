@@ -306,7 +306,7 @@ pub enum ClientAuth {
     ConfidentialAssertion {
         /// What the registration expects the assertion to be signed with. This, and never the
         /// token's own header, is what decides the algorithm: see
-        /// [`crate::client_assertion::verify_assertion`].
+        /// [`crate::client_assertion::verify_assertion_with_crypto`].
         keys: crate::client_assertion::AssertionKeys,
     },
     /// RFC 8705: a confidential client that authenticates with a mutual-TLS CERTIFICATE and

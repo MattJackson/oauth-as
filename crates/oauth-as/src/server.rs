@@ -1634,7 +1634,7 @@ fn randomness_error() -> ErrorResponse {
 /// what arrived on the wire, never of what the store holds.
 #[derive(Default)]
 struct CredentialCost {
-    /// A secret verification ran through [`crate::client::ClientAuth::verify_with`].
+    /// A secret verification ran through [`crate::client::ClientAuth::verify_with_crypto`].
     secret: bool,
     /// An RFC 7523 assertion verification was ATTEMPTED against a registration's keys.
     ///
@@ -2162,7 +2162,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// RS256, or EdDSA): RFC 9449 DPoP proofs, RFC 9101 request objects, RFC 7523 client assertions.
     ///
     /// Required for an algorithm unless a built-in backend covers it: `jwt-p256`, `jwt-rsa` and
-    /// `jwt-ed25519` install [`crate::jwt::P256Verifier`], the RSA and Ed25519 verifiers
+    /// `jwt-ed25519` install `crate::jwt::P256Verifier`, the RSA and Ed25519 verifiers
     /// respectively as defaults. With no verifier for a presented algorithm, every signed
     /// credential under it is REFUSED, exactly as an absent
     /// [`crate::par::RequestObjectKeys`] or an absent registration policy refuses: a server that
@@ -3050,7 +3050,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Answering both cases with the same code is worth nothing if the two take visibly different
     /// wall times, and the unknown-id path is naturally the cheaper one: there is no secret to
     /// verify. So this function performs a DUMMY verification when the id is unknown, through the
-    /// same [`crate::client::ClientAuth::verify_with`] every real authentication goes through.
+    /// same [`crate::client::ClientAuth::verify_with_crypto`] every real authentication goes through.
     ///
     /// What that covers exactly:
     ///

@@ -259,7 +259,7 @@ impl<'a> ClientCertificate<'a> {
     /// From a thumbprint the host computed itself, for a deployment whose TLS terminator forwards a
     /// fingerprint rather than the certificate (nginx's `$ssl_client_fingerprint`, an ALB's
     /// header). The host is then responsible for the encoding, which is why
-    /// [`ClientCertificate::from_der`] is the constructor to prefer where the DER is available.
+    /// [`ClientCertificate::from_der_with_crypto`] is the constructor to prefer where the DER is available.
     pub fn from_thumbprint(thumbprint: CertificateThumbprint) -> Self {
         ClientCertificate {
             thumbprint,
@@ -547,7 +547,7 @@ impl RegisteredCertificates {
     /// handshake and the registered one is whatever the client published. There is no secret here
     /// for a timing side channel to leak, and what actually authenticates the client is possession
     /// of the private key, which the handshake proved to the host. Compare with
-    /// [`crate::client::ClientAuth::verify_with`], where the value IS a secret and the comparison
+    /// [`crate::client::ClientAuth::verify_with_crypto`], where the value IS a secret and the comparison
     /// is constant time for that reason.
     pub fn contains(&self, thumbprint: &CertificateThumbprint) -> bool {
         self.0.contains(thumbprint)

@@ -790,7 +790,7 @@ impl Hooks {
         }
     }
 
-    /// The installed client secret verifier, for [`crate::client::ClientAuth::verify_with`].
+    /// The installed client secret verifier, for [`crate::client::ClientAuth::verify_with_crypto`].
     pub fn secret_verifier(&self) -> Option<&dyn SecretVerifier> {
         match &self.0 {
             Some(installed) => installed.secret_verifier.as_deref(),
