@@ -100,7 +100,7 @@ fn claims_with_jti(jti: &str) -> serde_json::Value {
 /// server could pick.
 #[test]
 fn an_iat_of_u64_max_is_refused_rather_than_panicking() {
-    let key = EcdsaP256Key::generate("attacker");
+    let key = EcdsaP256Key::try_generate("attacker").expect("test key entropy");
     let proof = signed_proof(
         &key,
         &serde_json::json!({
@@ -121,7 +121,7 @@ fn an_iat_of_u64_max_is_refused_rather_than_panicking() {
 /// The same overflow one step below the top, so the fix cannot be a special case for `u64::MAX`.
 #[test]
 fn an_iat_near_u64_max_is_refused_rather_than_panicking() {
-    let key = EcdsaP256Key::generate("attacker");
+    let key = EcdsaP256Key::try_generate("attacker").expect("test key entropy");
     for iat in [u64::MAX - 1, u64::MAX / 2, i64::MAX as u64] {
         let proof = signed_proof(
             &key,
@@ -157,7 +157,7 @@ fn an_iat_near_u64_max_is_refused_rather_than_panicking() {
 /// leaves the size gate as the only thing that can refuse this proof.
 #[test]
 fn a_proof_larger_than_the_cap_is_refused_before_it_is_parsed() {
-    let key = EcdsaP256Key::generate("attacker");
+    let key = EcdsaP256Key::try_generate("attacker").expect("test key entropy");
     let jti = "e1j3V_bKic8-LAEB";
     let proof = signed_proof(
         &key,
@@ -187,7 +187,7 @@ fn a_proof_larger_than_the_cap_is_refused_before_it_is_parsed() {
 /// 4.3 actually describes, with a P-256 JWK, `htm`, `htu`, `iat`, `jti` and an ES256 signature.
 #[test]
 fn an_ordinary_proof_is_far_inside_the_cap() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let proof = signed_proof(
         &key,
         &serde_json::json!({
@@ -221,7 +221,7 @@ fn an_ordinary_proof_is_far_inside_the_cap() {
 /// request buys 2.9 KiB of storage held three hundred times longer than the request took to refuse.
 #[test]
 fn a_jti_past_the_cap_is_refused_even_though_the_proof_is_well_inside_the_proof_cap() {
-    let key = EcdsaP256Key::generate("attacker");
+    let key = EcdsaP256Key::try_generate("attacker").expect("test key entropy");
     let proof = signed_proof(&key, &claims_with_jti(&"j".repeat(MAX_JTI_BYTES + 1)));
 
     // The point of the test: this proof is one the proof-size cap is happy with, and is refused
@@ -247,7 +247,7 @@ fn a_jti_past_the_cap_is_refused_even_though_the_proof_is_well_inside_the_proof_
 /// the call was `Ok`.
 #[test]
 fn a_jti_of_exactly_the_cap_is_accepted() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let jti = "j".repeat(MAX_JTI_BYTES);
     let proof = signed_proof(&key, &claims_with_jti(&jti));
 
@@ -261,7 +261,7 @@ fn a_jti_of_exactly_the_cap_is_accepted() {
 /// characters) and a base64url random (22 for 128 bits).
 #[test]
 fn the_jti_cap_leaves_room_for_the_values_conforming_clients_use() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     for jti in ["e1j3V_bKic8-LAEB", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"] {
         assert!(jti.len() <= MAX_JTI_BYTES);
         let proof = signed_proof(&key, &claims_with_jti(jti));
@@ -289,7 +289,7 @@ fn the_jti_cap_leaves_room_for_the_values_conforming_clients_use() {
 /// onto `CompactJws` to end — reproduced in the test suite instead of in the code.
 #[test]
 fn a_proof_whose_header_names_an_unknown_crit_extension_is_refused() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let mut header = proof_header(&key);
     header["crit"] = serde_json::json!(["b64"]);
     header["b64"] = serde_json::json!(false);
@@ -307,7 +307,7 @@ fn a_proof_whose_header_names_an_unknown_crit_extension_is_refused() {
 /// this one, having found none.
 #[test]
 fn a_proof_whose_header_has_an_empty_crit_is_refused() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let mut header = proof_header(&key);
     header["crit"] = serde_json::json!([]);
     let proof = signed_proof_with_header(&key, &header, &claims_with_jti("crit-2"));

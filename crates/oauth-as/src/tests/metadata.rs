@@ -87,8 +87,11 @@ fn jwks_uri_is_advertised_exactly_when_the_server_signs() {
     // Signing, with the URI declared where the signing is declared.
     config.jwks_uri = None;
     config.access_token_format = AccessTokenFormat::Jwt(Box::new(
-        JwtConfig::new(EcdsaP256Key::generate("k1"), "https://rs.example")
-            .with_jwks_uri("https://as.example/jwks"),
+        JwtConfig::new(
+            EcdsaP256Key::try_generate("k1").expect("test key entropy"),
+            "https://rs.example",
+        )
+        .with_jwks_uri("https://as.example/jwks"),
     ));
     assert_eq!(
         AuthorizationServerMetadata::from_config(&config).jwks_uri,
@@ -98,7 +101,7 @@ fn jwks_uri_is_advertised_exactly_when_the_server_signs() {
     // Signing with no URI anywhere: nothing to advertise, and inventing a path the host does not
     // serve would be the same lie in the other direction.
     config.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("k1"),
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
         "https://rs.example",
     )));
     assert_eq!(

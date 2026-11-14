@@ -18,6 +18,7 @@
 
 #![allow(dead_code)]
 
+use oauth_as_postgres::sqlx;
 use std::str::FromStr;
 
 use oauth_as_postgres::PostgresStorage;

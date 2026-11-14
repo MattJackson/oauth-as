@@ -89,8 +89,8 @@ fn kids(jwks: &Jwks) -> Vec<String> {
 #[tokio::test]
 async fn a_token_signed_under_the_old_key_survives_rotation_and_dies_only_when_the_key_is_dropped()
 {
-    let key_a = EcdsaP256Key::generate("key-a");
-    let key_b = EcdsaP256Key::generate("key-b");
+    let key_a = EcdsaP256Key::try_generate("key-a").expect("test key entropy");
+    let key_b = EcdsaP256Key::try_generate("key-b").expect("test key entropy");
 
     let config = JwtConfig::new(key_a, "https://api.example");
     let signed_under_a = config.sign_access_token(&claims("jti-a")).await.unwrap();
@@ -149,9 +149,12 @@ async fn a_token_signed_under_the_old_key_survives_rotation_and_dies_only_when_t
 /// exactly one retired key; a host recovering from a compromise may briefly hold several.
 #[test]
 fn successive_rotations_accumulate_retired_keys_newest_first() {
-    let config = JwtConfig::new(EcdsaP256Key::generate("k1"), "https://api.example")
-        .rotate_to(EcdsaP256Key::generate("k2"))
-        .rotate_to(EcdsaP256Key::generate("k3"));
+    let config = JwtConfig::new(
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
+        "https://api.example",
+    )
+    .rotate_to(EcdsaP256Key::try_generate("k2").expect("test key entropy"))
+    .rotate_to(EcdsaP256Key::try_generate("k3").expect("test key entropy"));
 
     assert_eq!(config.kid(), "k3");
     assert_eq!(
@@ -170,9 +173,12 @@ fn successive_rotations_accumulate_retired_keys_newest_first() {
 /// the exact failure `kid` exists to prevent (RFC 7517 section 4.5).
 #[test]
 fn a_reused_kid_never_appears_twice_in_the_key_set() {
-    let config = JwtConfig::new(EcdsaP256Key::generate("k1"), "https://api.example")
-        .rotate_to(EcdsaP256Key::generate("k2"))
-        .rotate_to(EcdsaP256Key::generate("k1"));
+    let config = JwtConfig::new(
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
+        "https://api.example",
+    )
+    .rotate_to(EcdsaP256Key::try_generate("k2").expect("test key entropy"))
+    .rotate_to(EcdsaP256Key::try_generate("k1").expect("test key entropy"));
 
     assert_eq!(config.kid(), "k1");
     assert_eq!(
@@ -186,10 +192,13 @@ fn a_reused_kid_never_appears_twice_in_the_key_set() {
 /// it does not publish, which is worse than the state it was trying to leave.
 #[test]
 fn dropping_an_unknown_or_active_kid_changes_nothing() {
-    let config = JwtConfig::new(EcdsaP256Key::generate("k1"), "https://api.example")
-        .rotate_to(EcdsaP256Key::generate("k2"))
-        .forget_retired_key_breaking_its_live_tokens("k2")
-        .forget_retired_key_breaking_its_live_tokens("nonexistent");
+    let config = JwtConfig::new(
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
+        "https://api.example",
+    )
+    .rotate_to(EcdsaP256Key::try_generate("k2").expect("test key entropy"))
+    .forget_retired_key_breaking_its_live_tokens("k2")
+    .forget_retired_key_breaking_its_live_tokens("nonexistent");
 
     assert_eq!(config.kid(), "k2");
     assert_eq!(
@@ -232,7 +241,7 @@ fn the_served_key_set_carries_the_retired_keys() {
         .build()
         .unwrap();
 
-    let old = EcdsaP256Key::generate("old");
+    let old = EcdsaP256Key::try_generate("old").expect("test key entropy");
     let signed_under_old = rt
         .block_on(
             JwtConfig::new(old.clone(), "https://api.example")
@@ -245,7 +254,7 @@ fn the_served_key_set_carries_the_retired_keys() {
     config.access_token_format = AccessTokenFormat::Jwt(Box::new(
         JwtConfig::new(old, "https://api.example")
             .with_jwks_uri("https://as.example/jwks")
-            .rotate_to(EcdsaP256Key::generate("new")),
+            .rotate_to(EcdsaP256Key::try_generate("new").expect("test key entropy")),
     ));
 
     let served = rt.block_on(async {

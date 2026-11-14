@@ -421,8 +421,13 @@ fn the_built_in_p256_backend_passes_every_check() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let violations =
-        rt.block_on(SignerConformance::new(EcdsaP256Key::generate("built-in"), P256Verifier).run());
+    let violations = rt.block_on(
+        SignerConformance::new(
+            EcdsaP256Key::try_generate("built-in").expect("test key entropy"),
+            P256Verifier,
+        )
+        .run(),
+    );
     assert!(violations.is_empty(), "{violations:#?}");
 }
 

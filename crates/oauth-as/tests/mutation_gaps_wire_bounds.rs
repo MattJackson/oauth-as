@@ -243,7 +243,7 @@ mod dpop_horizon {
         .await
         .unwrap();
 
-        let key = EcdsaP256Key::generate("skewed");
+        let key = EcdsaP256Key::try_generate("skewed").expect("test key entropy");
         // EXACTLY the horizon: the last instant `issued_at > horizon` does not refuse.
         let iat = now + CLOCK_SKEW_LEEWAY.as_secs();
         let header = serde_json::json!({

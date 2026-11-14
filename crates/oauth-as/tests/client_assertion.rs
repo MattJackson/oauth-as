@@ -179,7 +179,7 @@ async fn an_assertion_whose_header_has_an_empty_crit_is_refused() {
 async fn a_private_key_jwt_client_gets_a_token_without_ever_holding_a_shared_secret() {
     // The whole point of the feature: this server holds only the PUBLIC half, so a dump of its
     // client table contains nothing that can authenticate as this client.
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "pkjwt",
@@ -236,7 +236,7 @@ async fn the_same_assertion_cannot_be_spent_twice() {
     //
     // Both requests below are byte for byte identical. The first must succeed and the second must
     // not.
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "replay-me",
@@ -271,7 +271,7 @@ async fn the_same_assertion_cannot_be_spent_twice() {
 async fn a_fresh_jti_from_the_same_client_still_works_after_a_replay_was_refused() {
     // The defence must refuse the REPLAY, not the client. A server that locked the client out after
     // a replayed assertion would hand any observer a denial of service for free.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "still-fine",
@@ -309,8 +309,8 @@ async fn two_clients_may_use_the_same_jti_without_locking_each_other_out() {
     // The replay set is namespaced by client id. Without that, a client numbering its assertions
     // from a counter (which is a perfectly legal `jti`) could spend another client's future values
     // in advance: a denial of service bought for the price of one refused request.
-    let key_a = EcdsaP256Key::generate("a");
-    let key_b = EcdsaP256Key::generate("b");
+    let key_a = EcdsaP256Key::try_generate("a").expect("test key entropy");
+    let key_b = EcdsaP256Key::try_generate("b").expect("test key entropy");
     let srv = server();
     for (id, key) in [("client-a", &key_a), ("client-b", &key_b)] {
         srv.register_client(client(
@@ -355,7 +355,7 @@ async fn a_spent_jti_is_reclaimed_by_the_host_s_sweep() {
     // reclaimed the same way every other retained record is: when the HOST sweeps. A host that
     // never sweeps has a set that only grows, which is why `MAX_ASSERTION_LIFETIME` caps how long
     // any single entry can be made to live.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "sweepable",
@@ -405,7 +405,7 @@ async fn a_client_registered_for_an_assertion_cannot_authenticate_with_a_secret(
     // THE DOWNGRADE. A registration that says `private_key_jwt` is a statement that this client's
     // credential is a key; if a `client_secret_post` guess could also authenticate it, the
     // registration would be advice rather than a rule.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "keys-only",
@@ -457,7 +457,7 @@ async fn presenting_a_secret_and_an_assertion_together_is_refused() {
     // RFC 6749 s2.3: one authentication method per request. A server that resolves the ambiguity by
     // precedence behaves differently from the next server, and that difference is what a request
     // smuggling intermediary would aim at.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "both",
@@ -484,7 +484,7 @@ async fn presenting_a_secret_and_an_assertion_together_is_refused() {
 async fn an_assertion_with_the_wrong_or_missing_client_assertion_type_is_refused() {
     // RFC 7521 s4.2. An assertion whose format nobody declared is a credential this server cannot
     // check, and "cannot check" must never read as "checked out".
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "typed",
@@ -544,7 +544,7 @@ async fn an_assertion_from_one_client_cannot_authenticate_another() {
 async fn an_unknown_client_and_a_bad_assertion_are_the_same_answer_on_the_wire() {
     // RFC 6749 s5.2 `invalid_client`, with no description in either case: a description naming
     // which check failed would tell an attacker that the client id they guessed is real.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(client(
         "known",
@@ -558,7 +558,7 @@ async fn an_unknown_client_and_a_bad_assertion_are_the_same_answer_on_the_wire()
     .await
     .unwrap();
 
-    let foreign = EcdsaP256Key::generate("attacker");
+    let foreign = EcdsaP256Key::try_generate("attacker").expect("test key entropy");
     let bad = sign_es256(&foreign, &claims("known", "a-1"));
     let for_known = srv
         .token_with_context(request("known"), context(&bad))

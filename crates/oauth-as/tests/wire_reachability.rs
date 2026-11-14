@@ -1424,7 +1424,7 @@ async fn es256_dpop_proof_is_accepted(_service: &Service, _nonce: &str) -> bool 
 fn dpop_proof(jti: &str) -> String {
     use oauth_as::jwt::{compact_jws, EcdsaP256Key};
 
-    let key = EcdsaP256Key::generate("wire-dpop-key");
+    let key = EcdsaP256Key::try_generate("wire-dpop-key").expect("test key entropy");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("a clock after 1970")
@@ -1468,7 +1468,7 @@ async fn service_variants() -> Vec<(&'static str, Service)> {
 async fn signing_service() -> Service {
     use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, JwtConfig};
 
-    let key = EcdsaP256Key::generate("wire-key");
+    let key = EcdsaP256Key::try_generate("wire-key").expect("test key entropy");
     let mut config = base_config();
     config.access_token_format = AccessTokenFormat::Jwt(Box::new(
         JwtConfig::new(key, "https://rs.example/api").with_jwks_uri(format!("{ISSUER}/jwks")),
@@ -1823,7 +1823,9 @@ const PRIVATE_KEY_JWT_CLIENT: &str = "pkjwt-app";
 fn assertion_key() -> &'static oauth_as::jwt::EcdsaP256Key {
     use std::sync::OnceLock;
     static KEY: OnceLock<oauth_as::jwt::EcdsaP256Key> = OnceLock::new();
-    KEY.get_or_init(|| oauth_as::jwt::EcdsaP256Key::generate("wire-assertion-key"))
+    KEY.get_or_init(|| {
+        oauth_as::jwt::EcdsaP256Key::try_generate("wire-assertion-key").expect("test key entropy")
+    })
 }
 
 #[cfg(feature = "client-assertion")]

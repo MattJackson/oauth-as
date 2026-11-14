@@ -21,6 +21,7 @@
 
 #![cfg(feature = "pg-integration")]
 
+use oauth_as_postgres::sqlx;
 use std::time::{Duration, SystemTime};
 
 use oauth_as::store::Storage;

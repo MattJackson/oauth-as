@@ -96,7 +96,7 @@ fn query_request(challenge: &str) -> Vec<(&'static str, String)> {
 /// whoever last touched the URL.
 #[tokio::test]
 async fn an_unsigned_request_object_is_refused() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new())).await;
 
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
@@ -126,7 +126,7 @@ async fn an_unsigned_request_object_is_refused() {
 /// JWT a client ever signs becomes an authorization request it never made.
 #[tokio::test]
 async fn an_access_token_is_not_a_request_object() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new())).await;
 
     // An RFC 9068 access token, signed with that same key.
@@ -162,7 +162,7 @@ async fn an_access_token_is_not_a_request_object() {
 /// decoration.
 #[tokio::test]
 async fn requiring_a_signed_request_object_refuses_the_plain_query_request() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let mut jar = JarConfig::new();
     jar.require_signed_request_object = true;
     let server = server(&key, Some(jar)).await;
@@ -183,7 +183,7 @@ async fn requiring_a_signed_request_object_refuses_the_plain_query_request() {
 /// it rather than a parse attempt.
 #[tokio::test]
 async fn a_request_object_is_refused_outright_when_the_host_did_not_enable_jar() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, None).await;
 
     match server

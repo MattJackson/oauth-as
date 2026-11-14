@@ -33,6 +33,7 @@
 //!
 //! Behind the `pg-integration` feature, so it is not in any build a host could reach by accident.
 
+use crate::sqlx;
 use oauth_as::store::StorageError;
 use oauth_as::token::RefreshTokenRecord;
 use sqlx::{Pool, Postgres, Row};

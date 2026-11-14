@@ -248,8 +248,11 @@ done
 
 # --- Launch this crate's FAPI 2.0 fixture over HTTPS. -------------------------------------------
 echo "fapi2-conformance: launching fixture example '$FAPI2_FIXTURE_EXAMPLE'"
-cargo build --release --example "$FAPI2_FIXTURE_EXAMPLE" \
-  --features "axum,jwt-p256,dpop,par,client-assertion" \
+backend="${OAUTH_AS_CRYPTO:-rustcrypto}"
+features="axum,jwt,dpop,par,client-assertion,$backend"
+if [ "$backend" = rustcrypto ]; then features="$features,jwt-pkcs8"; fi
+cargo build --no-default-features --release --example "$FAPI2_FIXTURE_EXAMPLE" \
+  --features "$features" \
   || die "the fixture example failed to build"
 # The suite owns :8443 (its nginx front-end), so the fixture binds :8444 on all interfaces and is
 # reached from the suite containers as `as.local` (mapped to the host gateway above). The redirect

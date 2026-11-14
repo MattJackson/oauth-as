@@ -537,6 +537,13 @@ def main():
             % len(crate_features)
         )
     check_lockfiles()
+    # Provider implementations are alternatives, exercised by crypto-providers.yml rather
+    # than this RustCrypto protocol-feature matrix. Require their dedicated matrix explicitly.
+    provider_workflow = read(os.path.join(ROOT, ".github/workflows/crypto-providers.yml"))
+    for provider in ("rustcrypto", "aws-lc", "fips"):
+        if provider not in provider_workflow:
+            fail("crypto-providers.yml does not exercise " + provider)
+    crate_features = {k: v for k, v in crate_features.items() if k not in {"rustcrypto", "aws-lc", "fips"}}
     check_workflows(crate_features)
     check_no_rar_step(crate_features)
     check_size_probe(crate_features)

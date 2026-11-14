@@ -582,7 +582,7 @@ async fn the_requested_resource_replaces_the_configured_aud_claim() {
 
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("kid-1"),
+        EcdsaP256Key::try_generate("kid-1").expect("test key entropy"),
         "https://default-rs.example",
     )));
     let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), ManualClock::at_epoch());

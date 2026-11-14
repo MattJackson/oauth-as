@@ -47,7 +47,10 @@ export OAUTH_AS_ADDR="${OAUTH_AS_ADDR:-127.0.0.1:8914}"
 # RsaVerifier/Ed25519Verifier only when those backends are compiled in. The list here MUST match
 # the example's `required-features` in Cargo.toml, or cargo silently skips building the example and
 # the `exec` below finds no binary.
-cargo build --locked --manifest-path "$CRATE_DIR/Cargo.toml" \
-  --features axum,jwt-p256,client-assertion,jwt-rsa,jwt-ed25519 --example conformance_server >&2
+backend="${OAUTH_AS_CRYPTO:-rustcrypto}"
+features="axum,jwt,client-assertion,$backend"
+if [ "$backend" = rustcrypto ]; then features="$features,jwt-pkcs8,jwt-rsa,jwt-ed25519"; fi
+cargo build --no-default-features --locked --manifest-path "$CRATE_DIR/Cargo.toml" \
+  --features "$features" --example conformance_server >&2
 
 exec "$ROOT/target/debug/examples/conformance_server"

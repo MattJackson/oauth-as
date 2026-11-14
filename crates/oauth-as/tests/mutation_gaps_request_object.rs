@@ -113,7 +113,7 @@ fn request_object(key: &EcdsaP256Key, extra: serde_json::Value) -> String {
 
 /// The refusal a request object earned, or `None` if it was accepted.
 async fn refusal(extra: serde_json::Value) -> Option<ErrorCode> {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key).await;
     let object = request_object(&key, extra);
     match server

@@ -157,7 +157,7 @@ pub struct Confirmation {
     pub jkt: Option<String>,
     /// RFC 8705 section 3.1 `x5t#S256`: the SHA-256 thumbprint of the DER encoding of the
     /// X.509 certificate the client presented when the token was issued. A resource server
-    /// checks it with [`Confirmation::confirms_certificate`].
+    /// checks it with [`Confirmation::confirms_certificate_with_crypto`].
     #[cfg(feature = "mtls")]
     #[serde(rename = "x5t#S256", default, skip_serializing_if = "Option::is_none")]
     pub x5t_s256: Option<crate::mtls::CertificateThumbprint>,

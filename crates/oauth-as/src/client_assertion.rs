@@ -16,7 +16,7 @@
 //! The registration, and with it the algorithm. A client authenticates this way exactly when its
 //! [`crate::client::ClientAuth`] is [`crate::client::ClientAuth::ConfidentialAssertion`], and the
 //! [`AssertionKeys`] inside decide BOTH which `alg` is accepted and which key verifies. Nothing
-//! about either comes off the wire. See [`verify_assertion`] for why that is the whole defence
+//! about either comes off the wire. See [`verify_assertion_with_crypto`] for why that is the whole defence
 //! against JWS algorithm confusion rather than one check among many.
 //!
 //! # Single use is the point
@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::jwt::{verify_hs256, CompactJws, Jwk, JwsAlg, JwsVerifier};
+use crate::jwt::{verify_hs256_with_crypto, CompactJws, Jwk, JwsAlg, JwsVerifier};
 
 /// RFC 7521 section 4.2: the `client_assertion_type` a JWT bearer assertion must carry.
 pub const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -152,13 +152,13 @@ pub const MAX_ASSERTION_LIFETIME: Duration = Duration::from_secs(600);
 ///
 /// Granted in that direction only. Leeway that lets an assertion be accepted slightly early can
 /// only ever refuse a request that was going to be fine anyway; leeway on `exp` would keep a dead
-/// credential alive, so [`verify_assertion`] does not grant any there.
+/// credential alive, so [`verify_assertion_with_crypto`] does not grant any there.
 ///
 /// The SAME constant [`crate::dpop`] publishes for RFC 9449 proofs, re-exported rather than
 /// duplicated: see `src/skew.rs` for why one definition rather than two equal ones.
 pub use crate::skew::CLOCK_SKEW_LEEWAY;
 
-/// The largest client assertion [`verify_assertion`] and [`unverified_subject`] will look at, in
+/// The largest client assertion [`verify_assertion_with_crypto`] and [`unverified_subject`] will look at, in
 /// bytes, checked BEFORE either parses anything.
 ///
 /// THE SAME ARGUMENT [`crate::dpop::MAX_PROOF_BYTES`] MAKES, word for word, and it applies here for
@@ -185,7 +185,7 @@ pub const MAX_ASSERTION_BYTES: usize = 4096;
 ///
 /// The variants are the two RFC 7523 methods, and the choice between them is the choice of
 /// algorithm: there is deliberately no way to spell "this client uses `private_key_jwt` and also
-/// HS256". See [`verify_assertion`].
+/// HS256". See [`verify_assertion_with_crypto`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AssertionKeys {
     /// `client_secret_jwt` (RFC 7523 section 2.2 with a MAC): HMAC-SHA-256 under the registered
@@ -338,7 +338,7 @@ impl fmt::Display for AssertionFailure {
 
 impl std::error::Error for AssertionFailure {}
 
-/// Which `aud` values name this server, for [`verify_assertion`] (RFC 7523 section 3 (3)).
+/// Which `aud` values name this server, for [`verify_assertion_with_crypto`] (RFC 7523 section 3 (3)).
 ///
 /// A value rather than a second parameter so the acceptance shape cannot drift from the audience it
 /// is checked against. [`crate::server::AssertionAudience`] is the switch a host sets; each arm
@@ -422,7 +422,29 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 /// obtain is a type that should not have been exported. It is also the other half of
 /// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
 /// while hiding the verification it exists to feed left the safe path out of reach.
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn verify_assertion(
+    verifier: Option<&dyn JwsVerifier>,
+    keys: &AssertionKeys,
+    assertion: &str,
+    client_id: &str,
+    audience: AudienceRule<'_>,
+    now: SystemTime,
+) -> Result<VerifiedAssertion, AssertionFailure> {
+    verify_assertion_with_crypto(
+        &crate::crypto::builtin(),
+        verifier,
+        keys,
+        assertion,
+        client_id,
+        audience,
+        now,
+    )
+}
+
+/// Perform this operation with the explicitly selected crypto provider.
+pub fn verify_assertion_with_crypto(
+    crypto: &dyn crate::crypto::CryptoProvider,
     verifier: Option<&dyn JwsVerifier>,
     keys: &AssertionKeys,
     assertion: &str,
@@ -462,7 +484,8 @@ pub fn verify_assertion(
     let signed = match keys {
         // The entropy floor is enforced at registration and again on the way out of the host's
         // store, so nothing here has to re-check it; see `ClientSecretKey`.
-        AssertionKeys::ClientSecret { secret } => verify_hs256(
+        AssertionKeys::ClientSecret { secret } => verify_hs256_with_crypto(
+            crypto,
             secret.as_bytes(),
             jws.signing_input.as_bytes(),
             &jws.signature,
@@ -566,12 +589,12 @@ pub fn verify_assertion(
 ///
 /// It is safe only because of what the caller does next, and the caller is the only reason this is
 /// public: the value returned here is used to look up a client, and then
-/// [`verify_assertion`] re-checks `iss` and `sub` against that client's own id under the
+/// [`verify_assertion_with_crypto`] re-checks `iss` and `sub` against that client's own id under the
 /// registration's key. Nothing is believed on the strength of this read. A caller that used the
 /// result for anything else, an audit record naming the client, a rate limit bucket, an
 /// authorization decision, would be trusting an unsigned string an attacker wrote.
 pub fn unverified_subject(assertion: &str) -> Option<String> {
-    // (0) SIZE, on the same terms and for the same reason as in [`verify_assertion`], and if
+    // (0) SIZE, on the same terms and for the same reason as in [`verify_assertion_with_crypto`], and if
     // anything more urgently: this is the EARLIER of the two, called to find the registration that
     // will decide the key, so it runs on a string nothing at all is yet known about. A bound
     // enforced only by the verifier would leave the lookup that precedes it unbounded.

@@ -870,6 +870,9 @@ fn core_public_types_stay_within_their_size_budget() {
     const DPOP_VERIFIERS_CACHE: usize = 72;
     #[cfg(not(feature = "dpop"))]
     const DPOP_VERIFIERS_CACHE: usize = 0;
+    // One shared provider trait object per server (16 bytes); the legacy flag fits padding.
+    // Measured with all features: 1104 -> 1120 bytes. No per-request provider allocation.
+    const CRYPTO_PROVIDER: usize = 16;
     let server_budget = 832
         + REVOCATION_BARRIERS
         + RESOURCE_SERVERS
@@ -880,7 +883,8 @@ fn core_public_types_stay_within_their_size_budget() {
         + CIMD
         + REFRESH_RETRY_WINDOW
         + JWS_ALG_ALLOW_LIST
-        + DPOP_VERIFIERS_CACHE;
+        + DPOP_VERIFIERS_CACHE
+        + CRYPTO_PROVIDER;
     assert!(
         size_of::<AuthorizationServer<MemoryStorage>>() <= server_budget,
         "AuthorizationServer<MemoryStorage> grew past its size budget: {}",

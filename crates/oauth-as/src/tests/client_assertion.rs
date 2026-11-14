@@ -86,7 +86,7 @@ fn secret_keys() -> AssertionKeys {
 }
 
 fn key_pair() -> (EcdsaP256Key, AssertionKeys) {
-    let key = EcdsaP256Key::generate("client-key-1");
+    let key = EcdsaP256Key::try_generate("client-key-1").expect("test key entropy");
     let keys = AssertionKeys::PublicKeys {
         alg: JwsAlg::Es256,
         keys: vec![key.to_public_jwk()],
@@ -299,7 +299,7 @@ fn an_access_token_is_not_a_client_assertion() {
 #[test]
 fn an_assertion_signed_by_a_key_the_registration_does_not_name_is_refused() {
     let (_, keys) = key_pair();
-    let attacker = EcdsaP256Key::generate("attacker-key");
+    let attacker = EcdsaP256Key::try_generate("attacker-key").expect("test key entropy");
     let assertion = es256(&attacker, &json!({"alg": "ES256"}), &claims());
     assert_eq!(
         verify(&keys, &assertion),
@@ -340,8 +340,8 @@ fn a_wrong_client_secret_is_refused() {
 #[test]
 fn one_of_several_registered_keys_is_enough() {
     // Rotation: a client that has published a new key while the old one is still live.
-    let old = EcdsaP256Key::generate("old");
-    let new = EcdsaP256Key::generate("new");
+    let old = EcdsaP256Key::try_generate("old").expect("test key entropy");
+    let new = EcdsaP256Key::try_generate("new").expect("test key entropy");
     let keys = AssertionKeys::PublicKeys {
         alg: JwsAlg::Es256,
         keys: vec![old.to_public_jwk(), new.to_public_jwk()],
@@ -601,7 +601,7 @@ fn a_jwk_carrying_a_private_parameter_is_refused() {
     // RFC 9449 s4.3 requires this of a DPoP proof key, and the same rule is applied everywhere this
     // crate parses a JWK: see `PRIVATE_JWK_MEMBERS` in src/jwt.rs. A registration that silently
     // absorbed a `d` would be a client's private key sitting in the authorization server's store.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     for member in ["d", "k", "p", "q"] {
         let mut value = serde_json::to_value(key.to_public_jwk()).unwrap();
         value[member] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
@@ -617,7 +617,7 @@ fn a_jwk_with_a_trimmed_coordinate_is_refused() {
     // RFC 7518 s6.2.1.2 fixes the coordinate at the field size with leading zeros KEPT. A trimmed
     // coordinate names a different point, so accepting it would make one key have two spellings and
     // therefore two RFC 7638 thumbprints.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let mut value = serde_json::to_value(key.to_public_jwk()).unwrap();
     value["x"] = json!("AAAA");
     assert!(Jwk::from_json(&value).is_err());
