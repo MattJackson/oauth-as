@@ -470,7 +470,7 @@ fn dpop_proof(key: &oauth_as::jwt::EcdsaP256Key, jti: &str) -> String {
 fn dpop_proof_verification_bound() {
     let rt = current_thread_runtime();
     let srv = server(&rt, config());
-    let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     // Warm: the replay map's first bucket table, and the first signature verification, which may
     // initialise lazily inside p256.
     rt.block_on(srv.token_with_context(
@@ -536,7 +536,8 @@ fn token_request_with_no_dpop_proof_bound() {
         scope: None,
     };
     let with_proof = {
-        let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
+        let key =
+            oauth_as::jwt::EcdsaP256Key::try_generate("client-key").expect("test key entropy");
         let proof = dpop_proof(&key, "isolate");
         let request = credentials();
         let (_, d) = measure(|| {
@@ -575,7 +576,7 @@ fn client_assertion_verification_bound() {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let rt = current_thread_runtime();
-    let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let srv = rt.block_on(async {
         let srv = AuthorizationServer::new(config(), MemoryStorage::new());
         srv.register_client(Client {
@@ -804,7 +805,7 @@ fn jwks_serving_bound() {
     let mut cfg = config();
     cfg.access_token_format =
         oauth_as::jwt::AccessTokenFormat::Jwt(Box::new(oauth_as::jwt::JwtConfig::new(
-            oauth_as::jwt::EcdsaP256Key::generate("sign"),
+            oauth_as::jwt::EcdsaP256Key::try_generate("sign").expect("test key entropy"),
             "https://rs.example",
         )));
     let srv = server(&rt, cfg);
@@ -828,7 +829,7 @@ fn jwt_signing_bound() {
     let mut cfg = config();
     cfg.access_token_format =
         oauth_as::jwt::AccessTokenFormat::Jwt(Box::new(oauth_as::jwt::JwtConfig::new(
-            oauth_as::jwt::EcdsaP256Key::generate("sign"),
+            oauth_as::jwt::EcdsaP256Key::try_generate("sign").expect("test key entropy"),
             "https://rs.example",
         )));
     let srv = server(&rt, cfg);

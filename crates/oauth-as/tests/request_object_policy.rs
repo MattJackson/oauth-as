@@ -160,7 +160,7 @@ fn live_exp() -> String {
 /// REUSABLE, which is what the next test is about.
 #[tokio::test]
 async fn a_signed_request_object_does_not_satisfy_a_par_only_policy() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let mut par = ParConfig::new();
     par.require_pushed_authorization_requests = true;
     let server = server(&key, Some(JarConfig::new()), Some(par)).await;
@@ -203,7 +203,7 @@ async fn a_signed_request_object_does_not_satisfy_a_par_only_policy() {
 /// being one, and the ten years is only there to make the "forever" literal.
 #[tokio::test]
 async fn a_request_object_with_no_expiry_is_refused_rather_than_replayable_forever() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let clock = ManualClock::at_base();
     let server = server_at(&key, Some(JarConfig::new()), None, clock.clone()).await;
     let object = signed(&key, &plain_header(&key), "");
@@ -241,7 +241,7 @@ async fn a_request_object_with_no_expiry_is_refused_rather_than_replayable_forev
 /// removed (an oversized-but-valid object would then be accepted, not refused with this message).
 #[tokio::test]
 async fn an_oversized_request_object_is_refused_on_size_before_it_is_decoded() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let padding = "A".repeat(oauth_as::par::MAX_REQUEST_OBJECT_BYTES);
     let object = signed(
@@ -282,7 +282,7 @@ async fn an_oversized_request_object_is_refused_on_size_before_it_is_decoded() {
 /// because `iat` is optional too and because the remaining life is exactly the replay window.
 #[tokio::test]
 async fn a_request_object_whose_remaining_life_exceeds_the_ceiling_is_refused() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let object = signed(
         &key,
@@ -308,7 +308,7 @@ async fn a_request_object_whose_remaining_life_exceeds_the_ceiling_is_refused() 
 /// refused everything would satisfy the two tests above and break every client.
 #[tokio::test]
 async fn a_short_lived_request_object_works_and_then_stops_working() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let clock = ManualClock::at_base();
     let server = server_at(&key, Some(JarConfig::new()), None, clock.clone()).await;
     let object = signed(&key, &plain_header(&key), &live_exp());
@@ -335,7 +335,7 @@ async fn a_short_lived_request_object_works_and_then_stops_working() {
 /// pushed request that carried plain parameters.
 #[tokio::test]
 async fn a_pushed_plain_request_does_not_satisfy_a_signed_request_object_policy() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let mut jar = JarConfig::new();
     jar.require_signed_request_object = true;
     let server = server(&key, Some(jar), Some(ParConfig::new())).await;
@@ -367,7 +367,7 @@ async fn a_pushed_plain_request_does_not_satisfy_a_signed_request_object_policy(
 /// the server telling the signer it honoured `b64: false` when it never read the member.
 #[tokio::test]
 async fn a_crit_header_naming_an_unimplemented_extension_is_refused() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let header = format!(
         r#"{{"alg":"ES256","kid":"{}","crit":["b64"],"b64":false}}"#,
@@ -396,7 +396,7 @@ async fn a_crit_header_naming_an_unimplemented_extension_is_refused() {
 /// fractional `exp` was replayable for as long as the client's key stayed registered.
 #[tokio::test]
 async fn a_fractional_exp_in_the_past_is_still_expired() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let object = signed(
         &key,
@@ -432,7 +432,7 @@ async fn a_fractional_exp_in_the_past_is_still_expired() {
 /// `exp` is a conforming NumericDate that `as_u64` also could not read.
 #[tokio::test]
 async fn an_exponent_notation_exp_in_the_past_is_still_expired() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     // 1.0e9 seconds is September 2001, comfortably expired, and is exactly the JSON number RFC
     // 7519 s2 permits and `as_u64` refuses to read.
@@ -468,7 +468,7 @@ async fn an_exponent_notation_exp_in_the_past_is_still_expired() {
 /// accepted at the token endpoint.
 #[tokio::test]
 async fn an_nbf_inside_the_clock_skew_leeway_is_accepted() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let object = signed(
         &key,
@@ -486,7 +486,7 @@ async fn an_nbf_inside_the_clock_skew_leeway_is_accepted() {
 /// that widened the allowance without bound would fail here rather than pass quietly.
 #[tokio::test]
 async fn an_nbf_far_beyond_the_leeway_is_still_refused() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let object = signed(
         &key,
@@ -516,7 +516,7 @@ async fn an_nbf_far_beyond_the_leeway_is_still_refused() {
 /// which of the two happened.
 #[tokio::test]
 async fn a_non_numeric_exp_is_malformed_rather_than_ignored() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let object = signed(&key, &plain_header(&key), r#","exp":"soon""#);
 
@@ -542,7 +542,7 @@ async fn a_non_numeric_exp_is_malformed_rather_than_ignored() {
 /// this, every assertion above could be passing because the fixture never worked.
 #[tokio::test]
 async fn the_same_object_validates_when_no_policy_forbids_it() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key, Some(JarConfig::new()), None).await;
     let object = signed(&key, &plain_header(&key), &live_exp());
 
@@ -591,7 +591,7 @@ fn the_fixture_encoding_is_unpadded_base64url() {
 /// second is the kind of off-by-one that gets diagnosed as "the server is flaky" for a week.
 #[tokio::test]
 async fn a_request_object_at_exactly_the_ceiling_is_accepted() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let clock = ManualClock::at_base();
     let server = server_at(&key, Some(JarConfig::new()), None, clock.clone()).await;
 

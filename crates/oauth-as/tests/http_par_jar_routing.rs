@@ -495,7 +495,7 @@ async fn start_jar() -> (SocketAddr, oauth_as::jwt::EcdsaP256Key) {
         config.par = Some(Box::new(ParConfig::new()));
     }
 
-    let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let jwk = key.public_jwk();
     let registered = oauth_as::par::RegisteredRequestObjectKey::es256_from_jwk_coordinates(
         jwk.kid().map(str::to_string),

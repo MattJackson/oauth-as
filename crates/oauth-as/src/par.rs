@@ -1110,10 +1110,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // than the host's own error channel. `getrandom` fails for reasons a deployment really
         // meets — fd exhaustion, a seccomp filter without `getrandom(2)`, an uninitialised
         // early-boot pool.
-        let request_uri = match crate::server::try_random_hex(REQUEST_URI_ENTROPY_BYTES) {
-            Some(hex) => format!("{REQUEST_URI_PREFIX}{hex}"),
-            None => return Err(ErrorResponse::new(ErrorCode::ServerError)),
-        };
+        let request_uri =
+            match crate::server::try_random_hex(self.crypto(), REQUEST_URI_ENTROPY_BYTES) {
+                Some(hex) => format!("{REQUEST_URI_PREFIX}{hex}"),
+                None => return Err(ErrorResponse::new(ErrorCode::ServerError)),
+            };
         let expires_at = crate::server::saturating_deadline(now, ttl);
         let record = PushedAuthorizationRequest {
             // Read at request ENTRY, above `authenticate_client`, not here. See the comment there:

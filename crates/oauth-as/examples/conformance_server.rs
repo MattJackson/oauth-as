@@ -46,13 +46,15 @@
 //! everyone. Anyone who has read RFC 7515 can mint an access token this server would be believed
 //! to have issued. Do not copy that either.
 
+#[path = "support/crypto.rs"]
+mod fixture_crypto;
 use std::sync::Arc;
 
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::client_assertion::AssertionKeys;
 use oauth_as::grant::GrantType;
 use oauth_as::http::{ApprovalDecision, ServiceBuilder};
-use oauth_as::jwt::{AccessTokenFormat, EcdsaP256Key, Jwk, JwsAlg, JwtConfig};
+use oauth_as::jwt::{AccessTokenFormat, Jwk, JwsAlg, JwtConfig};
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AuthorizationServer, ServerConfig};
 use oauth_as::store::MemoryStorage;
@@ -162,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RFC 8628 s3.2: the device page the user is sent to. Under the issuer, so the router serves
     // it; a real host would put its own branded page here instead.
     let verification_uri = format!("{}/device", issuer.trim_end_matches('/'));
+    let crypto = fixture_crypto::provider()?;
     let mut config = ServerConfig::new(issuer.clone(), verification_uri);
     // RFC 8414 s2 `scopes_supported`: stating the catalogue costs nothing and lets a client see
     // what it may ask for without probing.
@@ -181,14 +184,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `with_jwks_uri` is what makes the RFC 8414 document advertise `jwks_uri` at all, and it
         // is under the issuer so that the router serves the key set itself rather than promising
         // an endpoint nothing answers.
-        let key = EcdsaP256Key::from_scalar_bytes(SEEDED_KID, &SEEDED_SIGNING_SCALAR)?;
+        let key = fixture_crypto::scalar_key(crypto.as_ref(), SEEDED_KID, &SEEDED_SIGNING_SCALAR)?;
         let jwks_uri = format!("{}/jwks", issuer.trim_end_matches('/'));
         config.access_token_format = AccessTokenFormat::Jwt(Box::new(
             JwtConfig::new(key, SEEDED_AUDIENCE).with_jwks_uri(jwks_uri),
         ));
     }
 
-    let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+    let server = Arc::new(AuthorizationServer::new_with_crypto(
+        config,
+        MemoryStorage::new(),
+        crypto,
+    )?);
 
     if seed {
         seed_fixtures(&server).await?;

@@ -56,7 +56,7 @@ fn sign(key: &EcdsaP256Key, claims: &serde_json::Value) -> String {
 /// `MAX_ASSERTION_LIFETIME` cap mean an `exp` that far out was never acceptable.
 #[test]
 fn an_exp_of_u64_max_is_refused_rather_than_panicking() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let assertion = sign(
         &key,
         &serde_json::json!({
@@ -87,7 +87,7 @@ fn an_exp_of_u64_max_is_refused_rather_than_panicking() {
 /// is beyond every horizon.
 #[test]
 fn an_nbf_or_iat_of_u64_max_is_refused_rather_than_panicking() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     for claim in ["nbf", "iat"] {
         let mut claims = serde_json::json!({
             "iss": CLIENT_ID,

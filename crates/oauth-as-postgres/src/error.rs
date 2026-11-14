@@ -21,6 +21,7 @@
 //! `42P01` is an unrun migration) and neither of which can contain a secret: SQLSTATE is a
 //! five-character code from a fixed alphabet defined by the SQL standard.
 
+use crate::sqlx;
 use oauth_as::store::StorageError;
 
 /// Map a driver failure to a [`StorageError`] that names the operation and the SQLSTATE, and

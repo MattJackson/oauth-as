@@ -779,7 +779,7 @@ async fn the_jwt_access_token_carries_the_authorization_details_claim() {
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     cfg.authorization_details_types_supported = Some(vec![PAYMENT.to_string()]);
     cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("k1"),
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
         "https://rs.example/",
     )));
     let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), ManualClock::at_epoch());
@@ -822,7 +822,7 @@ async fn a_grant_with_no_details_signs_no_claim() {
 
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("k1"),
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
         "https://rs.example/",
     )));
     let srv = AuthorizationServer::with_clock(cfg, MemoryStorage::new(), ManualClock::at_epoch());

@@ -61,6 +61,16 @@ env:
 jobs:
   fapi2-conformance:
     name: FAPI 2.0 Security Profile suite (plain_oauth, gates qa)
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [rustcrypto, aws-lc, fips]
+    env:
+      OAUTH_AS_CRYPTO: ${{ matrix.backend }}
+      # AWS-LC FIPS 3's delocator cannot consume newer GCC release assembly.
+      # Keep the validated module source intact; compile this fixture with Clang.
+      CC: clang
+      CXX: clang++
     runs-on: ubuntu-latest
     # Suite build (~8 min) + fixture build (~2 min) + the plan (capped at 25 min inside the
     # script). 40 minutes is comfortable headroom; anything past it is a hang, and the default
@@ -123,6 +133,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: fapi2-conformance-logs
+          name: fapi2-conformance-logs-${{ matrix.backend }}
           path: target/fapi2-conformance/
           if-no-files-found: warn

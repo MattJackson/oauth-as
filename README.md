@@ -101,7 +101,7 @@ discovered.
 
 ## Quickstart
 
-Add the crate. The default feature set is empty (see [Features](#features)); pick the wire surface
+Add the crate. RustCrypto primitives are enabled by default (see [Features](#features)); pick the wire surface
 you need — for an HTTP server with ES256 JWT access tokens:
 
 ```console
@@ -133,17 +133,20 @@ The full API reference is on [docs.rs](https://docs.rs/oauth-as).
 
 ## Features
 
-Eighteen features. The default set is **empty**, and stays that way.
+The default enables `rustcrypto` primitives. Protocol extensions and asymmetric algorithms remain opt-in.
 
 | Feature | Adds | Implies | Cost in dependencies |
 | ------- | ---- | ------- | -------------------- |
-| *(default)* | The protocol core | | `serde`, `getrandom`, `sha2`, `base64` |
+| *(no defaults)* | Protocol core with host-supplied crypto | | `serde`, `base64` |
+| `rustcrypto` *(default)* | RustCrypto primitives | | `sha2`, `hmac`, `getrandom`, `subtle` |
+| `aws-lc` | AWS-LC primitives and JWS operations | | `aws-lc-rs`, `aws-lc-sys` |
+| `fips` | AWS-LC FIPS primitives and approved JWS policy | | `aws-lc-rs`, `aws-lc-fips-sys` |
 | `http` | An HTTP service over the server: `http::Request` in, `http::Response` out, **no web framework and no async runtime** | | `http`, `http-body`, `bytes` |
 | `axum` | `impl From<AuthorizationService> for axum::Router`, plus the runtime to bind a listener with. About thirty lines, and the whole of this crate's exposure to a pre-1.0 framework | `http` | `axum` 0.8, `tokio` |
-| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, over the algorithm-tagged `JwsSigner` / `JwsVerifier` seam (`JwsAlg::{Es256,Rs256,EdDsa}`); no backend, so no key is minted or verified until one of the three below is enabled or the host installs its own | | `serde_json` |
-| `jwt-p256` | The built-in ES256 backend for that seam, for a host with no opinion about where its signing key lives | `jwt` | `p256` |
-| `jwt-rsa` | The built-in RS256 backend (`rsa` 0.9). Off by default: an RSA signature and key are far larger than ES256's, and in-process RSA *signing* carries RUSTSEC-2023-0071 (Marvin) — verification is unaffected, but a regulated deployment should prefer a KMS/HSM-backed async `JwsSigner` for signing | `jwt` | `rsa` |
-| `jwt-ed25519` | The built-in EdDSA (Ed25519 only) backend, over `ed25519-dalek` pinned to `~2.1` for this crate's 1.75 MSRV | `jwt` | `ed25519-dalek` |
+| `jwt` | RFC 9068 `at+jwt` access tokens and the RFC 7517 JWKS document, over the algorithm-tagged `JwsSigner` / `JwsVerifier` seam (`JwsAlg::{Es256,Rs256,Ps256,EdDsa}`); no backend, so no key is minted or verified until one of the three below is enabled or the host installs its own | | `serde_json` |
+| `jwt-p256` | The built-in ES256 backend for that seam, for a host with no opinion about where its signing key lives | `jwt`, `rustcrypto` | `p256` |
+| `jwt-rsa` | The built-in RS256 backend (`rsa` 0.9). Off by default: an RSA signature and key are far larger than ES256's, and in-process RSA *signing* carries RUSTSEC-2023-0071 (Marvin) — verification is unaffected, but a regulated deployment should prefer a KMS/HSM-backed async `JwsSigner` for signing | `jwt`, `rustcrypto` | `rsa` |
+| `jwt-ed25519` | The built-in EdDSA (Ed25519 only) backend, over `ed25519-dalek` pinned to `~2.1` for this crate's 1.75 MSRV | `jwt`, `rustcrypto` | `ed25519-dalek` |
 | `jwt-pkcs8` | `EcdsaP256Key::from_pkcs8_der` / `to_pkcs8_der`, for a host whose key arrives as DER rather than as a raw scalar | `jwt-p256` | one crate, `pkcs8`; `der`, `spki` and `const_oid` are already in a `jwt-p256` tree via `sec1` |
 | `client-assertion` | RFC 7523 `private_key_jwt` and `client_secret_jwt` | `jwt` | none of its own |
 | `dpop` | RFC 9449 sender-constrained tokens | `jwt` | none of its own |
@@ -157,16 +160,13 @@ Eighteen features. The default set is **empty**, and stays that way.
 | `cimd` | draft-ietf-oauth-client-id-metadata-document-01 client identifier metadata documents (the module docs carry a table mapping every section number it cites onto -02's renumbering). **Validation only: this crate makes no outbound HTTP request, so the host fetches the document and hands in the bytes.** See the module docs for the duties that leaves with the host | | `serde_json` |
 | `test-util` | A runnable `Storage` conformance harness for hosts to run against their own store | | none |
 
-Five of the eighteen add NOTHING to your dependency tree, not even transitively: `par`, `consent`,
-`token-exchange`, `resource-metadata` and `test-util` are serde shapes and comparisons over what is
-already there. Three more (`client-assertion`, `dpop`, `jar`) add no crate of their own; they turn
-on `jwt`, which brings `serde_json`. The other ten each bring at least one crate: `serde_json`
-for `jwt`, `mtls`, `rar` and `cimd` (it is optional as of 0.9.0, so a default build no longer carries it),
-`http`/`http-body`/`bytes` for `http`, `axum` and `tokio` for `axum`, `p256` for `jwt-p256`, `rsa`
-for `jwt-rsa`, `ed25519-dalek` for `jwt-ed25519`, and `pkcs8` for `jwt-pkcs8`. `jwt-p256`,
-`jwt-rsa` and `jwt-ed25519` are additive, not exclusive: a tree that enables more than one compiles
-and the host's own installed signer, if any, always wins because it was installed rather than
-selected by feature. `http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
+Protocol-only features never select a crypto backend. `jwt-p256`, `jwt-rsa` and
+`jwt-ed25519` select their RustCrypto implementations and may coexist. For a single
+host crypto stack, disable defaults and supply a provider; for AWS-LC or FIPS,
+enable that backend with protocol features such as `jwt`, `dpop` and `par`.
+The `test-util` storage harness uses fixed fixture hashes and needs no backend.
+
+`http` is deliberately **not** axum: `http` 1.x and `http-body` 1.x are 1.0 crates
 whose major has never moved, so they can appear in this crate's public signatures without making a
 framework upgrade in your tree a breaking change here. If you want a `Router`, turn on `axum` as
 well; if you are on a different axum major, leave it off and mount the service directly.
@@ -179,7 +179,8 @@ each item naming the feature that turns it on.
 
 ## Cost
 
-Measured, not asserted. Run it yourself: **`scripts/size-report.sh`**.
+The tables below record the pre-provider RustCrypto baseline. They do not measure
+AWS-LC or FIPS. Run **`scripts/size-report.sh`** for the current RustCrypto profile.
 
 ### Linked size
 
@@ -333,6 +334,64 @@ now **yours to do**. None of these is optional, and the first one is the one peo
 at each site saying what breaks if you get it wrong. Copy that one. Do not copy
 `conformance_server.rs`: it is a black-box test fixture and it says so at the top, in the loudest
 available terms.
+
+## Bring your own crypto / FIPS
+
+Version 1.1 adds a per-server `CryptoProvider`. It supplies SHA-256, HMAC-SHA-256,
+secure randomness, constant-time equality, and JWS verifier/signing-key factories.
+A provider is passed once and never replaced by an implicit fallback. Existing
+`JwsSigner` implementations, including remote KMS/HSM keys, remain supported.
+
+```toml
+# Host-owned cryptography: no crypto implementation in oauth-as's dependency graph.
+oauth-as = { version = "1.1", default-features = false, features = ["http", "jwt", "consent", "resource-metadata"] }
+```
+
+```rust,ignore
+let server = AuthorizationServer::new_with_crypto(config, storage, host_crypto)?;
+```
+
+The new constructor returns `CryptoError` for unavailable or forbidden configured
+algorithms. `try_new` selects a compiled backend and returns `MissingProvider` when
+none is enabled. Provider-aware standalone APIs use `_with_crypto`, including
+PKCE, secret hashing/verification, DPoP, client assertions, and certificate/JWK
+thumbprints. These helpers never need global provider state.
+
+| Feature | Implementation |
+| --- | --- |
+| `rustcrypto` (default) | Existing SHA-256 and entropy implementations, standard `hmac`, and `subtle` equality. Asymmetric backends remain opt-in through `jwt-p256`, `jwt-rsa`, and `jwt-ed25519`. |
+| `aws-lc` | AWS-LC SHA-256, HMAC, entropy, equality, ES256, RS256, PS256, and Ed25519. |
+| `fips` | AWS-LC FIPS 3 module, with ES256 and RSA policy; Ed25519 is refused. |
+
+For FIPS use `default-features = false`, enable `fips` and the required protocol
+features, and pass `Arc::new(oauth_as::crypto::Fips)` to `new_with_crypto`.
+Load signing keys with that same provider's `signing_key` factory. The server checks
+FIPS initialization and algorithm policy before accepting configuration. Verification
+metadata contains only algorithms available from that provider and permitted by server
+policy. A compiled RustCrypto feature cannot silently fill a FIPS capability gap.
+When several backends are compiled, explicitly selecting a provider avoids ambiguity;
+legacy default construction continues to select RustCrypto for compatibility.
+
+`aws-lc-rs` is pinned to 1.17.4 to retain the AWS-LC FIPS 3 module. Enabling a Cargo
+feature alone does not certify a deployment: use the module's documented supported
+operating environment and security policy. FIPS builds require CMake, Go, a C/C++
+compiler, and on some targets bindgen. CI uses Clang for optimized FIPS builds;
+newer GCC releases can emit assembly the FIPS 3 delocator rejects. Follow the
+[module security policy](https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp5314.pdf)
+for deployment requirements. RSA keys are restricted to 2048, 3072 or 4096 bits.
+HMAC callers must supply suitable key material; the protocol's `client_secret_jwt`
+key type enforces at least 32 bytes. No unsafe code is added to oauth-as.
+
+All server entropy failures return `server_error`. Use `EcdsaP256Key::try_generate`
+for provisioning; the old `generate` is deprecated and retains its documented panic
+solely for source compatibility. Persistent record encodings and default wire behavior
+are unchanged. Consumers that disable defaults must supply a provider explicitly and
+use the provider-aware standalone helpers.
+
+CI checks the backend-free consumer graph with cargo-deny, runs known-answer and
+entropy-failure tests, and drives the HTTP and FAPI conformance fixtures per backend.
+These runs are conformance evidence; the existing OpenID certification remains scoped
+to version 1.0.0.
 
 ## Minimum supported Rust version
 

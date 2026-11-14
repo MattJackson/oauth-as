@@ -29,7 +29,7 @@ path = "src/main.rs"
 [dependencies]
 # The crate under measurement. OPTIONAL so the same binary, built with `--no-default-features`,
 # is the matched BASELINE: same toolchain, same profile, same std, same main, minus this crate.
-oauth-as = { path = "../../crates/oauth-as", default-features = false, optional = true }
+oauth-as = { path = "../../crates/oauth-as", default-features = false, features = ["rustcrypto"], optional = true }
 
 # The "host already has the deps" case. A real host that embeds an authorization server almost
 # certainly already parses JSON and speaks the `http` vocabulary, so the marginal cost of adding

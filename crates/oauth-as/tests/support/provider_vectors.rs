@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (C) 2026 Matthew Jackson
+// RFC 7515 Appendix A.2, shared by backend conformance tests.
+pub const N_B64URL: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
+pub const E_B64URL: &str = "AQAB";
+pub const D_B64URL: &str = "Eq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyWPEAeP88vLNO97IjlA7_GQ5sLKMgvfTeXZx9SE-7YwVol2NXOoAJe46sui395IW_GO-pWJ1O0BkTGoVEn2bKVRUCgu-GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzjkn439X0M_V51gfpRLI9JYanrC4D4qAdGcopV_0ZHHzQlBjudU2QvXt4ehNYTCBr6XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl_x_jTj3ccPDVZFD9pIuhLhBOneufuBiB4cS98l2SR_RQyGWSeWjnczT0QU91p1DhOVRuOopznQ";
+pub const P_B64URL: &str = "4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPGBY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUc";
+pub const Q_B64URL: &str = "uQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdc";
+pub const SIGNING_INPUT: &[u8] =
+    b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+pub const EXPECTED_SIG_B64URL: &str = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+
+pub fn rsa_pkcs8() -> Vec<u8> {
+    use base64::Engine;
+    use rsa::{pkcs8::EncodePrivateKey, BigUint, RsaPrivateKey};
+    let dec = |v: &str| {
+        BigUint::from_bytes_be(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(v)
+                .unwrap(),
+        )
+    };
+    RsaPrivateKey::from_components(
+        dec(N_B64URL),
+        dec(E_B64URL),
+        dec(D_B64URL),
+        vec![dec(P_B64URL), dec(Q_B64URL)],
+    )
+    .unwrap()
+    .to_pkcs8_der()
+    .unwrap()
+    .as_bytes()
+    .to_vec()
+}
+
+// Public test key only: 3071 bits deliberately falls outside the FIPS backend policy.
+#[cfg(feature = "fips")]
+pub const NONAPPROVED_RSA_DER: &str = "MIIG-QIBADANBgkqhkiG9w0BAQEFAASCBuMwggbfAgEAAoIBgD4MAqTs9khT_X4R2iP2YHrRFCMNhAnawLVfI0DbEevs7_lXpZGt1ITmpqyLmRg59g8EetJOgFau-vTwXzSrEbGjkJYh5PzMgVJ2KhtrqO8xvwCPlxXa9_48AkQXh4OifqFk-INHTLR98DoNBhNWcFTK8lo42sBFBy6486FaKqjS63yUp5xxta5dB0zJ41oveQLTWReW18ofhJzQdSjZoVknT2EXSAr8h2ubvROd0hWciskkBEsx18zR0QmefwG-RgHfyFrUPjMoASC7Fe7KW4t68BXTBJH3bkaKltyeWjlnK0scwNWwBYHF65TxpUBekUvOnlQ0SFdD7kcLEhJBI9F50aP6LoVLdjUQpjO1MZUXr-fF2L408Zdj79hBqOHT6Ap4OKCDCCEXu4fjX_smEJMVId4B4WJzl_i9758x-TJXNjZfAMryiLwd08rantQEob2QwhN3e0DDmEERlpsATuUbHlQ4GqXJCkS22L_7eYYbH0rF23LsBUBkPN0uY-TfcwIDAQABAoIBgAojoUz9MhPIsdxno2uMB-EaCH3f6AtKNYKN_O9MvUV97wsicPp42wkqveLlXwuv8Q8sLrvuOxevOXBMVWqAaABM18RI3qgW7S0iBSh889q-mNVJIanfIfZoLQCejbULmUDbhKbDQHwgNmDuHueLEQkyLt9iehDAVveiHqHn35-98-BkVG2CwWswZZB9T0s-BbrZ-a2ap0Gu29daU0LtKWotu9GEYe_1q1WA2il5-UoxzhYnbhIxn2-ne87kGSIaSyIzBUoVZdHfUGJU7LgiVF2x5F5OkeZWCjmynAEOug6FXqmyWePj21MfFAi2bwMIBoidhc0xqzQw9vPys3WQ1MZEw1szWWjyVuiS80ROIOKkdL1Jipxvu7Ucegtmzz8-gXOkvwyXq-LmvfbvszAULbrdJbgHRSMhMKd9xo0aUrMRx1sb0M8sUso1nDpKL5_JdnQzF0y1mKml49oRzrk4C55uefYtrMiGcrS9jof3m2b7js1okp79UUy5YnZHzlB13QKBwH8rV7VvorvfbXeoCti1YmXBzk92hohJpjt1_fpvzqBl4KuI3JV3NRC3ikFDGTQthklar265Zh3GzXSPLRMm3Taq3W6mNAWPHIeU_vrl4WZOlxgXAV1tuhZmSR7OEfOLNNFxr2-DHwPjDrvu3iIX9l3ed2v61DjuMUYTYNmaSmxdtD59BFqhL2U2JZV483Rho2n4egtDu_F2DiNgZ_Hjb9kit5bX8ENMoQExGm-ymxQ639pZmR1rRJURmO6MF8exHwKBwHzniP1kIasm6fBAzmqeBuEvKA6NidYw58g5kmbLtiECOCfp9LcH6dcUr-eEVtOAmBBT6m7hh6rlt33DtFJRSGIYYlKwb8PVEg0mdo8nUr73Y83lObIdhNArH_r85AIL62G0lp4LYpGRQigZ498eMcCWu-pAxpBoeHRKV9HGTN11-keldo16PNhY_K0C3kEAaqG5WkN8j93OLc_F75bX-9oFRrRlfDD_yDfKjnsqRmCYJYENFafp2gS4Kw6-G3yjLQKBwGtk_RM6jeG_VEEC5vYQaGKrA0JURFUAbaQ1hyFiHsuSfeQfFrobC_NsLRPkSHqqH4f_T7xgUf6_j27qIxTTc2nhblMthS1UqLFPgO3-CRZPNIahlwOB0O9tvj6HpN1aKGbgbVntD9pGfID1vx5nwiWP5KaKE4NolLArWVUrWcKed8N17KFlEhOVYLQUivU0J78smlS9BRFrs5Dor5-1hRWIniaDgmIzap0JDNxbp1-0QKuzkv0nQ6noTJDYOpTn3QKBwAMoc308n-FM7ZNGgDGP50qgP5oGmBqTR_j3A62XrvYssTDJKIfMKmxmuH_ZB7z3PmEDTiUZjK2Ue0wxu4htR7A7P5kpntnLtFYix9KcwunTJXHaPtgzCN2eiYN2C2nF1WC2CSzbytU1X__Vj75fbBCbfwrQMnUKPylpi8jhA6aByh8vnsy673jk3xacwPPRx-Bo6FBWgOixwtTDA2jD8zky8vOysS4n-W73rxyMGBVvI1uc8hQ5xGpkIaqQwe8nzQKBwCmvuo8rN4LfscNDKYMFf7CqaiKEy9qfFs5hyJctlXheOXvUCfi_f06aRSFTqrrCzr9XOaR_Ho7sLzRAPyfrFdkhzyl2GZKzd47lLVOP0ma8Y9s-ocf8bmSeWthhs97N-VrtNS3ze9xcuOnpuy3I2mrAcLvneNzlFtgRCzzDKnm3dIZjTZj0Vh0_aaJ9cO_P70qlEBTZbbbxtq67_86TEUaxA-Tcvd3KZQRJqPzSIXhIlhYvG4dYUxfXjGZ4FSe0vw";

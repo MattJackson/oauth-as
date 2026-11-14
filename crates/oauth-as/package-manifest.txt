@@ -9,6 +9,7 @@ examples/conformance_server.rs
 examples/fapi2_conformance_server.rs
 examples/production_server.rs
 examples/protected_resource_fixture.rs
+examples/support/crypto.rs
 package-manifest.txt
 src/authorization.rs
 src/backends/ed25519.rs
@@ -18,6 +19,9 @@ src/cimd.rs
 src/client.rs
 src/client_assertion.rs
 src/consent.rs
+src/crypto/aws_lc.rs
+src/crypto/rustcrypto.rs
+src/crypto.rs
 src/delegate.rs
 src/device.rs
 src/dpop.rs
@@ -96,6 +100,7 @@ tests/consent.rs
 tests/constant_time.rs
 tests/containment_truth.rs
 tests/crypto_agility_snapshot.rs
+tests/crypto_provider.rs
 tests/device_flow.rs
 tests/device_flow_edges.rs
 tests/device_grant_races.rs
@@ -193,6 +198,7 @@ tests/storage_fault_endpoints.rs
 tests/storage_sweep.rs
 tests/support/alloc.rs
 tests/support/mod.rs
+tests/support/provider_vectors.rs
 tests/support/refresh_retry.rs
 tests/third_party_client.rs
 tests/token_exchange.rs

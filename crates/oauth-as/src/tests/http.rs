@@ -442,7 +442,7 @@ fn a_jwks_uri_off_the_issuer_refuses_to_build() {
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
     config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(Box::new(
         crate::jwt::JwtConfig::new(
-            crate::jwt::EcdsaP256Key::generate("k1"),
+            crate::jwt::EcdsaP256Key::try_generate("k1").expect("test key entropy"),
             "https://rs.example",
         )
         .with_jwks_uri("https://keys.example/jwks"),
@@ -469,7 +469,7 @@ fn a_jwks_uri_colliding_with_another_endpoint_refuses_to_build() {
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
     config.access_token_format = crate::jwt::AccessTokenFormat::Jwt(Box::new(
         crate::jwt::JwtConfig::new(
-            crate::jwt::EcdsaP256Key::generate("k1"),
+            crate::jwt::EcdsaP256Key::try_generate("k1").expect("test key entropy"),
             "https://rs.example",
         )
         .with_jwks_uri("https://as.example/token"),
@@ -958,4 +958,9 @@ fn the_response_body_reports_an_exact_length() {
 
     // An empty `Bytes` and no body at all are the same response on the wire.
     assert!(Body::from(Bytes::new()).is_end_stream());
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use crate::crypto::CryptoProvider;
+    crate::crypto::builtin().ct_eq(a.as_bytes(), b.as_bytes())
 }

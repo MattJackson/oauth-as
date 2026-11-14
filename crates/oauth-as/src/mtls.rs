@@ -42,18 +42,18 @@
 //! already holds the parsed certificate: every TLS stack exposes the subject and the subjectAltName
 //! entries, and every reverse proxy exposes them as strings. This module therefore takes the FACTS
 //! (a subject DN, the SAN entries, the DER bytes) and derives the one value RFC 8705 section 3.1
-//! actually defines arithmetic on: the SHA-256 thumbprint, which is `sha2` over bytes and
+//! actually defines arithmetic on: the SHA-256 thumbprint, which is the selected provider hashing bytes and
 //! `base64`, both of which this crate already depends on for RFC 7636. Adding an X.509 parser
 //! would add attack surface (a parser fed attacker-controlled DER) to buy a result the host must
 //! compute anyway to have completed the handshake at all.
 
 use std::fmt;
 
+use crate::crypto::CryptoProvider;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 use crate::client::{Client, ClientAuth};
 use crate::events::ClientAuthFailure;
@@ -107,9 +107,15 @@ impl CertificateThumbprint {
     ///
     /// `der` is the certificate itself, NOT a PEM block: base64 text with `-----BEGIN
     /// CERTIFICATE-----` around it hashes to something that matches nothing. See
-    /// [`CertificateThumbprint::from_pem`] for that form.
+    /// [`CertificateThumbprint::from_pem_with_crypto`] for that form.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_der(der: &[u8]) -> Self {
-        CertificateThumbprint(Sha256::digest(der).into())
+        Self::from_der_with_crypto(&crate::crypto::builtin(), der)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn from_der_with_crypto(crypto: &dyn CryptoProvider, der: &[u8]) -> Self {
+        CertificateThumbprint(crypto.sha256(der))
     }
 
     /// Compute the thumbprint of a PEM-encoded certificate, ignoring the armour lines and all
@@ -119,7 +125,16 @@ impl CertificateThumbprint {
     ///
     /// Only the FIRST certificate in the file is used: RFC 8705 binds to the end-entity
     /// certificate, and a PEM bundle carries its issuers after it.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_pem(pem: &str) -> Result<Self, MtlsRegistrationError> {
+        Self::from_pem_with_crypto(&crate::crypto::builtin(), pem)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn from_pem_with_crypto(
+        crypto: &dyn CryptoProvider,
+        pem: &str,
+    ) -> Result<Self, MtlsRegistrationError> {
         let body = match pem.find("-----BEGIN CERTIFICATE-----") {
             Some(start) => {
                 let after = &pem[start + "-----BEGIN CERTIFICATE-----".len()..];
@@ -134,7 +149,7 @@ impl CertificateThumbprint {
         let der = STANDARD
             .decode(compact.as_bytes())
             .map_err(|_| MtlsRegistrationError::MalformedCertificate)?;
-        Ok(CertificateThumbprint::from_der(&der))
+        Ok(CertificateThumbprint::from_der_with_crypto(crypto, &der))
     }
 
     /// The raw 32 byte hash.
@@ -231,8 +246,14 @@ impl<'a> ClientCertificate<'a> {
     /// clients by. A certificate with no facts attached can still be BOUND to a token (section 3),
     /// which is why they are optional rather than required: section 4 makes certificate binding
     /// available to a client that does not authenticate with mutual TLS at all.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_der(der: &[u8]) -> Self {
-        ClientCertificate::from_thumbprint(CertificateThumbprint::from_der(der))
+        Self::from_der_with_crypto(&crate::crypto::builtin(), der)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn from_der_with_crypto(crypto: &dyn CryptoProvider, der: &[u8]) -> Self {
+        ClientCertificate::from_thumbprint(CertificateThumbprint::from_der_with_crypto(crypto, der))
     }
 
     /// From a thumbprint the host computed itself, for a deployment whose TLS terminator forwards a
@@ -422,7 +443,7 @@ pub struct RegisteredCertificates(Vec<CertificateThumbprint>);
 impl RegisteredCertificates {
     /// From thumbprints already computed.
     ///
-    /// An EMPTY list is refused, exactly as [`RegisteredCertificates::from_jwks`] refuses a key set
+    /// An EMPTY list is refused, exactly as [`RegisteredCertificates::from_jwks_with_crypto`] refuses a key set
     /// that yields no certificate, and for the identical reason: a registration with nothing to
     /// compare against can never authenticate anybody, so it is a configuration mistake and not a
     /// permissive setting. Accepting it here and refusing it there would have made the outcome of
@@ -438,14 +459,26 @@ impl RegisteredCertificates {
 
     /// From the DER encodings of the registered certificates. An empty iterator is refused, for the
     /// reason [`RegisteredCertificates::from_thumbprints`] gives.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_der_certificates<'a, I>(certificates: I) -> Result<Self, MtlsRegistrationError>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        Self::from_der_certificates_with_crypto(&crate::crypto::builtin(), certificates)
+    }
+
+    /// Compute registered certificate thumbprints with the selected provider.
+    pub fn from_der_certificates_with_crypto<'a, I>(
+        crypto: &dyn CryptoProvider,
+        certificates: I,
+    ) -> Result<Self, MtlsRegistrationError>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
         RegisteredCertificates::from_thumbprints(
             certificates
                 .into_iter()
-                .map(CertificateThumbprint::from_der)
+                .map(|der| CertificateThumbprint::from_der_with_crypto(crypto, der))
                 .collect(),
         )
     }
@@ -463,7 +496,16 @@ impl RegisteredCertificates {
     /// A key with no `x5c` is SKIPPED, not an error: a JWK Set may legitimately carry keys for
     /// other purposes (RFC 9101 request object signing, say). A set that yields no certificate at
     /// all IS an error, because that registration can never authenticate anybody.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_jwks(jwks: &str) -> Result<Self, MtlsRegistrationError> {
+        Self::from_jwks_with_crypto(&crate::crypto::builtin(), jwks)
+    }
+
+    /// Read registered x5c certificates using the selected provider for thumbprints.
+    pub fn from_jwks_with_crypto(
+        crypto: &dyn CryptoProvider,
+        jwks: &str,
+    ) -> Result<Self, MtlsRegistrationError> {
         let document: serde_json::Value =
             serde_json::from_str(jwks).map_err(|_| MtlsRegistrationError::MalformedJwks)?;
         let keys = document
@@ -485,7 +527,7 @@ impl RegisteredCertificates {
             let der = STANDARD
                 .decode(leaf.as_bytes())
                 .map_err(|_| MtlsRegistrationError::MalformedCertificate)?;
-            thumbprints.push(CertificateThumbprint::from_der(&der));
+            thumbprints.push(CertificateThumbprint::from_der_with_crypto(crypto, &der));
         }
         if thumbprints.is_empty() {
             return Err(MtlsRegistrationError::NoCertificateInJwks);
@@ -636,9 +678,19 @@ impl Confirmation {
     /// this token bound to my caller", and an unbound token is not. A resource server that ACCEPTS
     /// unbound tokens (a mixed deployment, mid-migration) must ask that question separately, with
     /// [`Confirmation::certificate_thumbprint`], rather than reading a `false` here as permission.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn confirms_certificate(&self, der: &[u8]) -> bool {
+        self.confirms_certificate_with_crypto(&crate::crypto::builtin(), der)
+    }
+
+    /// Check the certificate binding with the explicitly selected provider.
+    pub fn confirms_certificate_with_crypto(
+        &self,
+        crypto: &dyn CryptoProvider,
+        der: &[u8],
+    ) -> bool {
         match self.certificate_thumbprint() {
-            Some(bound) => *bound == CertificateThumbprint::from_der(der),
+            Some(bound) => *bound == CertificateThumbprint::from_der_with_crypto(crypto, der),
             None => false,
         }
     }
@@ -670,7 +722,7 @@ impl Confirmation {
 ///
 /// - a [`ClientAuth::Mtls`] registration is decided here and ONLY here. It has no secret, so there
 ///   is no string that could be the right one, and it never reaches the secret comparison:
-///   [`ClientAuth::verify_with`] answers `false` for the variant, so no presented secret can
+///   [`ClientAuth::verify_with_crypto`] answers `false` for the variant, so no presented secret can
 ///   authenticate an mTLS client by that route either.
 /// - every other registration is decided exactly as it was before, and a certificate presented
 ///   alongside is NOT an authentication credential there. It is used only for RFC 8705 section 3

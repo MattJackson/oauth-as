@@ -8,7 +8,8 @@ use super::*;
 
 #[test]
 fn user_codes_use_the_alphabet_and_are_unbiased_in_shape() {
-    let code = random_user_code(8).expect("the OS provides randomness in a test process");
+    let code = random_user_code(&crate::crypto::builtin(), 8)
+        .expect("the OS provides randomness in a test process");
     assert_eq!(code.len(), 8);
     assert!(code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)));
 }
@@ -82,7 +83,8 @@ fn the_user_code_symbol_draw_is_exactly_uniform_over_the_alphabet() {
 #[test]
 fn random_user_code_redraws_rejections_rather_than_shortening_the_code() {
     for len in [MIN_USER_CODE_LENGTH, 9, 16] {
-        let code = random_user_code(len).expect("the OS provides randomness in a test process");
+        let code = random_user_code(&crate::crypto::builtin(), len)
+            .expect("the OS provides randomness in a test process");
         assert_eq!(code.len(), len, "a rejected byte must cost a redraw");
         assert!(code.bytes().all(|b| USER_CODE_ALPHABET.contains(&b)));
     }
@@ -90,10 +92,11 @@ fn random_user_code_redraws_rejections_rather_than_shortening_the_code() {
 
 #[test]
 fn random_hex_has_the_stated_entropy_width() {
-    let h = try_random_hex(32).expect("the OS provides randomness in a test process");
+    let h = try_random_hex(&crate::crypto::builtin(), 32)
+        .expect("the OS provides randomness in a test process");
     assert_eq!(h.len(), 64);
     assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
-    assert_ne!(h, try_random_hex(32).unwrap());
+    assert_ne!(h, try_random_hex(&crate::crypto::builtin(), 32).unwrap());
 }
 
 /// C13: every credential a token request carries is a credential in the RFC's own terms
@@ -301,13 +304,13 @@ fn a_replay_key_is_built_in_exactly_one_correctly_sized_allocation() {
 /// replaced, which is exactly the regression worth catching.
 #[test]
 fn the_request_reachable_randomness_draws_report_failure_rather_than_panicking() {
-    let hex: Option<String> = try_random_hex(32);
+    let hex: Option<String> = try_random_hex(&crate::crypto::builtin(), 32);
     assert_eq!(
         hex.expect("the OS provides randomness in a test process")
             .len(),
         64
     );
-    let code: Option<String> = random_user_code(MIN_USER_CODE_LENGTH);
+    let code: Option<String> = random_user_code(&crate::crypto::builtin(), MIN_USER_CODE_LENGTH);
     assert_eq!(
         code.expect("the OS provides randomness in a test process")
             .len(),

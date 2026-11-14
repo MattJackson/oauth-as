@@ -146,7 +146,10 @@ fn reports(violations: &[Violation], check: &str) -> bool {
 /// assertion below is only meaningful against this baseline.
 #[test]
 fn the_built_in_backend_is_the_baseline_and_reports_nothing() {
-    let violations = run(EcdsaP256Key::generate("baseline"), P256Verifier);
+    let violations = run(
+        EcdsaP256Key::try_generate("baseline").expect("test key entropy"),
+        P256Verifier,
+    );
     assert!(violations.is_empty(), "{violations:#?}");
 }
 
@@ -430,7 +433,10 @@ fn the_der_the_harness_presents_is_the_canonical_encoding() {
     let verifier = AcceptsCanonicalDer {
         canonical: canonical_der(&signature),
     };
-    let violations = run(EcdsaP256Key::generate("canonical"), verifier);
+    let violations = run(
+        EcdsaP256Key::try_generate("canonical").expect("test key entropy"),
+        verifier,
+    );
     assert!(
         reports(&violations, VERIFIER_REJECTS_DER),
         "a verifier that accepts the canonical DER of a valid signature is malleable and must be \
@@ -525,7 +531,7 @@ fn the_tampered_signature_check_flips_the_bit_rather_than_masking_the_byte() {
     let mut accept = decode(A3_SIGNATURE);
     accept[0] ^= 0x01;
     let violations = run(
-        EcdsaP256Key::generate("tamper-signature"),
+        EcdsaP256Key::try_generate("tamper-signature").expect("test key entropy"),
         AcceptsExactSignature { accept },
     );
     assert!(
@@ -552,7 +558,7 @@ fn the_tampered_input_check_flips_the_bit_rather_than_masking_the_byte() {
     let last = accept_input.len() - 1;
     accept_input[last] ^= 0x01;
     let violations = run(
-        EcdsaP256Key::generate("tamper-input"),
+        EcdsaP256Key::try_generate("tamper-input").expect("test key entropy"),
         AcceptsExactInput { accept_input },
     );
     assert!(

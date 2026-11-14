@@ -106,7 +106,7 @@ fn jwt_format() -> oauth_as::jwt::AccessTokenFormat {
     // repository is a habit worth not forming even in a measurement tool, and generation is on the
     // `jwt-p256` cost anyway.
     #[cfg(feature = "f-jwt-p256")]
-    let signer = oauth_as::jwt::EcdsaP256Key::generate("probe-es256-1");
+    let signer = oauth_as::jwt::EcdsaP256Key::try_generate("probe-es256-1").expect("test key entropy");
     #[cfg(not(feature = "f-jwt-p256"))]
     let signer = ProbeSigner;
     AccessTokenFormat::Jwt(Box::new(

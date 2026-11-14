@@ -102,7 +102,7 @@ pub fn jar() -> u64 {
 
     let mut acc: u64 = 0;
     // Key registration: the SEC 1 / JWK-coordinate import a host performs once per client.
-    let key = oauth_as::jwt::EcdsaP256Key::generate("probe-jar-1");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("probe-jar-1").expect("test key entropy");
     let jwk = key.public_jwk();
     if let Ok(value) = serde_json::to_value(&jwk) {
         let x = value["x"].as_str().unwrap_or_default().to_string();
@@ -200,7 +200,7 @@ pub fn client_assertion() -> u64 {
             acc = acc.wrapping_add(failure.to_string().len() as u64);
         }
     }
-    let key = oauth_as::jwt::EcdsaP256Key::generate("probe-assertion-1");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("probe-assertion-1").expect("test key entropy");
     if let Ok(value) = serde_json::to_value(key.public_jwk()) {
         if let Ok(public) = oauth_as::jwt::Jwk::from_json(&value) {
             let keys = AssertionKeys::PublicKeys {

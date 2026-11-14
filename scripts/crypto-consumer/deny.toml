@@ -1,0 +1,10 @@
+[graph]
+all-features = false
+[bans]
+multiple-versions = "allow"
+deny = [
+ { name = "sha2" }, { name = "getrandom" }, { name = "hmac" },
+ { name = "p256" }, { name = "ed25519-dalek" }, { name = "rsa" },
+ { name = "ring" }, { name = "aws-lc-rs" }, { name = "aws-lc-sys" },
+ { name = "aws-lc-fips-sys" },
+]

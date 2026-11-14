@@ -926,10 +926,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `?` rather than a panic, for the reason `randomness_failure` gives: this is an
         // unauthenticated HTTP route, and a library that aborts its host's request handler because
         // the OS would not hand over sixteen bytes is worse than one that answers 500.
-        let client_id =
-            ClientId::new(crate::server::try_random_hex(16).ok_or_else(randomness_failure)?);
+        let client_id = ClientId::new(
+            crate::server::try_random_hex(self.crypto(), 16).ok_or_else(randomness_failure)?,
+        );
         let secret = if registered.token_endpoint_auth_method != AUTH_METHOD_NONE {
-            Some(crate::server::try_random_hex(32).ok_or_else(randomness_failure)?)
+            Some(crate::server::try_random_hex(self.crypto(), 32).ok_or_else(randomness_failure)?)
         } else {
             None
         };
@@ -942,14 +943,14 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             Some(ttl) => now.unwrap_or_default().saturating_add(ttl.as_secs()),
         });
         let registration_access_token =
-            crate::server::try_random_hex(32).ok_or_else(randomness_failure)?;
+            crate::server::try_random_hex(self.crypto(), 32).ok_or_else(randomness_failure)?;
 
         let client = Client {
             client_id: client_id.clone(),
             auth: match &secret {
                 None => ClientAuth::Public,
                 Some(s) => ClientAuth::ConfidentialSecretHash {
-                    hash: SecretHash::sha256(s),
+                    hash: SecretHash::sha256_with_crypto(self.crypto(), s),
                 },
             },
             grant_types: registered.grant_types.clone(),
@@ -958,7 +959,10 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             default_scopes: registered.scope.clone(),
             name: registered.client_name.clone(),
             registration: Some(Box::new(DynamicRegistration {
-                registration_access_token_hash: SecretHash::sha256(&registration_access_token),
+                registration_access_token_hash: SecretHash::sha256_with_crypto(
+                    self.crypto(),
+                    &registration_access_token,
+                ),
                 client_id_issued_at: now,
                 client_secret_expires_at: secret_expires_at,
                 token_endpoint_auth_method: registered.token_endpoint_auth_method.clone(),
@@ -1019,7 +1023,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The same timing caveat that `AuthorizationServer::authenticate_client` documents applies:
     /// this returns before any hashing when the client is unknown, so an unknown client and a
     /// known client with the wrong token are distinguishable by wall time. The comparison itself
-    /// leaks nothing (see [`SecretHash::verify`]); equalising the two paths is the host's
+    /// leaks nothing (see [`SecretHash::verify_with_crypto`]); equalising the two paths is the host's
     /// business.
     ///
     /// THE HOST'S [`crate::events::RateLimiter`] IS ASKED FIRST, before the store is touched, and
@@ -1116,7 +1120,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
         if !registration
             .registration_access_token_hash
-            .verify(registration_access_token, self.hooks().secret_verifier())
+            .verify_with_crypto(
+                self.crypto(),
+                registration_access_token,
+                self.hooks().secret_verifier(),
+            )
         {
             return Err(self.registration_auth_failed(
                 client_id,
@@ -1295,13 +1303,13 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `?` for the reason `randomness_failure` gives; RFC 7592 s2.2 is a routed `PUT` and this
         // is the only path other than registration itself that mints a secret.
         let new_secret = if wants_secret && !had_secret {
-            Some(crate::server::try_random_hex(32).ok_or_else(randomness_failure)?)
+            Some(crate::server::try_random_hex(self.crypto(), 32).ok_or_else(randomness_failure)?)
         } else {
             None
         };
         let auth = match (&new_secret, wants_secret) {
             (Some(s), _) => ClientAuth::ConfidentialSecretHash {
-                hash: SecretHash::sha256(s),
+                hash: SecretHash::sha256_with_crypto(self.crypto(), s),
             },
             // Keeps the existing verifier: this server cannot re-issue a secret it does not hold,
             // and silently rotating one on every metadata edit would log the client out of the

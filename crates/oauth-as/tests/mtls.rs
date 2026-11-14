@@ -578,7 +578,7 @@ async fn a_signed_access_token_carries_the_cnf_claim() {
 
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("k1"),
+        EcdsaP256Key::try_generate("k1").expect("test key entropy"),
         "https://rs.example",
     )));
     let srv = oauth_as::AuthorizationServer::with_clock(

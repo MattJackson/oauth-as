@@ -5534,7 +5534,10 @@ fn sample_client(client_id: &str) -> Client {
     Client {
         client_id: ClientId::new(client_id),
         auth: ClientAuth::ConfidentialSecretHash {
-            hash: SecretHash::sha256("conformance-secret"),
+            hash: SecretHash::custom(
+                SecretHash::SHA256_HEX,
+                "d0d18cc0999e75e555481aad963ba46c6b8c8643a4f2cc8909d0a7dbcaa3f8d1",
+            ),
         },
         grant_types: vec![
             GrantType::AuthorizationCode,
@@ -5549,7 +5552,10 @@ fn sample_client(client_id: &str) -> Client {
         default_scopes: scopes("read"),
         name: Some("conformance client".to_string()),
         registration: Some(Box::new(DynamicRegistration {
-            registration_access_token_hash: SecretHash::sha256("conformance-rat"),
+            registration_access_token_hash: SecretHash::custom(
+                SecretHash::SHA256_HEX,
+                "9c84967040531643fc514be432c8893dbbbf8f59a9a24ca618e1fb5bcce1746c",
+            ),
             client_id_issued_at: Some(BASE_SECS),
             client_secret_expires_at: Some(0),
             token_endpoint_auth_method: "client_secret_basic".to_string(),
@@ -5754,9 +5760,12 @@ fn sample_token(access_token: &str, client_id: &str, family_id: Option<&str>) ->
         // consequence as dropping `jkt` above, by the other mechanism: a certificate-bound token
         // silently becomes a bearer token, and nothing on the token plane can tell.
         #[cfg(feature = "mtls")]
-        x5t_s256: Some(Box::new(crate::mtls::CertificateThumbprint::from_der(
-            b"conformance-fixture-certificate",
-        ))),
+        x5t_s256: Some(Box::new(
+            crate::mtls::CertificateThumbprint::from_base64url(
+                "fXs2T3z3OSgfwORiCgVEMlOLzW4WUMsrB9rtcSxA9ng",
+            )
+            .expect("fixed fixture thumbprint"),
+        )),
         #[cfg(feature = "consent")]
         authentication: sample_authentication(),
     }
@@ -5791,9 +5800,12 @@ fn sample_refresh(refresh_token: &str, client_id: &str, family_id: &str) -> Refr
         // consequence as dropping `jkt` above, by the other mechanism: a certificate-bound token
         // silently becomes a bearer token, and nothing on the token plane can tell.
         #[cfg(feature = "mtls")]
-        x5t_s256: Some(Box::new(crate::mtls::CertificateThumbprint::from_der(
-            b"conformance-fixture-certificate",
-        ))),
+        x5t_s256: Some(Box::new(
+            crate::mtls::CertificateThumbprint::from_base64url(
+                "fXs2T3z3OSgfwORiCgVEMlOLzW4WUMsrB9rtcSxA9ng",
+            )
+            .expect("fixed fixture thumbprint"),
+        )),
         #[cfg(feature = "consent")]
         authentication: sample_authentication(),
     }

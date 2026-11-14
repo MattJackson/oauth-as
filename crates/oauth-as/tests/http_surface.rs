@@ -1405,8 +1405,11 @@ async fn start_signing() -> (SocketAddr, String) {
     let mut config = ServerConfig::new(issuer.clone(), format!("{issuer}/device"));
     let kid = "wire-test-key-1".to_string();
     config.access_token_format = AccessTokenFormat::Jwt(Box::new(
-        JwtConfig::new(EcdsaP256Key::generate(kid.clone()), "https://rs.example")
-            .with_jwks_uri(format!("{issuer}/jwks")),
+        JwtConfig::new(
+            EcdsaP256Key::try_generate(kid.clone()).expect("test key entropy"),
+            "https://rs.example",
+        )
+        .with_jwks_uri(format!("{issuer}/jwks")),
     ));
     let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
     let scopes = ScopeSet::from_tokens(["read", "write"]).expect("scopes");
