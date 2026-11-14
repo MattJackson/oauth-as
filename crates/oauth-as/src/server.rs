@@ -2012,7 +2012,7 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
 impl<S: Storage> AuthorizationServer<S, SystemClock> {
     /// Construct with the real clock. This is the crate's allocation entry point: call it when
     /// (and only when) host config enables the AS.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
+    #[cfg(feature = "rustcrypto")]
     pub fn new(config: ServerConfig, store: S) -> Self {
         Self::with_clock(config, store, SystemClock)
     }
@@ -2032,13 +2032,13 @@ impl<S: Storage> AuthorizationServer<S, SystemClock> {
 
 impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Construct with an injected clock (tests).
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
+    #[cfg(feature = "rustcrypto")]
     pub fn with_clock(config: ServerConfig, store: S, clock: C) -> Self {
         Self::construct(
             config,
             store,
             clock,
-            std::sync::Arc::new(crate::crypto::builtin()),
+            std::sync::Arc::new(crate::crypto::RustCrypto),
             true,
         )
     }
@@ -2156,6 +2156,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         self
     }
 
+    /// Legacy constructor override (`new` / `with_clock` only). Explicit-provider servers
+    /// obtain every verifier from their provider; this method does not change that selection.
     /// Install a JWS verifier this server VERIFIES signatures with, for its own algorithm (ES256,
     /// RS256, or EdDSA): RFC 9449 DPoP proofs, RFC 9101 request objects, RFC 7523 client assertions.
     ///

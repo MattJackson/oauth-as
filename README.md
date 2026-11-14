@@ -334,6 +334,59 @@ at each site saying what breaks if you get it wrong. Copy that one. Do not copy
 `conformance_server.rs`: it is a black-box test fixture and it says so at the top, in the loudest
 available terms.
 
+## Bring your own crypto / FIPS
+
+Version 1.1 adds a per-server `CryptoProvider`. It supplies SHA-256, HMAC-SHA-256,
+secure randomness, constant-time equality, and JWS verifier/signing-key factories.
+A provider is passed once and never replaced by an implicit fallback. Existing
+`JwsSigner` implementations, including remote KMS/HSM keys, remain supported.
+
+```toml
+# Host-owned cryptography: no crypto implementation in oauth-as's dependency graph.
+oauth-as = { version = "1.1", default-features = false, features = ["http", "jwt", "consent", "resource-metadata"] }
+```
+
+```rust,ignore
+let server = AuthorizationServer::new_with_crypto(config, storage, host_crypto)?;
+```
+
+The new constructor returns `CryptoError` for unavailable or forbidden configured
+algorithms. `try_new` selects a compiled backend and returns `MissingProvider` when
+none is enabled. Provider-aware standalone APIs use `_with_crypto`, including
+PKCE, secret hashing/verification, DPoP, client assertions, and certificate/JWK
+thumbprints. These helpers never need global provider state.
+
+| Feature | Implementation |
+| --- | --- |
+| `rustcrypto` (default) | Existing SHA-256 and entropy implementations, standard `hmac`, and `subtle` equality. Asymmetric backends remain opt-in through `jwt-p256`, `jwt-rsa`, and `jwt-ed25519`. |
+| `aws-lc` | AWS-LC SHA-256, HMAC, entropy, equality, ES256, RS256, PS256, and Ed25519. |
+| `fips` | AWS-LC FIPS 3 module, with ES256 and RSA policy; Ed25519 is refused. |
+
+For FIPS use `default-features = false`, enable `fips` and the required protocol
+features, and pass `Arc::new(oauth_as::crypto::Fips)` to `new_with_crypto`.
+Load signing keys with that same provider's `signing_key` factory. The server checks
+FIPS initialization and algorithm policy before accepting configuration. Verification
+metadata contains only algorithms available from that provider and permitted by server
+policy. A compiled RustCrypto feature cannot silently fill a FIPS capability gap.
+When several backends are compiled, explicitly selecting a provider avoids ambiguity;
+legacy default construction continues to select RustCrypto for compatibility.
+
+`aws-lc-rs` is pinned to 1.17.4 to retain the AWS-LC FIPS 3 module. Enabling a Cargo
+feature alone does not certify a deployment: use the module's documented supported
+operating environment and security policy. FIPS builds require CMake, Go, a C/C++
+compiler, and on some targets bindgen. No unsafe code is added to oauth-as.
+
+All server entropy failures return `server_error`. Use `EcdsaP256Key::try_generate`
+for provisioning; the old `generate` is deprecated and retains its documented panic
+solely for source compatibility. Persistent record encodings and default wire behavior
+are unchanged. Consumers that disable defaults must supply a provider explicitly and
+use the provider-aware standalone helpers.
+
+CI checks the backend-free consumer graph with cargo-deny, runs known-answer and
+entropy-failure tests, and drives the HTTP and FAPI conformance fixtures per backend.
+These runs are conformance evidence; the existing OpenID certification remains scoped
+to version 1.0.0.
+
 ## Minimum supported Rust version
 
 The protocol core keeps Rust 1.75 support. Enabling the built-in ES256 backend now

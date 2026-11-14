@@ -12,6 +12,26 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+### Added
+
+- Per-server `CryptoProvider`, explicit fallible constructors, and provider-aware
+  hashing, PKCE, HMAC, thumbprint, client-assertion and DPoP APIs.
+- Optional AWS-LC and FIPS backends, algorithm refusal and matching discovery metadata.
+- A backend-free consumer graph gate, provider known-answer/entropy tests, and
+  backend-specific HTTP and FAPI conformance runs.
+
+### Changed
+
+- RustCrypto primitives are now a default feature. Disabling defaults removes all
+  cryptographic dependencies from the protocol core. Existing asymmetric features stay opt-in.
+- Handwritten HMAC and digest-based equality are replaced by provider operations.
+- `EcdsaP256Key::generate` is deprecated in favor of fallible `try_generate`; the legacy
+  method retains its documented panic. Server paths and RSA-PSS signing propagate entropy errors.
+- This is an additive 1.1 release for existing default callers. Explicit-provider consumers
+  use the new constructors and standalone helpers; serialized storage formats do not change.
+- The unpublished Postgres reference store depends directly on SQLx core/Postgres,
+  removing unused SQLite/MySQL packages and their advisory surface from the workspace lockfile.
+
 ## [1.0.1] - 2026-11-02
 
 ### Fixed
