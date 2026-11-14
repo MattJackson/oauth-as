@@ -49,6 +49,19 @@ these before correction. GitHub's pre-existing jsonwebtoken claim-type advisory
 to patched 10.3.0, using AWS-LC and omitting unused PEM support. The harness performs
 signature checks only; it is not a dependency of the published library.
 
+QA run 43572198514 also exposed Clippy's `needless_bool` in the existing
+`Confirmation::is_empty` implementation under DPoP-only features. Each supported
+field combination now returns its direct `is_none` expression; the existing
+feature-pair tests cover this behavior. This is a simplification without a policy
+change. The run passed size budgets, MSRVs, packaging, coverage and live checks
+before that narrow lint failure. Full FAPI run 43572198570 passed all three
+backends. Main provider run 43572204068 and CodeQL run 43572204020 passed.
+
+The pre-existing CodeQL cleartext-logging alerts identify synthetic test values
+and assertion output, not new production logging. Existing Scorecard policy and
+upstream RSA advisory notices are distinct from this changed-code audit; they
+have not been dismissed to claim a zero-alert repository.
+
 Status: no identified code finding remains without a correction. Provider contracts
 and HTTP conformance passed on all backends; backend-free compilation and rustdoc
 passed. Full FAPI run 43570734321 passed on RustCrypto, AWS-LC and FIPS. QA run
