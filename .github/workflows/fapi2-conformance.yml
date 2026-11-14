@@ -67,6 +67,10 @@ jobs:
         backend: [rustcrypto, aws-lc, fips]
     env:
       OAUTH_AS_CRYPTO: ${{ matrix.backend }}
+      # AWS-LC FIPS 3's delocator cannot consume newer GCC release assembly.
+      # Keep the validated module source intact; compile this fixture with Clang.
+      CC: clang
+      CXX: clang++
     runs-on: ubuntu-latest
     # Suite build (~8 min) + fixture build (~2 min) + the plan (capped at 25 min inside the
     # script). 40 minutes is comfortable headroom; anything past it is a hang, and the default

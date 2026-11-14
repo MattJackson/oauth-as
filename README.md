@@ -375,7 +375,12 @@ legacy default construction continues to select RustCrypto for compatibility.
 `aws-lc-rs` is pinned to 1.17.4 to retain the AWS-LC FIPS 3 module. Enabling a Cargo
 feature alone does not certify a deployment: use the module's documented supported
 operating environment and security policy. FIPS builds require CMake, Go, a C/C++
-compiler, and on some targets bindgen. No unsafe code is added to oauth-as.
+compiler, and on some targets bindgen. CI uses Clang for optimized FIPS builds;
+newer GCC releases can emit assembly the FIPS 3 delocator rejects. Follow the
+[module security policy](https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp5314.pdf)
+for deployment requirements. RSA keys are restricted to 2048, 3072 or 4096 bits.
+HMAC callers must supply suitable key material; the protocol's `client_secret_jwt`
+key type enforces at least 32 bytes. No unsafe code is added to oauth-as.
 
 All server entropy failures return `server_error`. Use `EcdsaP256Key::try_generate`
 for provisioning; the old `generate` is deprecated and retains its documented panic

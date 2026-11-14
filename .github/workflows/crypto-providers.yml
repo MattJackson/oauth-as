@@ -11,9 +11,15 @@ jobs:
       fail-fast: false
       matrix:
         backend: [rustcrypto, aws-lc, fips]
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Provider contract
         env:
           BACKEND: ${{ matrix.backend }}
@@ -23,9 +29,15 @@ jobs:
           cargo test -p oauth-as --no-default-features --features "$features" --test crypto_provider
           cargo clippy -p oauth-as --lib --no-default-features --features "$features" -- -D warnings
   consumer:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Consumer has no crypto implementation
         run: |
           cargo tree --manifest-path scripts/crypto-consumer/Cargo.toml -e normal --prefix none > "$RUNNER_TEMP/crypto-tree.txt"
@@ -34,6 +46,10 @@ jobs:
       - run: cargo test --manifest-path scripts/crypto-consumer/Cargo.toml
       - name: All protocol features remain backend-free
         run: cargo check --manifest-path scripts/crypto-consumer/Cargo.toml --features oauth-as/test-util,oauth-as/client-assertion,oauth-as/dpop,oauth-as/jar,oauth-as/mtls,oauth-as/par,oauth-as/rar,oauth-as/cimd,oauth-as/token-exchange
+      - name: Backend-free API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --manifest-path scripts/crypto-consumer/Cargo.toml -p oauth-as --no-deps --features oauth-as/test-util,oauth-as/client-assertion,oauth-as/dpop,oauth-as/jar,oauth-as/mtls,oauth-as/par
       - run: cargo install --locked cargo-deny@0.20.2
       - run: cargo deny --manifest-path scripts/crypto-consumer/Cargo.toml --config scripts/crypto-consumer/deny.toml check bans
 
@@ -42,9 +58,15 @@ jobs:
       fail-fast: false
       matrix:
         backend: [rustcrypto, aws-lc, fips]
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
       OAUTH_AS_CRYPTO: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: scripts/oauth-conformance.sh --check

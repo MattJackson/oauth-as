@@ -364,3 +364,66 @@ async fn ed25519_rfc8032_known_answer() {
     assert!(!verifier.verify(&key, b"changed", &expected));
     assert!(!verifier.verify(&key, b"", &[0; 64]));
 }
+
+#[cfg(feature = "jwt")]
+#[test]
+fn configured_signing_algorithm_must_be_supported_by_the_provider() {
+    use oauth_as::jwt::{
+        AccessTokenFormat, Jwk, JwsAlg, JwsSignature, JwsSigner, JwtConfig, SignerError,
+    };
+    struct Key;
+    impl JwsSigner for Key {
+        fn alg(&self) -> JwsAlg {
+            JwsAlg::Rs256
+        }
+        fn public_jwk(&self) -> Jwk {
+            Jwk::Rsa {
+                n: vectors::N_B64URL.into(),
+                e: vectors::E_B64URL.into(),
+                kid: Some("key".into()),
+            }
+        }
+        async fn sign(&self, _: &[u8]) -> Result<JwsSignature, SignerError> {
+            Err(SignerError::new("must never be called"))
+        }
+    }
+    let mut config = ServerConfig::new("https://as.example", "https://as.example/verify");
+    config.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(Key, "resource")));
+    assert!(matches!(
+        AuthorizationServer::new_with_crypto(config, MemoryStorage::default(), Arc::new(NoEntropy)),
+        Err(CryptoError::UnsupportedAlgorithm("RS256"))
+    ));
+}
+
+#[cfg(feature = "mtls")]
+#[test]
+fn certificate_helpers_use_the_selected_provider() {
+    use oauth_as::mtls::{CertificateThumbprint, RegisteredCertificates};
+    let p = selected();
+    let thumbprint = CertificateThumbprint::from_der_with_crypto(p.as_ref(), b"abc");
+    assert_eq!(thumbprint.as_bytes(), &p.sha256(b"abc"));
+    let expected = RegisteredCertificates::from_thumbprints(vec![thumbprint]).unwrap();
+    assert_eq!(
+        RegisteredCertificates::from_der_certificates_with_crypto(p.as_ref(), [b"abc".as_slice()])
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        RegisteredCertificates::from_jwks_with_crypto(p.as_ref(), r#"{"keys":[{"x5c":["YWJj"]}]}"#)
+            .unwrap(),
+        expected
+    );
+}
+
+#[cfg(feature = "jwt")]
+#[test]
+fn rfc7638_section_3_1_thumbprint() {
+    let key = oauth_as::jwt::Jwk::Rsa {
+        n: "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw".into(),
+        e: "AQAB".into(), kid: Some("2011-04-29".into()),
+    };
+    assert_eq!(
+        key.thumbprint_with_crypto(selected().as_ref()),
+        "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+    );
+}
