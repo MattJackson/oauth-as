@@ -32,7 +32,9 @@ RSA signing's documented upstream Marvin limitation is unchanged. FIPS complianc
 requires the module's supported deployment configuration; conformance runs do not
 extend the existing 1.0.0 OpenID certification to a new version.
 
-Further QA findings: the package manifest needed C-locale sorting; backend-free
+Further QA findings: the MCP scanner fixture needed `jwt-pkcs8` for the new provider
+key factory (reproduced as UnsupportedAlgorithm in job 132375619924); both scanner
+build commands now enable it. The package manifest needed C-locale sorting; backend-free
 rustdoc links needed provider-aware targets; clippy required moving the RSA salt
 adapter before the existing test module. The failing QA/publish logs reproduced
 these before correction. GitHub's pre-existing jsonwebtoken claim-type advisory
