@@ -26,16 +26,15 @@ impl CryptoProvider for RustCrypto {
     }
     #[cfg(feature = "jwt")]
     fn verifier(&self, alg: crate::jwt::JwsAlg) -> Option<&dyn crate::jwt::JwsVerifier> {
-        use crate::jwt::JwsAlg;
         match alg {
             #[cfg(feature = "jwt-p256")]
-            JwsAlg::Es256 => Some(&crate::jwt::P256Verifier),
+            crate::jwt::JwsAlg::Es256 => Some(&crate::jwt::P256Verifier),
             #[cfg(feature = "jwt-rsa")]
-            JwsAlg::Rs256 => Some(&crate::backends::rsa::RsaVerifier),
+            crate::jwt::JwsAlg::Rs256 => Some(&crate::backends::rsa::RsaVerifier),
             #[cfg(feature = "jwt-rsa")]
-            JwsAlg::Ps256 => Some(&crate::backends::rsa::Ps256Verifier),
+            crate::jwt::JwsAlg::Ps256 => Some(&crate::backends::rsa::Ps256Verifier),
             #[cfg(feature = "jwt-ed25519")]
-            JwsAlg::EdDsa => Some(&crate::backends::ed25519::Ed25519Verifier),
+            crate::jwt::JwsAlg::EdDsa => Some(&crate::backends::ed25519::Ed25519Verifier),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -47,25 +46,28 @@ impl CryptoProvider for RustCrypto {
         kid: &str,
         der: &[u8],
     ) -> Result<super::ProviderSigner, CryptoError> {
-        use crate::jwt::JwsAlg;
         let _ = (kid, der);
         match alg {
             #[cfg(feature = "jwt-pkcs8")]
-            JwsAlg::Es256 => crate::jwt::EcdsaP256Key::from_pkcs8_der(kid, der)
+            crate::jwt::JwsAlg::Es256 => crate::jwt::EcdsaP256Key::from_pkcs8_der(kid, der)
                 .map(super::ProviderSigner::from_signer)
                 .map_err(|_| CryptoError::InvalidKey),
             #[cfg(feature = "jwt-rsa")]
-            JwsAlg::Rs256 => crate::backends::rsa::RsaSigner::from_pkcs8_der(kid, der)
+            crate::jwt::JwsAlg::Rs256 => crate::backends::rsa::RsaSigner::from_pkcs8_der(kid, der)
                 .map(super::ProviderSigner::from_signer)
                 .map_err(|_| CryptoError::InvalidKey),
             #[cfg(feature = "jwt-rsa")]
-            JwsAlg::Ps256 => crate::backends::rsa::Ps256Signer::from_pkcs8_der(kid, der)
-                .map(super::ProviderSigner::from_signer)
-                .map_err(|_| CryptoError::InvalidKey),
+            crate::jwt::JwsAlg::Ps256 => {
+                crate::backends::rsa::Ps256Signer::from_pkcs8_der(kid, der)
+                    .map(super::ProviderSigner::from_signer)
+                    .map_err(|_| CryptoError::InvalidKey)
+            }
             #[cfg(feature = "jwt-ed25519-pkcs8")]
-            JwsAlg::EdDsa => crate::backends::ed25519::Ed25519Signer::from_pkcs8_der(kid, der)
-                .map(super::ProviderSigner::from_signer)
-                .map_err(|_| CryptoError::InvalidKey),
+            crate::jwt::JwsAlg::EdDsa => {
+                crate::backends::ed25519::Ed25519Signer::from_pkcs8_der(kid, der)
+                    .map(super::ProviderSigner::from_signer)
+                    .map_err(|_| CryptoError::InvalidKey)
+            }
             #[allow(unreachable_patterns)]
             _ => Err(CryptoError::UnsupportedAlgorithm(alg.jose_name())),
         }

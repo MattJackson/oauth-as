@@ -97,8 +97,11 @@ fn the_builtin_hash_scheme_is_lower_case_hex_sha256() {
 #[test]
 fn verify_builtin_refuses_a_scheme_it_does_not_implement() {
     let hash = SecretHash::custom("argon2id", "$argon2id$v=19$m=65536$c2FsdA$aGFzaA");
-    assert!(!hash.verify_builtin("$argon2id$v=19$m=65536$c2FsdA$aGFzaA"));
-    assert!(!hash.verify_builtin("anything"));
+    assert!(!hash.verify_builtin(
+        &crate::crypto::builtin(),
+        "$argon2id$v=19$m=65536$c2FsdA$aGFzaA"
+    ));
+    assert!(!hash.verify_builtin(&crate::crypto::builtin(), "anything"));
 }
 
 /// The hashed path answers EXACTLY what `==` on the two digests would answer, at equal and
@@ -123,36 +126,51 @@ fn the_hashed_path_answers_exactly_what_comparing_the_digests_would() {
     const SECRET: &str = "a-high-entropy-registered-client-secret";
     let hash = SecretHash::sha256(SECRET);
 
-    assert!(hash.verify_builtin(SECRET), "the registered secret");
+    assert!(
+        hash.verify_builtin(&crate::crypto::builtin(), SECRET),
+        "the registered secret"
+    );
 
     // Equal length, one byte different: the case a comparison that stopped at the first difference
     // would answer correctly and leak how far it got.
     let mut near = SECRET.to_string();
     near.replace_range(0..1, "b");
     assert_ne!(near, SECRET, "the fixture must actually differ");
-    assert!(!hash.verify_builtin(&near), "differs at the first byte");
+    assert!(
+        !hash.verify_builtin(&crate::crypto::builtin(), &near),
+        "differs at the first byte"
+    );
     let mut near_end = SECRET.to_string();
     near_end.replace_range(SECRET.len() - 1..SECRET.len(), "X");
-    assert!(!hash.verify_builtin(&near_end), "differs at the last byte");
+    assert!(
+        !hash.verify_builtin(&crate::crypto::builtin(), &near_end),
+        "differs at the last byte"
+    );
 
     // Different lengths, in both directions, including a presented secret that has the whole
     // registered one as a prefix. C9 was a length-handling defect, so length is asserted rather
     // than assumed.
-    assert!(!hash.verify_builtin(""), "the empty secret");
     assert!(
-        !hash.verify_builtin(&SECRET[..SECRET.len() - 1]),
+        !hash.verify_builtin(&crate::crypto::builtin(), ""),
+        "the empty secret"
+    );
+    assert!(
+        !hash.verify_builtin(&crate::crypto::builtin(), &SECRET[..SECRET.len() - 1]),
         "a prefix"
     );
     assert!(
-        !hash.verify_builtin(&format!("{SECRET}x")),
+        !hash.verify_builtin(&crate::crypto::builtin(), &format!("{SECRET}x")),
         "an extension of the registered secret"
     );
     assert!(
-        !hash.verify_builtin(&format!("{SECRET}{}", "\0".repeat(65536))),
+        !hash.verify_builtin(
+            &crate::crypto::builtin(),
+            &format!("{SECRET}{}", "\0".repeat(65536))
+        ),
         "the C9 padding: a length difference that only shows in bits above 15"
     );
     assert!(
-        SecretHash::sha256("").verify_builtin(""),
+        SecretHash::sha256("").verify_builtin(&crate::crypto::builtin(), ""),
         "an empty registered secret still verifies against itself"
     );
 
@@ -162,7 +180,7 @@ fn the_hashed_path_answers_exactly_what_comparing_the_digests_would() {
     let full = SecretHash::sha256(SECRET).encoded().to_string();
     let truncated = SecretHash::custom(SecretHash::SHA256_HEX, &full[..full.len() - 1]);
     assert!(
-        !truncated.verify_builtin(SECRET),
+        !truncated.verify_builtin(&crate::crypto::builtin(), SECRET),
         "a truncated stored digest must not match the secret it is a prefix of"
     );
 
@@ -182,7 +200,7 @@ fn the_hashed_path_answers_exactly_what_comparing_the_digests_would() {
         );
         for presented in ["", "a", "A", "hunter2", "hunter20", SECRET, "\u{0}"] {
             assert_eq!(
-                hash.verify_builtin(presented),
+                hash.verify_builtin(&crate::crypto::builtin(), presented),
                 reference_hex(&Sha256::digest(presented.as_bytes())) == *hash.encoded(),
                 "verify_builtin({presented:?}) against a hash of {registered:?}"
             );

@@ -66,6 +66,10 @@
 //! * `OAUTH_AS_RESOURCE` (default `{issuer}/resource`): the `resource.resourceUrl` the suite calls
 //!   with a DPoP-bound token. It is a route on THIS listener, so its DPoP `htu` is this URL.
 
+#[path = "support/crypto.rs"]
+mod fixture_crypto;
+use oauth_as::crypto::CryptoProvider;
+use oauth_as::jwt::JwsSigner;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -81,17 +85,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use oauth_as::client::{Client, ClientAuth, ClientId};
 use oauth_as::client_assertion::AssertionKeys;
-use oauth_as::dpop::{self, verify_proof};
+use oauth_as::dpop::{self, verify_proof_with_crypto};
 use oauth_as::grant::GrantType;
 use oauth_as::http::{ApprovalDecision, ServiceBuilder};
-use oauth_as::jwt::{
-    AccessTokenFormat, CompactJws, EcdsaP256Key, Jwk, JwsAlg, JwsVerifiers, JwtConfig, P256Verifier,
-};
+use oauth_as::jwt::{AccessTokenFormat, CompactJws, Jwk, JwsAlg, JwtConfig};
 use oauth_as::par::ParConfig;
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AssertionAudience, AuthorizationServer, RefreshRotation, ServerConfig};
 use oauth_as::store::MemoryStorage;
-use sha2::{Digest, Sha256};
 
 // #############################################################################
 // # CONFORMANCE FIXTURE ONLY. NEVER COPY ANY OF THIS INTO A PRODUCTION HOST.   #
@@ -155,6 +156,7 @@ const REQUEST_URI_TTL_SECS: u64 = 90;
 
 /// State the protected resource needs to verify a DPoP-bound token.
 struct ResourceState {
+    crypto: Arc<dyn CryptoProvider>,
     /// The PUBLIC half of the AS signing key: what verifies the `at+jwt` signature.
     as_public_jwk: Jwk,
     /// The RFC 8414 `issuer`, checked against the token's `iss`.
@@ -258,14 +260,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resource can verify them offline against the advertised JWKS. `with_jwks_uri` is what makes
     // the metadata advertise `jwks_uri`, served by this router at `/jwks`. The token `aud` is the
     // resource URL, which the resource checks.
-    let as_key = EcdsaP256Key::from_scalar_bytes(AS_SIGNING_KID, &AS_SIGNING_SCALAR)?;
+    let crypto = fixture_crypto::provider()?;
+    let as_key = fixture_crypto::scalar_key(crypto.as_ref(), AS_SIGNING_KID, &AS_SIGNING_SCALAR)?;
     let as_public_jwk = as_key.public_jwk();
     let jwks_uri = format!("{issuer}/jwks");
     config.access_token_format = AccessTokenFormat::Jwt(Box::new(
         JwtConfig::new(as_key, resource_url.clone()).with_jwks_uri(jwks_uri),
     ));
 
-    let server = Arc::new(AuthorizationServer::new(config, MemoryStorage::new()));
+    let server = Arc::new(AuthorizationServer::new_with_crypto(
+        config,
+        MemoryStorage::new(),
+        crypto.clone(),
+    )?);
 
     // (§2.3 item 3) the two static `private_key_jwt` clients, each with its own public key.
     // FAPI 2.0 mandates EXACT redirect-URI matching, and the suite tests that on a URI that carries
@@ -320,6 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The library hands back a framework-free service; the adapter puts it on axum. The protected
     // resource is one more route on the SAME origin, so its DPoP `htu` is under the issuer.
     let rs_state = Arc::new(ResourceState {
+        crypto,
         as_public_jwk,
         issuer: issuer.clone(),
         resource_url: resource_url.clone(),
@@ -383,7 +391,14 @@ fn client2_keys() -> AssertionKeys {
 /// Build a `private_key_jwt` registration from a private scalar: derive the PUBLIC JWK and register
 /// only that. The scalar itself never leaves this process; the suite holds its own copy.
 fn assertion_keys_for(kid: &str, scalar: &[u8; 32]) -> AssertionKeys {
-    let key = EcdsaP256Key::from_scalar_bytes(kid, scalar).expect("fixed 32-byte scalar is valid");
+    let key = fixture_crypto::scalar_key(
+        fixture_crypto::provider()
+            .expect("fixture backend")
+            .as_ref(),
+        kid,
+        scalar,
+    )
+    .expect("fixed fixture key");
     AssertionKeys::PublicKeys {
         alg: JwsAlg::Es256,
         keys: vec![key.public_jwk()],
@@ -489,11 +504,16 @@ fn verify_dpop_bound(state: &ResourceState, headers: &HeaderMap) -> Result<Strin
 
     // (3) the token is a valid RFC 9068 at+jwt.
     let jws = CompactJws::parse(token).map_err(|_| "access token is not a compact JWS")?;
-    if !oauth_as::jwt::verify_es256(
-        &state.as_public_jwk,
-        jws.signing_input.as_bytes(),
-        &jws.signature,
-    ) {
+    if !state
+        .crypto
+        .verifier(JwsAlg::Es256)
+        .ok_or("ES256 unavailable")?
+        .verify(
+            &state.as_public_jwk,
+            jws.signing_input.as_bytes(),
+            &jws.signature,
+        )
+    {
         return Err("access token signature does not verify");
     }
     let now = std::time::SystemTime::now();
@@ -522,10 +542,16 @@ fn verify_dpop_bound(state: &ResourceState, headers: &HeaderMap) -> Result<Strin
     // (4) the proof verifies for GET on this resource, within its iat window. Phase A's DPoP seam
     // takes the installed verifier SET (the header carries the proof key, so the algorithm is read
     // off the header against the installed verifiers); this fixture installs the built-in ES256 one.
-    let mut verifiers = JwsVerifiers::new();
-    verifiers.install(Arc::new(P256Verifier));
-    let verified = verify_proof(&verifiers, proof, "GET", &state.resource_url, now)
-        .map_err(|_| "DPoP proof did not verify for this request")?;
+    let verifiers = oauth_as::crypto::verifiers(state.crypto.clone());
+    let verified = verify_proof_with_crypto(
+        state.crypto.as_ref(),
+        &verifiers,
+        proof,
+        "GET",
+        &state.resource_url,
+        now,
+    )
+    .map_err(|_| "DPoP proof did not verify for this request")?;
 
     // (5, second half) the proof key IS the key the token is bound to.
     if verified.jkt != token_jkt {
@@ -535,7 +561,7 @@ fn verify_dpop_bound(state: &ResourceState, headers: &HeaderMap) -> Result<Strin
     // (6) ath binds the proof to THIS token. verify_proof cannot check it (no token in a proof), so
     // the resource does.
     let proof_jws = CompactJws::parse(proof).map_err(|_| "DPoP proof is not a compact JWS")?;
-    let expected_ath = URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()));
+    let expected_ath = URL_SAFE_NO_PAD.encode(state.crypto.sha256(token.as_bytes()));
     match proof_jws.claim_str("ath") {
         Some(ath) if ath == expected_ath => {}
         _ => return Err("DPoP proof ath does not match the presented token (RFC 9449 s4.3(11))"),

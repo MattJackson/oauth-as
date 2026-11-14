@@ -35,7 +35,7 @@ pub fn plane() -> u64 {
     let jwk = {
         use oauth_as::jwt::EcdsaP256Key;
 
-        let key = EcdsaP256Key::generate("probe-es256-2");
+        let key = EcdsaP256Key::try_generate("probe-es256-2").expect("test key entropy");
         acc = acc.wrapping_add(key.kid().len() as u64);
 
         // PKCS#8 export and re-import. This is the ONLY thing p256's `pkcs8` sub-feature buys, and

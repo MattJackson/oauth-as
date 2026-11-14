@@ -185,12 +185,12 @@ pub(crate) fn builtin() -> RustCrypto {
     RustCrypto
 }
 
-#[cfg(feature = "dpop")]
+#[cfg(feature = "jwt")]
 pub(crate) struct ProviderVerifier {
     pub(crate) provider: Arc<dyn CryptoProvider>,
     pub(crate) alg: crate::jwt::JwsAlg,
 }
-#[cfg(feature = "dpop")]
+#[cfg(feature = "jwt")]
 impl crate::jwt::JwsVerifier for ProviderVerifier {
     fn alg(&self) -> crate::jwt::JwsAlg {
         self.alg
@@ -200,4 +200,19 @@ impl crate::jwt::JwsVerifier for ProviderVerifier {
             .verifier(self.alg)
             .is_some_and(|v| v.verify(key, message, signature))
     }
+}
+
+/// Build verifier slots from exactly one provider, with no fallback implementations.
+#[cfg(feature = "jwt")]
+pub fn verifiers(provider: Arc<dyn CryptoProvider>) -> crate::jwt::JwsVerifiers {
+    let mut out = crate::jwt::JwsVerifiers::new();
+    for &alg in crate::jwt::JwsAlg::ALL {
+        if provider.verifier(alg).is_some() {
+            out.install(Arc::new(ProviderVerifier {
+                provider: provider.clone(),
+                alg,
+            }));
+        }
+    }
+    out
 }

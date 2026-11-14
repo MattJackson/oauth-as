@@ -1977,7 +1977,7 @@ pub(crate) struct RefreshChain {
 /// The authorization server. Generic over the host's [`Storage`] and (for tests) the [`Clock`].
 pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
     crypto: std::sync::Arc<dyn CryptoProvider>,
-    #[cfg(feature = "jwt")]
+    #[cfg(any(feature = "dpop", feature = "jar", feature = "client-assertion"))]
     legacy_verifiers: bool,
     config: ServerConfig,
     store: S,
@@ -2083,7 +2083,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         };
         AuthorizationServer {
             crypto,
-            #[cfg(feature = "jwt")]
+            #[cfg(any(feature = "dpop", feature = "jar", feature = "client-assertion"))]
             legacy_verifiers: _legacy_verifiers,
             config,
             store,

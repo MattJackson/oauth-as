@@ -7,10 +7,21 @@ permissions:
   contents: read
 jobs:
   provider-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [rustcrypto, aws-lc, fips]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: cargo test -p oauth-as --features jwt-p256 --test crypto_provider
+      - name: Provider contract
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          features="$BACKEND,http,jwt,client-assertion,dpop,par,jar,mtls,consent,test-util"
+          if [ "$BACKEND" = rustcrypto ]; then features="$features,jwt-pkcs8,jwt-rsa,jwt-ed25519-pkcs8"; fi
+          cargo test -p oauth-as --no-default-features --features "$features" --test crypto_provider
+          cargo clippy -p oauth-as --lib --no-default-features --features "$features" -- -D warnings
   consumer:
     runs-on: ubuntu-latest
     steps:
@@ -23,3 +34,15 @@ jobs:
       - run: cargo check --manifest-path scripts/crypto-consumer/Cargo.toml
       - run: cargo install --locked cargo-deny@0.20.2
       - run: cargo deny --manifest-path scripts/crypto-consumer/Cargo.toml check --config scripts/crypto-consumer/deny.toml bans
+
+  wire-conformance:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [rustcrypto, aws-lc, fips]
+    runs-on: ubuntu-latest
+    env:
+      OAUTH_AS_CRYPTO: ${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: scripts/oauth-conformance.sh --check

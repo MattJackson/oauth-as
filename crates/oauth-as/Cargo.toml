@@ -459,7 +459,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # requirement exists to prevent.
 [[example]]
 name = "conformance_server"
-required-features = ["axum", "jwt-p256", "client-assertion", "jwt-rsa", "jwt-ed25519"]
+required-features = ["axum", "jwt", "client-assertion"]
 
 # The WORKED PRODUCTION WIRING: what a real host must do at every seam this crate deliberately
 # leaves open (storage atomicity, rate limiting, consent, CSRF, session-backed subject
@@ -494,7 +494,7 @@ required-features = ["axum", "resource-metadata"]
 # and `client-assertion` is the `private_key_jwt` the two static clients authenticate with.
 [[example]]
 name = "fapi2_conformance_server"
-required-features = ["axum", "jwt-p256", "dpop", "par", "client-assertion"]
+required-features = ["axum", "jwt", "dpop", "par", "client-assertion"]
 
 # BENCHMARKS. `cargo bench -p oauth-as --all-features`; see benches/README.md for the machine, the
 # profile, and what these numbers do NOT mean.

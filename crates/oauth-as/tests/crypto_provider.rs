@@ -8,13 +8,13 @@ use std::sync::Arc;
 struct NoEntropy;
 impl CryptoProvider for NoEntropy {
     fn sha256(&self, input: &[u8]) -> [u8; 32] {
-        oauth_as::crypto::RustCrypto.sha256(input)
+        selected().sha256(input)
     }
     fn hmac_sha256(&self, key: &[u8], msg: &[u8]) -> [u8; 32] {
-        oauth_as::crypto::RustCrypto.hmac_sha256(key, msg)
+        selected().hmac_sha256(key, msg)
     }
     fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool {
-        oauth_as::crypto::RustCrypto.ct_eq(a, b)
+        selected().ct_eq(a, b)
     }
     fn fill_random(&self, _: &mut [u8]) -> Result<(), CryptoError> {
         Err(CryptoError::EntropyUnavailable)
@@ -49,7 +49,7 @@ async fn unavailable_entropy_returns_server_error_without_issuing_artifacts() {
 
 #[test]
 fn primitive_known_answers() {
-    let p = oauth_as::crypto::RustCrypto;
+    let p = selected();
     assert_eq!(
         oauth_as::pkce::code_challenge_s256_with_crypto(
             &p,
@@ -74,4 +74,36 @@ fn primitive_known_answers() {
 #[test]
 fn key_generation_propagates_entropy_failure() {
     assert!(oauth_as::EcdsaP256Key::try_generate_with_crypto("key", &NoEntropy).is_err());
+}
+
+fn selected() -> Arc<dyn CryptoProvider> {
+    oauth_as::crypto::default_provider().unwrap()
+}
+
+#[cfg(all(feature = "fips", feature = "jwt"))]
+#[test]
+fn fips_refuses_ed25519_and_does_not_advertise_it() {
+    use oauth_as::jwt::JwsAlg;
+    let p = oauth_as::crypto::Fips;
+    assert!(p.verifier(JwsAlg::EdDsa).is_none());
+    assert!(matches!(
+        p.signing_key(JwsAlg::EdDsa, "k", &[]),
+        Err(CryptoError::UnsupportedAlgorithm("EdDSA"))
+    ));
+    let server = AuthorizationServer::new_with_crypto(
+        ServerConfig::new("https://as.example", "https://as.example/verify"),
+        MemoryStorage::default(),
+        Arc::new(p),
+    )
+    .unwrap();
+    let metadata = serde_json::to_value(server.metadata()).unwrap();
+    for key in [
+        "token_endpoint_auth_signing_alg_values_supported",
+        "request_object_signing_alg_values_supported",
+        "dpop_signing_alg_values_supported",
+    ] {
+        if let Some(values) = metadata[key].as_array() {
+            assert!(!values.iter().any(|v| v.as_str() == Some("EdDSA")));
+        }
+    }
 }
