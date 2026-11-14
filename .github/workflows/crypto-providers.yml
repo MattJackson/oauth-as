@@ -1,0 +1,25 @@
+name: crypto providers
+on:
+  push:
+    branches: [dev, qa, main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  provider-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: cargo test -p oauth-as --features jwt-p256 --test crypto_provider
+  consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Consumer has no crypto implementation
+        run: |
+          cargo tree --manifest-path scripts/crypto-consumer/Cargo.toml -e normal --prefix none > "$RUNNER_TEMP/crypto-tree.txt"
+          cat "$RUNNER_TEMP/crypto-tree.txt"
+          if grep -E '^(sha2|getrandom|hmac|p256|ed25519-dalek|rsa|ring|aws-lc-[^ ]+) v' "$RUNNER_TEMP/crypto-tree.txt"; then exit 1; fi
+      - run: cargo check --manifest-path scripts/crypto-consumer/Cargo.toml
+      - run: cargo install --locked cargo-deny@0.20.2
+      - run: cargo deny --manifest-path scripts/crypto-consumer/Cargo.toml check --config scripts/crypto-consumer/deny.toml bans
