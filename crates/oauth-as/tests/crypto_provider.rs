@@ -294,3 +294,72 @@ fn explicit_provider_never_installs_builtin_verifiers() {
         }
     }
 }
+
+#[tokio::test]
+async fn token_issuance_propagates_entropy_failure() {
+    use oauth_as::{Client, ClientAuth, ClientId, GrantType, ScopeSet, TokenRequest};
+    let server = AuthorizationServer::new_with_crypto(
+        ServerConfig::new("https://as.example", "https://as.example/verify"),
+        MemoryStorage::default(),
+        Arc::new(NoEntropy),
+    )
+    .unwrap();
+    server
+        .register_client(Client {
+            client_id: ClientId::new("service"),
+            auth: ClientAuth::ConfidentialSecret {
+                secret: "secret".into(),
+            },
+            grant_types: vec![GrantType::ClientCredentials],
+            redirect_uris: vec![],
+            allowed_scopes: ScopeSet::default(),
+            default_scopes: ScopeSet::default(),
+            name: None,
+            registration: None,
+        })
+        .await
+        .unwrap();
+    let result = server
+        .token(TokenRequest::ClientCredentials {
+            client_id: ClientId::new("service"),
+            client_secret: Some("secret".into()),
+            scope: None,
+        })
+        .await;
+    assert_eq!(result.unwrap_err().error, oauth_as::ErrorCode::ServerError);
+}
+
+#[cfg(feature = "jwt")]
+#[tokio::test]
+async fn ed25519_rfc8032_known_answer() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+    use oauth_as::jwt::{Jwk, JwsAlg, JwsSigner};
+    let p = selected();
+    let Some(verifier) = p.verifier(JwsAlg::EdDsa) else {
+        return;
+    };
+    let hex = |s: &str| -> Vec<u8> {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+            .collect()
+    };
+    // RFC 8032 section 7.1 test 1. RFC 8410 PKCS#8 wrapping of the published seed.
+    let mut der = hex("302e020100300506032b657004220420");
+    der.extend(hex(
+        "9d61b19deffd5a60ba844af492ec2cc444449c5697b326919703bac031cae7f60",
+    ));
+    let public = hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    let expected = hex(concat!(
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155",
+        "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+    ));
+    let key =
+        Jwk::from_json(&serde_json::json!({"kty":"OKP", "crv":"Ed25519", "x":B64.encode(public)}))
+            .unwrap();
+    let signer = p.signing_key(JwsAlg::EdDsa, "rfc", &der).unwrap();
+    assert_eq!(signer.sign(b"").await.unwrap().as_bytes(), expected);
+    assert!(verifier.verify(&key, b"", &expected));
+    assert!(!verifier.verify(&key, b"changed", &expected));
+    assert!(!verifier.verify(&key, b"", &[0; 64]));
+}
