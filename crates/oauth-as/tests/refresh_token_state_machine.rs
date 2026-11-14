@@ -386,9 +386,9 @@ struct Keys {
 impl Keys {
     fn fresh() -> Self {
         Keys {
-            original: EcdsaP256Key::generate("original"),
-            rekeyed: EcdsaP256Key::generate("rekeyed"),
-            thief: EcdsaP256Key::generate("thief"),
+            original: EcdsaP256Key::try_generate("original").expect("test key entropy"),
+            rekeyed: EcdsaP256Key::try_generate("rekeyed").expect("test key entropy"),
+            thief: EcdsaP256Key::try_generate("thief").expect("test key entropy"),
         }
     }
     fn real(&self, k: Option<Key>) -> Option<&EcdsaP256Key> {

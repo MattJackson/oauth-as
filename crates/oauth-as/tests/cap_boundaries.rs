@@ -119,7 +119,8 @@ fn a_proof_of_exactly_the_cap_is_accepted() {
     let b64_len = |n: usize| n.div_ceil(3) * 4 - (3 - n % 3) % 3;
     let mut found = None;
     for kid_pad in 0..4 {
-        let key = EcdsaP256Key::generate(format!("boundary{}", "y".repeat(kid_pad)));
+        let key = EcdsaP256Key::try_generate(format!("boundary{}", "y".repeat(kid_pad)))
+            .expect("test key entropy");
         let header = serde_json::to_vec(&serde_json::json!({
             "typ": "dpop+jwt",
             "alg": "ES256",

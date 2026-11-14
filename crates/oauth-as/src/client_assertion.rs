@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::jwt::{verify_hs256, CompactJws, Jwk, JwsAlg, JwsVerifier};
+use crate::jwt::{verify_hs256_with_crypto, CompactJws, Jwk, JwsAlg, JwsVerifier};
 
 /// RFC 7521 section 4.2: the `client_assertion_type` a JWT bearer assertion must carry.
 pub const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -422,7 +422,29 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 /// obtain is a type that should not have been exported. It is also the other half of
 /// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
 /// while hiding the verification it exists to feed left the safe path out of reach.
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
 pub fn verify_assertion(
+    verifier: Option<&dyn JwsVerifier>,
+    keys: &AssertionKeys,
+    assertion: &str,
+    client_id: &str,
+    audience: AudienceRule<'_>,
+    now: SystemTime,
+) -> Result<VerifiedAssertion, AssertionFailure> {
+    verify_assertion_with_crypto(
+        &crate::crypto::builtin(),
+        verifier,
+        keys,
+        assertion,
+        client_id,
+        audience,
+        now,
+    )
+}
+
+/// Perform this operation with the explicitly selected crypto provider.
+pub fn verify_assertion_with_crypto(
+    crypto: &dyn crate::crypto::CryptoProvider,
     verifier: Option<&dyn JwsVerifier>,
     keys: &AssertionKeys,
     assertion: &str,
@@ -462,7 +484,8 @@ pub fn verify_assertion(
     let signed = match keys {
         // The entropy floor is enforced at registration and again on the way out of the host's
         // store, so nothing here has to re-check it; see `ClientSecretKey`.
-        AssertionKeys::ClientSecret { secret } => verify_hs256(
+        AssertionKeys::ClientSecret { secret } => verify_hs256_with_crypto(
+            crypto,
             secret.as_bytes(),
             jws.signing_input.as_bytes(),
             &jws.signature,

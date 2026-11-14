@@ -133,8 +133,8 @@ fn redeem(code: &str) -> TokenRequest {
 
 #[tokio::test]
 async fn a_code_bound_by_a_par_proof_is_redeemable_only_by_proving_that_key() {
-    let bound_key = EcdsaP256Key::generate("bound");
-    let other_key = EcdsaP256Key::generate("other");
+    let bound_key = EcdsaP256Key::try_generate("bound").expect("test key entropy");
+    let other_key = EcdsaP256Key::try_generate("other").expect("test key entropy");
     let srv = server();
     srv.register_client(client()).await.unwrap();
 
@@ -184,8 +184,8 @@ async fn a_code_bound_by_a_par_proof_is_redeemable_only_by_proving_that_key() {
 async fn a_par_push_refuses_a_dpop_jkt_parameter_that_disagrees_with_the_proof() {
     // RFC 9449 s10.1: if the pushed request carries BOTH a `dpop_jkt` parameter and a DPoP proof,
     // the parameter must equal the proof's key thumbprint.
-    let proof_key = EcdsaP256Key::generate("proof");
-    let declared_key = EcdsaP256Key::generate("declared");
+    let proof_key = EcdsaP256Key::try_generate("proof").expect("test key entropy");
+    let declared_key = EcdsaP256Key::try_generate("declared").expect("test key entropy");
     let srv = server();
     srv.register_client(client()).await.unwrap();
 
@@ -225,8 +225,8 @@ async fn a_dpop_jkt_parameter_on_a_plain_authorize_request_binds_the_code() {
     // authorization request, not only through a PAR push. This exercises
     // validate_authorization_request -> issue_authorization_code -> redemption for that route so a
     // regression that threaded `dpop_jkt` only through the PAR struct would be caught.
-    let bound_key = EcdsaP256Key::generate("bound");
-    let other_key = EcdsaP256Key::generate("other");
+    let bound_key = EcdsaP256Key::try_generate("bound").expect("test key entropy");
+    let other_key = EcdsaP256Key::try_generate("other").expect("test key entropy");
     let srv = server();
     srv.register_client(client()).await.unwrap();
 
@@ -293,8 +293,8 @@ async fn a_par_dpop_jkt_parameter_without_a_proof_binds_the_code() {
     // parameter alone must bind the code, so `bind_par_dpop`'s no-proof early return must leave the
     // declared binding intact through to redemption. The other PAR tests always send a proof, so
     // this guards the parameter-only branch end to end.
-    let bound_key = EcdsaP256Key::generate("bound");
-    let other_key = EcdsaP256Key::generate("other");
+    let bound_key = EcdsaP256Key::try_generate("bound").expect("test key entropy");
+    let other_key = EcdsaP256Key::try_generate("other").expect("test key entropy");
     let srv = server();
     srv.register_client(client()).await.unwrap();
 

@@ -164,7 +164,7 @@ async fn an_installed_verifier_that_refuses_beats_the_built_in_backend() {
         .with_jws_verifier(verifier.clone() as Arc<dyn JwsVerifier>);
     srv.register_client(confidential_client()).await.unwrap();
 
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let refused = srv
         .token_with_context(request(), with_proof(&proof(&key, "seam-1", true)))
         .await
@@ -189,7 +189,7 @@ async fn an_installed_verifier_that_accepts_beats_the_built_in_backend() {
         .with_jws_verifier(verifier.clone() as Arc<dyn JwsVerifier>);
     srv.register_client(confidential_client()).await.unwrap();
 
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     srv.token_with_context(request(), with_proof(&proof(&key, "seam-2", false)))
         .await
         .expect("the installed verifier said yes, so this unsigned proof is accepted");
@@ -209,7 +209,7 @@ async fn with_no_verifier_installed_the_built_in_backend_refuses_an_unsigned_pro
     let srv = AuthorizationServer::new(config(), MemoryStorage::new());
     srv.register_client(confidential_client()).await.unwrap();
 
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let refused = srv
         .token_with_context(request(), with_proof(&proof(&key, "seam-3", false)))
         .await

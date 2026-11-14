@@ -75,7 +75,7 @@ fn device_client() -> Client {
 }
 
 fn signing_key() -> EcdsaP256Key {
-    EcdsaP256Key::generate("test-kid-1")
+    EcdsaP256Key::try_generate("test-kid-1").expect("test key entropy")
 }
 
 fn jwt_config(key: EcdsaP256Key) -> JwtConfig {
@@ -302,7 +302,8 @@ fn our_jwks_coordinate_encoding_matches_the_rfc7515_appendix_a3_form() {
 
 #[test]
 fn jwks_is_rfc7517_shaped() {
-    let jwks = jwt_config(EcdsaP256Key::generate("rotate-me")).jwks();
+    let jwks =
+        jwt_config(EcdsaP256Key::try_generate("rotate-me").expect("test key entropy")).jwks();
     let doc = serde_json::to_value(&jwks).unwrap();
     let keys = doc["keys"].as_array().expect("keys array (RFC 7517 s5)");
     assert_eq!(keys.len(), 1);
@@ -458,7 +459,7 @@ async fn issued_token_verifies_against_the_advertised_jwks_and_tampering_fails()
     // a hint for key selection and never a substitute for checking the signature.
     let other = jwt_server(
         ManualClock::at_epoch(),
-        EcdsaP256Key::generate("test-kid-1"),
+        EcdsaP256Key::try_generate("test-kid-1").expect("test key entropy"),
     )
     .await;
     let foreign = issue_via_device_flow(&other).await;
@@ -586,7 +587,10 @@ mod empty_audience {
     use oauth_as::jwt::{AccessTokenClaims, Audience, EcdsaP256Key, JwtConfig};
 
     fn config() -> JwtConfig {
-        JwtConfig::new(EcdsaP256Key::generate("k1"), "https://rs.example")
+        JwtConfig::new(
+            EcdsaP256Key::try_generate("k1").expect("test key entropy"),
+            "https://rs.example",
+        )
     }
 
     fn claims(aud: Audience) -> AccessTokenClaims {
@@ -648,7 +652,10 @@ mod empty_audience {
     /// signing-time check above is what covers its degenerate case too.
     #[tokio::test]
     async fn an_empty_audience_configured_through_new_is_refused_at_signing_time() {
-        let config = JwtConfig::new(EcdsaP256Key::generate("k1"), "");
+        let config = JwtConfig::new(
+            EcdsaP256Key::try_generate("k1").expect("test key entropy"),
+            "",
+        );
         let aud = config.audience().clone();
         assert!(
             config.sign_access_token(&claims(aud)).await.is_err(),
@@ -671,7 +678,7 @@ mod empty_audience {
 /// verify path RFC 9449 DPoP proofs, RFC 9101 request objects and RFC 7523 assertions all reach.
 #[test]
 fn verify_es256_fails_closed_on_a_short_coordinate_rather_than_panicking() {
-    let key = EcdsaP256Key::generate("short-coordinate");
+    let key = EcdsaP256Key::try_generate("short-coordinate").expect("test key entropy");
     let jwk = key.public_jwk();
     // Trim one byte off `y`, the way a library that strips a leading zero emits it: now 31 bytes.
     let mut y = URL_SAFE_NO_PAD

@@ -308,7 +308,20 @@ fn htu_eq(claimed: &str, expected: &str) -> bool {
 /// [`AlgAllowList`](crate::jwt::AlgAllowList) is applied by `AuthorizationServer` when it BUILDS the
 /// set it passes here (it clears forbidden slots), so a host that hand-builds a `JwsVerifiers` and
 /// calls this directly is responsible for the algorithm policy of the set it supplies.
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
 pub fn verify_proof(
+    verifiers: &JwsVerifiers,
+    proof: &str,
+    htm: &str,
+    htu: &str,
+    now: SystemTime,
+) -> Result<VerifiedProof, DpopFailure> {
+    verify_proof_with_crypto(&crate::crypto::builtin(), verifiers, proof, htm, htu, now)
+}
+
+/// Perform this operation with the explicitly selected crypto provider.
+pub fn verify_proof_with_crypto(
+    crypto: &dyn crate::crypto::CryptoProvider,
     verifiers: &JwsVerifiers,
     proof: &str,
     htm: &str,
@@ -429,7 +442,7 @@ pub fn verify_proof(
     }
 
     Ok(VerifiedProof {
-        jkt: jwk.thumbprint(),
+        jkt: jwk.thumbprint_with_crypto(crypto),
         jti: jti.to_string(),
         replay_until,
     })

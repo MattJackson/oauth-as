@@ -99,7 +99,6 @@ use bytes::Buf as _;
 use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body::Body as _;
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 use crate::authorization::{AuthorizationError, AuthorizationRequest};
 use crate::client::ClientId;
@@ -3371,23 +3370,6 @@ fn redirect(location: String) -> Response {
     }
 }
 
-/// Constant-time equality, over SHA-256 digests so the loop bound does not depend on either
-/// input's length.
-///
-/// A CSRF token is a secret the submitter is claiming to know, so comparing it with `==` leaks
-/// the length of the match through timing exactly as a secret comparison would. This mirrors
-/// `client::constant_time_eq`, which is private to that module; duplicating six lines is cheaper
-/// than widening that function's visibility, and this one is exercised by its own test.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let da = Sha256::digest(a.as_bytes());
-    let db = Sha256::digest(b.as_bytes());
-    let mut acc: u8 = 0;
-    for i in 0..32 {
-        acc |= da[i] ^ db[i];
-    }
-    acc == 0
-}
-
 /// Whether the request body is `application/x-www-form-urlencoded`.
 ///
 /// Required on the verification POST as defence in depth for RFC 6749 s10.12: it is one of the
@@ -3688,7 +3670,12 @@ async fn verification_submit_handler<S: Storage, C: Clock>(
             };
         let presented = param(&form, "csrf_token").unwrap_or_default();
         // Constant time, and `expected` was consumed above, so a token works exactly once.
-        let ok = expected.is_some_and(|e| constant_time_eq(&e, presented));
+        let ok = expected.is_some_and(|e| {
+            state
+                .server
+                .crypto()
+                .ct_eq(e.as_bytes(), presented.as_bytes())
+        });
         if !ok {
             return html_response(
                 StatusCode::FORBIDDEN,

@@ -117,7 +117,7 @@ fn request_object_refusals_borrow_their_description() {
     }
 
     let rt = current_thread_runtime();
-    let key = oauth_as::jwt::EcdsaP256Key::generate("client-key");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let jwk = key.public_jwk();
     let registered = RegisteredRequestObjectKey::es256_from_jwk_coordinates(
         jwk.kid().map(str::to_string),
@@ -520,7 +520,10 @@ fn unknown_token_type_refusal_is_not_sized_by_the_caller() {}
 fn jwt_signing_bound() {
     use oauth_as::jwt::{AccessTokenClaims, Audience, EcdsaP256Key, JwtConfig};
 
-    let signer = JwtConfig::new(EcdsaP256Key::generate("sign"), "https://rs.example");
+    let signer = JwtConfig::new(
+        EcdsaP256Key::try_generate("sign").expect("test key entropy"),
+        "https://rs.example",
+    );
     // `AccessTokenClaims::new` fills empty `authorization_details` and `cnf: None`, which is what
     // this fixture set explicitly before the type became non_exhaustive; `scope` is the one member
     // it wants a value for, and the claims are built OUTSIDE the measured window either way.

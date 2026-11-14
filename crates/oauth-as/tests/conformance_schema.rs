@@ -823,7 +823,7 @@ async fn a_dpop_bound_token_response_matches_the_rfc_schemas() {
     .await
     .unwrap();
 
-    let key = oauth_as::jwt::EcdsaP256Key::generate("conformance");
+    let key = oauth_as::jwt::EcdsaP256Key::try_generate("conformance").expect("test key entropy");
     let iat = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

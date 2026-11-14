@@ -37,7 +37,7 @@ categories = ["authentication", "web-programming"]
 # list and about 65 KB in the tarball.
 exclude = ["conformance-serve.sh", "benches"]
 
-# DOCS.RS BUILDS THE WHOLE CRATE, and it has to be told to, because `default = []` here means a
+# DOCS.RS BUILDS THE WHOLE CRATE; the default enables primitives only.
 # docs.rs build with no configuration would render the core library and NOTHING ELSE: no HTTP
 # service, no JWT, no DPoP, no PAR, no consent, and none of the crate-root re-exports behind them.
 # That is most of what this crate is, and a reader evaluating it from docs.rs would conclude the
@@ -51,11 +51,15 @@ exclude = ["conformance-serve.sh", "benches"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# FEATURES. The default set is EMPTY and stays that way. A consumer who wants only the library
+# FEATURES. The default preserves the existing RustCrypto primitives. A consumer who wants only the library
 # gets no HTTP stack and no async runtime: the whole premise of this crate is that the host owns
 # the listener, so an optional feature is the only place a web framework may appear.
 [features]
-default = []
+default = ["rustcrypto"]
+# Primitive backends; asymmetric RustCrypto implementations remain individually opt-in.
+rustcrypto = ["dep:sha2", "dep:hmac", "dep:getrandom", "dep:subtle"]
+aws-lc = ["dep:aws-lc-rs"]
+fips = ["aws-lc", "aws-lc-rs/fips"]
 # `http` adds an HTTP service over AuthorizationServer, for hosts that want the RFC-shaped wire
 # surface rather than writing it themselves, and for the black-box conformance harness (which
 # needs an external process to talk to). Nothing in the library depends on it.
@@ -109,7 +113,7 @@ jwt = ["dep:serde_json"]
 # Enabling it INSTALLS the verifier as the default: `AuthorizationServer` falls back to
 # `P256Verifier` when the host installs none, so a consumer who enables `jwt-p256` sees exactly
 # the behaviour, the tokens, the JWKS and the `kid` they had before.
-jwt-p256 = ["jwt", "dep:p256"]
+jwt-p256 = ["jwt", "rustcrypto", "dep:p256"]
 # THE BUILT-IN RS256 BACKEND: `RsaSigner` (a `JwsSigner` over `rsa`, RSASSA-PKCS1-v1.5 + SHA-256 ==
 # RS256, RFC 7518 s3.3) and `RsaVerifier`. Additive beside `jwt-p256`, exactly like it: a tree that
 # enables both compiles and a host's installed signer still wins. Enables `jwt` (the seam + traits)
@@ -121,7 +125,7 @@ jwt-p256 = ["jwt", "dep:p256"]
 # that only accept RSA. See `RsaSigner`'s docs for the RUSTSEC-2023-0071 (Marvin) note: the
 # advisory is a timing side channel on in-process RSA *signing*, so a regulated deployment should
 # prefer an out-of-process/KMS async `JwsSigner` and use this backend's verifier-only path.
-jwt-rsa = ["jwt", "dep:rsa"]
+jwt-rsa = ["jwt", "rustcrypto", "dep:rsa"]
 # THE BUILT-IN EdDSA (Ed25519) BACKEND: `Ed25519Signer` (a `JwsSigner`, `alg = EdDSA`) and
 # `Ed25519Verifier`, over `ed25519-dalek`. Additive in exactly the way `jwt-p256` is: enabling it
 # installs an EdDSA verifier alongside (never instead of) whatever ES256 backend is present, and a
@@ -131,7 +135,7 @@ jwt-rsa = ["jwt", "dep:rsa"]
 #
 # `EdDSA` here means Ed25519 ONLY (RFC 8037 `OKP`/`Ed25519`). Ed448 shares the `EdDSA` JOSE
 # algorithm name but is a different curve this crate does not implement; see `backends/ed25519.rs`.
-jwt-ed25519 = ["jwt", "dep:ed25519-dalek"]
+jwt-ed25519 = ["jwt", "rustcrypto", "dep:ed25519-dalek"]
 # RFC 8705 mutual-TLS client authentication and certificate-bound access tokens.
 # OFF by default, and it adds NO dependency: TLS termination is the host's job in this
 # crate (it never sees a socket), so the host hands in a certificate it has already
@@ -286,8 +290,12 @@ serde = { version = "1", features = ["derive"] }
 # packages. Four fewer, not three, because serde_json itself counts alongside itoa, ryu and
 # memchr.
 serde_json = { version = "1", optional = true }
-getrandom = "0.3"
-sha2 = "0.10"              # PKCE S256 (RFC 7636); verified against the RFC's appendix B vector
+getrandom = { version = "0.3", optional = true }
+sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
+subtle = { version = "2.6", optional = true }
+# 1.17.x retains the AWS-LC FIPS 3 module; upgrading the module is deliberate.
+aws-lc-rs = { version = "=1.17.4", default-features = false, features = ["alloc", "ring-io"], optional = true }
 base64 = "0.22"            # BASE64URL-without-padding, the exact PKCE challenge encoding
 
 # OPTIONAL, feature `http` only. The HTTP vocabulary, and nothing above it.

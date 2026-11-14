@@ -290,8 +290,10 @@ pub fn rsa_public_jwk(public: &RsaPublicKey, kid: Option<String>) -> Jwk {
 /// `RngCore::fill_bytes` is infallible, so an OS randomness failure PANICS here rather than surfacing
 /// as a `SignerError` — the same house style as `EcdsaP256Key::generate`'s `.expect(...)`. An AS that
 /// cannot draw randomness cannot safely mint artifacts; failing loudly is correct.
+#[cfg(test)]
 struct OsFillRng;
 
+#[cfg(test)]
 impl rsa::rand_core::RngCore for OsFillRng {
     fn next_u32(&mut self) -> u32 {
         let mut b = [0u8; 4];
@@ -306,7 +308,10 @@ impl rsa::rand_core::RngCore for OsFillRng {
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        getrandom::fill(dest).expect("OS CSPRNG must be available to sign OAuth artifacts");
+        use crate::crypto::CryptoProvider;
+        crate::crypto::RustCrypto
+            .fill_random(dest)
+            .expect("test entropy");
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
@@ -315,6 +320,7 @@ impl rsa::rand_core::RngCore for OsFillRng {
     }
 }
 
+#[cfg(test)]
 impl rsa::rand_core::CryptoRng for OsFillRng {}
 
 /// An in-process PS256 signing key: RSASSA-PSS (MGF1-SHA-256, salt length 32) + SHA-256 over a
@@ -396,10 +402,31 @@ impl Ps256Signer {
     /// Sign a JWS Signing Input with PS256. RANDOMIZED (a fresh salt per call), so — unlike RS256 —
     /// the output is not a pure function of key and input; verification stays deterministic.
     fn sign_ps256(&self, message: &[u8]) -> Result<Box<[u8]>, SignerError> {
+        self.sign_ps256_with_crypto(message, &crate::crypto::RustCrypto)
+    }
+
+    /// Sign using explicit entropy. No private-key operation runs if the salt draw fails.
+    pub fn sign_ps256_with_crypto(
+        &self,
+        message: &[u8],
+        crypto: &dyn crate::crypto::CryptoProvider,
+    ) -> Result<Box<[u8]>, SignerError> {
+        let mut salt = [0u8; 32];
+        crypto
+            .fill_random(&mut salt)
+            .map_err(|_| SignerError::new("RSA-PSS entropy unavailable"))?;
+        let mut rng = SaltRng {
+            salt,
+            used: false,
+            failed: false,
+        };
         let signature: PssSignature = self
             .signing
-            .try_sign_with_rng(&mut OsFillRng, message)
+            .try_sign_with_rng(&mut rng, message)
             .map_err(|_| SignerError::new("RSA-PSS signing failed"))?;
+        if rng.failed {
+            return Err(SignerError::new("unexpected RSA-PSS entropy request"));
+        }
         // `to_bytes` yields exactly `k` octets (the modulus size), which `JwsSignature::Ps256`'s
         // `Box<[u8]>` carries for any 2048/3072/4096-bit key.
         Ok(signature.to_bytes())
@@ -1006,3 +1033,37 @@ mod seam_tests {
             .expect("try_fill_bytes is infallible over the OS CSPRNG");
     }
 }
+
+// rsa's RngCore is infallible, but its PSS SigningKey consumes one 32-byte salt. Acquire
+// that salt fallibly BEFORE signing. A dependency changing this contract cannot emit a signature:
+// the failure latch is checked before the result is returned. This adapter is not a general RNG.
+struct SaltRng {
+    salt: [u8; 32],
+    used: bool,
+    failed: bool,
+}
+impl rsa::rand_core::RngCore for SaltRng {
+    fn next_u32(&mut self) -> u32 {
+        self.failed = true;
+        0
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.failed = true;
+        0
+    }
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        if self.try_fill_bytes(out).is_err() {
+            out.fill(0);
+        }
+    }
+    fn try_fill_bytes(&mut self, out: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        if self.used || out.len() != self.salt.len() {
+            self.failed = true;
+            return Err(rsa::rand_core::Error::new("unexpected PSS salt request"));
+        }
+        out.copy_from_slice(&self.salt);
+        self.used = true;
+        Ok(())
+    }
+}
+impl rsa::rand_core::CryptoRng for SaltRng {}

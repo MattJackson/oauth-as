@@ -17,12 +17,13 @@ use crate::authorization::{
 };
 use crate::client::{Client, ClientAuth, ClientId};
 #[cfg(feature = "client-assertion")]
-use crate::client_assertion::{verify_assertion, AudienceRule, CLIENT_ASSERTION_TYPE};
+use crate::client_assertion::{verify_assertion_with_crypto, AudienceRule, CLIENT_ASSERTION_TYPE};
+use crate::crypto::{CryptoError, CryptoProvider};
 use crate::device::{
     normalize_user_code, DeviceAuthorizationResponse, DeviceGrant, DeviceGrantState,
 };
 #[cfg(feature = "dpop")]
-use crate::dpop::verify_proof;
+use crate::dpop::verify_proof_with_crypto;
 use crate::error::{ErrorCode, ErrorResponse};
 use crate::events::{
     Attempt, AttemptOutcome, ClientAuthFailure, Event, EventSink, Hooks, RateLimitDecision,
@@ -1485,9 +1486,9 @@ const USER_CODE_ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 /// thirty-two on the machine benches/README.md names. So the number of calls is the thing to
 /// reduce, and a caller that needs two 32-byte artifacts should draw 64 bytes once rather than 32
 /// bytes twice. See `issue`.
-pub(crate) fn try_random_hex(n_bytes: usize) -> Option<String> {
+pub(crate) fn try_random_hex(crypto: &dyn CryptoProvider, n_bytes: usize) -> Option<String> {
     let mut buf = vec![0u8; n_bytes];
-    getrandom::fill(&mut buf).ok()?;
+    crypto.fill_random(&mut buf).ok()?;
     Some(hex_encode(&buf))
 }
 
@@ -1719,11 +1720,11 @@ fn user_code_symbol(byte: u8) -> Option<u8> {
 /// `None` for the reason [`try_random_hex`] gives: this runs on RFC 8628 section 3.1's device
 /// authorization endpoint, which is an ordinary request, and a library must not abort its host's
 /// process because the OS momentarily would not hand over 64 bytes.
-fn random_user_code(len: usize) -> Option<String> {
+fn random_user_code(crypto: &dyn CryptoProvider, len: usize) -> Option<String> {
     let mut out = String::with_capacity(len);
     let mut buf = [0u8; 64];
     while out.len() < len {
-        getrandom::fill(&mut buf).ok()?;
+        crypto.fill_random(&mut buf).ok()?;
         for &byte in buf.iter() {
             if out.len() == len {
                 break;
@@ -1975,6 +1976,9 @@ pub(crate) struct RefreshChain {
 
 /// The authorization server. Generic over the host's [`Storage`] and (for tests) the [`Clock`].
 pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
+    crypto: std::sync::Arc<dyn CryptoProvider>,
+    #[cfg(feature = "jwt")]
+    legacy_verifiers: bool,
     config: ServerConfig,
     store: S,
     clock: C,
@@ -2008,14 +2012,67 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
 impl<S: Storage> AuthorizationServer<S, SystemClock> {
     /// Construct with the real clock. This is the crate's allocation entry point: call it when
     /// (and only when) host config enables the AS.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn new(config: ServerConfig, store: S) -> Self {
         Self::with_clock(config, store, SystemClock)
+    }
+    /// Construct with an explicit provider; missing capabilities are never filled by another backend.
+    pub fn new_with_crypto(
+        config: ServerConfig,
+        store: S,
+        crypto: std::sync::Arc<dyn CryptoProvider>,
+    ) -> Result<Self, CryptoError> {
+        Self::with_clock_and_crypto(config, store, SystemClock, crypto)
+    }
+    /// Use a compiled backend, or return `MissingProvider` in a backend-free build.
+    pub fn try_new(config: ServerConfig, store: S) -> Result<Self, CryptoError> {
+        Self::new_with_crypto(config, store, crate::crypto::default_provider()?)
     }
 }
 
 impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Construct with an injected clock (tests).
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn with_clock(config: ServerConfig, store: S, clock: C) -> Self {
+        Self::construct(
+            config,
+            store,
+            clock,
+            std::sync::Arc::new(crate::crypto::builtin()),
+            true,
+        )
+    }
+
+    /// Construct with explicit time and cryptography. Validates configured signing policy.
+    pub fn with_clock_and_crypto(
+        config: ServerConfig,
+        store: S,
+        clock: C,
+        crypto: std::sync::Arc<dyn CryptoProvider>,
+    ) -> Result<Self, CryptoError> {
+        crypto.validate()?;
+        #[cfg(feature = "jwt")]
+        if let crate::jwt::AccessTokenFormat::Jwt(jwt) = &config.access_token_format {
+            let alg = jwt.algorithm();
+            if crypto.verifier(alg).is_none() || !config.jws_alg_allow_list.is_allowed(alg) {
+                return Err(CryptoError::UnsupportedAlgorithm(alg.jose_name()));
+            }
+        }
+        Ok(Self::construct(config, store, clock, crypto, false))
+    }
+
+    /// This server's selected primitive implementation.
+    pub fn crypto(&self) -> &dyn CryptoProvider {
+        self.crypto.as_ref()
+    }
+
+    fn construct(
+        config: ServerConfig,
+        store: S,
+        clock: C,
+        crypto: std::sync::Arc<dyn CryptoProvider>,
+        _legacy_verifiers: bool,
+    ) -> Self {
         // Derived HERE and not at each use, and derived exactly as
         // `AuthorizationServerMetadata::from_config` derives it, because a server whose own idea
         // of its token endpoint differs from the one it publishes refuses every conforming client.
@@ -2025,6 +2082,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             None => format!("{}/token", config.issuer.trim_end_matches('/')).into_boxed_str(),
         };
         AuthorizationServer {
+            crypto,
+            #[cfg(feature = "jwt")]
+            legacy_verifiers: _legacy_verifiers,
             config,
             store,
             clock,
@@ -2149,31 +2209,12 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         if !self.config.jws_alg_allow_list.is_allowed(alg) {
             return None;
         }
-        if let Some(installed) = self.hooks.jws_verifiers().and_then(|vs| vs.get(alg)) {
-            return Some(installed);
+        if self.legacy_verifiers {
+            if let Some(installed) = self.hooks.jws_verifiers().and_then(|vs| vs.get(alg)) {
+                return Some(installed);
+            }
         }
-        // The built-in fallbacks, one per compiled backend feature. Written as independent guarded
-        // returns rather than a `match` so the arm set is exactly the features that are on: no
-        // exhaustiveness gap when a backend is off, no unreachable arm when several are on.
-        #[cfg(feature = "jwt-p256")]
-        if alg == crate::jwt::JwsAlg::Es256 {
-            return Some(&crate::jwt::P256Verifier);
-        }
-        #[cfg(feature = "jwt-rsa")]
-        if alg == crate::jwt::JwsAlg::Rs256 {
-            return Some(&crate::backends::rsa::RsaVerifier);
-        }
-        // PS256 rides the same `jwt-rsa` feature as RS256 but its OWN verifier (PSS, not PKCS#1 v1.5).
-        #[cfg(feature = "jwt-rsa")]
-        if alg == crate::jwt::JwsAlg::Ps256 {
-            return Some(&crate::backends::rsa::Ps256Verifier);
-        }
-        #[cfg(feature = "jwt-ed25519")]
-        if alg == crate::jwt::JwsAlg::EdDsa {
-            return Some(&crate::backends::ed25519::Ed25519Verifier);
-        }
-        let _ = alg;
-        None
+        self.crypto.verifier(alg)
     }
 
     /// The full set of verifiers this server resolves, HOST-installed plus the built-in `jwt-p256`
@@ -2189,32 +2230,19 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // Computed ONCE and cached (see `dpop_verifiers_cache`): the set is a pure function of the
         // host's installed verifiers and the allow-list, both frozen before the first request.
         self.dpop_verifiers_cache.get_or_init(|| {
-            // `mut` only matters when a built-in backend is compiled to install a fallback below; a
-            // `dpop`-only build (no jwt-p256/jwt-rsa/jwt-ed25519) returns the host set untouched.
-            #[allow(unused_mut)]
-            let mut verifiers = self.hooks.jws_verifiers().cloned().unwrap_or_default();
-            #[cfg(feature = "jwt-p256")]
-            if verifiers.get(crate::jwt::JwsAlg::Es256).is_none() {
-                verifiers.install(std::sync::Arc::new(crate::jwt::P256Verifier));
+            let mut verifiers = if self.legacy_verifiers {
+                self.hooks.jws_verifiers().cloned().unwrap_or_default()
+            } else {
+                crate::jwt::JwsVerifiers::new()
+            };
+            for &alg in crate::jwt::JwsAlg::ALL {
+                if verifiers.get(alg).is_none() && self.crypto.verifier(alg).is_some() {
+                    verifiers.install(std::sync::Arc::new(crate::crypto::ProviderVerifier {
+                        provider: self.crypto.clone(),
+                        alg,
+                    }));
+                }
             }
-            #[cfg(feature = "jwt-rsa")]
-            if verifiers.get(crate::jwt::JwsAlg::Rs256).is_none() {
-                verifiers.install(std::sync::Arc::new(crate::backends::rsa::RsaVerifier));
-            }
-            #[cfg(feature = "jwt-rsa")]
-            if verifiers.get(crate::jwt::JwsAlg::Ps256).is_none() {
-                verifiers.install(std::sync::Arc::new(crate::backends::rsa::Ps256Verifier));
-            }
-            #[cfg(feature = "jwt-ed25519")]
-            if verifiers.get(crate::jwt::JwsAlg::EdDsa).is_none() {
-                verifiers.install(std::sync::Arc::new(
-                    crate::backends::ed25519::Ed25519Verifier,
-                ));
-            }
-            // The DPoP `AnyInstalled` chokepoint for the server-level allow-list: clear the slot of every
-            // forbidden algorithm AFTER the built-in fallbacks are installed, so a self-carried DPoP proof
-            // key cannot reintroduce a forbidden algorithm. `expect_alg(AnyInstalled)` selects only among
-            // occupied slots, so a cleared slot reads as `NotInstalled`.
             verifiers.restrict_to(&self.config.jws_alg_allow_list);
             verifiers
         })
@@ -2851,12 +2879,17 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // The crate's own, over a constant that is not a secret and does not need to be: no
             // registration names this hash, so nothing authenticates by presenting the string it
             // was built from. It is a cost, not a credential.
-            None => crate::client::SecretHash::sha256(
+            None => crate::client::SecretHash::sha256_with_crypto(
+                self.crypto(),
                 "oauth-as dummy verification input; no registration is stored under this",
             ),
         };
         let dummy = crate::client::ClientAuth::ConfidentialSecretHash { hash };
-        let _ = std::hint::black_box(dummy.verify_with(Some(presented), verifier));
+        let _ = std::hint::black_box(dummy.verify_with_crypto(
+            self.crypto(),
+            Some(presented),
+            verifier,
+        ));
     }
 
     /// The asymmetric [`crate::jwt::JwsAlg`] a presented client assertion's header names, or `None`
@@ -2949,7 +2982,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // the signatures above this is a COST and not a credential, and an HMAC costs the same
             // whatever key it is handed.
             None => {
-                let _ = std::hint::black_box(crate::jwt::verify_hs256(
+                let _ = std::hint::black_box(crate::jwt::verify_hs256_with_crypto(
+                    self.crypto(),
                     DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
                     DUMMY_ASSERTION_SIGNING_INPUT.as_bytes(),
                     &DUMMY_ASSERTION_SIGNATURE[..32],
@@ -3365,10 +3399,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `verify_with` rather than `verify`: a registration stored as a hash in a scheme this
         // crate does not implement is decided by the host's verifier (see
         // `crate::client::SecretVerifier`), and by nobody at all when none is installed.
-        if !client
-            .auth
-            .verify_with(cred.client_secret, self.hooks.secret_verifier())
-        {
+        if !client.auth.verify_with_crypto(
+            self.crypto(),
+            cred.client_secret,
+            self.hooks.secret_verifier(),
+        ) {
             return Ok(ClientAuthVerdict::Refused(
                 ClientAuthFailure::SecretMismatch,
             ));
@@ -3503,7 +3538,8 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             AssertionAudience::Rfc7523 => AudienceRule::AnyOf(&either),
             AssertionAudience::IssuerOnly => AudienceRule::Exactly(self.issuer_identifier()),
         };
-        let verified = verify_assertion(
+        let verified = verify_assertion_with_crypto(
+            self.crypto(),
             assertion_verifier,
             keys,
             assertion,
@@ -3631,17 +3667,18 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // anonymous caller could read a deployment misconfiguration off a refusal.
             return Err(ErrorResponse::new(ErrorCode::InvalidDpopProof));
         }
-        let verified = verify_proof(verifiers, proof, htm, htu, self.clock.now())
-            // THE REASON GOES TO THE AUDIT CHANNEL, and until 0.9.1 it went nowhere: this arm was
-            // `map_err(|_| ..)` and no event was emitted at all, against `dpop.rs`'s statement that
-            // "the distinction here is for the host's audit channel, not for the wire". A deployment
-            // could therefore not tell a client with a skewed clock (`StaleProof`) from one whose
-            // proofs are being captured and replayed (`Replayed`), which are a configuration problem
-            // and an incident.
-            .map_err(|failure| {
-                self.hooks.emit(|| Event::DpopProofRefused { failure });
-                ErrorResponse::new(ErrorCode::InvalidDpopProof)
-            })?;
+        let verified =
+            verify_proof_with_crypto(self.crypto(), verifiers, proof, htm, htu, self.clock.now())
+                // THE REASON GOES TO THE AUDIT CHANNEL, and until 0.9.1 it went nowhere: this arm was
+                // `map_err(|_| ..)` and no event was emitted at all, against `dpop.rs`'s statement that
+                // "the distinction here is for the host's audit channel, not for the wire". A deployment
+                // could therefore not tell a client with a skewed clock (`StaleProof`) from one whose
+                // proofs are being captured and replayed (`Replayed`), which are a configuration problem
+                // and an incident.
+                .map_err(|failure| {
+                    self.hooks.emit(|| Event::DpopProofRefused { failure });
+                    ErrorResponse::new(ErrorCode::InvalidDpopProof)
+                })?;
         // Namespaced by THUMBPRINT rather than by client id: a proof is bound to a key, not to a
         // registration (a public client's proof arrives before anything has authenticated), so the
         // key is the only identity available at this point that an attacker cannot choose freely.
@@ -3805,7 +3842,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `?` rather than a panic: this is an unauthenticated-shaped request path like any
         // other, and an OS that will not hand over 32 bytes is a `server_error`, not a reason to
         // abort the host's process. See `try_random_hex`.
-        let device_code = try_random_hex(32).ok_or_else(randomness_error)?;
+        let device_code = try_random_hex(self.crypto(), 32).ok_or_else(randomness_error)?;
         let user_code = self.unique_user_code().await?;
         let grant = DeviceGrant {
             device_code: device_code.clone(),
@@ -3865,7 +3902,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         for _ in 0..USER_CODE_GENERATION_ATTEMPTS {
             // `None` is the OS refusing randomness, which is the same `server_error` the
             // storage failures in this loop become rather than a panic on a request path.
-            let raw = random_user_code(len).ok_or_else(randomness_error)?;
+            let raw = random_user_code(self.crypto(), len).ok_or_else(randomness_error)?;
             // The store indexes NORMALIZED codes, and `raw` is already the normalized form (the
             // alphabet is upper case and carries no hyphen), so this needs no second pass.
             if self
@@ -4897,7 +4934,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         // `?` rather than a panic, for the reason `try_random_hex` gives. The refusal is a
         // REDIRECT because by this point the redirect URI has been validated (RFC 6749 s4.1.2.1),
         // so it goes back to the client the same way the storage failure below does.
-        let code = try_random_hex(32).ok_or_else(|| {
+        let code = try_random_hex(self.crypto(), 32).ok_or_else(|| {
             self.hooks.record(attempt, AttemptOutcome::Failed);
             AuthorizationError::Redirect(AuthorizationErrorRedirect {
                 redirect_uri: request.redirect_uri.clone(),
@@ -5188,7 +5225,11 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
         let verified = match (code_verifier, record.code_challenge_method) {
             (Some(v), CodeChallengeMethod::S256) => {
                 crate::pkce::verifier_is_valid(v)
-                    && crate::pkce::verify_s256(v, &record.code_challenge)
+                    && crate::pkce::verify_s256_with_crypto(
+                        self.crypto(),
+                        v,
+                        &record.code_challenge,
+                    )
             }
             (None, _) => false,
         };
@@ -6229,7 +6270,9 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
             // `ok_or_else` rather than `expect`: this is the token endpoint, every other
             // fallible step of which answers `server_error`, and a panic here aborts the host
             // in a host built with `panic = "abort"`. See `try_random_hex`.
-            getrandom::fill(&mut entropy).map_err(|_| randomness_error())?;
+            self.crypto
+                .fill_random(&mut entropy)
+                .map_err(|_| randomness_error())?;
             // The family id is minted (or inherited) BEFORE the access token, because the access
             // token has to carry it: RFC 9700 section 4.14.2 revokes the tokens of the whole grant
             // on detected reuse, and an access token with no family is unreachable from that event.
@@ -6957,7 +7000,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
                     // `?` rather than a panic, for the reason `try_random_hex` gives. This
                     // function answers `StorageError`, so that is the shape the refusal takes
                     // here; the host learns what happened from its own logs either way.
-                    consent_id: try_random_hex(16)
+                    consent_id: try_random_hex(self.crypto(), 16)
                         .ok_or_else(|| {
                             StorageError::new(
                                 "the OS would not provide randomness for a consent id",

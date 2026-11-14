@@ -112,7 +112,7 @@ impl oauth_as::events::EventSink for Recorder {
 
 #[tokio::test]
 async fn a_token_issued_against_a_proof_is_bound_to_that_key_and_says_so() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
 
@@ -172,7 +172,7 @@ async fn a_deployment_may_require_a_proof_on_every_token_request() {
     let refused = srv.token(request()).await.unwrap_err();
     assert_eq!(refused.error, ErrorCode::InvalidDpopProof);
 
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     assert!(srv
         .token_with_context(request(), with_proof(&proof(&key, "p-1")))
         .await
@@ -191,7 +191,7 @@ async fn the_same_proof_cannot_be_spent_twice() {
     // check, and this is it.
     //
     // Both requests below are byte for byte identical.
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
 
@@ -216,7 +216,7 @@ async fn the_same_proof_cannot_be_spent_twice() {
 async fn a_fresh_proof_from_the_same_key_still_works_after_a_replay_was_refused() {
     // The defence refuses the REPLAY, not the key. Otherwise any observer could lock a client out
     // of its own key by replaying one proof.
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
 
@@ -239,8 +239,8 @@ async fn a_fresh_proof_from_the_same_key_still_works_after_a_replay_was_refused(
 async fn two_keys_may_use_the_same_jti() {
     // The replay set is namespaced by thumbprint, so one client cannot spend another's `jti` values
     // in advance. A `jti` is often a counter, so the collision is ordinary rather than exotic.
-    let a = EcdsaP256Key::generate("a");
-    let b = EcdsaP256Key::generate("b");
+    let a = EcdsaP256Key::try_generate("a").expect("test key entropy");
+    let b = EcdsaP256Key::try_generate("b").expect("test key entropy");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
     assert!(srv
@@ -265,7 +265,7 @@ async fn two_keys_may_use_the_same_jti() {
 /// different records rather than the same one counted twice.
 #[tokio::test]
 async fn a_spent_proof_jti_is_reclaimed_by_the_host_s_sweep() {
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
     let issued_at = SystemTime::now();
@@ -318,7 +318,7 @@ async fn a_proof_captured_at_a_resource_server_cannot_be_spent_at_the_token_endp
     // The reason `htu` exists. The client sends a proof with EVERY resource-server request, so a
     // compromised or merely nosy resource server accumulates them by the thousand. If the token
     // endpoint accepted one, that resource server could mint fresh tokens for the client's key.
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let srv = server().with_event_sink(Box::new(Recorder(seen.clone())));
     srv.register_client(confidential_client()).await.unwrap();
@@ -343,7 +343,7 @@ async fn a_proof_captured_at_a_resource_server_cannot_be_spent_at_the_token_endp
 
 #[tokio::test]
 async fn a_proof_for_the_right_endpoint_but_the_wrong_method_is_refused() {
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server();
     srv.register_client(confidential_client()).await.unwrap();
     let refused = srv
@@ -366,7 +366,7 @@ async fn the_proof_is_checked_against_the_token_endpoint_the_metadata_advertises
     let srv = AuthorizationServer::new(config, MemoryStorage::new());
     srv.register_client(confidential_client()).await.unwrap();
 
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     assert!(
         srv.token_with_context(
             request(),
@@ -532,8 +532,8 @@ async fn a_confidential_client_may_rotate_a_bound_chain_onto_a_different_key() {
     // must bind to the NEW key, so the chain stays sender-constrained rather than reverting to
     // bearer. This is exactly what FAPI 2.0 SP `refresh-token` exercises: it rotates with a fresh
     // key and requires success.
-    let first = EcdsaP256Key::generate("first");
-    let second = EcdsaP256Key::generate("second");
+    let first = EcdsaP256Key::try_generate("first").expect("test key entropy");
+    let second = EcdsaP256Key::try_generate("second").expect("test key entropy");
     let srv = server();
     let rt = mint_refresh_token(&srv, Some(&first), "seed").await;
 
@@ -567,8 +567,8 @@ async fn a_public_client_refresh_chain_cannot_be_rebound_to_another_key() {
     // key is the ONLY thing binding the chain: if a rotation accepted a proof from a DIFFERENT key,
     // a thief who stole the token string simply presents their own key, gets a fresh access token
     // bound to THEIR key, and the victim is locked out. RFC 9449 s5.
-    let victim = EcdsaP256Key::generate("victim");
-    let thief = EcdsaP256Key::generate("thief");
+    let victim = EcdsaP256Key::try_generate("victim").expect("test key entropy");
+    let thief = EcdsaP256Key::try_generate("thief").expect("test key entropy");
     let srv = server();
     let stolen = mint_public_refresh_token(&srv, Some(&victim), "seed").await;
 
@@ -607,7 +607,7 @@ async fn a_public_client_refresh_chain_cannot_be_rebound_to_another_key() {
 async fn a_bound_refresh_chain_cannot_be_rotated_with_no_proof_at_all() {
     // The other half of the same attack, and the easier one: presenting no proof must not read as
     // "unbound", or a thief could simply omit the header.
-    let victim = EcdsaP256Key::generate("victim");
+    let victim = EcdsaP256Key::try_generate("victim").expect("test key entropy");
     let srv = server();
     let stolen = mint_refresh_token(&srv, Some(&victim), "seed").await;
     let refused = srv
@@ -628,7 +628,7 @@ async fn an_unbound_refresh_chain_cannot_be_bound_by_presenting_a_proof_at_rotat
     let srv = server();
     let unbound = mint_refresh_token(&srv, None, "unused").await;
 
-    let key = EcdsaP256Key::generate("opportunist");
+    let key = EcdsaP256Key::try_generate("opportunist").expect("test key entropy");
     let refused = srv
         .token_with_context(
             TokenRequest::RefreshToken {
@@ -647,7 +647,7 @@ async fn an_unbound_refresh_chain_cannot_be_bound_by_presenting_a_proof_at_rotat
 async fn the_binding_survives_rotation() {
     // The rotated token is bound to the same key, so the chain stays sender-constrained rather than
     // reverting to bearer after the first refresh.
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let srv = server();
     let rt = mint_refresh_token(&srv, Some(&key), "seed").await;
     let rotated = srv
@@ -706,7 +706,7 @@ fn htu_of_is_the_comparison_the_rfc_describes() {
 fn jwt_server() -> AuthorizationServer<MemoryStorage> {
     let mut cfg = ServerConfig::new(ISSUER, "https://as.example/device");
     cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("as-kid-1"),
+        EcdsaP256Key::try_generate("as-kid-1").expect("test key entropy"),
         "https://rs.example",
     )));
     AuthorizationServer::new(cfg, MemoryStorage::new())
@@ -726,7 +726,7 @@ fn jwt_claims(token: &str) -> serde_json::Value {
 /// was invisible to exactly the resource servers that verify signatures, and every test passed.
 #[tokio::test]
 async fn a_signed_access_token_carries_the_dpop_thumbprint_in_its_own_claims() {
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let srv = jwt_server();
     srv.register_client(confidential_client()).await.unwrap();
 
@@ -793,7 +793,7 @@ async fn a_signed_access_token_carries_both_bindings_when_the_client_holds_both(
     .await
     .unwrap();
 
-    let key = EcdsaP256Key::generate("device");
+    let key = EcdsaP256Key::try_generate("device").expect("test key entropy");
     let certificate = ClientCertificate::from_der(DER);
     let dpop = proof(&key, "both-1");
     let response = srv
@@ -824,8 +824,8 @@ async fn a_signed_access_token_carries_both_bindings_when_the_client_holds_both(
 
 #[tokio::test]
 async fn refresh_retry_requires_the_original_dpop_key() {
-    let victim = EcdsaP256Key::generate("victim");
-    let thief = EcdsaP256Key::generate("thief");
+    let victim = EcdsaP256Key::try_generate("victim").expect("test key entropy");
+    let thief = EcdsaP256Key::try_generate("thief").expect("test key entropy");
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
     config.token_endpoint = Some(TOKEN_ENDPOINT.into());
     config.refresh_retry_window = Duration::from_secs(30);
@@ -867,8 +867,8 @@ async fn refresh_retry_requires_the_original_dpop_key() {
 // presented key against the key the WINNING rotation bound to, not the spent predecessor's key.
 #[tokio::test]
 async fn a_confidential_client_retry_matches_the_re_keyed_rotations_key_not_the_predecessors() {
-    let original = EcdsaP256Key::generate("original");
-    let rekeyed = EcdsaP256Key::generate("rekeyed");
+    let original = EcdsaP256Key::try_generate("original").expect("test key entropy");
+    let rekeyed = EcdsaP256Key::try_generate("rekeyed").expect("test key entropy");
     let mut config = ServerConfig::new("https://as.example", "https://as.example/device");
     config.token_endpoint = Some(TOKEN_ENDPOINT.into());
     config.refresh_retry_window = Duration::from_secs(30);
@@ -895,7 +895,7 @@ async fn a_confidential_client_retry_matches_the_re_keyed_rotations_key_not_the_
     assert_eq!(retried.access_token, rotated.access_token);
     assert_eq!(retried.refresh_token, rotated.refresh_token);
     // And a thief with the client credential but a THIRD key still cannot claim the cached response.
-    let thief = EcdsaP256Key::generate("thief");
+    let thief = EcdsaP256Key::try_generate("thief").expect("test key entropy");
     assert_eq!(
         srv.token_with_context(request(), with_proof(&proof(&thief, "rekey-thief")))
             .await

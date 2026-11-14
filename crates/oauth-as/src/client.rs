@@ -6,8 +6,8 @@
 
 use std::fmt;
 
+use crate::crypto::CryptoProvider;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::grant::GrantType;
 // Aliased to the name this module used when it carried its own copy of the encoder, so the call
@@ -87,10 +87,16 @@ impl SecretHash {
 
     /// Hash `secret` with the built-in scheme. The result is what the host stores; the secret
     /// itself is handed to the client once and never persisted here.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn sha256(secret: &str) -> Self {
+        Self::sha256_with_crypto(&crate::crypto::builtin(), secret)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn sha256_with_crypto(crypto: &dyn CryptoProvider, secret: &str) -> Self {
         SecretHash {
             scheme: SecretHash::SHA256_HEX.to_string(),
-            encoded: hex_lower(&Sha256::digest(secret.as_bytes())),
+            encoded: hex_lower(&crypto.sha256(secret.as_bytes())),
         }
     }
 
@@ -116,12 +122,12 @@ impl SecretHash {
 
     /// Verify against the BUILT-IN scheme only; any other scheme is `false` here and is the host
     /// verifier's business. Constant time via [`constant_time_eq`].
-    fn verify_builtin(&self, presented: &str) -> bool {
+    fn verify_builtin(&self, crypto: &dyn CryptoProvider, presented: &str) -> bool {
         if self.scheme != SecretHash::SHA256_HEX {
             return false;
         }
-        let computed = hex_lower(&Sha256::digest(presented.as_bytes()));
-        constant_time_eq(computed.as_bytes(), self.encoded.as_bytes())
+        let computed = hex_lower(&crypto.sha256(presented.as_bytes()));
+        crypto.ct_eq(computed.as_bytes(), self.encoded.as_bytes())
     }
 
     /// Whether `presented` is the secret behind this stored verifier, consulting `verifier` for a
@@ -136,9 +142,20 @@ impl SecretHash {
     /// the registration access token a bearer credential the server has to check on every
     /// management request, and it is stored the same one-way way for the same reason (see
     /// [`crate::registration`]), so it needs the same comparison rather than a second copy of it.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn verify(&self, presented: &str, verifier: Option<&dyn SecretVerifier>) -> bool {
+        self.verify_with_crypto(&crate::crypto::builtin(), presented, verifier)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn verify_with_crypto(
+        &self,
+        crypto: &dyn CryptoProvider,
+        presented: &str,
+        verifier: Option<&dyn SecretVerifier>,
+    ) -> bool {
         if self.scheme == SecretHash::SHA256_HEX {
-            self.verify_builtin(presented)
+            self.verify_builtin(crypto, presented)
         } else {
             // Fails closed with no verifier: the server cannot check this credential, and "cannot
             // check" must never read as "checked out".
@@ -362,6 +379,7 @@ impl ClientAuth {
     /// Verify a presented secret with no host verifier installed. See [`ClientAuth::verify_with`],
     /// which this delegates to; a [`ClientAuth::ConfidentialSecretHash`] in a scheme this crate
     /// does not implement therefore never authenticates through this entry point.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn verify(&self, presented: Option<&str>) -> bool {
         self.verify_with(presented, None)
     }
@@ -387,19 +405,30 @@ impl ClientAuth {
     /// `AuthorizationServer::authenticate_client` discharges it by running a DUMMY verification
     /// through this same function on the unknown-id path. See [`SecretVerifier::dummy_hash`] for
     /// the part of it only the host can supply.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn verify_with(
         &self,
+        presented: Option<&str>,
+        verifier: Option<&dyn SecretVerifier>,
+    ) -> bool {
+        self.verify_with_crypto(&crate::crypto::builtin(), presented, verifier)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn verify_with_crypto(
+        &self,
+        crypto: &dyn CryptoProvider,
         presented: Option<&str>,
         verifier: Option<&dyn SecretVerifier>,
     ) -> bool {
         match self {
             ClientAuth::Public => presented.is_none(),
             ClientAuth::ConfidentialSecret { secret } => match presented {
-                Some(p) => constant_time_eq(secret.as_bytes(), p.as_bytes()),
+                Some(p) => crypto.ct_eq(secret.as_bytes(), p.as_bytes()),
                 None => false,
             },
             ClientAuth::ConfidentialSecretHash { hash } => match presented {
-                Some(p) => hash.verify(p, verifier),
+                Some(p) => hash.verify_with_crypto(crypto, p, verifier),
                 None => false,
             },
             // NEVER, and not because it is unimplemented. This registration's credential is a
@@ -422,40 +451,6 @@ impl ClientAuth {
             ClientAuth::Mtls { .. } => false,
         }
     }
-}
-
-/// Constant-time equality, by comparing SHA-256 digests over a fixed 32 bytes rather than the raw
-/// inputs.
-///
-/// Hashing first is what makes this constant time, on two axes that a raw byte-by-byte compare
-/// cannot deliver at once:
-///
-/// 1. Value: the accumulator below visits all 32 digest bytes regardless of where (or whether) the
-///    inputs first differ, so no early difference shows up as an early exit.
-/// 2. Length: SHA-256 always produces exactly 32 bytes no matter how long `a` or `b` are, so the
-///    loop always runs exactly 32 iterations. Comparing the raw inputs directly, even with a
-///    "run for max(a.len(), b.len())" loop, makes wall time grow with the presented secret's
-///    length once it exceeds the registered one, which lets a network attacker binary-search the
-///    registered secret's length by timing the token endpoint. Hashing first removes the input
-///    length from the loop bound entirely.
-///
-/// This also happens to make the function actually correct: two digests are equal only when the
-/// two inputs were equal (SHA-256 collision resistance), so there is no longer a length-encoding
-/// edge case where sufficiently padded unequal inputs compare equal.
-///
-/// This is NOT password hashing, and SHA-256 is not being used as a KDF here. `secret` is a
-/// high-entropy, host-generated and host-managed credential, not a human-chosen password, so
-/// there is no offline-guessing threat this needs to be slow against. SHA-256's only job in this
-/// function is to be a fixed-width length equaliser ahead of a constant-time compare; nobody
-/// should read this as a template for verifying user passwords.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let da = Sha256::digest(a);
-    let db = Sha256::digest(b);
-    let mut acc: u8 = 0;
-    for i in 0..32 {
-        acc |= da[i] ^ db[i];
-    }
-    acc == 0
 }
 
 /// A registered client: identity, authentication, and what it is allowed to do.

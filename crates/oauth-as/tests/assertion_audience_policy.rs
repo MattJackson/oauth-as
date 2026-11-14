@@ -101,7 +101,7 @@ fn context(assertion: &str) -> TokenRequestContext<'_> {
 
 #[tokio::test]
 async fn issuer_only_token_endpoint_refuses_the_token_endpoint_url_as_audience() {
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server_with_audience(&key, AssertionAudience::IssuerOnly).await;
     let assertion = sign(&key, serde_json::json!(TOKEN_ENDPOINT), "aud-1");
     let refused = srv
@@ -114,7 +114,7 @@ async fn issuer_only_token_endpoint_refuses_the_token_endpoint_url_as_audience()
 #[tokio::test]
 async fn issuer_only_token_endpoint_refuses_an_array_carrying_the_issuer() {
     // The suite's exact payload: aud = [issuer, token_endpoint].
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server_with_audience(&key, AssertionAudience::IssuerOnly).await;
     let assertion = sign(&key, serde_json::json!([ISSUER, TOKEN_ENDPOINT]), "aud-1");
     let refused = srv
@@ -126,7 +126,7 @@ async fn issuer_only_token_endpoint_refuses_an_array_carrying_the_issuer() {
 
 #[tokio::test]
 async fn issuer_only_token_endpoint_accepts_the_issuer_as_a_string() {
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server_with_audience(&key, AssertionAudience::IssuerOnly).await;
     let assertion = sign(&key, serde_json::json!(ISSUER), "aud-1");
     srv.token_with_context(cc_request(), context(&assertion))
@@ -141,7 +141,7 @@ async fn issuer_only_token_endpoint_accepts_the_issuer_as_a_string() {
 async fn issuer_only_par_endpoint_refuses_the_url_and_accepts_the_issuer() {
     use oauth_as::ParConfig;
 
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let mut cfg = ServerConfig::new(ISSUER, "https://as.example/device")
         .with_assertion_audience(AssertionAudience::IssuerOnly);
     cfg.par = Some(Box::new(ParConfig::new()));
@@ -193,7 +193,7 @@ async fn issuer_only_par_endpoint_refuses_the_url_and_accepts_the_issuer() {
 async fn the_default_posture_still_accepts_the_token_endpoint_url_and_an_array() {
     // Rfc7523 (the default) is unchanged by the switch existing: the token endpoint URL and an
     // array with a matching member both authenticate, exactly as before D4.
-    let key = EcdsaP256Key::generate("k");
+    let key = EcdsaP256Key::try_generate("k").expect("test key entropy");
     let srv = server_with_audience(&key, AssertionAudience::Rfc7523).await;
 
     let url_aud = sign(&key, serde_json::json!(TOKEN_ENDPOINT), "def-1");

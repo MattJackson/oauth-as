@@ -49,11 +49,11 @@
 
 use std::fmt;
 
+use crate::crypto::CryptoProvider;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 use crate::client::{Client, ClientAuth};
 use crate::events::ClientAuthFailure;
@@ -108,8 +108,14 @@ impl CertificateThumbprint {
     /// `der` is the certificate itself, NOT a PEM block: base64 text with `-----BEGIN
     /// CERTIFICATE-----` around it hashes to something that matches nothing. See
     /// [`CertificateThumbprint::from_pem`] for that form.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn from_der(der: &[u8]) -> Self {
-        CertificateThumbprint(Sha256::digest(der).into())
+        Self::from_der_with_crypto(&crate::crypto::builtin(), der)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn from_der_with_crypto(crypto: &dyn CryptoProvider, der: &[u8]) -> Self {
+        CertificateThumbprint(crypto.sha256(der))
     }
 
     /// Compute the thumbprint of a PEM-encoded certificate, ignoring the armour lines and all
@@ -119,7 +125,16 @@ impl CertificateThumbprint {
     ///
     /// Only the FIRST certificate in the file is used: RFC 8705 binds to the end-entity
     /// certificate, and a PEM bundle carries its issuers after it.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn from_pem(pem: &str) -> Result<Self, MtlsRegistrationError> {
+        Self::from_pem_with_crypto(&crate::crypto::builtin(), pem)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn from_pem_with_crypto(
+        crypto: &dyn CryptoProvider,
+        pem: &str,
+    ) -> Result<Self, MtlsRegistrationError> {
         let body = match pem.find("-----BEGIN CERTIFICATE-----") {
             Some(start) => {
                 let after = &pem[start + "-----BEGIN CERTIFICATE-----".len()..];
@@ -134,7 +149,7 @@ impl CertificateThumbprint {
         let der = STANDARD
             .decode(compact.as_bytes())
             .map_err(|_| MtlsRegistrationError::MalformedCertificate)?;
-        Ok(CertificateThumbprint::from_der(&der))
+        Ok(CertificateThumbprint::from_der_with_crypto(crypto, &der))
     }
 
     /// The raw 32 byte hash.
@@ -231,8 +246,14 @@ impl<'a> ClientCertificate<'a> {
     /// clients by. A certificate with no facts attached can still be BOUND to a token (section 3),
     /// which is why they are optional rather than required: section 4 makes certificate binding
     /// available to a client that does not authenticate with mutual TLS at all.
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn from_der(der: &[u8]) -> Self {
-        ClientCertificate::from_thumbprint(CertificateThumbprint::from_der(der))
+        Self::from_der_with_crypto(&crate::crypto::builtin(), der)
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn from_der_with_crypto(crypto: &dyn CryptoProvider, der: &[u8]) -> Self {
+        ClientCertificate::from_thumbprint(CertificateThumbprint::from_der_with_crypto(crypto, der))
     }
 
     /// From a thumbprint the host computed itself, for a deployment whose TLS terminator forwards a

@@ -103,7 +103,7 @@ async fn a_dpop_bound_subject_token_cannot_be_exchanged_into_a_bearer_token() {
     let srv = server_with(clock.clone(), vec![victim(), gateway()]).await;
 
     // The victim gets a token bound to a key only it holds.
-    let key = EcdsaP256Key::generate("victim-device");
+    let key = EcdsaP256Key::try_generate("victim-device").expect("test key entropy");
     let iat = clock.now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let header = serde_json::json!({
         "typ": "dpop+jwt",

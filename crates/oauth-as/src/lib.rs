@@ -232,6 +232,7 @@ pub mod client_assertion;
 #[cfg(feature = "consent")]
 #[cfg_attr(docsrs, doc(cfg(feature = "consent")))]
 pub mod consent;
+pub mod crypto;
 // Ungated: the macro it exports forwards the feature-gated methods under their own `#[cfg]`, so
 // this module is meaningful in every build and costs nothing in any of them (a `macro_rules!`
 // definition compiles to no code until it is used).

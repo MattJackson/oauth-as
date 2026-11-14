@@ -86,7 +86,7 @@ fn main() {
         // The primitive: one ES256 signature over a realistic signing input, with the base64url
         // encoding and the compact serialization included, because that is what an issuer actually
         // executes. Nothing here touches storage.
-        let key = EcdsaP256Key::generate("bench-kid");
+        let key = EcdsaP256Key::try_generate("bench-kid").expect("test key entropy");
         let header = br#"{"alg":"ES256","typ":"at+jwt","kid":"bench-kid"}"#;
         let payload = br#"{"iss":"https://as.example","sub":"user-1","aud":"https://rs.example","exp":1900000000,"iat":1899996400,"jti":"0123456789abcdef0123456789abcdef","client_id":"confidential-app","scope":"read"}"#;
         b.bench_fast("es256_sign_compact_jws", || {
@@ -106,8 +106,11 @@ fn main() {
         let jwt_srv = rt.block_on(async {
             let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
             cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(
-                JwtConfig::new(EcdsaP256Key::generate("bench-kid"), "https://rs.example")
-                    .with_jwks_uri("https://as.example/jwks"),
+                JwtConfig::new(
+                    EcdsaP256Key::try_generate("bench-kid").expect("test key entropy"),
+                    "https://rs.example",
+                )
+                .with_jwks_uri("https://as.example/jwks"),
             ));
             let srv = AuthorizationServer::new(cfg, MemoryStorage::new());
             srv.register_client(client()).await.unwrap();
@@ -149,7 +152,7 @@ fn main() {
         // ES256 verify it exists to isolate. The installed set does not change between iterations,
         // so building it once is both faster and what the row is meant to measure.
         let installed = verifiers();
-        let key = EcdsaP256Key::generate("device-key");
+        let key = EcdsaP256Key::try_generate("device-key").expect("test key entropy");
         let header = serde_json::json!({
             "typ": "dpop+jwt",
             "alg": "ES256",
@@ -285,7 +288,7 @@ fn main() {
         // private_key_jwt: ES256, asymmetric, and the reason a deployment whose policy forbids
         // transmitting a shared secret can use this crate at all. Measured next to HS256 so the
         // price of that policy is a number rather than a feeling.
-        let key = EcdsaP256Key::generate("client-key-1");
+        let key = EcdsaP256Key::try_generate("client-key-1").expect("test key entropy");
         let es_keys = AssertionKeys::PublicKeys {
             alg: oauth_as::jwt::JwsAlg::Es256,
             keys: vec![key.to_public_jwk()],

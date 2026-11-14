@@ -58,7 +58,7 @@ fn client(id: &str, secret: &str) -> Client {
 async fn signing_server() -> AuthorizationServer<MemoryStorage> {
     let mut cfg = ServerConfig::new("https://as.example", "https://as.example/device");
     cfg.access_token_format = AccessTokenFormat::Jwt(Box::new(JwtConfig::new(
-        EcdsaP256Key::generate("act-test-kid"),
+        EcdsaP256Key::try_generate("act-test-kid").expect("test key entropy"),
         "https://rs.example",
     )));
     let srv = AuthorizationServer::new(cfg, MemoryStorage::new());

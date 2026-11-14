@@ -677,7 +677,7 @@ async fn a_replay_store_outage_is_not_reported_as_a_captured_and_replayed_assert
     use oauth_as::server::{ClientCredential, TokenRequestContext};
     use oauth_as::Storage as _;
 
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let store = ReplayStoreOutage(MemoryStorage::new());
     store
         .put_client(Client {

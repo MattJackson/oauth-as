@@ -5,6 +5,7 @@
 //! private items, so they live in the crate rather than in `tests/`.
 
 use super::*;
+use sha2::{Digest, Sha256};
 
 #[test]
 fn public_client_rejects_a_presented_secret() {
@@ -215,4 +216,9 @@ fn constant_time_eq_agrees_with_eq() {
     for (a, b, want) in cases {
         assert_eq!(constant_time_eq(a, b), *want, "{:?} vs {:?}", a, b);
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use crate::crypto::CryptoProvider;
+    crate::crypto::builtin().ct_eq(a, b)
 }

@@ -110,7 +110,7 @@ fn now() -> u64 {
 /// as though the client had asked for a plain `read` and nothing else.
 #[tokio::test]
 async fn a_signed_authorization_details_is_refused_by_a_build_without_rar() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key).await;
     let object = signed_object(
         &key,
@@ -139,7 +139,7 @@ async fn a_signed_authorization_details_is_refused_by_a_build_without_rar() {
 /// parameter and not about the fixture.
 #[tokio::test]
 async fn the_same_object_without_the_claim_is_accepted() {
-    let key = EcdsaP256Key::generate("client-key");
+    let key = EcdsaP256Key::try_generate("client-key").expect("test key entropy");
     let server = server(&key).await;
     let object = signed_object(&key, &claims("")).await;
 

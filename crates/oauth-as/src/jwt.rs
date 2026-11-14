@@ -85,6 +85,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::crypto::CryptoProvider;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 #[cfg(feature = "jwt-p256")]
@@ -96,7 +97,6 @@ use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 #[cfg(feature = "jwt-p256")]
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 // =============================================================================================
 // THE ALGORITHM-TAGGED SEAM.
@@ -914,16 +914,33 @@ impl EcdsaP256Key {
     ///
     /// # Panics
     /// If the OS refuses randomness, which the rest of this crate also treats as unrecoverable.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use try_generate; entropy failure must be handled"
+    )]
     pub fn generate(kid: impl Into<String>) -> Self {
+        Self::try_generate(kid).expect("OS randomness for OAuth artifacts")
+    }
+
+    /// Generate a key, returning entropy failures instead of panicking.
+    pub fn try_generate(kid: impl Into<String>) -> Result<Self, crate::crypto::CryptoError> {
+        Self::try_generate_with_crypto(kid, &crate::crypto::RustCrypto)
+    }
+
+    /// Generate with host-provided entropy and RustCrypto P-256 key validation.
+    pub fn try_generate_with_crypto(
+        kid: impl Into<String>,
+        crypto: &dyn CryptoProvider,
+    ) -> Result<Self, crate::crypto::CryptoError> {
         let kid = kid.into();
         loop {
             let mut buf = [0u8; 32];
-            getrandom::fill(&mut buf).expect("OS randomness for OAuth artifacts");
+            crypto.fill_random(&mut buf)?;
             // Rejection sampling: a uniform 32 byte string is occasionally outside [1, n-1] for
             // P-256's order n. Reducing it instead would bias the key; the probability of a redraw
             // is about 2^-32, so this loop terminates immediately in practice.
             if let Ok(key) = Self::from_scalar_bytes(kid.clone(), &buf) {
-                return key;
+                return Ok(key);
             }
         }
     }
@@ -1591,6 +1608,10 @@ fn encoded_jose_header(alg: JwsAlg, kid: &str) -> Box<str> {
 }
 
 impl JwtConfig {
+    /// Algorithm of the active signing key.
+    pub fn algorithm(&self) -> JwsAlg {
+        self.alg
+    }
     /// Configure signing for one audience. The audience is REQUIRED (RFC 9068 section 2.2) and has
     /// no default: only the deployment knows which resource server a token is meant for, and a
     /// guessed `aud` is a token that is valid somewhere nobody intended.
@@ -2154,7 +2175,13 @@ impl Jwk {
     /// of one description of it; including any of them would let the same key produce two
     /// thumbprints and so two tokens a resource server could not tell were bound to one client. The
     /// required-member set and its order are per key TYPE (RFC 7638 section 3.2).
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
     pub fn thumbprint(&self) -> String {
+        self.thumbprint_with_crypto(&crate::crypto::builtin())
+    }
+
+    /// Perform this operation with the explicitly selected crypto provider.
+    pub fn thumbprint_with_crypto(&self, crypto: &dyn CryptoProvider) -> String {
         // Built by hand rather than through `serde_json`, because a serializer's member order is a
         // property of a struct declaration and this order is a property of the RFC. For `EC` the
         // required set is `crv`, `kty`, `x`, `y`, which is already lexicographic.
@@ -2169,7 +2196,7 @@ impl Jwk {
                 json.push_str("\",\"y\":\"");
                 json.push_str(y);
                 json.push_str("\"}");
-                URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+                URL_SAFE_NO_PAD.encode(crypto.sha256(json.as_bytes()))
             }
             // RFC 7638 section 3.2: the RSA required set is `e`, `kty`, `n`, already lexicographic
             // (`e` < `k` < `n`).
@@ -2180,7 +2207,7 @@ impl Jwk {
                 json.push_str("\",\"kty\":\"RSA\",\"n\":\"");
                 json.push_str(n);
                 json.push_str("\"}");
-                URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+                URL_SAFE_NO_PAD.encode(crypto.sha256(json.as_bytes()))
             }
             // OKP required set is `crv`, `kty`, `x` (RFC 8037 section 2; the order every
             // interoperable JOSE library uses), already lexicographic (`c` < `k` < `x`).
@@ -2192,7 +2219,7 @@ impl Jwk {
                 json.push_str("\",\"kty\":\"OKP\",\"x\":\"");
                 json.push_str(x);
                 json.push_str("\"}");
-                URL_SAFE_NO_PAD.encode(Sha256::digest(json.as_bytes()))
+                URL_SAFE_NO_PAD.encode(crypto.sha256(json.as_bytes()))
             }
         }
     }
@@ -2391,56 +2418,24 @@ pub fn verify_es256(key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
     key.verify(signing_input, &signature).is_ok()
 }
 
-/// HMAC-SHA-256 (RFC 2104), the primitive `HS256` is (RFC 7518 section 3.2).
-///
-/// Hand written rather than pulled in. `hmac` is already in this crate's dependency GRAPH, through
-/// `p256`'s RFC 6979 deterministic nonce, but it is not a direct dependency, and taking one on to
-/// express twenty lines of fully specified construction would widen a surface this crate promises
-/// to keep tiny. The construction has published test vectors, which `src/tests/client_assertion.rs`
-/// checks against, so "we wrote it ourselves" is a checkable claim rather than an assertion.
+/// HMAC-SHA-256 through the compiled default backend. Prefer an explicit provider.
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    // RFC 2104: a key longer than the block size is replaced by its own digest; a shorter one is
-    // zero padded to the block size. SHA-256's block size is 64 bytes.
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= block[i];
-        opad[i] ^= block[i];
-    }
-    let inner = Sha256::new()
-        .chain_update(ipad)
-        .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(opad)
-        .chain_update(inner)
-        .finalize()
-        .into()
+    crate::crypto::builtin().hmac_sha256(key, message)
 }
-
-/// Verify an `HS256` signature (RFC 7518 section 3.2) over `signing_input` with a shared secret.
-///
-/// The comparison is CONSTANT TIME with respect to the presented tag. A byte-by-byte compare that
-/// exits at the first difference lets a network attacker build a valid tag one byte at a time
-/// without ever learning the secret, which is the classic MAC verification timing attack; the
-/// length here is fixed at 32 bytes by SHA-256, so unlike `client::constant_time_eq` there is no
-/// length channel to close as well.
-pub fn verify_hs256(secret: &[u8], signing_input: &[u8], signature: &[u8]) -> bool {
-    if signature.len() != 32 {
-        return false;
-    }
-    let expected = hmac_sha256(secret, signing_input);
-    let mut acc = 0u8;
-    for i in 0..32 {
-        acc |= expected[i] ^ signature[i];
-    }
-    acc == 0
+/// Verify HS256 through the compiled default backend.
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+pub fn verify_hs256(secret: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    verify_hs256_with_crypto(&crate::crypto::builtin(), secret, message, signature)
+}
+/// Verify HS256 using the selected backend for both HMAC and constant-time comparison.
+pub fn verify_hs256_with_crypto(
+    crypto: &dyn CryptoProvider,
+    secret: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    signature.len() == 32 && crypto.ct_eq(&crypto.hmac_sha256(secret, message), signature)
 }
 
 /// Assemble one RFC 7515 section 3.1 compact JWS from an already-serialized header and payload.
