@@ -1023,7 +1023,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// The same timing caveat that `AuthorizationServer::authenticate_client` documents applies:
     /// this returns before any hashing when the client is unknown, so an unknown client and a
     /// known client with the wrong token are distinguishable by wall time. The comparison itself
-    /// leaks nothing (see [`SecretHash::verify`]); equalising the two paths is the host's
+    /// leaks nothing (see [`SecretHash::verify_with_crypto`]); equalising the two paths is the host's
     /// business.
     ///
     /// THE HOST'S [`crate::events::RateLimiter`] IS ASKED FIRST, before the store is touched, and

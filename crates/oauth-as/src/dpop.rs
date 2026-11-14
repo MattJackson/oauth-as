@@ -25,7 +25,7 @@
 //!   presented with. This function verifies a proof against a method and a URI; it takes no access
 //!   token, so it cannot check `ath` and does not. That is the right scope for an AS — at the
 //!   token endpoint there is no access token yet — but it MATTERS for the resource-server use
-//!   [`verify_proof`] documents below, because without it a proof is bound to a key and a request
+//!   [`verify_proof_with_crypto`] documents below, because without it a proof is bound to a key and a request
 //!   line but not to a token: an RS built only on this accepts token A presented with a proof
 //!   carrying no `ath`, or one whose `ath` hashes a different token B, as long as both were issued
 //!   to the same key. An RS MUST check `ath` itself, against the token it is about to accept.
@@ -51,7 +51,7 @@
 //!
 //! A proof is not a secret: it travels in a header on every request, so anything on the path sees
 //! them constantly. Its whole value is in what a captured one cannot be used for, which is `htm`,
-//! `htu`, `iat` and `jti` (section 4.3). [`verify_proof`] is PURE and returns the `jti` with the
+//! `htu`, `iat` and `jti` (section 4.3). [`verify_proof_with_crypto`] is PURE and returns the `jti` with the
 //! deadline it must be remembered to; claiming it is [`crate::store::Storage::claim_replay_id`],
 //! which `AuthorizationServer` calls on the same request. A verifier that checks the signature and
 //! skips the `jti` has left the replay window wide open for exactly [`MAX_PROOF_AGE`].
@@ -102,7 +102,7 @@ pub const MAX_PROOF_AGE: Duration = Duration::from_secs(300);
 /// hand.
 pub use crate::skew::CLOCK_SKEW_LEEWAY;
 
-/// The largest DPoP proof [`verify_proof`] will look at, in bytes, checked BEFORE it is parsed.
+/// The largest DPoP proof [`verify_proof_with_crypto`] will look at, in bytes, checked BEFORE it is parsed.
 ///
 /// WHY THIS CRATE NEEDS ITS OWN. Every other credential this server checks arrives in a request
 /// BODY, and the body is bounded (`MAX_BODY_BYTES` in `src/http.rs`). A proof arrives in a request
@@ -123,11 +123,11 @@ pub use crate::skew::CLOCK_SKEW_LEEWAY;
 /// DEFENCE IN DEPTH, stated honestly: a host's HTTP server almost always caps total header size as
 /// well (8 KiB per header line is a common default), so in most deployments this is the second line
 /// and not the only one. It is here because this library never sees the socket and so cannot rely
-/// on a limit it did not set, and because [`verify_proof`] is public: a host may hand it a string
+/// on a limit it did not set, and because [`verify_proof_with_crypto`] is public: a host may hand it a string
 /// from anywhere.
 pub const MAX_PROOF_BYTES: usize = 4096;
 
-/// The longest `jti` [`verify_proof`] will accept on a proof, in bytes.
+/// The longest `jti` [`verify_proof_with_crypto`] will accept on a proof, in bytes.
 ///
 /// WHY A SECOND CAP, when [`MAX_PROOF_BYTES`] already bounds the whole string. That one bounds the
 /// WORK; this one bounds what is RETAINED, and they are different quantities. Everything else

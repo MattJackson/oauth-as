@@ -1,0 +1,36 @@
+# 1.1.0 changed-code audit
+
+Scope: every change from 4726677 (1.0.1 dev baseline), including provider modules,
+protocol wiring, examples, tests, feature/dependency graphs, CI, package contents,
+and documentation. Review covered capability/algorithm confusion, entropy/error
+paths, secret comparisons, untrusted key parsing, metadata, compatibility, allocation
+costs, and release/conformance wiring. Compilation and tests run only in Actions.
+
+Findings corrected during development and audit:
+
+| Severity | Finding | Correction and evidence |
+| --- | --- | --- |
+| Medium | FIPS RSA policy checked byte count and allowed non-approved verification sizes | Enforce exact 2048/3072/4096-bit moduli; validate private keys with AWS-LC's FIPS key check. A valid 3071-bit signature reproduced the defect in run 43570275650, job 132372931576. Provider tests pass after the fix in run 43570493605. |
+| Medium | Explicit-provider metadata inherited the compiled ES256 default | Rebuild verifier-dependent metadata from the selected provider. A provider with no asymmetric operations plus an accepting legacy hook reproduced the defect in run 43570275650, job 132372931467; fixed in ecfeea5. |
+| Medium | FAPI fixture broadened DPoP policy when selecting AWS-LC | Apply AlgAllowList::fapi at the AS and protected resource. OIDF run 43570014751, job 132372143931 rejected the previous implementation for accepting RS256. Fixed in c90292e; full backend rerun requested. |
+| Medium | Backend-free mTLS and storage conformance retained legacy hash helpers | Add provider-aware certificate-list/JWKS/confirmation methods; use fixed storage fixture hashes. All-protocol consumer build reproduced seven missing symbols in run 43570275650, job 132372931274. Fixed in ecfeea5. |
+| Low | FIPS release fixture used incompatible GCC-generated assembly | Select Clang in the FAPI workflow without modifying the validated module source. Build failure recorded in run 43570014751, job 132372143791. |
+| Low | SQLx umbrella pulled unused SQLite with an advisory | Use the same SQLx 0.8 PostgreSQL driver directly; no advisory exemption added. Supply-chain workflow passes. Missing adapter imports exposed by the full suite were corrected. |
+| Low | Default-feature and provider-free documentation was stale | Update README, API links, backend selection and deployment requirements. Include backend-free rustdoc in CI. |
+| Low | Server allocation budget omitted its provider pointer | Account explicitly for the measured 16-byte Arc trait object; no per-request provider allocation. Existing efficiency tests remain active. |
+
+Initial red proof: run 43568192111 failed the new provider API and banned dependency
+checks before implementation. The independent consumer checks the requested
+http,jwt,consent,resource-metadata graph and additionally compiles every protocol
+feature with no backend. Provider tests exercise RFC 7636, 4231, 7638, 7515 and
+8032 vectors, invalid signatures, entropy errors, forbidden algorithms and metadata.
+
+Compatibility decisions: default RustCrypto behavior and serialized storage formats
+are preserved. EcdsaP256Key::generate remains deprecated with its existing panic;
+try_generate is fallible. Backend-free callers use the new explicit APIs. Existing
+RSA signing's documented upstream Marvin limitation is unchanged. FIPS compliance
+requires the module's supported deployment configuration; conformance runs do not
+extend the existing 1.0.0 OpenID certification to a new version.
+
+Status: all identified code defects have fixes. Final CI, FAPI and release results
+are recorded after QA; this document does not claim those unfinished runs passed.

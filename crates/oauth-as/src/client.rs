@@ -53,7 +53,7 @@ impl fmt::Display for ClientId {
 ///   client secret is high-entropy and host-generated, so there is no dictionary to run against
 ///   it, and the offline-guessing threat that makes a slow KDF necessary for human-chosen
 ///   passwords does not exist here. The comparison is constant time regardless, for the reason
-///   given on [`ClientAuth::verify_with`].
+///   given on [`ClientAuth::verify_with_crypto`].
 /// - Anything else, built by [`SecretHash::custom`] and verified by a host-supplied
 ///   [`SecretVerifier`]. A host whose policy names argon2id, scrypt or bcrypt, or whose
 ///   verification happens in an HSM, keeps that dependency in its own tree where it belongs. A
@@ -133,7 +133,7 @@ impl SecretHash {
     /// scheme this crate does not implement.
     ///
     /// The same ORDER OF PREFERENCE, and the same fail-closed rule, as
-    /// [`ClientAuth::verify_with`], which delegates here: the crate's own scheme is decided by the
+    /// [`ClientAuth::verify_with_crypto`], which delegates here: the crate's own scheme is decided by the
     /// crate, an unrecognised one is decided by the host, and an unrecognised one with no host
     /// verifier installed never verifies.
     ///
@@ -169,7 +169,7 @@ impl SecretHash {
 /// The host's client-secret verifier, for [`SecretHash`] schemes this crate does not implement.
 ///
 /// Installed on the server (`AuthorizationServer::with_secret_verifier`) and consulted by
-/// [`ClientAuth::verify_with`]. It is an ADDITION, never an override: a registration in the
+/// [`ClientAuth::verify_with_crypto`]. It is an ADDITION, never an override: a registration in the
 /// built-in scheme is always verified by this crate, so a permissive or buggy host verifier cannot
 /// weaken one.
 ///
@@ -375,7 +375,7 @@ impl ClientAuth {
         !matches!(self, ClientAuth::Public)
     }
 
-    /// Verify a presented secret with no host verifier installed. See [`ClientAuth::verify_with`],
+    /// Verify a presented secret with no host verifier installed. See [`ClientAuth::verify_with_crypto`],
     /// which this delegates to; a [`ClientAuth::ConfidentialSecretHash`] in a scheme this crate
     /// does not implement therefore never authenticates through this entry point.
     #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]

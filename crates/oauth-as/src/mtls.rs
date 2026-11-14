@@ -107,7 +107,7 @@ impl CertificateThumbprint {
     ///
     /// `der` is the certificate itself, NOT a PEM block: base64 text with `-----BEGIN
     /// CERTIFICATE-----` around it hashes to something that matches nothing. See
-    /// [`CertificateThumbprint::from_pem`] for that form.
+    /// [`CertificateThumbprint::from_pem_with_crypto`] for that form.
     #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_der(der: &[u8]) -> Self {
         Self::from_der_with_crypto(&crate::crypto::builtin(), der)
@@ -443,7 +443,7 @@ pub struct RegisteredCertificates(Vec<CertificateThumbprint>);
 impl RegisteredCertificates {
     /// From thumbprints already computed.
     ///
-    /// An EMPTY list is refused, exactly as [`RegisteredCertificates::from_jwks`] refuses a key set
+    /// An EMPTY list is refused, exactly as [`RegisteredCertificates::from_jwks_with_crypto`] refuses a key set
     /// that yields no certificate, and for the identical reason: a registration with nothing to
     /// compare against can never authenticate anybody, so it is a configuration mistake and not a
     /// permissive setting. Accepting it here and refusing it there would have made the outcome of
@@ -722,7 +722,7 @@ impl Confirmation {
 ///
 /// - a [`ClientAuth::Mtls`] registration is decided here and ONLY here. It has no secret, so there
 ///   is no string that could be the right one, and it never reaches the secret comparison:
-///   [`ClientAuth::verify_with`] answers `false` for the variant, so no presented secret can
+///   [`ClientAuth::verify_with_crypto`] answers `false` for the variant, so no presented secret can
 ///   authenticate an mTLS client by that route either.
 /// - every other registration is decided exactly as it was before, and a certificate presented
 ///   alongside is NOT an authentication credential there. It is used only for RFC 8705 section 3

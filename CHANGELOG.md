@@ -12,6 +12,8 @@ whatever version is current at each real crates.io release appear as published o
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-14
+
 ### Added
 
 - Per-server `CryptoProvider`, explicit fallible constructors, and provider-aware

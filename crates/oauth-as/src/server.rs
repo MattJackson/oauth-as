@@ -3609,7 +3609,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// `htu`, so a server whose own idea of its token endpoint differs from the one it published
     /// refuses every conforming client.
     ///
-    /// PRECOMPUTED at construction (see [`AuthorizationServer::with_clock`]) and borrowed here.
+    /// PRECOMPUTED at construction (see [`AuthorizationServer::with_clock_and_crypto`]) and borrowed here.
     /// The value is fixed for the life of the server, and this is called once per RFC 9449 proof
     /// verification and once per RFC 7523 assertion verification, so a `private_key_jwt` client
     /// sending DPoP paid two `format!`s of a constant on every token request. The crate already

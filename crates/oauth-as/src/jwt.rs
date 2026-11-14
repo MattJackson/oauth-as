@@ -2104,7 +2104,7 @@ impl Jwk {
 
     /// Name this key, with the RFC 7517 section 4.5 `kid` a client publishes it under.
     ///
-    /// Deliberately NOT part of the thumbprint: see [`Jwk::thumbprint`] on why relabelling a key
+    /// Deliberately NOT part of the thumbprint: see [`Jwk::thumbprint_with_crypto`] on why relabelling a key
     /// must not change what a token is bound to.
     pub fn with_kid(self, kid: &str) -> Self {
         let kid = Some(kid.to_string());
