@@ -513,6 +513,40 @@ impl JwsVerifier for Ps256Verifier {
     }
 }
 
+// rsa's RngCore is infallible, but its PSS SigningKey consumes one 32-byte salt. Acquire
+// that salt fallibly BEFORE signing. A dependency changing this contract cannot emit a signature:
+// the failure latch is checked before the result is returned. This adapter is not a general RNG.
+struct SaltRng {
+    salt: [u8; 32],
+    used: bool,
+    failed: bool,
+}
+impl rsa::rand_core::RngCore for SaltRng {
+    fn next_u32(&mut self) -> u32 {
+        self.failed = true;
+        0
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.failed = true;
+        0
+    }
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        if self.try_fill_bytes(out).is_err() {
+            out.fill(0);
+        }
+    }
+    fn try_fill_bytes(&mut self, out: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        if self.used || out.len() != self.salt.len() {
+            self.failed = true;
+            return Err(rsa::rand_core::Error::new("unexpected PSS salt request"));
+        }
+        out.copy_from_slice(&self.salt);
+        self.used = true;
+        Ok(())
+    }
+}
+impl rsa::rand_core::CryptoRng for SaltRng {}
+
 // NOTE: the RFC 7638 RSA thumbprint is NOT duplicated here. The canonical, production
 // implementation is `crate::jwt::Jwk::thumbprint` (the `Jwk::Rsa` arm); the tests below call it
 // directly so this backend cannot drift a second, unreviewed copy of it.
@@ -1026,37 +1060,3 @@ mod seam_tests {
             .expect("try_fill_bytes is infallible over the OS CSPRNG");
     }
 }
-
-// rsa's RngCore is infallible, but its PSS SigningKey consumes one 32-byte salt. Acquire
-// that salt fallibly BEFORE signing. A dependency changing this contract cannot emit a signature:
-// the failure latch is checked before the result is returned. This adapter is not a general RNG.
-struct SaltRng {
-    salt: [u8; 32],
-    used: bool,
-    failed: bool,
-}
-impl rsa::rand_core::RngCore for SaltRng {
-    fn next_u32(&mut self) -> u32 {
-        self.failed = true;
-        0
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.failed = true;
-        0
-    }
-    fn fill_bytes(&mut self, out: &mut [u8]) {
-        if self.try_fill_bytes(out).is_err() {
-            out.fill(0);
-        }
-    }
-    fn try_fill_bytes(&mut self, out: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-        if self.used || out.len() != self.salt.len() {
-            self.failed = true;
-            return Err(rsa::rand_core::Error::new("unexpected PSS salt request"));
-        }
-        out.copy_from_slice(&self.salt);
-        self.used = true;
-        Ok(())
-    }
-}
-impl rsa::rand_core::CryptoRng for SaltRng {}

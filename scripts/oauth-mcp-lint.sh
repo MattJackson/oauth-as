@@ -139,7 +139,7 @@ install_scanner() {
 build_examples() {
   note "building the AS and the RFC 9728 fixture resource"
   ( cd "$ROOT" && cargo build --locked -p oauth-as \
-      --features axum,jwt-p256,resource-metadata,client-assertion,jwt-rsa,jwt-ed25519 \
+      --features axum,jwt-pkcs8,resource-metadata,client-assertion,jwt-rsa,jwt-ed25519 \
       --example conformance_server --example protected_resource_fixture ) \
       >"$TMPDIR_LINT/build.log" 2>&1 \
       || { cat "$TMPDIR_LINT/build.log"; fail "the examples did not build"; }
