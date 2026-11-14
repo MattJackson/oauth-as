@@ -63,8 +63,8 @@
 //! - `jwt-p256`, THE BUILT-IN ES256 BACKEND, and the one to reach for first: `jwt` compiles the
 //!   RFC 7515 machinery and the [`jwt::JwsSigner`] / [`jwt::JwsVerifier`] seams but SIGNS
 //!   NOTHING BY ITSELF, because where a private key lives is the host's decision (see the
-//!   [`jwt`] module docs). `jwt-p256` supplies [`jwt::EcdsaP256Key`] and installs
-//!   [`jwt::P256Verifier`] as the default, which is what a host with no opinion about its key
+//!   [`jwt`] module docs). `jwt-p256` supplies `jwt::EcdsaP256Key` and installs
+//!   `jwt::P256Verifier` as the default, which is what a host with no opinion about its key
 //!   wants; a host with an HSM or a KMS installs its own signer instead and takes no `p256`.
 //!   The features are ADDITIVE rather than exclusive, so both at once compiles and the installed
 //!   signer wins. `jwt-pkcs8` adds PKCS#8 DER loading on top of `jwt-p256`, for a host whose key
@@ -181,7 +181,7 @@ let service = ServiceBuilder::new(server)
 //! A host that compiles this crate in but never turns it on must pay nothing at runtime. The crate
 //! keeps that promise structurally: there are NO global statics, NO lazy singletons, NO background
 //! tasks, and no allocation at load time. The only allocation entry point is
-//! [`server::AuthorizationServer::new`] (plus whatever `Storage` the host constructs to pass in),
+//! [`server::AuthorizationServer::new_with_crypto`] (plus whatever `Storage` the host constructs to pass in),
 //! so "enabled by config" for a host means exactly "construct the value when config says so".
 //!
 //! # THE SWEEP: an obligation that comes with the no-background-tasks promise
