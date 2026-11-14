@@ -79,6 +79,7 @@
 //! resource server registered in `ServerConfig::resource_servers`, so it is a real answer here and
 //! not only short lifetimes.
 
+use crate::sqlx;
 use oauth_as::authorization::AuthorizationCodeRecord;
 use oauth_as::client::{Client, ClientId};
 use oauth_as::device::{DeviceGrant, DeviceGrantState};

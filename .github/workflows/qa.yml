@@ -507,7 +507,7 @@ jobs:
                    "consent" "resource-metadata" "cimd" "test-util" "test-util,jwt"; do
             echo "::group::features: ${f:-<default>}"
             if [ -z "$f" ]; then
-              cargo clippy -p oauth-as --locked --all-targets --no-default-features -- -D warnings
+              cargo clippy -p oauth-as --locked --all-targets -- -D warnings
             else
               cargo clippy -p oauth-as --locked --all-targets --features "$f" -- -D warnings
             fi

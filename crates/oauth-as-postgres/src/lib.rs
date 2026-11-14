@@ -60,6 +60,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[doc(hidden)]
+pub mod sqlx;
+
 use sqlx::postgres::{PgPoolOptions, Postgres};
 use sqlx::Executor;
 use sqlx::{Pool, Transaction};

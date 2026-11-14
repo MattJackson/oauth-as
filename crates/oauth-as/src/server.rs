@@ -6116,7 +6116,6 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     // Eight arguments rather than seven, because the audit event has to name the grant that
     // produced the token and `issue` is the only place that sees the whole issuance. Bundling them
     // into a struct would be churn for its own sake on a private function with four call sites.
-    #[allow(clippy::too_many_arguments)]
     /// [`AuthorizationServer::issue`] behind one heap allocation.
     ///
     /// Every caller of `issue` goes through here, and the reason is a measurement rather than a

@@ -6,6 +6,7 @@
 mod oauth_support;
 mod support;
 use oauth_as::{token::RefreshTokenState, AuthorizationServer, ErrorCode, Storage};
+use oauth_as_postgres::sqlx;
 use oauth_support::{
     refresh_retry::{config, exercise, mint, request},
     ManualClock,
