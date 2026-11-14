@@ -180,7 +180,11 @@ each item naming the feature that turns it on.
 ## Cost
 
 The tables below record the pre-provider RustCrypto baseline. They do not measure
-AWS-LC or FIPS. Run **`scripts/size-report.sh`** for the current RustCrypto profile.
+AWS-LC or FIPS. The 1.1 QA run measured 235.5 KiB for the default core,
+270.9 KiB for the JWT seam, 353.5 KiB with P-256, 476.2 KiB for HTTP+JWT,
+and 676.4 KiB with axum. Provider dispatch retains its operations in the binary,
+including verification in a signing-only P-256 probe. Run
+**`scripts/size-report.sh`** for the current RustCrypto profile.
 
 ### Linked size
 

@@ -32,6 +32,13 @@ RSA signing's documented upstream Marvin limitation is unchanged. FIPS complianc
 requires the module's supported deployment configuration; conformance runs do not
 extend the existing 1.0.0 OpenID certification to a new version.
 
+The 1.1 provider seam has an intentional linked-size cost: QA measured axum
+692,648 bytes, P-256 361,962 bytes and HTTP+JWT 487,636 bytes. The provider vtable
+retains its operations, including P-256 verification in a signing-only probe.
+Those three bands are rebased to approximately +/-1.5%; other budgets are retained.
+Key generation also avoids cloning the key identifier on every rejection-sampling
+attempt. This is a documented capability/size tradeoff, not a net source-size saving.
+
 Further QA findings: the MCP scanner fixture needed `jwt-pkcs8` for the new provider
 key factory (reproduced as UnsupportedAlgorithm in job 132375619924); both scanner
 build commands now enable it. The package manifest needed C-locale sorting; backend-free

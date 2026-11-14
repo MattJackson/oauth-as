@@ -275,7 +275,10 @@ budget_for() {
     # row was set from. The 233 KiB over the `http` row is almost entirely the runtime, which is
     # the host's cost and not this crate's.
     # Budget down from 681,984 to 672,768.
-    aarch64-apple-darwin:axum) echo 691200 ;;
+    # 1.1 provider seam: measured 692,648 in QA 43571128509. Explicit shared
+    # provider dispatch retains its primitive vtable; accept that capability cost,
+    # with a new +/-1.5% band rather than leaving arbitrary headroom.
+    aarch64-apple-darwin:axum) echo 703488 ;;
     # + RFC 9068 signing over a HOST-SUPPLIED `Es256Signer`, the RFC 7517 JWKS, and the JWK parsing
     # the verification seam rests on. NO curve implementation: this is what a host with its key in
     # a KMS pays. MEASURED 256,106, essentially where it was at 0.9.1 (256,491, down 385) -- and
@@ -293,12 +296,17 @@ budget_for() {
     # actually wants.
     # Budget down from 308,224 to 296,960, because 308,224 was 5.4% above a row that moved by 749
     # bytes all release.
-    aarch64-apple-darwin:jwt-p256) echo 353280 ;;
+    # 1.1 measured 361,962. The provider vtable also retains P-256 verification
+    # when this particular probe only signs. Both operations belong to the new
+    # provider contract; disabling the backend removes both for BYO-crypto hosts.
+    aarch64-apple-darwin:jwt-p256) echo 367616 ;;
     # the conformance server's own feature set: the HTTP surface plus the signing seam, with no
     # curve. MEASURED 458,484, down 14,036 from the 472,520 this row was set from, for the same
     # reason as `http`.
     # Budget down from 476,160 to 465,920.
-    aarch64-apple-darwin:"http,jwt") echo 484352 ;;
+    # 1.1 measured 487,636: shared provider selection and its complete primitive
+    # operations. Same 1.5% band as above; protocol exercises are unchanged.
+    aarch64-apple-darwin:"http,jwt") echo 495616 ;;
     # every feature, every one exercised. MEASURED 1,380,383, down 22,175 from the 1,402,558 this
     # row was set from -- the largest absolute saving in the table, because this row links every
     # feature's scope handling at once and `ScopeSet` is in all of them.
@@ -404,7 +412,7 @@ floor_for() {
     # `default` row's 221 KB and this floor is 195 KB above that.
     aarch64-apple-darwin:http) echo 434176 ;;
     # MEASURED 662,357, budget 672,768. Down to 637 KiB.
-    aarch64-apple-darwin:axum) echo 669696 ;;
+    aarch64-apple-darwin:axum) echo 681984 ;;
     # MEASURED 256,106, budget 260,096. Down to 246 KiB. The tightest band in the table in
     # absolute terms after `default`, and the row the 0.9.2 notes describe as flat: it moved 385
     # bytes across a whole release, so 4 KB of downward slack is generous for it.
@@ -412,9 +420,9 @@ floor_for() {
     # MEASURED 292,418, budget 296,960. Down to 281 KiB. The gap to the seam-only floor is what
     # stops the built-in p256 backend disappearing from the probe unnoticed.
     # 1.0.1 CI measurement 347,772 -1.5%, rounded down to 334 KiB.
-    aarch64-apple-darwin:jwt-p256) echo 342016 ;;
+    aarch64-apple-darwin:jwt-p256) echo 356352 ;;
     # MEASURED 458,484, budget 465,920. Down to 441 KiB.
-    aarch64-apple-darwin:"http,jwt") echo 468992 ;;
+    aarch64-apple-darwin:"http,jwt") echo 480256 ;;
     # MEASURED 1,380,383, budget 1,401,856. Down to 1327 KiB. 21 KB of downward slack, which is
     # the largest in the table in bytes and the same 1.56% in proportion. Read the note above
     # before trusting this one to notice a single feature: it will not.

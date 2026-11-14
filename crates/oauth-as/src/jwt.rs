@@ -939,8 +939,11 @@ impl EcdsaP256Key {
             // Rejection sampling: a uniform 32 byte string is occasionally outside [1, n-1] for
             // P-256's order n. Reducing it instead would bias the key; the probability of a redraw
             // is about 2^-32, so this loop terminates immediately in practice.
-            if let Ok(key) = Self::from_scalar_bytes(kid.clone(), &buf) {
-                return Ok(key);
+            if let Ok(secret) = SecretKey::from_slice(&buf) {
+                return Ok(Self {
+                    kid,
+                    signing: SigningKey::from(&secret),
+                });
             }
         }
     }
