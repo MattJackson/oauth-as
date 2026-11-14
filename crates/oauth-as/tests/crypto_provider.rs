@@ -280,7 +280,6 @@ fn explicit_provider_never_installs_builtin_verifiers() {
         provider,
     )
     .unwrap();
-    #[cfg(any(feature = "client-assertion", feature = "dpop", feature = "jar"))]
     let server = server.with_jws_verifier(Arc::new(AcceptEverything));
     let metadata = serde_json::to_value(server.metadata()).unwrap();
     for key in [
@@ -358,8 +357,14 @@ async fn ed25519_rfc8032_known_answer() {
     let key =
         Jwk::from_json(&serde_json::json!({"kty":"OKP", "crv":"Ed25519", "x":B64.encode(public)}))
             .unwrap();
-    let signer = p.signing_key(JwsAlg::EdDsa, "rfc", &der).unwrap();
-    assert_eq!(signer.sign(b"").await.unwrap().as_bytes(), expected);
+    // RustCrypto's DER codec is independently opt-in; verification needs only jwt-ed25519.
+    if !cfg!(all(
+        feature = "rustcrypto",
+        not(feature = "jwt-ed25519-pkcs8")
+    )) {
+        let signer = p.signing_key(JwsAlg::EdDsa, "rfc", &der).unwrap();
+        assert_eq!(signer.sign(b"").await.unwrap().as_bytes(), expected);
+    }
     assert!(verifier.verify(&key, b"", &expected));
     assert!(!verifier.verify(&key, b"changed", &expected));
     assert!(!verifier.verify(&key, b"", &[0; 64]));
