@@ -409,7 +409,7 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 /// after 0.9.0: enable `jwt-p256`/`jwt-rsa`/`jwt-ed25519` for a built-in [`crate::jwt::JwsVerifier`]
 /// (ES256, RS256, EdDSA, PS256 — the last two both under `jwt-rsa`), or pass your own.
 ///
-/// It is an `Option`, and unlike [`crate::dpop::verify_proof`]'s it HAS to be, because only ONE of
+/// It is an `Option`, and unlike [`crate::dpop::verify_proof_with_crypto`]'s it HAS to be, because only ONE of
 /// the two RFC 7523 methods carries an asymmetric signature at all. `private_key_jwt` names one
 /// asymmetric algorithm and `None` refuses it, for that function's reason: a caller holding no
 /// verifier must refuse the credential rather than verify it leniently. `client_secret_jwt` is

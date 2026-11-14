@@ -11,7 +11,7 @@
 //! symmetric. The module doc used to be able to say this crate "never parses a JWT it did not
 //! make"; the `client-assertion` and `dpop` features ended that. An RFC 7523 client assertion and
 //! an RFC 9449 DPoP proof are both JWTs a CLIENT made, so [`CompactJws::parse`], [`Jwk`] and
-//! [`verify_es256`] are handling attacker-controlled input, and anyone verifying against them
+//! `verify_es256` are handling attacker-controlled input, and anyone verifying against them
 //! needs these three rules rather than a pointer at the source.
 //!
 //! They are the same three rules every published JWS confusion attack has been aimed at:
@@ -23,8 +23,8 @@
 //!    proof, but the proof only ever proves possession of THAT key, and it is the `cnf.jkt`
 //!    binding, not this module, that decides whether the key means anything (see the `dpop`
 //!    module).
-//! 2. THE ALGORITHM IS CHOSEN BY THE VERIFIER, never by the token. [`verify_es256`] and
-//!    [`verify_hs256`] are separate functions taking separate key types, so there is no value of
+//! 2. THE ALGORITHM IS CHOSEN BY THE VERIFIER, never by the token. `verify_es256` and
+//!    [`verify_hs256_with_crypto`] are separate functions taking separate key types, so there is no value of
 //!    `alg` a caller can be made to route an HMAC verification at a public key it already
 //!    published. `none` is not implemented at all: no code path here accepts an unsigned JWS. A
 //!    caller still has to check that the `alg` it was handed is the one the REGISTRATION expects,
@@ -41,7 +41,7 @@
 //! whose `Deserialize` impl is routed through it rather than derived. The type's fields are sealed,
 //! so the other constructors are the only alternatives and neither can express a private member:
 //! [`Jwk::from_coordinates`] takes two P-256 coordinates and nothing else, and
-//! [`EcdsaP256Key::to_public_jwk`] converts a key this crate PUBLISHED, which by construction has no private
+//! `EcdsaP256Key::to_public_jwk` converts a key this crate PUBLISHED, which by construction has no private
 //! half in it. See [`Jwk`] on what each does and does not revalidate.
 //!
 //! # Why this is hand-rolled
@@ -76,7 +76,7 @@
 //!
 //! The signing key. This module will not invent one at startup and does not persist one: a key
 //! that appears from nowhere is a key nobody is managing, and a key regenerated on restart
-//! silently invalidates every live token. [`EcdsaP256Key::generate`] exists for tests and for a
+//! silently invalidates every live token. `EcdsaP256Key::generate` exists for tests and for a
 //! host's own key-provisioning tool, and the host is expected to store what it generates.
 
 use std::fmt;
@@ -166,7 +166,7 @@ pub enum KeyKind {
 /// release that adds a variant here and forces every `match` in this file to grow an arm, which is
 /// exactly the review a new signature algorithm should compel. HMAC (`HS256`) is NOT a member and
 /// cannot be spelled here: it verifies with a secret both parties hold, has its own
-/// [`verify_hs256`] path, and must never reach a [`JwsVerifier`]. `none` is likewise absent, so no
+/// [`verify_hs256_with_crypto`] path, and must never reach a [`JwsVerifier`]. `none` is likewise absent, so no
 /// code path can route an unsigned JWS through this seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(docsrs, doc(cfg(feature = "jwt")))]
@@ -337,7 +337,7 @@ pub enum JwsSignature {
     /// An RS256 signature (RFC 7518 section 3.3). Its width is the modulus size `k` (256 bytes for
     /// RSA-2048, 384 for 3072, 512 for 4096), so unlike the fixed-width curves it is boxed octets.
     /// The `length == modulus` check is the verifier's, not the wire's: `rsa`'s parse is
-    /// length-lenient, so [`crate::backends::rsa::RsaVerifier`] guards it per key.
+    /// length-lenient, so `crate::backends::rsa::RsaVerifier` guards it per key.
     Rs256(Box<[u8]>),
     /// A 64-byte fixed-width Ed25519 signature (RFC 8032 section 5.1; RFC 8037 section 3.1).
     EdDsa([u8; 64]),
@@ -345,7 +345,7 @@ pub enum JwsSignature {
     /// same as [`JwsSignature::Rs256`], so it is boxed octets. A SEPARATE variant from `Rs256`, not a
     /// reuse: the variant IS the algorithm tag ([`JwsSignature::alg`]), so RS256 and PS256 must tag
     /// distinctly even though both are RSA. The `length == modulus` check is the verifier's; `rsa`'s
-    /// PSS parse is length-lenient (see [`crate::backends::rsa::Ps256Verifier`]).
+    /// PSS parse is length-lenient (see `crate::backends::rsa::Ps256Verifier`).
     Ps256(Box<[u8]>),
 }
 
@@ -460,7 +460,7 @@ impl JwsVerifiers {
 ///   `client_secret_jwt` outright — closes that door by not registering such clients;
 /// - a rewrite of host-authored free-form fields such as the RFC 9728 resource-metadata alg lists
 ///   (those are the host's declaration about a protected resource, not the AS's client-auth policy);
-/// - reachable by a host that calls a low-level verify entry point (e.g. [`crate::dpop::verify_proof`])
+/// - reachable by a host that calls a low-level verify entry point (e.g. [`crate::dpop::verify_proof_with_crypto`])
 ///   with its own verifier set — that is the host operating its own crypto, outside this server's
 ///   mediation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,7 +558,7 @@ impl std::error::Error for JwtError {}
 
 /// A signing backend could not produce a signature.
 ///
-/// The generic signing error for the whole seam: [`EcdsaP256Key`], the RSA and Ed25519 backends,
+/// The generic signing error for the whole seam: `EcdsaP256Key`, the RSA and Ed25519 backends,
 /// and any host [`JwsSigner`] all report failure through this one type, so it names no algorithm.
 ///
 /// One opaque type rather than an enum, and no source error: the caller in
@@ -588,7 +588,7 @@ impl std::error::Error for SignerError {}
 
 /// WHERE THIS SERVER'S SIGNING KEY LIVES. The host implements it; this crate holds only a handle.
 ///
-/// Enable `jwt-p256` and use [`EcdsaP256Key`] if the key is a scalar in this process. Implement
+/// Enable `jwt-p256` and use `EcdsaP256Key` if the key is a scalar in this process. Implement
 /// this if it is not: a cloud KMS, a PKCS#11 token, an HSM, a remote signing service.
 ///
 /// # The two halves are deliberately different shapes
@@ -722,7 +722,7 @@ impl<T: JwsSigner + ?Sized> JwsSigner for Arc<T> {
 /// HOW THIS SERVER CHECKS A SIGNATURE SOMEBODY ELSE MADE: RFC 9449 DPoP proofs, RFC 9101 request
 /// objects, RFC 7523 client assertions.
 ///
-/// Enable `jwt-p256` for the built-in [`P256Verifier`], or install your own with
+/// Enable `jwt-p256` for the built-in `P256Verifier`, or install your own with
 /// [`crate::AuthorizationServer::with_jws_verifier`]. With neither, every signed credential is
 /// REFUSED: a server that cannot check a signature must never behave as though it had checked one.
 ///
@@ -894,7 +894,7 @@ impl EcdsaP256Key {
     /// split takes the `pkcs8` crate off a `--features jwt` tree. It does NOT save a host any
     /// linked size, because a build with the feature on and these two constructors never called
     /// measures byte for byte identical to one with it off; LTO deletes what nothing reaches. A
-    /// host whose key material arrives as a raw scalar uses [`EcdsaP256Key::from_scalar_bytes`]
+    /// host whose key material arrives as a raw scalar uses `EcdsaP256Key::from_scalar_bytes`
     /// and pays nothing either way.
     #[cfg(feature = "jwt-pkcs8")]
     #[cfg_attr(docsrs, doc(cfg(feature = "jwt-pkcs8")))]
@@ -909,7 +909,7 @@ impl EcdsaP256Key {
 
     /// A fresh random key. For TESTS and for a host's own key-provisioning step: this crate never
     /// calls it, because a key that materialises at startup is a key nobody is managing. Whatever
-    /// this returns must be exported ([`EcdsaP256Key::to_pkcs8_der`]) and stored by the host, or
+    /// this returns must be exported (`EcdsaP256Key::to_pkcs8_der`) and stored by the host, or
     /// the tokens signed with it die with the process.
     ///
     /// # Panics
@@ -948,7 +948,7 @@ impl EcdsaP256Key {
     /// Export as PKCS#8 DER. PRIVATE KEY MATERIAL: the caller is responsible for where this goes.
     /// Present so a host can persist a key it generated; nothing in this crate calls it.
     ///
-    /// Behind `jwt-pkcs8`, for the reason on [`EcdsaP256Key::from_pkcs8_der`].
+    /// Behind `jwt-pkcs8`, for the reason on `EcdsaP256Key::from_pkcs8_der`.
     #[cfg(feature = "jwt-pkcs8")]
     #[cfg_attr(docsrs, doc(cfg(feature = "jwt-pkcs8")))]
     pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, KeyError> {
@@ -1615,7 +1615,7 @@ impl JwtConfig {
     /// Configure signing for one audience. The audience is REQUIRED (RFC 9068 section 2.2) and has
     /// no default: only the deployment knows which resource server a token is meant for, and a
     /// guessed `aud` is a token that is valid somewhere nobody intended.
-    /// `signer` is anything implementing [`JwsSigner`]: [`EcdsaP256Key`] under `jwt-p256`, an
+    /// `signer` is anything implementing [`JwsSigner`]: `EcdsaP256Key` under `jwt-p256`, an
     /// `Arc` of one shared with another configuration, or the host's own KMS-backed type. Its
     /// public half is read HERE, once, and never again; see [`JwsSigner::public_jwk`] for what
     /// that requires of an implementor and for why rotation must come back through
@@ -1777,7 +1777,7 @@ impl JwtConfig {
     /// Serialize and sign one access token into RFC 7515 section 3.1 compact form.
     ///
     /// ASYNC because [`JwsSigner::sign`] is, which is because the key may not be in this
-    /// process. With the in-process [`EcdsaP256Key`] backend the future is ready on its first poll
+    /// process. With the in-process `EcdsaP256Key` backend the future is ready on its first poll
     /// and there is no suspension point.
     pub async fn sign_access_token(&self, claims: &AccessTokenClaims) -> Result<String, JwtError> {
         self.finish_signing(self.signing_input(claims)?).await
@@ -2371,7 +2371,7 @@ impl<'a> CompactJws<'a> {
 /// somebody to treat one as recoverable.
 ///
 /// THIS IS THE BUILT-IN BACKEND'S BODY, and it is the crate's ONE implementation of ES256
-/// verification. Everything inside the crate reaches it through [`P256Verifier`] and the
+/// verification. Everything inside the crate reaches it through `P256Verifier` and the
 /// [`JwsVerifier`] seam; it stays public because a host writing the resource-server half of RFC
 /// 9449 in the same tree needs it directly, and because it is what every existing consumer calls.
 ///
@@ -2470,7 +2470,7 @@ fn base64_len(n: usize) -> usize {
 
 #[cfg(feature = "jwt-p256")]
 impl EcdsaP256Key {
-    /// Sign an arbitrary JWS Signing Input with `ES256`: the counterpart of [`verify_es256`], and
+    /// Sign an arbitrary JWS Signing Input with `ES256`: the counterpart of `verify_es256`, and
     /// the signing half [`compact_jws`] is usually handed.
     pub fn sign_signing_input(&self, signing_input: &str) -> Result<Vec<u8>, JwtError> {
         self.sign_es256(signing_input.as_bytes())
@@ -2478,7 +2478,7 @@ impl EcdsaP256Key {
     }
 
     /// The public half as a [`Jwk`], for a host registering this key as a client's
-    /// `private_key_jwt` key. Identical to [`EcdsaP256Key::public_jwk`] now that one [`Jwk`] serves
+    /// `private_key_jwt` key. Identical to `EcdsaP256Key::public_jwk` now that one [`Jwk`] serves
     /// both jobs; retained so existing callers keep compiling. There is still no method anywhere in
     /// this crate that emits `d`.
     pub fn to_public_jwk(&self) -> Jwk {
