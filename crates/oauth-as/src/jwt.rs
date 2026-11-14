@@ -430,10 +430,10 @@ impl JwsVerifiers {
     /// algorithm's slot here makes it `NotInstalled` no matter what key a self-carried DPoP proof
     /// brings — the allow-list cannot be reintroduced by the proof.
     ///
-    /// Gated on `dpop`, its only caller ([`crate::AuthorizationServer::resolved_jws_verifiers`]): the
+    /// Gated on `dpop`, for authorization servers and host resource servers: the
     /// `AnyInstalled` set exists only for DPoP, so a build without it has no whole-set to restrict.
     #[cfg(feature = "dpop")]
-    pub(crate) fn restrict_to(&mut self, allow: &AlgAllowList) {
+    pub fn restrict_to(&mut self, allow: &AlgAllowList) {
         for alg in JwsAlg::ALL {
             if !allow.is_allowed(*alg) {
                 self.slots[alg.slot()] = None;

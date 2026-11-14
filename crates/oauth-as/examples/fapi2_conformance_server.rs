@@ -88,7 +88,7 @@ use oauth_as::client_assertion::AssertionKeys;
 use oauth_as::dpop::{self, verify_proof_with_crypto};
 use oauth_as::grant::GrantType;
 use oauth_as::http::{ApprovalDecision, ServiceBuilder};
-use oauth_as::jwt::{AccessTokenFormat, CompactJws, Jwk, JwsAlg, JwtConfig};
+use oauth_as::jwt::{AccessTokenFormat, AlgAllowList, CompactJws, Jwk, JwsAlg, JwtConfig};
 use oauth_as::par::ParConfig;
 use oauth_as::scope::ScopeSet;
 use oauth_as::server::{AssertionAudience, AuthorizationServer, RefreshRotation, ServerConfig};
@@ -260,6 +260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resource can verify them offline against the advertised JWKS. `with_jwks_uri` is what makes
     // the metadata advertise `jwks_uri`, served by this router at `/jwks`. The token `aud` is the
     // resource URL, which the resource checks.
+    // Backend capability is broader than FAPI policy (AWS-LC also supports RS256).
+    config.jws_alg_allow_list = AlgAllowList::fapi();
     let crypto = fixture_crypto::provider()?;
     let as_key = fixture_crypto::scalar_key(crypto.as_ref(), AS_SIGNING_KID, &AS_SIGNING_SCALAR)?;
     let as_public_jwk = as_key.public_jwk();
@@ -542,7 +544,8 @@ fn verify_dpop_bound(state: &ResourceState, headers: &HeaderMap) -> Result<Strin
     // (4) the proof verifies for GET on this resource, within its iat window. Phase A's DPoP seam
     // takes the installed verifier SET (the header carries the proof key, so the algorithm is read
     // off the header against the installed verifiers); this fixture installs the built-in ES256 one.
-    let verifiers = oauth_as::crypto::verifiers(state.crypto.clone());
+    let mut verifiers = oauth_as::crypto::verifiers(state.crypto.clone());
+    verifiers.restrict_to(&AlgAllowList::fapi());
     let verified = verify_proof_with_crypto(
         state.crypto.as_ref(),
         &verifiers,
