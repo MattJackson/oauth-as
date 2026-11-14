@@ -3125,7 +3125,7 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// readable only for one the attacker already knows does.
     ///
     /// THIRD, and in the same class: a `ConfidentialSecret` registration compares its secret with
-    /// [`crate::client::constant_time_eq`], two SHA-256 digests, while the dummy an unknown id pays
+    /// [`CryptoProvider::ct_eq`], a constant-time content comparison, while the dummy an unknown id pays
     /// goes through the INSTALLED verifier's scheme. In a deployment that installs argon2id and
     /// still holds plaintext-secret registrations those differ by milliseconds, so such a
     /// registration is distinguishable from an unknown id. A deployment that stores hashes

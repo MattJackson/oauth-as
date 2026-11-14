@@ -31,7 +31,7 @@ jobs:
           cargo tree --manifest-path scripts/crypto-consumer/Cargo.toml -e normal --prefix none > "$RUNNER_TEMP/crypto-tree.txt"
           cat "$RUNNER_TEMP/crypto-tree.txt"
           if grep -E '^(sha2|getrandom|hmac|p256|ed25519-dalek|rsa|ring|aws-lc-[^ ]+) v' "$RUNNER_TEMP/crypto-tree.txt"; then exit 1; fi
-      - run: cargo check --manifest-path scripts/crypto-consumer/Cargo.toml
+      - run: cargo test --manifest-path scripts/crypto-consumer/Cargo.toml
       - run: cargo install --locked cargo-deny@0.20.2
       - run: cargo deny --manifest-path scripts/crypto-consumer/Cargo.toml --config scripts/crypto-consumer/deny.toml check bans
 

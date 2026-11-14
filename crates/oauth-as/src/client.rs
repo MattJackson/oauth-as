@@ -121,7 +121,7 @@ impl SecretHash {
     }
 
     /// Verify against the BUILT-IN scheme only; any other scheme is `false` here and is the host
-    /// verifier's business. Constant time via [`constant_time_eq`].
+    /// verifier's business. Constant time via [`CryptoProvider::ct_eq`].
     fn verify_builtin(&self, crypto: &dyn CryptoProvider, presented: &str) -> bool {
         if self.scheme != SecretHash::SHA256_HEX {
             return false;

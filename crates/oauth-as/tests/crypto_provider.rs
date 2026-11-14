@@ -223,3 +223,74 @@ async fn es256_signer_passes_independent_contract() {
         .await;
     assert!(failures.is_empty(), "{failures:?}");
 }
+
+#[cfg(all(feature = "fips", feature = "jwt"))]
+#[test]
+fn fips_rejects_rsa_moduli_outside_approved_bit_lengths() {
+    use aws_lc_rs::signature;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+    use oauth_as::jwt::{Jwk, JwsAlg};
+    let der = B64.decode(vectors::NONAPPROVED_RSA_DER).unwrap();
+    let key = signature::RsaKeyPair::from_pkcs8(&der).unwrap();
+    let public = key.public_key();
+    let jwk = Jwk::Rsa {
+        n: B64.encode(public.modulus().big_endian_without_leading_zero()),
+        e: B64.encode(public.exponent().big_endian_without_leading_zero()),
+        kid: None,
+    };
+    let mut signature = vec![0; key.public_modulus_len()];
+    key.sign(
+        &signature::RSA_PKCS1_SHA256,
+        &aws_lc_rs::rand::SystemRandom::new(),
+        b"nonapproved modulus",
+        &mut signature,
+    )
+    .unwrap();
+    assert!(!oauth_as::crypto::Fips
+        .verifier(JwsAlg::Rs256)
+        .unwrap()
+        .verify(&jwk, b"nonapproved modulus", &signature));
+    assert!(matches!(
+        oauth_as::crypto::Fips.signing_key(JwsAlg::Rs256, "key", &der),
+        Err(CryptoError::InvalidKey)
+    ));
+}
+
+#[cfg(feature = "jwt")]
+#[test]
+fn explicit_provider_never_installs_builtin_verifiers() {
+    use oauth_as::jwt::{Jwk, JwsAlg, JwsVerifier};
+    struct AcceptEverything;
+    impl JwsVerifier for AcceptEverything {
+        fn alg(&self) -> JwsAlg {
+            JwsAlg::Es256
+        }
+        fn verify(&self, _: &Jwk, _: &[u8], _: &[u8]) -> bool {
+            true
+        }
+    }
+    let provider = Arc::new(NoEntropy);
+    assert!(oauth_as::crypto::verifiers(provider.clone())
+        .algorithms()
+        .is_empty());
+    let server = AuthorizationServer::new_with_crypto(
+        ServerConfig::new("https://as.example", "https://as.example/verify"),
+        MemoryStorage::default(),
+        provider,
+    )
+    .unwrap();
+    #[cfg(any(feature = "client-assertion", feature = "dpop", feature = "jar"))]
+    let server = server.with_jws_verifier(Arc::new(AcceptEverything));
+    let metadata = serde_json::to_value(server.metadata()).unwrap();
+    for key in [
+        "token_endpoint_auth_signing_alg_values_supported",
+        "request_object_signing_alg_values_supported",
+        "dpop_signing_alg_values_supported",
+    ] {
+        if let Some(values) = metadata[key].as_array() {
+            assert!(!values.iter().any(|v| JwsAlg::ALL
+                .iter()
+                .any(|a| v.as_str() == Some(a.jose_name()))));
+        }
+    }
+}
