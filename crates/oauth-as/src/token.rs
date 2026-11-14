@@ -180,15 +180,18 @@ impl Confirmation {
     /// object: an empty `cnf` claims a constraint exists and then names none, which is worse
     /// than silence.
     pub fn is_empty(&self) -> bool {
-        #[cfg(feature = "dpop")]
-        if self.jkt.is_some() {
-            return false;
+        #[cfg(all(feature = "dpop", feature = "mtls"))]
+        {
+            self.jkt.is_none() && self.x5t_s256.is_none()
         }
-        #[cfg(feature = "mtls")]
-        if self.x5t_s256.is_some() {
-            return false;
+        #[cfg(all(feature = "dpop", not(feature = "mtls")))]
+        {
+            self.jkt.is_none()
         }
-        true
+        #[cfg(all(feature = "mtls", not(feature = "dpop")))]
+        {
+            self.x5t_s256.is_none()
+        }
     }
 }
 
