@@ -52,7 +52,7 @@ fn primitive_known_answers() {
     let p = selected();
     assert_eq!(
         oauth_as::pkce::code_challenge_s256_with_crypto(
-            &p,
+            p.as_ref(),
             "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         ),
         "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"

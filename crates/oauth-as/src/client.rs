@@ -87,7 +87,7 @@ impl SecretHash {
 
     /// Hash `secret` with the built-in scheme. The result is what the host stores; the secret
     /// itself is handed to the client once and never persisted here.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn sha256(secret: &str) -> Self {
         Self::sha256_with_crypto(&crate::crypto::builtin(), secret)
     }
@@ -142,7 +142,7 @@ impl SecretHash {
     /// the registration access token a bearer credential the server has to check on every
     /// management request, and it is stored the same one-way way for the same reason (see
     /// [`crate::registration`]), so it needs the same comparison rather than a second copy of it.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn verify(&self, presented: &str, verifier: Option<&dyn SecretVerifier>) -> bool {
         self.verify_with_crypto(&crate::crypto::builtin(), presented, verifier)
     }
@@ -379,7 +379,7 @@ impl ClientAuth {
     /// Verify a presented secret with no host verifier installed. See [`ClientAuth::verify_with`],
     /// which this delegates to; a [`ClientAuth::ConfidentialSecretHash`] in a scheme this crate
     /// does not implement therefore never authenticates through this entry point.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn verify(&self, presented: Option<&str>) -> bool {
         self.verify_with(presented, None)
     }
@@ -405,7 +405,7 @@ impl ClientAuth {
     /// `AuthorizationServer::authenticate_client` discharges it by running a DUMMY verification
     /// through this same function on the unknown-id path. See [`SecretVerifier::dummy_hash`] for
     /// the part of it only the host can supply.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn verify_with(
         &self,
         presented: Option<&str>,

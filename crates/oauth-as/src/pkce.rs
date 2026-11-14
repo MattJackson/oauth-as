@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
 /// Compute the `S256` challenge for a verifier (RFC 7636 section 4.2).
-#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn code_challenge_s256(verifier: &str) -> String {
     code_challenge_s256_with_crypto(&crate::crypto::builtin(), verifier)
 }
@@ -23,7 +23,7 @@ pub fn code_challenge_s256_with_crypto(crypto: &dyn CryptoProvider, verifier: &s
 /// Verify a presented verifier against a stored challenge (RFC 7636 section 4.6): recompute and
 /// compare. The comparison is constant time in the challenge length; an S256 challenge is a fixed
 /// 43 characters so length itself leaks nothing.
-#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn verify_s256(verifier: &str, challenge: &str) -> bool {
     verify_s256_with_crypto(&crate::crypto::builtin(), verifier, challenge)
 }

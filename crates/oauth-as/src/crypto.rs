@@ -148,7 +148,7 @@ impl crate::jwt::JwsSigner for ProviderSigner {
 mod rustcrypto;
 #[cfg(feature = "rustcrypto")]
 pub use rustcrypto::RustCrypto;
-#[cfg(feature = "aws-lc")]
+#[cfg(any(feature = "aws-lc", feature = "fips"))]
 mod aws_lc;
 #[cfg(feature = "aws-lc")]
 pub use aws_lc::AwsLc;
@@ -159,13 +159,13 @@ pub use aws_lc::Fips;
 /// RustCrypto preserves legacy defaults when compiled; otherwise FIPS precedes AWS-LC.
 /// Explicit FIPS deployments disable defaults or pass `Fips` directly. Errors never fall back.
 pub fn default_provider() -> Result<Arc<dyn CryptoProvider>, CryptoError> {
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     {
         let p = builtin();
         p.validate()?;
         Ok(Arc::new(p))
     }
-    #[cfg(not(any(feature = "rustcrypto", feature = "aws-lc")))]
+    #[cfg(not(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips")))]
     {
         Err(CryptoError::MissingProvider)
     }

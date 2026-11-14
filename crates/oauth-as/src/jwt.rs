@@ -2175,7 +2175,7 @@ impl Jwk {
     /// of one description of it; including any of them would let the same key produce two
     /// thumbprints and so two tokens a resource server could not tell were bound to one client. The
     /// required-member set and its order are per key TYPE (RFC 7638 section 3.2).
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn thumbprint(&self) -> String {
         self.thumbprint_with_crypto(&crate::crypto::builtin())
     }
@@ -2419,12 +2419,12 @@ pub fn verify_es256(key: &Jwk, signing_input: &[u8], signature: &[u8]) -> bool {
 }
 
 /// HMAC-SHA-256 through the compiled default backend. Prefer an explicit provider.
-#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     crate::crypto::builtin().hmac_sha256(key, message)
 }
 /// Verify HS256 through the compiled default backend.
-#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn verify_hs256(secret: &[u8], message: &[u8], signature: &[u8]) -> bool {
     verify_hs256_with_crypto(&crate::crypto::builtin(), secret, message, signature)
 }

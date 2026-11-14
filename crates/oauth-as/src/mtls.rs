@@ -108,7 +108,7 @@ impl CertificateThumbprint {
     /// `der` is the certificate itself, NOT a PEM block: base64 text with `-----BEGIN
     /// CERTIFICATE-----` around it hashes to something that matches nothing. See
     /// [`CertificateThumbprint::from_pem`] for that form.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_der(der: &[u8]) -> Self {
         Self::from_der_with_crypto(&crate::crypto::builtin(), der)
     }
@@ -125,7 +125,7 @@ impl CertificateThumbprint {
     ///
     /// Only the FIRST certificate in the file is used: RFC 8705 binds to the end-entity
     /// certificate, and a PEM bundle carries its issuers after it.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_pem(pem: &str) -> Result<Self, MtlsRegistrationError> {
         Self::from_pem_with_crypto(&crate::crypto::builtin(), pem)
     }
@@ -246,7 +246,7 @@ impl<'a> ClientCertificate<'a> {
     /// clients by. A certificate with no facts attached can still be BOUND to a token (section 3),
     /// which is why they are optional rather than required: section 4 makes certificate binding
     /// available to a client that does not authenticate with mutual TLS at all.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn from_der(der: &[u8]) -> Self {
         Self::from_der_with_crypto(&crate::crypto::builtin(), der)
     }

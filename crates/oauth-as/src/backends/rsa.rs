@@ -282,14 +282,7 @@ pub fn rsa_public_jwk(public: &RsaPublicKey, kid: Option<String>) -> Jwk {
 ///
 /// PSS signing draws a fresh 32-byte salt per signature (RFC 8017 §9.1), so unlike deterministic
 /// PKCS#1 v1.5 it needs randomness. Zero-state: it holds nothing and reaches the OS synchronously per
-/// call through [`getrandom::fill`] — the SAME source [`crate::jwt::EcdsaP256Key::generate`] uses —
-/// so there is no hidden global, no background thread, and no new dependency. It exists to feed
-/// `RandomizedSigner::try_sign_with_rng`, which lets this backend avoid `rsa`'s `getrandom` feature
-/// (whose blanket `Signer::sign` would drag a second `getrandom`/`rand_core` major into the tree).
-///
-/// `RngCore::fill_bytes` is infallible, so an OS randomness failure PANICS here rather than surfacing
-/// as a `SignerError` — the same house style as `EcdsaP256Key::generate`'s `.expect(...)`. An AS that
-/// cannot draw randomness cannot safely mint artifacts; failing loudly is correct.
+/// test-fixture entropy adapter. Production PSS signing uses a fallible, preloaded salt.
 #[cfg(test)]
 struct OsFillRng;
 

@@ -422,7 +422,7 @@ const ACCEPTED_TYP: &[&str] = &["JWT", "jwt", "client-authentication+jwt"];
 /// obtain is a type that should not have been exported. It is also the other half of
 /// [`unverified_subject`], which has always been public: exposing the "believe nothing" lookup
 /// while hiding the verification it exists to feed left the safe path out of reach.
-#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn verify_assertion(
     verifier: Option<&dyn JwsVerifier>,
     keys: &AssertionKeys,

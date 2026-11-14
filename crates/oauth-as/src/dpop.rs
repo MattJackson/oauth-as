@@ -308,7 +308,7 @@ fn htu_eq(claimed: &str, expected: &str) -> bool {
 /// [`AlgAllowList`](crate::jwt::AlgAllowList) is applied by `AuthorizationServer` when it BUILDS the
 /// set it passes here (it clears forbidden slots), so a host that hand-builds a `JwsVerifiers` and
 /// calls this directly is responsible for the algorithm policy of the set it supplies.
-#[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+#[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
 pub fn verify_proof(
     verifiers: &JwsVerifiers,
     proof: &str,

@@ -58,8 +58,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["rustcrypto"]
 # Primitive backends; asymmetric RustCrypto implementations remain individually opt-in.
 rustcrypto = ["dep:sha2", "dep:hmac", "dep:getrandom", "dep:subtle"]
-aws-lc = ["dep:aws-lc-rs"]
-fips = ["aws-lc", "aws-lc-rs/fips"]
+aws-lc = ["dep:aws-lc-rs", "aws-lc-rs/aws-lc-sys"]
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips"]
 # `http` adds an HTTP service over AuthorizationServer, for hosts that want the RFC-shaped wire
 # surface rather than writing it themselves, and for the black-box conformance harness (which
 # needs an external process to talk to). Nothing in the library depends on it.

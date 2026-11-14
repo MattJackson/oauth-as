@@ -2012,7 +2012,7 @@ pub struct AuthorizationServer<S: Storage, C: Clock = SystemClock> {
 impl<S: Storage> AuthorizationServer<S, SystemClock> {
     /// Construct with the real clock. This is the crate's allocation entry point: call it when
     /// (and only when) host config enables the AS.
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn new(config: ServerConfig, store: S) -> Self {
         Self::with_clock(config, store, SystemClock)
     }
@@ -2032,7 +2032,7 @@ impl<S: Storage> AuthorizationServer<S, SystemClock> {
 
 impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     /// Construct with an injected clock (tests).
-    #[cfg(any(feature = "rustcrypto", feature = "aws-lc"))]
+    #[cfg(any(feature = "rustcrypto", feature = "aws-lc", feature = "fips"))]
     pub fn with_clock(config: ServerConfig, store: S, clock: C) -> Self {
         Self::construct(
             config,

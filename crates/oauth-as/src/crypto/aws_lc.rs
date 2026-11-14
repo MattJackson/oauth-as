@@ -3,6 +3,7 @@
 use super::{CryptoError, CryptoProvider};
 
 /// AWS-LC primitives and asymmetric operations.
+#[cfg(feature = "aws-lc")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AwsLc;
 /// AWS-LC FIPS 3 primitives, restricted to this backend's approved algorithm policy.
@@ -33,6 +34,7 @@ macro_rules! primitives {
         }
     };
 }
+#[cfg(feature = "aws-lc")]
 impl CryptoProvider for AwsLc {
     primitives!();
     #[cfg(feature = "jwt")]
