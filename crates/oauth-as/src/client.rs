@@ -48,8 +48,7 @@ impl fmt::Display for ClientId {
 ///
 /// Two kinds of scheme:
 ///
-/// - [`SecretHash::SHA256_HEX`], built by [`SecretHash::sha256`] and verified by this crate with
-///   no host code and no new dependency (`sha2` is already here for RFC 7636 PKCE). Plain SHA-256
+/// - [`SecretHash::SHA256_HEX`], built by [`SecretHash::sha256_with_crypto`] and verified through the selected provider. Plain SHA-256
 ///   is the RIGHT primitive for this particular job and the wrong one for a user password: a
 ///   client secret is high-entropy and host-generated, so there is no dictionary to run against
 ///   it, and the offline-guessing threat that makes a slow KDF necessary for human-chosen

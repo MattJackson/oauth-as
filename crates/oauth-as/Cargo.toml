@@ -474,7 +474,7 @@ required-features = ["axum", "jwt", "client-assertion"]
 # exercises it and a plain `--features axum` build still gets the example.
 [[example]]
 name = "production_server"
-required-features = ["axum"]
+required-features = ["axum", "rustcrypto"]
 
 # The RFC 9728 fixture resource (see the example's own module docs for why an AUTHORIZATION SERVER
 # crate ships a resource-server example, and for what it deliberately is not). `axum` for the

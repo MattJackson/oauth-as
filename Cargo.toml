@@ -75,7 +75,7 @@ exclude = ["fuzz"]
 #     and costs one copy; a host that instantiates several pays for several. This is a deliberate
 #     trade: generics keep the storage seam allocation-free and devirtualized, where a
 #     `dyn Storage` would add an indirect call on every storage operation on the token path.
-#   * The default feature set is empty, so a consumer who wants only the protocol core links no
+#   * The default enables RustCrypto primitives only, so a protocol-core consumer links no
 #     HTTP stack and no signing code at all.
 # The guidance we give consumers lives in the README rather than here, where they would never
 # see it.

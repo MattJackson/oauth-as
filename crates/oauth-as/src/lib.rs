@@ -30,7 +30,7 @@
 //!
 //! # What is here
 //!
-//! ALWAYS COMPILED, no feature and no dependency beyond serde, sha2, base64 and getrandom:
+//! ALWAYS COMPILED, with serde/base64 and the selected crypto provider:
 //!
 //! - Protocol types mirroring the specs in OUR OWN structs (a deliberate project rule; no third
 //!   party's generated types): [`client::Client`], [`grant::GrantType`], [`token::TokenResponse`],

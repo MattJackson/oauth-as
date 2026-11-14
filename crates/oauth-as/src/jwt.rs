@@ -913,7 +913,7 @@ impl EcdsaP256Key {
     /// the tokens signed with it die with the process.
     ///
     /// # Panics
-    /// If the OS refuses randomness, which the rest of this crate also treats as unrecoverable.
+    /// If the OS refuses randomness. Use `try_generate` to handle that error.
     #[deprecated(
         since = "1.1.0",
         note = "use try_generate; entropy failure must be handled"

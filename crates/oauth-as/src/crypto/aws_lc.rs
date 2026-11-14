@@ -39,7 +39,7 @@ impl CryptoProvider for AwsLc {
     primitives!();
     #[cfg(feature = "jwt")]
     fn verifier(&self, alg: crate::jwt::JwsAlg) -> Option<&dyn crate::jwt::JwsVerifier> {
-        Some(verifier(alg))
+        Some(verifier(alg, false))
     }
     #[cfg(feature = "jwt")]
     fn signing_key(
@@ -63,7 +63,7 @@ impl CryptoProvider for Fips {
         if alg == crate::jwt::JwsAlg::EdDsa {
             None
         } else {
-            Some(verifier(alg))
+            Some(verifier(alg, true))
         }
     }
     #[cfg(feature = "jwt")]
@@ -89,15 +89,25 @@ use aws_lc_rs::signature::{self, KeyPair};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
 
 #[cfg(feature = "jwt")]
-struct Verifier(JwsAlg);
+struct Verifier(JwsAlg, bool);
 #[cfg(feature = "jwt")]
-fn verifier(alg: JwsAlg) -> &'static Verifier {
-    match alg {
-        JwsAlg::Es256 => &Verifier(JwsAlg::Es256),
-        JwsAlg::EdDsa => &Verifier(JwsAlg::EdDsa),
-        JwsAlg::Rs256 => &Verifier(JwsAlg::Rs256),
-        JwsAlg::Ps256 => &Verifier(JwsAlg::Ps256),
+fn verifier(alg: JwsAlg, fips: bool) -> &'static Verifier {
+    match (alg, fips) {
+        (JwsAlg::Es256, false) => &Verifier(JwsAlg::Es256, false),
+        (JwsAlg::EdDsa, false) => &Verifier(JwsAlg::EdDsa, false),
+        (JwsAlg::Rs256, false) => &Verifier(JwsAlg::Rs256, false),
+        (JwsAlg::Ps256, false) => &Verifier(JwsAlg::Ps256, false),
+        (JwsAlg::Es256, true) => &Verifier(JwsAlg::Es256, true),
+        (JwsAlg::EdDsa, true) => &Verifier(JwsAlg::EdDsa, true),
+        (JwsAlg::Rs256, true) => &Verifier(JwsAlg::Rs256, true),
+        (JwsAlg::Ps256, true) => &Verifier(JwsAlg::Ps256, true),
     }
+}
+// Certificate 5314, approved RSA signature sizes. Require the high bit as well as byte
+// length: a 3071-bit modulus occupies the same number of bytes as a 3072-bit modulus.
+#[cfg(feature = "jwt")]
+fn approved_rsa_modulus(n: &[u8]) -> bool {
+    [256, 384, 512].contains(&n.len()) && n[0] & 0x80 != 0
 }
 #[cfg(feature = "jwt")]
 impl JwsVerifier for Verifier {
@@ -105,7 +115,7 @@ impl JwsVerifier for Verifier {
         self.0
     }
     fn verify(&self, key: &Jwk, message: &[u8], sig: &[u8]) -> bool {
-        if !crate::jwt::consistent(self.0, key) {
+        if !crate::jwt::consistent(self.0, key) || (self.1 && self.0 == JwsAlg::EdDsa) {
             return false;
         }
         match key {
@@ -139,6 +149,9 @@ impl JwsVerifier for Verifier {
                 let (Ok(n), Ok(e)) = (B64.decode(n), B64.decode(e)) else {
                     return false;
                 };
+                if self.1 && !approved_rsa_modulus(&n) {
+                    return false;
+                }
                 let alg = match self.0 {
                     JwsAlg::Rs256 => &signature::RSA_PKCS1_2048_8192_SHA256,
                     JwsAlg::Ps256 => &signature::RSA_PSS_2048_8192_SHA256,
@@ -192,7 +205,10 @@ fn load_key(
             }
             let k =
                 signature::Ed25519KeyPair::from_pkcs8(der).map_err(|_| CryptoError::InvalidKey)?;
-            let j=Jwk::from_json(&serde_json::json!({"kty":"OKP","crv":"Ed25519","x":B64.encode(k.public_key().as_ref()),"kid":kid})).map_err(|_|CryptoError::InvalidKey)?;
+            let j = Jwk::from_json(&serde_json::json!({
+                "kty": "OKP", "crv": "Ed25519", "x": B64.encode(k.public_key().as_ref()), "kid": kid
+            }))
+            .map_err(|_| CryptoError::InvalidKey)?;
             (Key::Ed(k), j)
         }
         JwsAlg::Rs256 | JwsAlg::Ps256 => {
@@ -200,7 +216,11 @@ fn load_key(
             let p = k.public_key();
             let n = p.modulus().big_endian_without_leading_zero();
             let e = p.exponent().big_endian_without_leading_zero();
-            if n.len() < 256 || (fips && ![256, 384, 512].contains(&n.len())) {
+            if n.len() < 256 || (fips && !approved_rsa_modulus(n)) {
+                return Err(CryptoError::InvalidKey);
+            }
+            #[cfg(feature = "fips")]
+            if fips && !k.is_valid_fips_key() {
                 return Err(CryptoError::InvalidKey);
             }
             let j = Jwk::from_json(

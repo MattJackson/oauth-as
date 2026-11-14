@@ -2554,6 +2554,25 @@ impl<S: Storage, C: Clock> AuthorizationServer<S, C> {
     pub fn metadata(&self) -> crate::metadata::AuthorizationServerMetadata {
         #[allow(unused_mut)]
         let mut meta = crate::metadata::AuthorizationServerMetadata::from_config(&self.config);
+        // The legacy config-only metadata includes feature-derived ES256 defaults. An
+        // explicit provider must replace those defaults before resolving its own capabilities.
+        #[cfg(any(feature = "client-assertion", feature = "jar", feature = "dpop"))]
+        if !self.legacy_verifiers {
+            #[cfg(feature = "client-assertion")]
+            {
+                meta.token_endpoint_auth_methods_supported
+                    .retain(|m| m != crate::client_assertion::PRIVATE_KEY_JWT);
+                meta.token_endpoint_auth_signing_alg_values_supported = Some(vec!["HS256".into()]);
+            }
+            #[cfg(feature = "jar")]
+            {
+                meta.request_object_signing_alg_values_supported = None;
+            }
+            #[cfg(feature = "dpop")]
+            {
+                meta.dpop_signing_alg_values_supported = None;
+            }
+        }
         // Only the verifier-dependent members need adjusting, and only in a build that could verify
         // at all: the `cfg` is exactly the set `jws_verifier` is gated on. Every wired algorithm
         // whose verifier actually RESOLVES (the built-in backend for its feature, or a host's
