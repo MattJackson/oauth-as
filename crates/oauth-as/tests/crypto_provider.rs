@@ -227,7 +227,7 @@ async fn es256_signer_passes_independent_contract() {
 #[cfg(all(feature = "fips", feature = "jwt"))]
 #[test]
 fn fips_rejects_rsa_moduli_outside_approved_bit_lengths() {
-    use aws_lc_rs::signature;
+    use aws_lc_rs::signature::{self, KeyPair};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
     use oauth_as::jwt::{Jwk, JwsAlg};
     let der = B64.decode(vectors::NONAPPROVED_RSA_DER).unwrap();
@@ -271,8 +271,9 @@ fn explicit_provider_never_installs_builtin_verifiers() {
     }
     let provider = Arc::new(NoEntropy);
     assert!(oauth_as::crypto::verifiers(provider.clone())
-        .algorithms()
-        .is_empty());
+        .installed()
+        .next()
+        .is_none());
     let server = AuthorizationServer::new_with_crypto(
         ServerConfig::new("https://as.example", "https://as.example/verify"),
         MemoryStorage::default(),
