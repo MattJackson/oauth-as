@@ -19,9 +19,9 @@ src/cimd.rs
 src/client.rs
 src/client_assertion.rs
 src/consent.rs
+src/crypto.rs
 src/crypto/aws_lc.rs
 src/crypto/rustcrypto.rs
-src/crypto.rs
 src/delegate.rs
 src/device.rs
 src/dpop.rs
