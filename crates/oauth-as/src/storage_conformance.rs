@@ -105,10 +105,14 @@
 //! - Nothing here observes the store's isolation level, its retry behaviour, or what it does when
 //!   the connection drops mid-operation.
 //!
-//! If the rendezvous gate cannot be satisfied (a `with_spawn` that runs tasks strictly one after
-//! another to completion, so no two racers are ever in flight), the harness reports
-//! `harness/race_setup` and the atomicity results in that run mean nothing. That is deliberately a
-//! reported violation rather than a silent pass.
+//! If the rendezvous gate cannot be satisfied (a `with_spawn` that runs its task to completion
+//! inline, inside the call that hands it over, so no two racers are ever in flight), the harness
+//! reports `harness/race_setup` and the atomicity results in that run mean nothing. That is
+//! deliberately a reported violation rather than a silent pass. A racer waiting at the gate for
+//! racers that HAVE been handed over waits for them however long the host takes to run them: how
+//! fast a runtime polls one task says nothing about whether it will run the others, so the gate
+//! never judges by it. A `with_spawn` that queues its tasks to something that runs them one after
+//! another to completion therefore hangs the check, which the host's test timeout reports.
 //!
 //! # Cost when you do not enable it
 //!
@@ -121,6 +125,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::thread::ThreadId;
 use std::time::{Duration, SystemTime};
 
 use crate::authorization::{AuthorizationCodeRecord, AuthorizationCodeState, CodeChallengeMethod};
@@ -350,13 +355,6 @@ type TakeResults<T> = Vec<Result<Option<T>, StorageError>>;
 
 /// The default number of racers per `take_*` check.
 const DEFAULT_RACERS: usize = 8;
-
-/// How many times a racer will re-poll while waiting at the rendezvous gate before giving up and
-/// declaring the race unsatisfiable. Arrival needs no I/O (the gate is reached before the store is
-/// touched), so a spawner that runs its tasks concurrently at all satisfies this in a handful of
-/// polls; the budget exists only so a spawner that runs tasks strictly sequentially reports
-/// `harness/race_setup` instead of hanging the host's test suite forever.
-const GATE_POLL_BUDGET: u32 = 10_000;
 
 /// The [`Storage`] conformance harness. See the module docs, particularly the honest account of
 /// what the concurrency checks can and cannot prove.
@@ -3756,21 +3754,23 @@ where
                     let collected = Arc::clone(&collected);
                     let latch = Arc::clone(&latch);
                     let abandoned = Arc::clone(&abandoned);
-                    spawn(Box::pin(async move {
-                        let mut guard = RacerGuard {
-                            latch,
-                            abandoned,
-                            finished: false,
-                        };
-                        let outcome = fut.await;
-                        // A poisoned lock means another racer panicked; the recovered guard is
-                        // sound here because the vector is only ever pushed to.
-                        collected
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(outcome);
-                        guard.finished = true;
-                    }));
+                    gate.hand_over(|| {
+                        spawn(Box::pin(async move {
+                            let mut guard = RacerGuard {
+                                latch,
+                                abandoned,
+                                finished: false,
+                            };
+                            let outcome = fut.await;
+                            // A poisoned lock means another racer panicked; the recovered guard
+                            // is sound here because the vector is only ever pushed to.
+                            collected
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(outcome);
+                            guard.finished = true;
+                        }))
+                    });
                 }
                 latch.wait().await;
                 let mut guard = collected.lock().unwrap_or_else(|e| e.into_inner());
@@ -5233,6 +5233,13 @@ fn race_setup_verdict(report: &mut Report, abandoned: usize, n: usize, gate_unsa
 /// A rendezvous the racers park on so their `take_*` calls are all in flight at once. Without it,
 /// a runtime is free to run each spawned task to completion before starting the next, and a
 /// read-then-delete store would pass by never overlapping with itself.
+///
+/// A racer that is not last waits on its waker until the last one arrives. It gives up only when
+/// the others provably cannot arrive: it is being polled inside the spawner call that hands it
+/// over, on the thread making that call, so the spawner is running it to completion inline and
+/// the harness cannot hand over the next racer until it finishes. It never gives up because it
+/// was polled many times, or for a long time, before the others arrived: that measures how the
+/// host schedules threads, not whether the racers overlap.
 pub(crate) struct Gate {
     target: usize,
     arrived: AtomicUsize,
@@ -5240,6 +5247,8 @@ pub(crate) struct Gate {
     /// True when a racer gave up waiting: the run's atomicity results prove nothing.
     unsatisfied: AtomicBool,
     waiters: Mutex<Vec<Waker>>,
+    /// The thread inside the spawner call that is handing a racer over, while it is inside it.
+    handing_over: Mutex<Option<ThreadId>>,
 }
 
 impl Gate {
@@ -5250,6 +5259,7 @@ impl Gate {
             open: AtomicBool::new(false),
             unsatisfied: AtomicBool::new(false),
             waiters: Mutex::new(Vec::new()),
+            handing_over: Mutex::new(None),
         })
     }
 
@@ -5257,12 +5267,27 @@ impl Gate {
         GateWait {
             gate: Arc::clone(self),
             counted: false,
-            budget: GATE_POLL_BUDGET,
         }
     }
 
     pub(crate) fn unsatisfied(&self) -> bool {
         self.unsatisfied.load(Ordering::SeqCst)
+    }
+
+    /// Run `spawn`, the call that hands one racer to the host, marked as a hand-over on this
+    /// thread, so a racer the spawner polls inline, inside that call, can tell that the others
+    /// cannot arrive while it waits.
+    pub(crate) fn hand_over(&self, spawn: impl FnOnce()) {
+        *self.handing_over.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::thread::current().id());
+        spawn();
+        *self.handing_over.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Whether this thread is inside a hand-over: a racer polled here is being run inline.
+    fn handed_over_inline(&self) -> bool {
+        *self.handing_over.lock().unwrap_or_else(|e| e.into_inner())
+            == Some(std::thread::current().id())
     }
 
     fn wake_all(&self) {
@@ -5276,7 +5301,6 @@ impl Gate {
 pub(crate) struct GateWait {
     gate: Arc<Gate>,
     counted: bool,
-    budget: u32,
 }
 
 impl Future for GateWait {
@@ -5294,15 +5318,15 @@ impl Future for GateWait {
         if self.gate.open.load(Ordering::SeqCst) {
             return Poll::Ready(());
         }
-        if self.budget == 0 {
-            // Nobody else is coming: the racers are being run one at a time. Recorded rather than
-            // hung, and reported as `harness/race_setup` so the run is not mistaken for a pass.
+        if self.gate.handed_over_inline() {
+            // Nobody else is coming: the spawner is running this racer inline, and the next one
+            // is handed over only after it finishes. Recorded rather than hung, and reported as
+            // `harness/race_setup` so the run is not mistaken for a pass.
             self.gate.unsatisfied.store(true, Ordering::SeqCst);
             return Poll::Ready(());
         }
-        self.budget -= 1;
-        // Both a registered waker (for a racer parked on another thread) and a self-wake (so a
-        // cooperatively polled racer is re-polled and the budget actually counts down).
+        // Registered, then the gate looked at again: the last arrival opens the gate before it
+        // takes the waiters, so either this racer sees it open or the last arrival wakes it.
         self.gate
             .waiters
             .lock()
@@ -5311,7 +5335,6 @@ impl Future for GateWait {
         if self.gate.open.load(Ordering::SeqCst) {
             return Poll::Ready(());
         }
-        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }

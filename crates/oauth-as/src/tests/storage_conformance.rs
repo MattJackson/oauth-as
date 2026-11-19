@@ -103,17 +103,55 @@ async fn the_gate_opens_only_once_every_racer_has_arrived() {
     );
 }
 
-/// A racer that is run alone must not hang the host's test suite forever. It gives up after its
-/// poll budget and marks the gate unsatisfied, which the harness reports as `harness/race_setup`:
-/// a run whose racers never overlapped proves nothing about atomicity and must not read as a pass.
-#[tokio::test]
-async fn a_lone_racer_gives_up_and_marks_the_race_unsatisfied() {
+/// A waker that does nothing: these tests poll by hand and decide themselves when to poll again.
+fn idle_waker() -> Waker {
+    struct Idle;
+    impl std::task::Wake for Idle {
+        fn wake(self: Arc<Self>) {}
+    }
+    Waker::from(Arc::new(Idle))
+}
+
+/// A racer the spawner runs inline, inside the call that hands it over, must not hang the host's
+/// test suite forever: the next racer cannot be handed over until it finishes. It gives up and
+/// marks the gate unsatisfied, which the harness reports as `harness/race_setup`: a run whose
+/// racers never overlapped proves nothing about atomicity and must not read as a pass.
+#[test]
+fn a_racer_run_inside_its_own_hand_over_gives_up_and_marks_the_race_unsatisfied() {
     let gate = Gate::new(2);
-    gate.wait().await;
+    let waker = idle_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut wait = gate.wait();
+    gate.hand_over(|| {
+        assert!(Pin::new(&mut wait).poll(&mut cx).is_ready());
+    });
     assert!(
         gate.unsatisfied(),
-        "waiting alone for a partner that never arrives must be recorded, not silently ignored"
+        "waiting alone for a partner that cannot be handed over must be recorded, not silently \
+         ignored"
     );
+}
+
+/// How often, or how fast, a waiting racer is polled before the others arrive says nothing about
+/// whether they will: a host's runtime can poll one racer's task over and over while the thread
+/// that holds the others is not scheduled. A racer handed over normally waits for its partner
+/// however many times it is polled first, and the race is satisfied when the partner arrives.
+#[test]
+fn a_racer_waits_for_a_late_partner_however_often_it_is_polled() {
+    let gate = Gate::new(2);
+    let waker = idle_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut early = gate.wait();
+    for _ in 0..100_000 {
+        assert!(
+            Pin::new(&mut early).poll(&mut cx).is_pending(),
+            "a racer gave up before its partner, which had been handed over, was polled"
+        );
+    }
+    let mut late = gate.wait();
+    assert!(Pin::new(&mut late).poll(&mut cx).is_ready());
+    assert!(Pin::new(&mut early).poll(&mut cx).is_ready());
+    assert!(!gate.unsatisfied(), "the race was satisfied");
 }
 
 #[tokio::test]

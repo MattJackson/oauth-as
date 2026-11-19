@@ -2661,6 +2661,22 @@ async fn a_look_then_insert_replay_claim_is_caught() {
 
 // ---------------------------------------------------------------------- the harness's own limits
 
+/// Polls `task` to completion on the calling thread, parking the thread between polls.
+fn run_inline(task: oauth_as::storage_conformance::Task) {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut task = task;
+    while task.as_mut().poll(&mut cx).is_pending() {
+        std::thread::park();
+    }
+}
+
 /// A "spawner" that runs each racer to completion before returning is not concurrency, and an
 /// atomicity result obtained that way proves nothing. The harness must SAY so rather than report
 /// a clean run, even when the store underneath is a correct one.
@@ -2668,17 +2684,10 @@ async fn a_look_then_insert_replay_claim_is_caught() {
 async fn a_sequential_spawner_is_reported_rather_than_mistaken_for_a_pass() {
     let violations = StorageConformance::new(|| async { MemoryStorage::new() })
         .with_spawn(|task| {
-            // Each task gets its own thread and its own single-threaded runtime, and is joined
-            // before the next one is even created: strictly one at a time, which is exactly the
-            // shape the gate exists to detect.
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .expect("current-thread runtime")
-                    .block_on(task);
-            })
-            .join()
-            .expect("racer thread");
+            // Each task is polled to completion right here, on the calling thread, before the
+            // call returns and the next one can be handed over: strictly one at a time, which is
+            // exactly the shape the gate exists to detect.
+            run_inline(task);
         })
         .racers(2)
         .run()
